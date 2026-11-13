@@ -35,6 +35,7 @@ type Config struct {
 	SessionTTL        time.Duration
 	InsecureLocalHTTP bool
 	Now               func() time.Time
+	GitTimeout        time.Duration
 }
 
 type App struct {
@@ -47,6 +48,7 @@ type App struct {
 	rate          map[string][]time.Time
 	logins        map[string]pendingLogin
 	sessions      map[[32]byte]time.Time
+	projects      *projectManager
 }
 
 func New(cfg Config) (*App, error) {
@@ -163,7 +165,12 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
-	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]time.Time)}, nil
+	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]time.Time), projects: projects}, nil
 }
 
 func loadOPAQUEServerKey(c *opaque.Configuration, path string, priorDatabase bool) (*opaque.ServerKeyMaterial, string, error) {
@@ -316,6 +323,10 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /opaque/login/finish", a.loginFinish)
 	m.HandleFunc("GET /api/session", a.sessionStatus)
 	m.HandleFunc("POST /api/logout", a.logout)
+	m.HandleFunc("GET /api/projects", a.listProjects)
+	m.HandleFunc("POST /api/projects", a.createProject)
+	m.HandleFunc("GET /api/projects/{id}/refs", a.projectRefs)
+	m.HandleFunc("POST /api/projects/{id}/refresh", a.refreshProject)
 	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if a.cfg.CanonicalOrigin != "" {
 			origin, _ := url.Parse(a.cfg.CanonicalOrigin)

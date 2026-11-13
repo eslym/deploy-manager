@@ -28,8 +28,9 @@ func main() {
 	key := flags.String("tls-key", "", "TLS private key")
 	loginTTL := flags.Duration("login-ttl", 2*time.Minute, "maximum lifetime of an OPAQUE login handshake")
 	sessionTTL := flags.Duration("session-ttl", 12*time.Hour, "maximum lifetime of an authenticated session")
+	gitTimeout := flags.Duration("git-timeout", 2*time.Minute, "maximum duration of a repository fetch")
 	_ = flags.Parse(os.Args[2:])
-	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), CanonicalOrigin: *origin, InsecureLocalHTTP: true, LoginTTL: *loginTTL, SessionTTL: *sessionTTL})
+	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), CanonicalOrigin: *origin, InsecureLocalHTTP: true, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, GitTimeout: *gitTimeout})
 	if err != nil {
 		log.Fatal(err)
 	}

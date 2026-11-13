@@ -22,3 +22,4 @@ go vet ./...
 cd tests/browser
 bun install --frozen-lockfile
 DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" node registration.mjs
+DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" node projects.mjs

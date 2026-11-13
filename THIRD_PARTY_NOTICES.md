@@ -20,6 +20,12 @@ copyright, attribution, and patent notice before distributing source or
 binaries. Go transitive modules include MIT and Go Authors BSD-3-Clause
 licensed works; their upstream notices remain applicable as well.
 
+Public repository support adds `github.com/go-git/go-git/v5 v5.19.3` and its
+transitive Go module graph. That graph has not been individually inventoried
+for distribution here; retain and review all applicable upstream license and
+notice files as part of the still-open #26 closure. This addition does not
+complete the application's third-party license inventory.
+
 The accepted Serenity WASM malformed-argument memory-leak risk also remains
 subject to the mandatory upgrade tracked by
 [#25](https://github.com/eslym/deploy-manager/issues/25): verify the published
