@@ -2,11 +2,13 @@ package lib
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -23,15 +25,35 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/format/pktline"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
+	"github.com/go-git/go-git/v5/plumbing/storer"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	gitclient "github.com/go-git/go-git/v5/plumbing/transport/client"
-	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	gitserver "github.com/go-git/go-git/v5/plumbing/transport/server"
 )
 
 func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	remoteDir := filepath.Join(t.TempDir(), "repo.git")
 	featureAtCreate := createSmartFixture(t, remoteDir)
+	partialDir := filepath.Join(t.TempDir(), "partial.git")
+	partialFeature := createSmartFixture(t, partialDir)
+	partialRepo, err := git.PlainOpen(partialDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialCommit, err := partialRepo.CommitObject(plumbing.NewHash(partialFeature))
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialTree, err := partialCommit.Tree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialFile, err := partialTree.File("README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialStore := missingObjectStorer{Storer: partialRepo.Storer, missing: partialFile.Hash}
 	var failRequests atomic.Bool
 	source, err := git.PlainOpen(remoteDir)
 	if err != nil {
@@ -39,15 +61,23 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	var endpoint *transport.Endpoint
 	var backend transport.Transport
+	var partialEndpoint *transport.Endpoint
+	var partialBackend transport.Transport
 	var remoteURL string
 	var redirectRequests atomic.Bool
 	var redirectedHits atomic.Int32
+	var gitRequests atomic.Int32
 	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gitRequests.Add(1)
 		if failRequests.Load() {
 			http.Error(w, "fixture deliberately unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		if endpoint == nil || backend == nil {
+		requestEndpoint, requestBackend := endpoint, backend
+		if strings.HasPrefix(r.URL.Path, "/partial.git/") {
+			requestEndpoint, requestBackend = partialEndpoint, partialBackend
+		}
+		if requestEndpoint == nil || requestBackend == nil {
 			http.Error(w, "fixture not ready", 500)
 			return
 		}
@@ -60,25 +90,42 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 			http.Redirect(w, r, remoteURL+"/redirected/repo.git/info/refs?service=git-upload-pack", http.StatusFound)
 			return
 		}
-		session, err := backend.NewUploadPackSession(endpoint, nil)
+		if r.Method == http.MethodGet && r.URL.Path == "/dumb.git/info/refs" {
+			w.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(w, strings.Repeat("0", 40)+" refs/heads/main\n")
+			return
+		}
+		if r.Method == http.MethodGet && r.URL.Path == "/sha256.git/info/refs" {
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+			encoder := pktline.NewEncoder(w)
+			_ = encoder.Encode([]byte("# service=git-upload-pack\n"))
+			_ = encoder.Flush()
+			_ = encoder.Encode([]byte(strings.Repeat("0", 40) + " refs/heads/main\x00object-format=sha256\n"))
+			_ = encoder.Flush()
+			return
+		}
+		session, err := requestBackend.NewUploadPackSession(requestEndpoint, nil)
 		if err != nil {
 			http.Error(w, "session unavailable", 500)
 			return
 		}
 		defer session.Close()
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repo.git/info/refs" && r.URL.Query().Get("service") == "git-upload-pack":
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") && r.URL.Query().Get("service") == "git-upload-pack":
 			adv, err := session.AdvertisedReferencesContext(r.Context())
 			if err != nil {
 				http.Error(w, "advertisement failed", 500)
 				return
 			}
 			adv.Prefix = [][]byte{[]byte("# service=git-upload-pack"), pktline.Flush}
+			if err := adv.Capabilities.Set(capability.Filter); err != nil {
+				t.Errorf("enable server filter capability: %v", err)
+			}
 			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
 			if err := adv.Encode(w); err != nil {
 				t.Errorf("encode refs: %v", err)
 			}
-		case r.Method == http.MethodPost && r.URL.Path == "/repo.git/git-upload-pack":
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/git-upload-pack"):
 			if _, err := session.AdvertisedReferencesContext(r.Context()); err != nil {
 				http.Error(w, "advertisement failed", 500)
 				return
@@ -105,7 +152,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 			}
 			defer response.Close()
 			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-			if err := response.Encode(w); err != nil {
+			if err := response.Encode(w); err != nil && r.Context().Err() == nil && !strings.HasPrefix(r.URL.Path, "/partial.git/") {
 				t.Errorf("encode pack: %v", err)
 			}
 		default:
@@ -119,10 +166,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend = gitserver.NewServer(gitserver.MapLoader{endpoint.String(): source.Storer})
+	partialEndpoint, err = transport.NewEndpoint(remote.URL + "/partial.git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialBackend = gitserver.NewServer(gitserver.MapLoader{partialEndpoint.String(): partialStore})
 	installTrustedSmartHTTPTestClient(t, remote)
 
 	dir := t.TempDir()
-	cfg := Config{DatabasePath: filepath.Join(dir, "state.sqlite"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), GitTimeout: time.Minute}
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.sqlite"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), GitTimeout: time.Minute, GitMaxTransferBytes: 64 << 10, GitMaxCacheBytes: 32 << 20, GitMaxRefs: 10}
 	app, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -145,8 +197,63 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	initialRefs := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
 	requireProjectRefs(t, initialRefs, featureAtCreate)
+	for _, unsupported := range []struct {
+		name string
+		url  string
+	}{
+		{"dumb HTTP", remote.URL + "/dumb.git"},
+		{"SHA-256 Git", remote.URL + "/sha256.git"},
+		{"partial clone", remote.URL + "/partial.git"},
+	} {
+		response := projectPost(t, client, appServer.URL, cookie, "/api/projects", `{"name":"`+unsupported.name+`","url":"`+unsupported.url+`"}`)
+		message := responseText(response)
+		response.Body.Close()
+		if response.StatusCode != http.StatusBadRequest || strings.Contains(message, unsupported.url) {
+			t.Fatalf("unsupported %s repository was not safely rejected: status %d, %s", unsupported.name, response.StatusCode, message)
+		}
+		if unsupported.name == "SHA-256 Git" && !strings.Contains(strings.ToLower(message), "sha-256") {
+			t.Fatalf("SHA-256 rejection is not actionable: %s", message)
+		}
+		if unsupported.name == "dumb HTTP" && !strings.Contains(strings.ToLower(message), "smart https") {
+			t.Fatalf("dumb HTTP rejection is not actionable: %s", message)
+		}
+		if unsupported.name == "partial clone" && !strings.Contains(strings.ToLower(message), "partial") && !strings.Contains(strings.ToLower(message), "incomplete") {
+			t.Fatalf("incomplete repository rejection is not actionable: %s", message)
+		}
+	}
 
-	featureAfter := addSmartFixtureCommit(t, remoteDir, "after refresh")
+	largePayload := make([]byte, 256<<10)
+	if _, err := rand.Read(largePayload); err != nil {
+		t.Fatal(err)
+	}
+	fixtureRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtureWorktree, err := fixtureRepo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixtureWorktree.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("feature/search")}); err != nil {
+		t.Fatal(err)
+	}
+	featureAfter := commitFixtureFile(t, remoteDir, fixtureWorktree, "feature", string(largePayload)).String()
+	lastSuccessfulBeforeOversizedRefresh := listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched
+	oversized := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	if oversized.StatusCode != http.StatusBadGateway {
+		t.Fatalf("oversized pack refresh status %d: %s", oversized.StatusCode, responseText(oversized))
+	}
+	oversizedMessage := responseText(oversized)
+	if !strings.Contains(strings.ToLower(oversizedMessage), "limit") {
+		t.Fatalf("oversized pack error is not actionable: %s", oversizedMessage)
+	}
+	refsAfterOversizedRefresh := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
+	if len(refsAfterOversizedRefresh) != len(initialRefs) || listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched == nil || !listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched.Equal(*lastSuccessfulBeforeOversizedRefresh) {
+		t.Fatal("oversized transfer changed cached refs or last successful fetch time")
+	}
+	// Increase the configured transfer ceiling for the remainder of the fixture
+	// so the same valid repository update can be exercised after the rejection.
+	app.projects.maxTransferBytes = 1 << 20
 	refreshRes := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
 	if refreshRes.StatusCode != http.StatusOK {
 		t.Fatalf("refresh status %d: %s", refreshRes.StatusCode, responseText(refreshRes))
@@ -160,6 +267,29 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	lastSuccessful := listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched
 	if lastSuccessful == nil {
 		t.Fatal("successful refresh has no timestamp")
+	}
+	for i := 0; i < 12; i++ {
+		name := plumbing.NewBranchReferenceName(fmt.Sprintf("refs-test/%02d", i))
+		if err := fixtureRepo.Storer.SetReference(plumbing.NewHashReference(name, plumbing.NewHash(featureAfter))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tooManyRefs := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	if tooManyRefs.StatusCode != http.StatusBadGateway {
+		t.Fatalf("excessive refs refresh status %d: %s", tooManyRefs.StatusCode, responseText(tooManyRefs))
+	}
+	refLimitMessage := responseText(tooManyRefs)
+	if !strings.Contains(strings.ToLower(refLimitMessage), "ref") {
+		t.Fatalf("excessive refs error is not actionable: %s", refLimitMessage)
+	}
+	if got := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID); !equalProjectRefs(refreshedRefs, got) {
+		t.Fatalf("excessive refs changed the successful cached refs: %#v", got)
+	}
+	for i := 0; i < 12; i++ {
+		name := plumbing.NewBranchReferenceName(fmt.Sprintf("refs-test/%02d", i))
+		if err := fixtureRepo.Storer.RemoveReference(name); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	// A genuinely failed refresh must keep refs and the timestamp from the last
@@ -212,6 +342,22 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if got := listProjectsFromAPI(t, restarted.Client(), restarted.URL, cookie); len(got) != 1 {
 		t.Fatalf("redirected repository was saved: %#v", got)
 	}
+	usedCache, err := directorySize(app.projects.root, app.projects.maxCacheBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldCacheLimit := app.projects.maxCacheBytes
+	app.projects.maxCacheBytes = usedCache + maxGitCacheGrowthFactor*app.projects.maxTransferBytes - 1
+	requestsBeforeCacheLimit := gitRequests.Load()
+	cacheLimitedCreate := projectPost(t, restarted.Client(), restarted.URL, cookie, "/api/projects", `{"name":"budget limited","url":"`+remote.URL+`/repo.git"}`)
+	if cacheLimitedCreate.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("cache-limited project creation status %d: %s", cacheLimitedCreate.StatusCode, responseText(cacheLimitedCreate))
+	}
+	cacheLimitedCreate.Body.Close()
+	if gitRequests.Load() != requestsBeforeCacheLimit || len(listProjectsFromAPI(t, restarted.Client(), restarted.URL, cookie)) != 1 {
+		t.Fatal("cache budget was checked only after starting another repository transfer")
+	}
+	app.projects.maxCacheBytes = oldCacheLimit
 }
 
 func installTrustedSmartHTTPTestClient(t *testing.T, server *httptest.Server) {
@@ -228,7 +374,7 @@ func installTrustedSmartHTTPTestClient(t *testing.T, server *httptest.Server) {
 		},
 	}
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	gitclient.InstallProtocol("https", githttp.NewClientWithOptions(client, &githttp.ClientOptions{RedirectPolicy: githttp.NoFollowRedirects}))
+	installProjectHTTPSClient(client)
 	t.Cleanup(func() {
 		transport.CloseIdleConnections()
 		gitclient.InstallProtocol("https", previous)
@@ -401,4 +547,23 @@ func equalProjectRefs(a, b []projectRef) bool {
 func responseText(response *http.Response) string {
 	data, _ := io.ReadAll(response.Body)
 	return string(data)
+}
+
+type missingObjectStorer struct {
+	storer.Storer
+	missing plumbing.Hash
+}
+
+func (s missingObjectStorer) EncodedObject(kind plumbing.ObjectType, hash plumbing.Hash) (plumbing.EncodedObject, error) {
+	if hash == s.missing {
+		return nil, plumbing.ErrObjectNotFound
+	}
+	return s.Storer.EncodedObject(kind, hash)
+}
+
+func (s missingObjectStorer) HasEncodedObject(hash plumbing.Hash) error {
+	if hash == s.missing {
+		return plumbing.ErrObjectNotFound
+	}
+	return s.Storer.HasEncodedObject(hash)
 }

@@ -133,6 +133,25 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 	}
 }
 
+func TestProjectResourceLimitsRequirePositiveBoundedValues(t *testing.T) {
+	for name, override := range map[string]func(*Config){
+		"transfer":      func(cfg *Config) { cfg.GitMaxTransferBytes = -1 },
+		"cache":         func(cfg *Config) { cfg.GitMaxCacheBytes = 1024 },
+		"refs":          func(cfg *Config) { cfg.GitMaxRefs = -1 },
+		"advertisement": func(cfg *Config) { cfg.GitMaxAdvertisementBytes = -1 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := Config{DatabasePath: filepath.Join(dir, "state.sqlite"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key")}
+			override(&cfg)
+			if app, err := New(cfg); err == nil {
+				app.Close()
+				t.Fatal("invalid resource limits were accepted")
+			}
+		})
+	}
+}
+
 func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)

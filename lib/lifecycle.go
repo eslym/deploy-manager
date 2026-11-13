@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"bytes"
 	"database/sql"
 	"errors"
 	"net/http"
@@ -22,6 +23,7 @@ func (a *App) refreshCredentialGenerationLocked() error {
 		a.credentialGeneration = generation
 		a.sessions = make(map[[32]byte]sessionState)
 		a.logins = make(map[string]pendingLogin)
+		a.registrationTxs = make(map[string]registrationTransaction)
 	}
 	return nil
 }
@@ -101,13 +103,13 @@ func (a *App) passwordChangeFinish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "recent authentication required", http.StatusUnauthorized)
 		return
 	}
-	a.replaceCredential(w, nil, b, "change", digest)
+	a.replaceCredential(w, nil, b, "change", digest, "", "")
 }
 
 // replaceCredential changes only the administrator's OPAQUE record and its
 // credential generation. The profile and external OPAQUE key generation stay fixed.
 // The caller holds a.mu so login completion cannot issue a stale session.
-func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte, purpose string, sessionDigest [32]byte) {
+func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte, purpose string, sessionDigest [32]byte, transaction, transactionOrigin string) {
 	if err := a.refreshCredentialGenerationLocked(); err != nil {
 		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
 		return
@@ -121,6 +123,11 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 	defer tx.Rollback()
 	now := a.cfg.Now().UnixNano()
 	if purpose == "recovery" {
+		pending, ok := a.pendingRegistrationLocked(transaction, transactionOrigin, "recovery")
+		if !ok || !bytes.Equal(pending.grantHash[:], grantHash) {
+			http.Error(w, "registration transaction expired or invalid; start again", http.StatusGone)
+			return
+		}
 		res, e := tx.Exec(`DELETE FROM registration_grants WHERE token_hash=? AND purpose='recovery' AND credential_generation=? AND expires_at>=?`, grantHash, old, now)
 		if e != nil {
 			http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
@@ -159,6 +166,7 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 	a.credentialGeneration = old + 1
 	a.sessions = make(map[[32]byte]sessionState)
 	a.logins = make(map[string]pendingLogin)
+	a.registrationTxs = make(map[string]registrationTransaction)
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)

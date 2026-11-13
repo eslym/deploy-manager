@@ -134,6 +134,27 @@ try {
   const refreshedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
   if (!refreshedTimestamp || refreshedTimestamp === initialTimestamp) throw new Error("successful refresh did not update the last-fetch timestamp");
 
+  await page.route("**/api/projects", async route => {
+    if (route.request().method() === "GET" && new URL(route.request().url()).pathname === "/api/projects") {
+      await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE INTERNAL RESPONSE DETAIL" });
+      return;
+    }
+    await route.continue();
+  });
+  const failedReload = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "GET" && response.status() === 500);
+  const refreshWithFailedListReload = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
+  await page.getByRole("button", { name: "Refresh" }).click();
+  const refreshedBeforeReloadFailure = await refreshWithFailedListReload;
+  if (refreshedBeforeReloadFailure.status() !== 200) throw new Error(`refresh before failed list reload returned ${refreshedBeforeReloadFailure.status()}`);
+  await failedReload;
+  await page.getByText(/Your current branches and tags are still shown/).waitFor();
+  await page.getByText("Fixture site", { exact: true }).waitFor();
+  await page.getByText("feature/search", { exact: true }).waitFor();
+  if ((await page.locator("body").innerText()).includes("SENSITIVE INTERNAL RESPONSE DETAIL")) throw new Error("dashboard exposed an HTTP response body");
+  await page.unroute("**/api/projects");
+  const timestampAfterReloadFailure = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
+  if (!timestampAfterReloadFailure || timestampAfterReloadFailure === refreshedTimestamp) throw new Error("server did not record the successful refresh before the failed list reload");
+
   const failFixture = await httpsRequestStatus("127.0.0.1", 18441, "/__fixture/fail", "POST");
   if (failFixture !== 204) throw new Error(`fixture fail control returned ${failFixture}`);
   const cachedRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), id);
@@ -141,11 +162,11 @@ try {
   await page.getByRole("button", { name: "Refresh" }).click();
   const failedRefresh = await failedRefreshResponse;
   if (failedRefresh.status() !== 502) throw new Error(`failed refresh returned ${failedRefresh.status()}`);
-  await page.getByText(/Cached refs are still shown/).waitFor();
+  await page.getByText(/Your current branches and tags are still shown/).waitFor();
   const retainedRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), id);
   if (JSON.stringify(retainedRefs) !== JSON.stringify(cachedRefs)) throw new Error("failed refresh changed the cached refs");
   const failedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
-  if (failedTimestamp !== refreshedTimestamp) throw new Error("failed refresh changed last successful fetch time");
+  if (failedTimestamp !== timestampAfterReloadFailure) throw new Error("failed refresh changed last successful fetch time");
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
   console.log("combined-binary authenticated project workflow passed: smart HTTPS create/fetch, searchable full-ID refs, refresh timestamp, and failed-refresh cache retention");
 } finally {

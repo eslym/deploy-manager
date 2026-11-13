@@ -28,7 +28,24 @@
 			credentials: 'same-origin',
 			headers: { 'Content-Type': 'application/json', ...init?.headers }
 		});
-		if (!response.ok) throw new Error((await response.text()).trim() || 'Request failed.');
+		if (!response.ok) {
+			const status = Number.isInteger(response.status) ? ` (HTTP ${response.status})` : '';
+			const message =
+				response.status === 401 || response.status === 403
+					? 'Your session may have expired. Sign in again.'
+					: response.status === 404
+						? 'The requested item was not found. Refresh the page and try again.'
+						: response.status === 413
+							? 'This repository has too much data or too many branches and tags. Reduce it and try again.'
+							: response.status === 429
+								? 'The server is handling too many requests. Wait briefly and try again.'
+								: response.status === 502
+									? 'The repository could not be fetched. Check public HTTPS access and try again.'
+									: response.status >= 500
+										? 'The server could not complete the request. Try again shortly.'
+										: 'The request could not be completed. Check your input and try again.';
+			throw new Error(`${message}${status}`);
+		}
 		return response.status === 204 ? null : response.json();
 	}
 	async function loadProjects() {
@@ -66,14 +83,24 @@
 	async function refresh(project: Project) {
 		if (busy) return;
 		busy = true;
-		error = '';
 		try {
 			await request(`/api/projects/${project.id}/refresh`, { method: 'POST', body: '{}' });
-			await loadRefs(project.id);
-			projects = await request('/api/projects');
+			const refreshedRefs: Ref[] = await request(`/api/projects/${project.id}/refs`);
+			const refreshedProjects: Project[] = await request('/api/projects');
+			refs[project.id] = refreshedRefs;
+			projects = refreshedProjects;
+			error = '';
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Refresh failed.';
-			projects = await request('/api/projects');
+			const message =
+				cause instanceof Error ? cause.message : 'The request could not be completed. Try again.';
+			projects = projects.map((item) =>
+				item.id === project.id
+					? {
+							...item,
+							warning: `Could not update branches and tags. ${message}`
+						}
+					: item
+			);
 		} finally {
 			busy = false;
 		}
@@ -160,7 +187,7 @@
 						role="alert"
 						class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900"
 					>
-						Refresh failed: {project.warning} Cached refs are still shown.
+						{project.warning} Your current branches and tags are still shown.
 					</p>{/if}
 				<label class="mt-4 grid gap-1 text-sm font-medium text-[#354238]"
 					>Search branches and tags<input

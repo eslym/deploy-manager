@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -92,5 +93,20 @@ func TestSafeRemoteAllowsOnlyAnonymousHTTPS(t *testing.T) {
 	}
 	if _, err := safeRemote("https://example.test/owner/site.git"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPublicGitIPRejectsSpecialPurposeRanges(t *testing.T) {
+	for _, address := range []string{"100.64.0.1", "192.0.2.1", "198.18.0.1", "2001:db8::1", "64:ff9b:1::1", "::ffff:192.0.2.1"} {
+		ip, _ := netip.ParseAddr(address)
+		if isPublicGitIP(ip) {
+			t.Errorf("special-purpose address %s was classified public", address)
+		}
+	}
+	for _, address := range []string{"8.8.8.8", "2606:4700:4700::1111"} {
+		ip, _ := netip.ParseAddr(address)
+		if !isPublicGitIP(ip) {
+			t.Errorf("public address %s was classified non-public", address)
+		}
 	}
 }

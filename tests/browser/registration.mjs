@@ -182,6 +182,7 @@ try {
 
   const page = await context.newPage();
   const postedBodies = [];
+  const registrationRequests = [];
   const pageErrors = [];
   const failedScripts = [];
   const failedRequests = [];
@@ -202,7 +203,13 @@ try {
       failedScripts.push(`${url.pathname}: ${redact(request.failure()?.errorText || "request failed", grant)}`);
     }
   });
-  page.on("request", request => { if (request.method() === "POST") postedBodies.push(request.postData() || ""); });
+  page.on("request", request => {
+    if (request.method() === "POST") {
+      const body = request.postData() || "";
+      postedBodies.push(body);
+      registrationRequests.push({ path: new URL(request.url()).pathname, body: JSON.parse(body) });
+    }
+  });
   let finishRaceStatuses;
   await page.route("**/opaque/register/finish", async route => {
     const results = await Promise.all([route.fetch(), route.fetch()]);
@@ -247,7 +254,10 @@ try {
   if (largeJavaScript.length <= largeBundlesBeforeSubmit) throw new Error("OPAQUE bundle was not loaded when registration started");
   if (JSON.stringify(finishRaceStatuses) !== JSON.stringify([204, 410])) throw new Error(`grant consumption race was not single-use: ${finishRaceStatuses}`);
   if (observedURLs.some(url => url.includes(grant))) throw new Error("registration grant leaked into a browser request URL");
-  if (!postedBodies.length || postedBodies.some(body => !body.includes(grant))) throw new Error("grant was not sent with protected registration POST bodies");
+  const registrationStarts = registrationRequests.filter(request => request.path === "/opaque/register/start");
+  const registrationFinishes = registrationRequests.filter(request => request.path === "/opaque/register/finish");
+  if (!registrationStarts.length || registrationStarts.some(request => request.body.grant !== grant || request.body.transaction)) throw new Error("setup grant was not confined to registration-start requests");
+  if (!registrationFinishes.length || registrationFinishes.some(request => request.body.grant || typeof request.body.transaction !== "string" || !request.body.transaction)) throw new Error("registration finish was not bound to its one-use transaction handle");
   if (await context.cookies().then(cookies => cookies.length)) throw new Error("registration unexpectedly issued a session cookie");
   for (const body of postedBodies) {
     if (body.includes("Correct horse battery staple") || body.includes("clientRegistrationState") || body.includes("exportKey") || body.includes("sessionKey")) {
@@ -522,7 +532,15 @@ try {
   const recoveryPage = await recoveryContext.newPage();
   const recoveryBodies = [];
   const recoveryURLs = [];
-  recoveryPage.on("request", request => { recoveryURLs.push(request.url()); if (request.method() === "POST") recoveryBodies.push(request.postData() || ""); });
+  const recoveryRequests = [];
+  recoveryPage.on("request", request => {
+    recoveryURLs.push(request.url());
+    if (request.method() === "POST") {
+      const body = request.postData() || "";
+      recoveryBodies.push(body);
+      recoveryRequests.push({ path: new URL(request.url()).pathname, body: JSON.parse(body) });
+    }
+  });
   await recoveryPage.goto(recoveryLink, { waitUntil: "domcontentloaded" });
   await recoveryPage.getByLabel("Replace password").waitFor({ state: "visible", timeout: 30000 });
   await recoveryPage.waitForFunction(() => location.hash === "", null, { timeout: 10000 });
@@ -555,7 +573,11 @@ try {
   await recoveryPage.getByText("Administrator password replaced. You can close this page.").waitFor({ timeout: 60000 });
   if (JSON.stringify(recoveryRaceStatuses) !== JSON.stringify([204, 410])) throw new Error(`recovery grant was not atomically consumed: ${recoveryRaceStatuses}`);
   if (recoveryURLs.some(url => url.includes(recoveryGrant))) throw new Error("recovery grant leaked into a request URL");
-  if (!recoveryBodies.length || recoveryBodies.some(body => !body.includes(recoveryGrant) || body.includes(recoveredPassword) || body.includes("clientRegistrationState"))) throw new Error("recovery requests omitted grant or transmitted a password/client state");
+  if (!recoveryBodies.length || recoveryBodies.some(body => body.includes(recoveredPassword) || body.includes("clientRegistrationState"))) throw new Error("recovery requests transmitted a password or client state");
+  const recoveryStarts = recoveryRequests.filter(request => request.path === "/opaque/register/start");
+  const recoveryFinishes = recoveryRequests.filter(request => request.path === "/opaque/register/finish");
+  if (!recoveryStarts.length || recoveryStarts.some(request => request.body.grant !== recoveryGrant || request.body.transaction)) throw new Error("recovery start did not carry only the recovery grant");
+  if (!recoveryFinishes.length || recoveryFinishes.some(request => request.body.grant || typeof request.body.transaction !== "string" || !request.body.transaction)) throw new Error("recovery finish was not bound to its one-use transaction handle");
   const reusedRecovery = await httpsPostStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/opaque/register/start", secureOrigin, { grant: recoveryGrant, value: "AA" });
   if (reusedRecovery !== 410) throw new Error(`spent recovery grant returned ${reusedRecovery}, expected 410`);
   await recoveryPage.goto(`${secureOrigin}/login`, { waitUntil: "domcontentloaded" });

@@ -48,7 +48,12 @@
 			const profile = { 'argon2id-custom': { iterations: 1, memory: 65536, parallelism: 4 } };
 			const start = opaque.client.startRegistration({ password });
 			const response = await send('/opaque/register/start', start.registrationRequest, grant);
-			if (!response)
+			if (
+				!response ||
+				typeof response.value !== 'string' ||
+				typeof response.transaction !== 'string' ||
+				response.transaction.length === 0
+			)
 				throw new RegistrationError(
 					'Registration could not be completed. Ask an administrator for a new setup link.'
 				);
@@ -59,7 +64,7 @@
 				keyStretching: profile
 			});
 			password = '';
-			await send('/opaque/register/finish', finish.registrationRecord, grant);
+			await send('/opaque/register/finish', finish.registrationRecord, response.transaction);
 			clearSetupGrant();
 			complete = true;
 			status = 'Administrator account created. You can close this page.';
@@ -78,13 +83,17 @@
 	async function send(
 		path: string,
 		value: string,
-		grant: string
-	): Promise<{ value: string } | null> {
+		credential: string
+	): Promise<{ value: string; transaction?: string } | null> {
 		const response = await fetch(path, {
 			method: 'POST',
 			credentials: 'same-origin',
 			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({ grant, value })
+			body: JSON.stringify(
+				path === '/opaque/register/start'
+					? { grant: credential, value }
+					: { transaction: credential, value }
+			)
 		});
 		if (!response.ok) {
 			if (response.status === 410) {

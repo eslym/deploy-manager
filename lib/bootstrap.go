@@ -27,17 +27,21 @@ import (
 
 // Config controls durable administrator bootstrap. OPAQUEKeyPath must be external to SQLite.
 type Config struct {
-	DatabasePath          string
-	OPAQUEKeyPath         string
-	CanonicalOrigin       string
-	GrantTTL              time.Duration
-	LoginTTL              time.Duration
-	SessionTTL            time.Duration
-	RecentAuthTTL         time.Duration
-	AuthRequestsPerMinute int
-	InsecureLocalHTTP     bool
-	Now                   func() time.Time
-	GitTimeout            time.Duration
+	DatabasePath             string
+	OPAQUEKeyPath            string
+	CanonicalOrigin          string
+	GrantTTL                 time.Duration
+	LoginTTL                 time.Duration
+	SessionTTL               time.Duration
+	RecentAuthTTL            time.Duration
+	AuthRequestsPerMinute    int
+	InsecureLocalHTTP        bool
+	Now                      func() time.Time
+	GitTimeout               time.Duration
+	GitMaxTransferBytes      int64
+	GitMaxCacheBytes         int64
+	GitMaxRefs               int
+	GitMaxAdvertisementBytes int64
 }
 
 type App struct {
@@ -52,6 +56,7 @@ type App struct {
 	logins               map[string]pendingLogin
 	sessions             map[[32]byte]sessionState
 	projects             *projectManager
+	registrationTxs      map[string]registrationTransaction
 }
 
 func New(cfg Config) (*App, error) {
@@ -99,6 +104,24 @@ func New(cfg Config) (*App, error) {
 	}
 	if cfg.AuthRequestsPerMinute < 1 || cfg.AuthRequestsPerMinute > 1000 {
 		return nil, errors.New("authentication request limit must be between 1 and 1000 per minute")
+	}
+	if cfg.GitMaxTransferBytes == 0 {
+		cfg.GitMaxTransferBytes = 32 << 20
+	}
+	if cfg.GitMaxCacheBytes == 0 {
+		cfg.GitMaxCacheBytes = 1 << 30
+	}
+	if cfg.GitMaxRefs == 0 {
+		cfg.GitMaxRefs = 10000
+	}
+	if cfg.GitMaxAdvertisementBytes == 0 {
+		cfg.GitMaxAdvertisementBytes = 4 << 20
+		if cfg.GitMaxAdvertisementBytes > cfg.GitMaxTransferBytes {
+			cfg.GitMaxAdvertisementBytes = cfg.GitMaxTransferBytes
+		}
+	}
+	if cfg.GitMaxTransferBytes < 1024 || cfg.GitMaxTransferBytes > 1<<30 || cfg.GitMaxCacheBytes < cfg.GitMaxTransferBytes*maxGitCacheGrowthFactor || cfg.GitMaxCacheBytes > 1<<40 || cfg.GitMaxRefs < 1 || cfg.GitMaxRefs > 100000 || cfg.GitMaxAdvertisementBytes < 1024 || cfg.GitMaxAdvertisementBytes > 64<<20 || cfg.GitMaxAdvertisementBytes > cfg.GitMaxTransferBytes {
+		return nil, errors.New("Git transfer, cache, or reference limit is outside the supported range")
 	}
 	prior, err := pathExists(cfg.DatabasePath)
 	if err != nil {
@@ -197,12 +220,13 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	projects.maxTransferBytes, projects.maxCacheBytes, projects.maxRefs, projects.maxAdvertisementBytes = cfg.GitMaxTransferBytes, cfg.GitMaxCacheBytes, cfg.GitMaxRefs, cfg.GitMaxAdvertisementBytes
 	var credentialGeneration int64
 	if err = db.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&credentialGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		db.Close()
 		return nil, err
 	}
-	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects}, nil
+	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, registrationTxs: make(map[string]registrationTransaction)}, nil
 }
 
 func ensureColumn(db *sql.DB, table, column, definition string) error {
@@ -669,6 +693,54 @@ type protocolMessage struct {
 	Value       string  `json:"value"`
 }
 
+type registrationTransaction struct {
+	grantHash  [32]byte
+	purpose    string
+	generation int64
+	origin     string
+	expiresAt  time.Time
+}
+
+const registrationTransactionTTL = 5 * time.Minute
+const maxRegistrationTransactions = 128
+
+func (a *App) newRegistrationTransactionLocked(grant, purpose, origin string, generation int64) (string, error) {
+	now := a.cfg.Now()
+	for handle, pending := range a.registrationTxs {
+		if !pending.expiresAt.After(now) {
+			delete(a.registrationTxs, handle)
+		}
+	}
+	if len(a.registrationTxs) >= maxRegistrationTransactions {
+		return "", errors.New("registration is busy; try again")
+	}
+	grantHash := sha256.Sum256([]byte(grant))
+	var expires int64
+	if err := a.db.QueryRow(`SELECT expires_at FROM registration_grants WHERE token_hash=? AND purpose=? AND credential_generation=?`, grantHash[:], purpose, generation).Scan(&expires); err != nil || expires < now.UnixNano() {
+		return "", errors.New("invalid or expired grant")
+	}
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	handle := base64.RawURLEncoding.EncodeToString(raw[:])
+	deadline := now.Add(registrationTransactionTTL)
+	grantDeadline := time.Unix(0, expires)
+	if grantDeadline.Before(deadline) {
+		deadline = grantDeadline
+	}
+	a.registrationTxs[handle] = registrationTransaction{grantHash: grantHash, purpose: purpose, generation: generation, origin: origin, expiresAt: deadline}
+	return handle, nil
+}
+
+func (a *App) pendingRegistrationLocked(handle, origin, purpose string) (registrationTransaction, bool) {
+	pending, ok := a.registrationTxs[handle]
+	if !ok || !pending.expiresAt.After(a.cfg.Now()) || pending.origin != origin || pending.purpose != purpose || pending.generation != a.credentialGeneration {
+		return registrationTransaction{}, false
+	}
+	return pending, true
+}
+
 func (a *App) decode(w http.ResponseWriter, r *http.Request) (protocolMessage, bool) {
 	var m protocolMessage
 	r.Body = http.MaxBytesReader(w, r.Body, 65536)
@@ -723,13 +795,12 @@ func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 		purpose = "recovery"
 	}
 	a.mu.Lock()
+	defer a.mu.Unlock()
 	if err := a.refreshCredentialGenerationLocked(); err != nil {
-		a.mu.Unlock()
 		http.Error(w, "registration is temporarily unavailable", http.StatusInternalServerError)
 		return
 	}
 	generation := a.credentialGeneration
-	a.mu.Unlock()
 	if !a.grantValid(m.Grant, purpose, generation) {
 		http.Error(w, "invalid or expired grant", 410)
 		return
@@ -749,18 +820,25 @@ func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
-	jsonValue(w, response.Serialize())
+	handle, e := a.newRegistrationTransactionLocked(m.Grant, purpose, r.Header.Get("Origin"), generation)
+	if e != nil {
+		http.Error(w, "registration is temporarily unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	_ = json.NewEncoder(w).Encode(map[string]string{"value": base64.RawURLEncoding.EncodeToString(response.Serialize()), "transaction": handle})
 }
 func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 	m, ok := a.decode(w, r)
 	if !ok {
 		return
 	}
-	if m.Transaction != nil {
+	if m.Transaction == nil || *m.Transaction == "" || m.Grant != "" {
 		http.Error(w, "invalid protocol message", http.StatusBadRequest)
 		return
 	}
-	token := m.Grant
+	handle := *m.Transaction
 	b, e := decodeValue(m.Value)
 	if e != nil {
 		http.Error(w, "invalid protocol message", 400)
@@ -771,20 +849,30 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid protocol message", 400)
 		return
 	}
-	hash := sha256.Sum256([]byte(token))
 	registered, e := a.HasAdministrator()
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
-	if registered {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		a.replaceCredential(w, hash[:], b, "recovery", [32]byte{})
-		return
-	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if err := a.refreshCredentialGenerationLocked(); err != nil {
+		http.Error(w, "registration unavailable", 500)
+		return
+	}
+	purpose := "setup"
+	if registered {
+		purpose = "recovery"
+	}
+	pending, valid := a.pendingRegistrationLocked(handle, r.Header.Get("Origin"), purpose)
+	if !valid {
+		http.Error(w, "registration transaction expired or invalid; start again", http.StatusGone)
+		return
+	}
+	if registered {
+		a.replaceCredential(w, pending.grantHash[:], b, "recovery", [32]byte{}, handle, r.Header.Get("Origin"))
+		return
+	}
 	tx, e := a.db.Begin()
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
@@ -801,7 +889,7 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	res, e := tx.Exec(`DELETE FROM registration_grants WHERE token_hash=? AND purpose='setup' AND expires_at>=?`, hash[:], now)
+	res, e := tx.Exec(`DELETE FROM registration_grants WHERE token_hash=? AND purpose='setup' AND credential_generation=? AND expires_at>=?`, pending.grantHash[:], pending.generation, now)
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
@@ -824,6 +912,7 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.credentialGeneration = 1
+	a.registrationTxs = make(map[string]registrationTransaction)
 	w.WriteHeader(http.StatusNoContent)
 }
 

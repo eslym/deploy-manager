@@ -1,14 +1,17 @@
 package lib
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,15 +21,44 @@ import (
 
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/filemode"
+	"github.com/go-git/go-git/v5/plumbing/object"
 	gitclient "github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 )
 
 type projectManager struct {
-	db      *sql.DB
-	root    string
-	timeout time.Duration
-	mu      sync.Mutex
+	db                    *sql.DB
+	root                  string
+	timeout               time.Duration
+	maxTransferBytes      int64
+	maxCacheBytes         int64
+	maxRefs               int
+	maxAdvertisementBytes int64
+	mu                    sync.Mutex
+}
+
+// Reserve conservative room for pack indexes and repository metadata before
+// accepting a pack, not only after go-git has written it.
+const maxGitCacheGrowthFactor = 16
+const maxGitTreeObjectBytes = 16 << 20
+const maxGitCommitObjectBytes = 1 << 20
+
+var errGitTransferTooLarge = errors.New("Git server response exceeds the configured transfer limit")
+var errGitUnsupportedSmartHTTP = errors.New("server does not provide a supported smart HTTPS Git repository")
+var errGitUnsupportedSHA256 = errors.New("SHA-256 Git repositories are not supported")
+var errGitIncompleteRepository = errors.New("repository is incomplete or uses an unsupported partial clone")
+var errGitTooManyRefs = errors.New("repository has more references than the configured limit")
+
+type gitHTTPPolicyKey struct{}
+
+type gitHTTPPolicy struct {
+	transferBytes      int64
+	advertisementBytes int64
+}
+
+func withGitHTTPPolicy(ctx context.Context, manager *projectManager) context.Context {
+	return context.WithValue(ctx, gitHTTPPolicyKey{}, gitHTTPPolicy{transferBytes: manager.maxTransferBytes, advertisementBytes: manager.maxAdvertisementBytes})
 }
 
 var configureTestGitTransport = func() error { return nil }
@@ -163,13 +195,23 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := fmt.Sprintf("%x", idBytes)
+	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes-maxGitCacheGrowthFactor*p.maxTransferBytes {
+		http.Error(w, "project caches are near the configured storage limit; recreate or remove a project cache before adding another", http.StatusRequestEntityTooLarge)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
+	ctx = withGitHTTPPolicy(ctx, p)
 	remote := u.String()
 	_, err = git.PlainCloneContext(ctx, p.repoPath(id), true, &git.CloneOptions{URL: remote, NoCheckout: true, Tags: git.AllTags})
 	if err != nil {
 		_ = os.RemoveAll(p.repoPath(id))
 		http.Error(w, sanitizeGitError(err, remote), 400)
+		return
+	}
+	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes {
+		_ = os.RemoveAll(p.repoPath(id))
+		http.Error(w, "project caches exceed the configured storage limit", http.StatusRequestEntityTooLarge)
 		return
 	}
 	now := time.Now().UTC()
@@ -179,10 +221,14 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not save project", 500)
 		return
 	}
-	if err = saveProjectRefs(p.db, id, p.repoPath(id)); err != nil {
+	if err = saveProjectRefs(p.db, id, p.repoPath(id), p.maxRefs); err != nil {
 		_, _ = p.db.Exec(`DELETE FROM projects WHERE id=?`, id)
 		_ = os.RemoveAll(p.repoPath(id))
-		http.Error(w, "repository fetched but project could not be saved; try again", 500)
+		if errors.Is(err, errGitIncompleteRepository) || errors.Is(err, errGitTooManyRefs) {
+			http.Error(w, sanitizeGitError(err, remote), http.StatusBadRequest)
+		} else {
+			http.Error(w, "repository fetched but project could not be saved; try again", 500)
+		}
 		return
 	}
 	writeJSONStatus(w, http.StatusCreated, project{ID: id, Name: strings.TrimSpace(input.Name), URL: remote, LastFetched: &now})
@@ -231,6 +277,13 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
+	ctx = withGitHTTPPolicy(ctx, p)
+	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes-maxGitCacheGrowthFactor*p.maxTransferBytes {
+		warning := "project caches are near the configured storage limit; recreate a cache before refreshing"
+		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		http.Error(w, warning, http.StatusRequestEntityTooLarge)
+		return
+	}
 	repo, err := git.PlainOpen(p.repoPath(id))
 	if err == nil {
 		err = repo.FetchContext(ctx, &git.FetchOptions{RemoteName: "origin", Tags: git.AllTags, Force: true, Prune: true})
@@ -238,10 +291,19 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	if err == git.NoErrAlreadyUpToDate {
 		err = nil
 	}
-	if err == nil {
-		err = saveProjectRefs(p.db, id, p.repoPath(id))
-	}
 	if err != nil {
+		warning := sanitizeGitError(err, remote)
+		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		http.Error(w, warning, 502)
+		return
+	}
+	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes {
+		warning := "project caches exceeded the configured storage limit; cached refs were not changed"
+		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		http.Error(w, warning, http.StatusRequestEntityTooLarge)
+		return
+	}
+	if err = saveProjectRefs(p.db, id, p.repoPath(id), p.maxRefs); err != nil {
 		warning := sanitizeGitError(err, remote)
 		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
 		http.Error(w, warning, 502)
@@ -256,7 +318,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"lastFetched": now})
 }
 
-func saveProjectRefs(db *sql.DB, id, dir string) error {
+func saveProjectRefs(db *sql.DB, id, dir string, maxRefs int) error {
 	repo, err := git.PlainOpen(dir)
 	if err != nil {
 		return err
@@ -274,6 +336,8 @@ func saveProjectRefs(db *sql.DB, id, dir string) error {
 	if _, err = tx.Exec(`DELETE FROM project_refs WHERE project_id=?`, id); err != nil {
 		return err
 	}
+	count := 0
+	checkedObjects := make(map[plumbing.Hash]struct{})
 	iterErr := refs.ForEach(func(ref *plumbing.Reference) error {
 		name := ref.Name()
 		kind := ""
@@ -286,8 +350,14 @@ func saveProjectRefs(db *sql.DB, id, dir string) error {
 		} else {
 			return nil
 		}
+		if count >= maxRefs {
+			return errGitTooManyRefs
+		}
 		hash := ref.Hash()
 		if kind == "tag" {
+			if size, sizeErr := repo.Storer.EncodedObjectSize(hash); sizeErr == nil && size > maxGitCommitObjectBytes {
+				return errors.New("repository contains an oversized tag object")
+			}
 			_, e := repo.TagObject(hash)
 			if e == nil {
 				target, e := repo.ResolveRevision(plumbing.Revision(name.String()))
@@ -297,11 +367,20 @@ func saveProjectRefs(db *sql.DB, id, dir string) error {
 				hash = *target
 			}
 		}
+		if size, sizeErr := repo.Storer.EncodedObjectSize(hash); sizeErr == nil && size > maxGitCommitObjectBytes {
+			return errors.New("repository contains an oversized commit object")
+		}
 		c, e := repo.CommitObject(hash)
 		if e != nil {
-			return nil
+			return errGitIncompleteRepository
+		}
+		if err := verifyCompleteCommit(repo, c, checkedObjects, 100000); err != nil {
+			return err
 		}
 		_, e = tx.Exec(`INSERT INTO project_refs(project_id,kind,name,commit_id) VALUES(?,?,?,?)`, id, kind, shortName, c.Hash.String())
+		if e == nil {
+			count++
+		}
 		return e
 	})
 	if iterErr != nil {
@@ -310,9 +389,89 @@ func saveProjectRefs(db *sql.DB, id, dir string) error {
 	return tx.Commit()
 }
 
+func verifyCompleteCommit(repo *git.Repository, commit *object.Commit, checked map[plumbing.Hash]struct{}, maxObjects int) error {
+	var visitTree func(plumbing.Hash) error
+	visitTree = func(hash plumbing.Hash) error {
+		if _, exists := checked[hash]; exists {
+			return nil
+		}
+		if len(checked) >= maxObjects {
+			return errors.New("repository tree exceeds the supported object-count limit")
+		}
+		if size, sizeErr := repo.Storer.EncodedObjectSize(hash); sizeErr != nil || size > maxGitTreeObjectBytes {
+			return errors.New("repository tree object is missing or exceeds the supported object-size limit")
+		}
+		checked[hash] = struct{}{}
+		tree, err := repo.TreeObject(hash)
+		if err != nil {
+			return errGitIncompleteRepository
+		}
+		for _, entry := range tree.Entries {
+			switch entry.Mode {
+			case filemode.Dir:
+				if err := visitTree(entry.Hash); err != nil {
+					return err
+				}
+			case filemode.Regular, filemode.Executable, filemode.Symlink:
+				if _, exists := checked[entry.Hash]; exists {
+					continue
+				}
+				if len(checked) >= maxObjects {
+					return errors.New("repository tree exceeds the supported object-count limit")
+				}
+				if err := repo.Storer.HasEncodedObject(entry.Hash); err != nil {
+					return errGitIncompleteRepository
+				}
+				checked[entry.Hash] = struct{}{}
+			case filemode.Submodule:
+				// A gitlink points at another repository and is not an object
+				// expected in this project's object database.
+				continue
+			default:
+				// Browse-only project caches still fail closed for gitlinks and
+				// unsupported tree entries rather than presenting them as complete.
+				return errors.New("repository contains an unsupported tree entry")
+			}
+		}
+		return nil
+	}
+	if _, exists := checked[commit.Hash]; !exists {
+		if len(checked) >= maxObjects {
+			return errors.New("repository tree exceeds the supported object-count limit")
+		}
+		checked[commit.Hash] = struct{}{}
+	}
+	return visitTree(commit.TreeHash)
+}
+
 func sanitizeGitError(err error, remote string) string {
 	s := strings.ReplaceAll(err.Error(), remote, "repository URL")
-	if strings.Contains(strings.ToLower(s), "authentication") || strings.Contains(strings.ToLower(s), "authorization") {
+	lower := strings.ToLower(s)
+	if errors.Is(err, errGitUnsupportedSmartHTTP) {
+		return "server does not provide a supported smart HTTPS Git repository"
+	}
+	if errors.Is(err, errGitUnsupportedSHA256) {
+		return "SHA-256 Git repositories are not supported; use a conventional SHA-1 repository"
+	}
+	if errors.Is(err, errGitIncompleteRepository) {
+		return "partial or incomplete repositories are not supported; use a complete SHA-1 repository"
+	}
+	if errors.Is(err, errGitTooManyRefs) {
+		return "repository has more refs than the configured limit; reduce the number of branches and tags"
+	}
+	if strings.Contains(lower, "partial") || strings.Contains(lower, "incomplete") || strings.Contains(lower, "object not found") {
+		return "partial or incomplete repositories are not supported; use a complete SHA-1 repository"
+	}
+	if strings.Contains(lower, "unable to fetch packfile") {
+		return "repository did not provide a complete Git pack; partial or incomplete repositories are not supported"
+	}
+	if strings.Contains(lower, "sha-256") || strings.Contains(lower, "sha256") || strings.Contains(lower, "object-format") {
+		return "SHA-256 Git repositories are not supported; use a conventional SHA-1 repository"
+	}
+	if errors.Is(err, errGitTransferTooLarge) || strings.Contains(lower, "transfer limit") {
+		return "repository transfer exceeded the configured byte limit"
+	}
+	if strings.Contains(lower, "authentication") || strings.Contains(lower, "authorization") {
 		return "repository could not be read anonymously; use a public HTTPS repository"
 	}
 	if strings.Contains(strings.ToLower(s), "not found") {
@@ -353,8 +512,8 @@ func publicGitDialContext(dialer *net.Dialer) func(context.Context, string, stri
 			return nil, err
 		}
 		remote, _, err := net.SplitHostPort(conn.RemoteAddr().String())
-		ip := net.ParseIP(remote)
-		if err != nil || ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		ip, parseErr := netip.ParseAddr(remote)
+		if err != nil || parseErr != nil || !isPublicGitIP(ip) {
 			_ = conn.Close()
 			return nil, errors.New("repository host resolved to a non-public address")
 		}
@@ -362,6 +521,136 @@ func publicGitDialContext(dialer *net.Dialer) func(context.Context, string, stri
 	}
 }
 
+func isPublicGitIP(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	ip = ip.Unmap()
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return false
+	}
+	var blocked []string
+	if ip.Is4() {
+		blocked = []string{
+			"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+			"192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "198.18.0.0/15", "198.51.100.0/24",
+			"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+		}
+	} else {
+		// Only globally allocated unicast space is eligible. Explicit exclusions
+		// cover protocol assignments, documentation, translation and transition
+		// ranges that net.IP/netip classify as global-unicast.
+		if !netip.MustParsePrefix("2000::/3").Contains(ip) {
+			return false
+		}
+		blocked = []string{
+			"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20",
+		}
+	}
+	for _, block := range blocked {
+		if netip.MustParsePrefix(block).Contains(ip) {
+			return false
+		}
+	}
+	return true
+}
+
 func installProjectHTTPSClient(client *http.Client) {
-	gitclient.InstallProtocol("https", githttp.NewClientWithOptions(client, &githttp.ClientOptions{RedirectPolicy: githttp.NoFollowRedirects}))
+	bounded := *client
+	bounded.Transport = limitedResponseTransport{base: client.Transport}
+	gitclient.InstallProtocol("https", githttp.NewClientWithOptions(&bounded, &githttp.ClientOptions{RedirectPolicy: githttp.NoFollowRedirects}))
+}
+
+type limitedResponseTransport struct {
+	base http.RoundTripper
+}
+
+func (t limitedResponseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	response, err := base.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	policy, ok := req.Context().Value(gitHTTPPolicyKey{}).(gitHTTPPolicy)
+	if !ok || policy.transferBytes <= 0 || policy.advertisementBytes <= 0 {
+		policy = gitHTTPPolicy{transferBytes: 64 << 20, advertisementBytes: 4 << 20}
+	}
+	if response.ContentLength > policy.transferBytes {
+		_ = response.Body.Close()
+		return nil, errGitTransferTooLarge
+	}
+	response.Body = &limitedResponseBody{ReadCloser: response.Body, limit: policy.transferBytes}
+	if req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
+		contentType := strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])
+		if contentType != "application/x-git-upload-pack-advertisement" {
+			_ = response.Body.Close()
+			return nil, errGitUnsupportedSmartHTTP
+		}
+		limit := policy.advertisementBytes
+		if transferLimit := policy.transferBytes; limit > transferLimit {
+			limit = transferLimit
+		}
+		if response.ContentLength > limit {
+			_ = response.Body.Close()
+			return nil, errGitTransferTooLarge
+		}
+		advertisement, readErr := io.ReadAll(&limitedResponseBody{ReadCloser: response.Body, limit: limit})
+		_ = response.Body.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if bytes.Contains(advertisement, []byte("object-format=sha256")) || bytes.Contains(advertisement, []byte("object-format=sha-256")) {
+			return nil, errGitUnsupportedSHA256
+		}
+		response.Body = io.NopCloser(bytes.NewReader(advertisement))
+	}
+	return response, nil
+}
+
+type limitedResponseBody struct {
+	io.ReadCloser
+	limit int64
+	read  int64
+}
+
+func (b *limitedResponseBody) Read(p []byte) (int, error) {
+	if b.read >= b.limit {
+		var probe [1]byte
+		n, err := b.ReadCloser.Read(probe[:])
+		if n > 0 {
+			return 0, errGitTransferTooLarge
+		}
+		return 0, err
+	}
+	if int64(len(p)) > b.limit-b.read {
+		p = p[:b.limit-b.read]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.read += int64(n)
+	return n, err
+}
+
+func directorySize(root string, stopAfter int64) (int64, error) {
+	var size int64
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		size += info.Size()
+		if size > stopAfter {
+			return errors.New("repository cache exceeds limit")
+		}
+		return nil
+	})
+	return size, err
 }
