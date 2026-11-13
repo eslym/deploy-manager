@@ -4,7 +4,9 @@
   "description": "Isolated RFC 9807 feasibility experiment; not production authentication",
   "main": "index.js",
   "scripts": {
-    "test": "node --test"
+    "test": "bun run bun-test.mjs",
+    "browser": "bun run browser-test.mjs",
+    "audit-artifact": "bun run artifact-audit.mjs"
   },
   "keywords": [],
   "author": "",
