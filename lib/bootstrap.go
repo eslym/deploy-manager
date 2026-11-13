@@ -390,8 +390,12 @@ func serveAsset(w http.ResponseWriter, r *http.Request, name string, data []byte
 	}
 }
 
+// SvelteKit's route announcer has this fixed style attribute. Permit only its
+// exact hash; arbitrary inline styles remain blocked.
+const baseContentSecurityPolicy = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; style-src-attr 'unsafe-hashes' 'sha256-S8qMpvofolR8Mpjy4kQvEm7m1q8clzU4dfDH0AmvZjo='; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'"
+
 func shellContentSecurityPolicy(html []byte) string {
-	policy := "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'"
+	policy := baseContentSecurityPolicy
 	text := string(html)
 	for len(text) > 0 {
 		start := strings.Index(text, "<script")
@@ -440,7 +444,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'")
+		w.Header().Set("Content-Security-Policy", baseContentSecurityPolicy)
 		next.ServeHTTP(w, r)
 	})
 }

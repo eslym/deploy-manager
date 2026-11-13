@@ -116,7 +116,16 @@ try {
     }
   });
   failedInitPage.on("request", request => { if (request.method() === "POST") initRequests++; });
+  await failedInitPage.addInitScript(() => {
+    globalThis.__cspViolations = [];
+    document.addEventListener("securitypolicyviolation", event => {
+      // The expected WebAssembly initialization error is tested separately; CSP violations are never expected.
+      globalThis.__cspViolations.push(`${event.effectiveDirective}: ${event.blockedURI}`);
+    });
+  });
   await navigate(failedInitPage, failedInitLink);
+  await failedInitPage.waitForTimeout(100);
+  if (await failedInitPage.evaluate(() => globalThis.__cspViolations.length)) throw new Error(`production CSP blocked page styling or resources during the WASM-init failure case: ${await failedInitPage.evaluate(() => globalThis.__cspViolations.join(", "))}`);
   try {
     await failedInitPage.getByLabel("Password").waitFor({ state: "visible", timeout: 10000 });
   } catch {
@@ -134,6 +143,7 @@ try {
   await initChunk;
   await failedInitPage.getByText(/Check that JavaScript and WebAssembly are enabled/).waitFor({ timeout: 30000 });
   if (initRequests !== 0) throw new Error("initialization failure attempted an enrollment request");
+  if (await failedInitPage.evaluate(() => globalThis.__cspViolations.length)) throw new Error(`CSP violation occurred during the deliberate WASM-init failure case: ${await failedInitPage.evaluate(() => globalThis.__cspViolations.join(", "))}`);
   await failedInitPage.close();
 
   const noGrantPage = await context.newPage();
@@ -152,6 +162,12 @@ try {
   page.on("pageerror", error => pageErrors.push(redact(`${error.name}: ${error.message}`, grant)));
   page.on("console", message => {
     if (message.type() === "error") pageErrors.push(redact(message.text(), grant));
+  });
+  await page.addInitScript(() => {
+    globalThis.__cspViolations = [];
+    document.addEventListener("securitypolicyviolation", event => {
+      globalThis.__cspViolations.push(`${event.effectiveDirective}: ${event.blockedURI}`);
+    });
   });
   page.on("requestfailed", request => {
     const url = new URL(request.url());
@@ -172,6 +188,8 @@ try {
   const response = await navigate(page, link, { waitUntil: "domcontentloaded" });
   const hashAtDOMContentLoaded = Boolean(new URL(page.url()).hash);
   await page.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
+  await page.waitForTimeout(100);
+  if (await page.evaluate(() => globalThis.__cspViolations.length)) throw new Error(`production CSP blocked page styling or resources: ${await page.evaluate(() => globalThis.__cspViolations.join(", "))}`);
   const hashWhenFormReady = Boolean(new URL(page.url()).hash);
   try {
     await page.waitForFunction(() => window.location.hash === "", null, { timeout: 1500 });
