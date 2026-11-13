@@ -5,8 +5,10 @@
   "main": "index.js",
   "scripts": {
     "test": "bun run bun-test.mjs",
-    "browser": "bun run browser-test.mjs",
-    "audit-artifact": "bun run artifact-audit.mjs"
+    "browser": "bash run-browser.sh",
+    "audit-artifact": "bun run artifact-audit.mjs",
+    "test-browser-gate": "bun run browser-gate.test.mjs",
+    "test-vectors": "python3 run-rfc-vectors.py"
   },
   "keywords": [],
   "author": "",

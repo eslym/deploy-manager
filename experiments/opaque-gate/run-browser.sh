@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Never start Chromium unless the exact registry artifact passes its integrity
+# checks and the fast Bun protocol suite still passes.
+bun run audit-artifact
+bun run test
+
 deps=/tmp/opencode/opaque-gate-browser-libs
 browser=$(bun -e "import { chromium } from 'playwright'; console.log(chromium.executablePath())")
 mkdir -p "$deps/debs" "$deps/root"
