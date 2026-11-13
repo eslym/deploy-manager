@@ -4,6 +4,7 @@ import { copyFile, mkdtemp, rm, chmod } from "node:fs/promises";
 import { chromium } from "playwright";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { request as httpsRequest } from "node:https";
 
 const root = new URL("../../", import.meta.url).pathname;
 const dir = await mkdtemp(join(tmpdir(), "deploy-manager-browser-"));
@@ -19,6 +20,29 @@ function redact(value, grant = "") {
   return text
     .replaceAll(testPassword, "<REDACTED>")
     .replace(/#[^\s"'<>]*/g, "#<REDACTED>");
+}
+
+function httpsStatus(hostname, port, path, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const req = httpsRequest({ hostname, port, path, method: "GET", rejectUnauthorized: false, headers }, response => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode));
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function httpsPostStatus(hostname, port, path, origin, body) {
+  return new Promise((resolve, reject) => {
+    const payload = JSON.stringify(body);
+    const req = httpsRequest({ hostname, port, path, method: "POST", rejectUnauthorized: false, headers: { Origin: origin, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } }, response => {
+      response.resume();
+      response.on("end", () => resolve(response.statusCode));
+    });
+    req.on("error", reject);
+    req.end(payload);
+  });
 }
 
 async function navigate(page, url, options = {}) {
@@ -86,7 +110,9 @@ try {
   const wrongProtocolMethod = await fetch(`http://${listen}/opaque/register/start`);
   if (wrongProtocolMethod.status !== 405) throw new Error(`protocol path returned SPA or wrong status for GET: ${wrongProtocolMethod.status}`);
   const nestedRoute = await fetch(`http://${listen}/dashboard/projects/nested`, { headers: { Accept: "text/html" } });
-  if (nestedRoute.status !== 200 || !(await nestedRoute.text()).includes("_app/immutable/entry/start.")) throw new Error("nested client route did not return the SPA shell");
+  if (nestedRoute.status !== 426) throw new Error(`dashboard route over plain HTTP returned ${nestedRoute.status}, expected 426`);
+  const plainLogin = await fetch(`http://${listen}/login`, { headers: { Accept: "text/html" } });
+  if (plainLogin.status !== 426) throw new Error(`login page over plain HTTP returned ${plainLogin.status}, expected 426`);
 
   const browserPath = process.env.CHROMIUM_PATH || chromium.executablePath();
   browser = await chromium.launch({ headless: true, executablePath: browserPath, args: ["--no-sandbox"] });
@@ -209,6 +235,7 @@ try {
     throw new Error(`grant-fragment cleanup failed at app-ready check: ${signals}`);
   }
   await page.getByRole("link", { name: "Return to start" }).click();
+  await page.getByRole("link", { name: "Sign in" }).waitFor({ state: "visible", timeout: 30000 });
   await page.getByRole("link", { name: "Open administrator setup" }).click();
   await page.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
   if (new URL(page.url()).hash) throw new Error("client navigation restored the setup grant in the URL");
@@ -253,8 +280,183 @@ try {
     body: JSON.stringify({ grant, value: "AA" })
   });
   if (restartGrant.status !== 410) throw new Error(`administrator state was not durable across restart: ${restartGrant.status}`);
+
+  // Login and session behavior is exercised over real TLS so Secure cookies are never weakened for tests.
+  server.kill("SIGTERM");
+  await once(server, "exit");
+  const secureListen = "127.0.0.1:18438";
+  const cert = join(dir, "localhost.crt");
+  const key = join(dir, "localhost.key");
+  const secureOrigin = `https://127.0.0.1:${secureListen.split(":")[1]}`;
+  const certificate = spawnSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1", "-days", "1"], { encoding: "utf8" });
+  if (certificate.status !== 0) throw new Error(certificate.stderr || "Could not create test TLS certificate");
+  server = spawn(executable, ["serve", "--data", dir, "--listen", secureListen, "--tls-cert", cert, "--tls-key", key, "--origin", secureOrigin, "--login-ttl", "3s", "--session-ttl", "30s"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  server.stdout.on("data", chunk => { serverOutput += chunk.toString(); });
+  server.stderr.on("data", chunk => { serverOutput += chunk.toString(); });
+  await new Promise((resolve, reject) => {
+    const started = Date.now();
+    const poll = async () => {
+      try {
+        if (await httpsStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/login", { Accept: "text/html" }) === 200) return resolve();
+      } catch {}
+      if (Date.now() - started > 10000) return reject(new Error(`HTTPS application did not start: ${serverOutput}`));
+      setTimeout(poll, 100);
+    };
+    poll();
+  });
+  const wrongHost = await httpsStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/login", { Accept: "text/html", Host: "attacker.example" });
+  if (wrongHost !== 421) throw new Error(`non-canonical Host header returned ${wrongHost}, expected 421`);
+  const crossOriginLogin = await httpsPostStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/opaque/login/start", "https://attacker.example", { value: "AA" });
+  if (crossOriginLogin !== 403) throw new Error(`cross-origin login start returned ${crossOriginLogin}, expected 403`);
+
+  const authContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const authPage = await authContext.newPage();
+  const authBodies = [];
+  const authCryptoAssets = [];
+  await authPage.addInitScript(() => {
+    globalThis.__cspViolations = [];
+    document.addEventListener("securitypolicyviolation", event => globalThis.__cspViolations.push(`${event.effectiveDirective}: ${event.blockedURI}`));
+  });
+  authPage.on("request", request => {
+    if (request.method() === "POST") authBodies.push(request.postData() || "");
+  });
+  authPage.on("response", response => {
+    if (response.headers()["content-type"]?.includes("javascript") && Number(response.headers()["content-length"]) > 300000) authCryptoAssets.push(response.url());
+  });
+  await authPage.goto(`${secureOrigin}/dashboard/projects/nested`, { waitUntil: "domcontentloaded" });
+  await authPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
+  if (await authPage.evaluate(() => globalThis.__cspViolations.length)) throw new Error(`CSP blocked login resources: ${await authPage.evaluate(() => globalThis.__cspViolations.join(", "))}`);
+  const unauthStatus = await authPage.evaluate(async () => (await fetch("/api/session")).status);
+  if (unauthStatus !== 401) throw new Error(`direct unauthenticated session read returned ${unauthStatus}`);
+  if (authCryptoAssets.length) throw new Error("dashboard/login loaded OPAQUE before an authentication attempt");
+
+  await authPage.getByLabel("Password").fill("Wrong password 2026!");
+  await authPage.getByRole("button", { name: "Sign in" }).click();
+  await authPage.getByText("Sign-in failed. Check your password and try again.").waitFor({ timeout: 30000 });
+  if (authCryptoAssets.length !== 1) throw new Error(`login did not load exactly one lazy OPAQUE asset: ${authCryptoAssets.length}`);
+  if ((await authContext.cookies()).length) throw new Error("incorrect password created a session cookie");
+
+  let expiredHandshakeStatus;
+  const expiredHandshake = new Promise(resolve => { expiredHandshakeStatus = resolve; });
+  await authPage.route("**/opaque/login/finish", async route => {
+    await new Promise(resolve => setTimeout(resolve, 3200));
+    const response = await route.fetch();
+    expiredHandshakeStatus(response.status());
+    await route.fulfill({ response });
+  });
+  await authPage.getByLabel("Password").fill(testPassword);
+  await authPage.getByRole("button", { name: "Sign in" }).click();
+  const expiredStatus = await expiredHandshake;
+  await authPage.waitForFunction(() => document.querySelector('[role="status"]')?.textContent?.includes("Sign-in failed"), null, { timeout: 30000 });
+  if (expiredStatus !== 401 || (await authContext.cookies()).length) throw new Error(`expired login handshake returned ${expiredStatus} or issued a cookie`);
+  await authPage.unroute("**/opaque/login/finish");
+
+  let tamperedResponse;
+  let finishTampered;
+  const tamperedCompletion = new Promise(resolve => { finishTampered = resolve; });
+  await authPage.route("**/opaque/login/finish", async route => {
+    const body = JSON.parse(route.request().postData());
+    const bytes = Buffer.from(body.value.replaceAll("-", "+").replaceAll("_", "/"), "base64");
+    bytes[0] ^= 1;
+    body.value = bytes.toString("base64url");
+    tamperedResponse = await route.fetch({ postData: JSON.stringify(body) });
+    await route.fulfill({ response: tamperedResponse });
+    finishTampered(tamperedResponse.status());
+  });
+  await authPage.getByLabel("Password").fill(testPassword);
+  await authPage.getByRole("button", { name: "Sign in" }).click();
+  await authPage.waitForFunction(() => document.querySelector('[role="status"]')?.textContent?.includes("Sign-in failed"), null, { timeout: 30000 });
+  const tamperedStatus = await tamperedCompletion;
+  if (tamperedStatus !== 401 || (await authContext.cookies()).length) throw new Error(`tampered KE3 authenticated or issued a cookie (status ${tamperedStatus}, cookies ${(await authContext.cookies()).length})`);
+  await authPage.unroute("**/opaque/login/finish");
+
+  let finishBody;
+  await authPage.route("**/opaque/login/finish", async route => {
+    finishBody = route.request().postData();
+    await route.continue();
+  });
+  await authPage.getByLabel("Password").fill(testPassword);
+  await authPage.getByRole("button", { name: "Sign in" }).click();
+  await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  if (await authPage.evaluate(() => globalThis.__cspViolations.length)) throw new Error(`CSP blocked dashboard resources: ${await authPage.evaluate(() => globalThis.__cspViolations.join(", "))}`);
+  const sessionCookie = (await authContext.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session");
+  if (!sessionCookie || !sessionCookie.secure || !sessionCookie.httpOnly || sessionCookie.sameSite !== "Strict") throw new Error("session cookie attributes are not Secure, HttpOnly, and SameSite=Strict");
+  if (!finishBody || finishBody.includes(testPassword) || finishBody.includes("clientLoginState") || finishBody.includes("sessionKey")) throw new Error("login transmitted password or local OPAQUE secret state");
+  const authenticated = await authPage.evaluate(async () => (await fetch("/api/session")).status);
+  if (authenticated !== 200) throw new Error(`authenticated session check returned ${authenticated}`);
+  await authPage.goto(`${secureOrigin}/dashboard/projects/nested`, { waitUntil: "domcontentloaded" });
+  await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  await authPage.reload({ waitUntil: "domcontentloaded" });
+  await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  await authPage.waitForFunction(async () => (await fetch("/api/session")).status === 401, null, { timeout: 35000 });
+  const expiredLogout = await authPage.evaluate(async () => (await fetch("/api/logout", { method: "POST" })).status);
+  if (expiredLogout !== 204) throw new Error(`logout after session expiry returned ${expiredLogout}`);
+  await authPage.goto(`${secureOrigin}/login`, { waitUntil: "domcontentloaded" });
+  try {
+    await authPage.locator("#password").waitFor({ state: "visible", timeout: 10000 });
+  } catch {
+    const state = await authPage.evaluate(() => ({ url: location.href, title: document.title, text: document.body.innerText.slice(0, 500) }));
+    throw new Error(`login page did not appear after session expiry: ${JSON.stringify(state)}`);
+  }
+  await authPage.getByLabel("Password").fill(testPassword);
+  await authPage.getByRole("button", { name: "Sign in" }).click();
+  await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  const finish = JSON.parse(finishBody);
+  const replay = await authPage.evaluate(async payload => (await fetch("/opaque/login/finish", { method: "POST", headers: { "Content-Type": "application/json" }, body: payload })).status, JSON.stringify(finish));
+  if (replay !== 401) throw new Error(`replayed KE3 returned ${replay}, expected 401`);
+  const crossOriginStatus = await new Promise((resolve, reject) => {
+    const req = httpsRequest({ hostname: "127.0.0.1", port: Number(secureListen.split(":")[1]), path: "/api/logout", method: "POST", rejectUnauthorized: false, headers: { Origin: "https://attacker.example", Cookie: `${sessionCookie.name}=${sessionCookie.value}` } }, response => { response.resume(); response.on("end", () => resolve(response.statusCode)); });
+    req.on("error", reject);
+    req.end();
+  });
+  if (crossOriginStatus !== 403) throw new Error(`cross-origin logout returned ${crossOriginStatus}, expected 403`);
+  await authPage.getByRole("button", { name: "Sign out" }).click();
+  await authPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
+  if (await authPage.evaluate(async () => (await fetch("/api/session")).status) !== 401) throw new Error("logout did not revoke the server session");
+
+  await authPage.getByLabel("Password").fill(testPassword);
+  await authPage.getByRole("button", { name: "Sign in" }).click();
+  await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  const oldCookie = (await authContext.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session");
+  if (!oldCookie) throw new Error("could not capture active session before restart");
+
+  const pendingContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const pendingPage = await pendingContext.newPage();
+  await pendingPage.goto(`${secureOrigin}/login`, { waitUntil: "domcontentloaded" });
+  await pendingPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
+  let interruptedLogin;
+  await pendingPage.route("**/opaque/login/finish", async route => {
+    interruptedLogin = JSON.parse(route.request().postData());
+    await route.fulfill({ status: 503, body: "interrupted" });
+  });
+  await pendingPage.getByLabel("Password").fill(testPassword);
+  await pendingPage.getByRole("button", { name: "Sign in" }).click();
+  await pendingPage.getByText("Sign-in failed. Check your password and try again.").waitFor({ timeout: 30000 });
+  if (!interruptedLogin?.transaction) throw new Error("could not create the pending login used for restart coverage");
+
+  server.kill("SIGTERM");
+  await once(server, "exit");
+  server = spawn(executable, ["serve", "--data", dir, "--listen", secureListen, "--tls-cert", cert, "--tls-key", key, "--origin", secureOrigin], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  server.stdout.on("data", chunk => { serverOutput += chunk.toString(); });
+  server.stderr.on("data", chunk => { serverOutput += chunk.toString(); });
+  await new Promise((resolve, reject) => {
+    const started = Date.now();
+    const poll = async () => {
+      try {
+        if (await httpsStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/api/session", { Cookie: `${oldCookie.name}=${oldCookie.value}` }) === 401) return resolve();
+      } catch {}
+      if (Date.now() - started > 10000) return reject(new Error(`HTTPS application did not restart: ${serverOutput}`));
+      setTimeout(poll, 100);
+    };
+    poll();
+  });
+  const interruptedStatus = await httpsPostStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/opaque/login/finish", secureOrigin, interruptedLogin);
+  if (interruptedStatus !== 401) throw new Error(`pre-restart login handshake survived restart: ${interruptedStatus}`);
+  await pendingContext.close();
+  if (authBodies.some(body => body.includes(testPassword) || body.includes("clientLoginState") || body.includes("sessionKey"))) throw new Error("browser login traffic contained password or OPAQUE secret state");
+  await authContext.close();
   await context.close();
-  console.log("combined-binary browser regression passed: embedded SPA routes/assets, lazy OPAQUE, protected registration, one-time grants, and restart durability");
+  console.log("combined-binary browser regression passed: embedded SPA, registration, OPAQUE login, one-use KE3, secure sessions, logout, CSRF, and restart invalidation");
 } finally {
   await browser?.close();
   if (server && server.exitCode === null) {

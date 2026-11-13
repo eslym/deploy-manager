@@ -29,7 +29,10 @@ import (
 type Config struct {
 	DatabasePath      string
 	OPAQUEKeyPath     string
+	CanonicalOrigin   string
 	GrantTTL          time.Duration
+	LoginTTL          time.Duration
+	SessionTTL        time.Duration
 	InsecureLocalHTTP bool
 	Now               func() time.Time
 }
@@ -42,11 +45,19 @@ type App struct {
 	keyGeneration string
 	mu            sync.Mutex
 	rate          map[string][]time.Time
+	logins        map[string]pendingLogin
+	sessions      map[[32]byte]time.Time
 }
 
 func New(cfg Config) (*App, error) {
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
+	}
+	if cfg.CanonicalOrigin != "" {
+		origin, err := url.Parse(cfg.CanonicalOrigin)
+		if err != nil || origin.Scheme != "https" || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+			return nil, errors.New("canonical origin must be an HTTPS origin without path, query, or credentials")
+		}
 	}
 	dbPath, keyPath := filepath.Clean(cfg.DatabasePath), filepath.Clean(cfg.OPAQUEKeyPath)
 	if keyPath == dbPath || keyPath == dbPath+"-wal" || keyPath == dbPath+"-shm" {
@@ -59,6 +70,15 @@ func New(cfg Config) (*App, error) {
 	}
 	if cfg.GrantTTL == 0 {
 		cfg.GrantTTL = 15 * time.Minute
+	}
+	if cfg.LoginTTL == 0 {
+		cfg.LoginTTL = 2 * time.Minute
+	}
+	if cfg.SessionTTL == 0 {
+		cfg.SessionTTL = 12 * time.Hour
+	}
+	if cfg.GrantTTL < time.Second || cfg.GrantTTL > 24*time.Hour || cfg.LoginTTL < time.Second || cfg.LoginTTL > 10*time.Minute || cfg.SessionTTL < time.Second || cfg.SessionTTL > 30*24*time.Hour {
+		return nil, errors.New("grant, login, or session lifetime is outside the supported range")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -143,7 +163,7 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
-	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, rate: make(map[string][]time.Time)}, nil
+	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]time.Time)}, nil
 }
 
 func loadOPAQUEServerKey(c *opaque.Configuration, path string, priorDatabase bool) (*opaque.ServerKeyMaterial, string, error) {
@@ -292,12 +312,30 @@ func (a *App) Handler() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("POST /opaque/register/start", a.registerStart)
 	m.HandleFunc("POST /opaque/register/finish", a.registerFinish)
+	m.HandleFunc("POST /opaque/login/start", a.loginStart)
+	m.HandleFunc("POST /opaque/login/finish", a.loginFinish)
+	m.HandleFunc("GET /api/session", a.sessionStatus)
+	m.HandleFunc("POST /api/logout", a.logout)
 	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if a.cfg.CanonicalOrigin != "" {
+			origin, _ := url.Parse(a.cfg.CanonicalOrigin)
+			if !strings.EqualFold(r.Host, origin.Host) {
+				http.Error(w, "request host is not the configured application origin", http.StatusMisdirectedRequest)
+				return
+			}
+		}
+		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+		if (r.URL.Path == "/login" || r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/")) && !a.https(r) {
+			http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
+			return
+		}
 		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.TrimSuffix(r.URL.Path, "/") == "/register" && !a.secure(r) {
 			http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/webhooks/") {
+		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/webhooks/") || strings.HasPrefix(r.URL.Path, "/api/") {
 			m.ServeHTTP(w, r)
 			return
 		}
@@ -449,6 +487,18 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 func (a *App) secure(r *http.Request) bool {
+	if a.https(r) {
+		return true
+	}
+	ip, _, e := net.SplitHostPort(r.RemoteAddr)
+	host, _, hostErr := net.SplitHostPort(r.Host)
+	if hostErr != nil {
+		host = strings.Trim(r.Host, "[]")
+	}
+	return a.cfg.InsecureLocalHTTP && e == nil && isLoopback(ip) && isLoopback(host)
+}
+
+func (a *App) https(r *http.Request) bool {
 	if r.TLS != nil {
 		return true
 	}
@@ -456,11 +506,7 @@ func (a *App) secure(r *http.Request) bool {
 	if e == nil && isLoopback(ip) && strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")) == "https" {
 		return true
 	}
-	host, _, hostErr := net.SplitHostPort(r.Host)
-	if hostErr != nil {
-		host = strings.Trim(r.Host, "[]")
-	}
-	return a.cfg.InsecureLocalHTTP && e == nil && isLoopback(ip) && isLoopback(host)
+	return false
 }
 func (a *App) originOK(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
@@ -468,8 +514,15 @@ func (a *App) originOK(r *http.Request) bool {
 		return false
 	}
 	u, e := url.Parse(origin)
-	scheme := a.requestScheme(r)
-	return e == nil && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == "" && u.Scheme == scheme && strings.EqualFold(u.Host, r.Host)
+	scheme, host := a.requestScheme(r), r.Host
+	if a.cfg.CanonicalOrigin != "" {
+		canonical, parseErr := url.Parse(a.cfg.CanonicalOrigin)
+		if parseErr != nil {
+			return false
+		}
+		scheme, host = canonical.Scheme, canonical.Host
+	}
+	return e == nil && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == "" && u.Scheme == scheme && strings.EqualFold(u.Host, host)
 }
 func (a *App) requestScheme(r *http.Request) string {
 	if r.TLS != nil {
@@ -518,7 +571,7 @@ func (a *App) allow(r *http.Request) bool {
 			old = append(old, t)
 		}
 	}
-	if len(old) >= 10 {
+	if len(old) >= 20 {
 		a.rate[ip] = old
 		return false
 	}
@@ -527,8 +580,9 @@ func (a *App) allow(r *http.Request) bool {
 }
 
 type protocolMessage struct {
-	Grant string `json:"grant"`
-	Value string `json:"value"`
+	Grant       string  `json:"grant"`
+	Transaction *string `json:"transaction"`
+	Value       string  `json:"value"`
 }
 
 func (a *App) decode(w http.ResponseWriter, r *http.Request) (protocolMessage, bool) {
@@ -571,6 +625,10 @@ func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	if m.Transaction != nil {
+		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		return
+	}
 	registered, err := a.HasAdministrator()
 	if err != nil {
 		http.Error(w, "registration is temporarily unavailable", http.StatusInternalServerError)
@@ -604,6 +662,10 @@ func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 	m, ok := a.decode(w, r)
 	if !ok {
+		return
+	}
+	if m.Transaction != nil {
+		http.Error(w, "invalid protocol message", http.StatusBadRequest)
 		return
 	}
 	token := m.Grant

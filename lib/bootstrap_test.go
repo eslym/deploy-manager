@@ -2,6 +2,7 @@ package lib
 
 import (
 	"bytes"
+	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -48,7 +49,7 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 	if !strings.Contains(res.Header().Get("Content-Security-Policy"), "sha256-") {
 		t.Fatal("SPA shell must authorize only its exact inline boot script")
 	}
-	for _, route := range []string{"/register", "/dashboard/projects/nested"} {
+	for _, route := range []string{"/register"} {
 		deep := httptest.NewRequest(http.MethodGet, route, nil)
 		deep.RemoteAddr, deep.Host = "127.0.0.1:43210", "127.0.0.1:8080"
 		deep.Header.Set("Accept", "text/html")
@@ -57,6 +58,14 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "_app/immutable/entry/start.") {
 			t.Fatalf("SPA route %s did not return shell: %d", route, response.Code)
 		}
+	}
+	plainDashboard := httptest.NewRecorder()
+	plainDashboardRequest := httptest.NewRequest(http.MethodGet, "/dashboard/projects/nested", nil)
+	plainDashboardRequest.RemoteAddr, plainDashboardRequest.Host = "127.0.0.1:43210", "127.0.0.1:8080"
+	plainDashboardRequest.Header.Set("Accept", "text/html")
+	app.Handler().ServeHTTP(plainDashboard, plainDashboardRequest)
+	if plainDashboard.Code != http.StatusUpgradeRequired {
+		t.Fatalf("plain HTTP dashboard status = %d, want 426", plainDashboard.Code)
 	}
 	missing := httptest.NewRecorder()
 	missingReq := httptest.NewRequest(http.MethodGet, "/_app/immutable/entry/missing.deadbeef.js", nil)
@@ -144,6 +153,14 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("fresh local grant rejected: %d", res.Code)
+	}
+	plainLogin := httptest.NewRequest(http.MethodGet, "/login", nil)
+	plainLogin.RemoteAddr, plainLogin.Host = "127.0.0.1:4321", "127.0.0.1:8080"
+	plainLogin.Header.Set("Accept", "text/html")
+	plainLoginResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(plainLoginResponse, plainLogin)
+	if plainLoginResponse.Code != http.StatusUpgradeRequired {
+		t.Fatalf("plain HTTP login page status = %d, want 426", plainLoginResponse.Code)
 	}
 	now = now.Add(2 * time.Minute)
 	expired := httptest.NewRequest(http.MethodPost, "/opaque/register/start", strings.NewReader(`{"grant":"`+token+`","value":"AA"}`))
@@ -249,5 +266,47 @@ func TestOpaqueKeyMissingFailsClosed(t *testing.T) {
 	}
 	if _, err := New(cfg); err == nil {
 		t.Fatal("missing OPAQUE key must fail closed")
+	}
+}
+
+func TestDashboardEndpointsRequireSessionAndSameOrigin(t *testing.T) {
+	dir := t.TempDir()
+	app, err := New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	plainStatus := httptest.NewRecorder()
+	plainRequest := httptest.NewRequest(http.MethodGet, "/api/session", nil)
+	plainRequest.RemoteAddr, plainRequest.Host = "127.0.0.1:43210", "127.0.0.1:8080"
+	app.Handler().ServeHTTP(plainStatus, plainRequest)
+	if plainStatus.Code != http.StatusUpgradeRequired {
+		t.Fatalf("plain HTTP session status = %d, want 426", plainStatus.Code)
+	}
+	status := httptest.NewRecorder()
+	statusRequest := httptest.NewRequest(http.MethodGet, "/api/session", nil)
+	statusRequest.RemoteAddr, statusRequest.Host, statusRequest.TLS = "127.0.0.1:43210", "127.0.0.1:8080", &tls.ConnectionState{}
+	app.Handler().ServeHTTP(status, statusRequest)
+	if status.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated HTTPS session status = %d, want 401", status.Code)
+	}
+
+	logout := httptest.NewRequest(http.MethodPost, "/api/logout", nil)
+	logout.RemoteAddr, logout.Host = "127.0.0.1:43210", "127.0.0.1:8080"
+	logout.TLS = &tls.ConnectionState{}
+	logout.Header.Set("Origin", "https://attacker.example")
+	logoutResponse := httptest.NewRecorder()
+	app.Handler().ServeHTTP(logoutResponse, logout)
+	if logoutResponse.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin logout = %d, want 403", logoutResponse.Code)
+	}
+
+	protected := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodGet, "/api/private/projects", nil)
+	request.Header.Set("Accept", "application/json")
+	app.Handler().ServeHTTP(protected, request)
+	if protected.Code == http.StatusOK || strings.Contains(protected.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("private endpoint must not return a successful SPA shell: %d %q", protected.Code, protected.Header().Get("Content-Type"))
 	}
 }

@@ -23,10 +23,13 @@ func main() {
 	data := flags.String("data", "./data", "application data directory")
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP(S) listen address")
 	base := flags.String("url", "", "externally reachable HTTPS base URL for setup link")
+	origin := flags.String("origin", "", "canonical HTTPS origin used by the application")
 	cert := flags.String("tls-cert", "", "TLS certificate (required for non-loopback serving)")
 	key := flags.String("tls-key", "", "TLS private key")
+	loginTTL := flags.Duration("login-ttl", 2*time.Minute, "maximum lifetime of an OPAQUE login handshake")
+	sessionTTL := flags.Duration("session-ttl", 12*time.Hour, "maximum lifetime of an authenticated session")
 	_ = flags.Parse(os.Args[2:])
-	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), InsecureLocalHTTP: true})
+	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), CanonicalOrigin: *origin, InsecureLocalHTTP: true, LoginTTL: *loginTTL, SessionTTL: *sessionTTL})
 	if err != nil {
 		log.Fatal(err)
 	}

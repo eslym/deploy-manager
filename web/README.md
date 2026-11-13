@@ -5,15 +5,23 @@ authentication and the protected dashboard. The [agreed design](../docs/design.m
 requires client rendering and a static production build embedded in the Go
 executable, not a separately deployed frontend server.
 
-## Current status
+## Authentication and hosting
 
-This directory is still a scaffold. The static adapter has a fallback configured,
-but the combined frontend/Go build and SPA application flows are not implemented.
-Current registration lives outside `web/` in Go-defined HTML and standalone JS.
-Existing ticket [#3](https://github.com/eslym/deploy-manager/issues/3) tracks its
-migration and build/embedding integration; #4 adds login and the protected
-dashboard. Do not treat a successful standalone frontend build as proof that
-the Go binary uses this frontend.
+The SPA contains browser-side administrator setup and OPAQUE login, plus a
+session-guarded dashboard. OPAQUE JavaScript/WASM loads only when an
+authentication form is submitted. Go verifies protocol messages and protects
+session endpoints; the static shell itself contains no protected data.
+
+Serve login and dashboard pages over HTTPS, either directly with `--tls-cert`
+and `--tls-key` or through a trusted loopback reverse proxy. Configure the
+external HTTPS origin with `--origin https://manager.example`. The default
+session lifetime is 12 hours and can be changed with `--session-ttl`; sessions
+are intentionally invalidated on server restart, while the administrator
+credential remains stored durably.
+
+The combined build is performed by `scripts/build.sh`; it builds and embeds the
+static frontend before compiling Go. Do not treat a standalone frontend build
+as proof that the Go binary uses this frontend.
 
 ## Development and checks
 
