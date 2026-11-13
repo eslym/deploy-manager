@@ -4,7 +4,7 @@ This standalone module is not imported by the application and does not approve i
 
 ## Reproduce
 
-Environment measured: Ubuntu 26.04 x86-64, Go 1.26.8, Bun 1.4.4, Playwright 1.65.0, Chromium 158.0.8127.18 (headless). The Go dependency graph and Serenity package are pinned in `go.mod`/`go.sum` and `package.json`/`bun.lock`; use Bun, not npm:
+Environment measured: Ubuntu 26.04 x86-64, 4 vCPUs on Intel Pentium Silver J5005 @ 1.50GHz, host reports 7.1 GiB RAM; Go 1.26.8, Bun 1.4.4, Playwright 1.65.0, Chromium 158.0.8127.18 (headless). The Go dependency graph and Serenity package are pinned in `go.mod`/`go.sum` and `package.json`/`bun.lock`; use Bun, not npm:
 
 ```sh
 go mod download
