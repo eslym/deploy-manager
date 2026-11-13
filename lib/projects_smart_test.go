@@ -539,6 +539,37 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 			t.Fatalf("orphan cache stage survived startup reconciliation: %s", entry.Name())
 		}
 	}
+	cacheBeforeLoweredLimit, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recoveredServer.Close()
+	loweredLimitConfig := cfg
+	loweredLimitConfig.GitMaxCacheBytes = 1
+	if overLimitApp, startupErr := New(loweredLimitConfig); startupErr == nil {
+		_ = overLimitApp.Close()
+		t.Fatal("restart accepted committed project caches over the lowered cache limit")
+	} else if !strings.Contains(strings.ToLower(startupErr.Error()), "cache") || !strings.Contains(strings.ToLower(startupErr.Error()), "limit") {
+		t.Fatalf("lowered cache limit startup error is not actionable: %v", startupErr)
+	}
+	cacheAfterLoweredLimit, err := digestProjectCache(filepath.Join(cfg.DatabasePath+".projects", created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cacheAfterLoweredLimit != cacheBeforeLoweredLimit {
+		t.Fatal("lowered cache limit startup deleted or modified the committed project cache")
+	}
+	if _, err := os.Lstat(filepath.Join(cfg.DatabasePath+".projects", ".git-stage-refresh-"+created.ID)); !os.IsNotExist(err) {
+		t.Fatalf("lowered cache limit startup allocated a refresh stage: %v", err)
+	}
+	app, err = New(cfg)
+	if err != nil {
+		t.Fatalf("original cache limit could not reopen preserved project cache: %v", err)
+	}
+	defer app.Close()
 }
 
 type countingHTTPWriter struct {

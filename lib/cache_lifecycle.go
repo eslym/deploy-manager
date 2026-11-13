@@ -54,6 +54,13 @@ func (p *projectManager) ensureCacheReady() error {
 	return nil
 }
 
+func (p *projectManager) checkPersistentCacheBudget() error {
+	if _, err := directorySize(p.root, p.maxCacheBytes); err != nil {
+		return errors.New("existing project caches exceed the configured GitMaxCacheBytes; increase the limit or explicitly recreate caches")
+	}
+	return nil
+}
+
 func (p *projectManager) cleanupStage(path string) error {
 	if path == "" {
 		return nil
@@ -201,7 +208,7 @@ func (p *projectManager) reconcileCacheFiles() error {
 			}
 		}
 	}
-	return nil
+	return p.checkPersistentCacheBudget()
 }
 
 func (p *projectManager) removeOwnedPath(path string) error {

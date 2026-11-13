@@ -76,7 +76,7 @@ type projectRef struct {
 	Commit string `json:"commit"`
 }
 
-func newProjectManager(db *sql.DB, root string, timeout time.Duration) (*projectManager, error) {
+func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheBytes int64) (*projectManager, error) {
 	if err := configureTestGitTransport(); err != nil {
 		return nil, fmt.Errorf("invalid test Git transport configuration: %w", err)
 	}
@@ -101,7 +101,7 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration) (*project
 			return nil, err
 		}
 	}
-	manager := &projectManager{db: db, root: root, timeout: timeout, cacheFS: osProjectCacheFS{}}
+	manager := &projectManager{db: db, root: root, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
 	if err := manager.reconcileCacheFiles(); err != nil {
 		return nil, fmt.Errorf("project cache recovery failed; refusing to start: %w", err)
 	}
@@ -312,6 +312,10 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	var remote string
 	if p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote) != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if err := p.checkPersistentCacheBudget(); err != nil {
+		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)

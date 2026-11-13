@@ -217,7 +217,7 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
-	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout)
+	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout, cfg.GitMaxCacheBytes)
 	if err != nil {
 		db.Close()
 		return nil, err
