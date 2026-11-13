@@ -38,9 +38,6 @@ type projectManager struct {
 	mu                    sync.Mutex
 }
 
-// Reserve conservative room for pack indexes and repository metadata before
-// accepting a pack, not only after go-git has written it.
-const maxGitCacheGrowthFactor = 16
 const maxGitTreeObjectBytes = 16 << 20
 const maxGitCommitObjectBytes = 1 << 20
 
@@ -195,25 +192,38 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := fmt.Sprintf("%x", idBytes)
-	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes-maxGitCacheGrowthFactor*p.maxTransferBytes {
-		http.Error(w, "project caches are near the configured storage limit; recreate or remove a project cache before adding another", http.StatusRequestEntityTooLarge)
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
 	ctx = withGitHTTPPolicy(ctx, p)
 	remote := u.String()
-	_, err = git.PlainCloneContext(ctx, p.repoPath(id), true, &git.CloneOptions{URL: remote, NoCheckout: true, Tags: git.AllTags})
+	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size >= p.maxCacheBytes {
+		http.Error(w, "project caches have no remaining space under the configured storage limit", http.StatusRequestEntityTooLarge)
+		return
+	}
+	stage, err := os.MkdirTemp(p.root, ".git-stage-")
 	if err != nil {
-		_ = os.RemoveAll(p.repoPath(id))
+		http.Error(w, "could not prepare bounded repository staging", 500)
+		return
+	}
+	defer os.RemoveAll(stage)
+	_, err = git.CloneContext(ctx, boundedStorage(stage, p.maxCacheBytes), nil, &git.CloneOptions{URL: remote, NoCheckout: true, Tags: git.AllTags})
+	if err != nil {
+		if errors.Is(err, errGitCacheLimit) {
+			http.Error(w, "repository object storage exceeded the configured cache limit", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, sanitizeGitError(err, remote), 400)
 		return
 	}
 	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes {
-		_ = os.RemoveAll(p.repoPath(id))
 		http.Error(w, "project caches exceed the configured storage limit", http.StatusRequestEntityTooLarge)
 		return
 	}
+	if err = os.Rename(stage, p.repoPath(id)); err != nil {
+		http.Error(w, "repository fetched but could not be promoted from staging", 500)
+		return
+	}
+	stage = ""
 	now := time.Now().UTC()
 	_, err = p.db.Exec(`INSERT INTO projects(id,name,remote_url,created_at,last_fetched,warning) VALUES(?,?,?,?,?,'')`, id, strings.TrimSpace(input.Name), remote, now.UnixNano(), now.UnixNano())
 	if err != nil {
@@ -278,13 +288,19 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
 	ctx = withGitHTTPPolicy(ctx, p)
-	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes-maxGitCacheGrowthFactor*p.maxTransferBytes {
-		warning := "project caches are near the configured storage limit; recreate a cache before refreshing"
+	stage, err := os.MkdirTemp(p.root, ".git-stage-")
+	if err != nil {
+		http.Error(w, "could not prepare bounded repository staging", 500)
+		return
+	}
+	defer os.RemoveAll(stage)
+	if err = copyGitCache(p.repoPath(id), stage, p.maxCacheBytes); err != nil {
+		warning := "could not stage the existing repository within the configured cache limit"
 		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
 		http.Error(w, warning, http.StatusRequestEntityTooLarge)
 		return
 	}
-	repo, err := git.PlainOpen(p.repoPath(id))
+	repo, err := git.Open(boundedStorage(stage, p.maxCacheBytes), nil)
 	if err == nil {
 		err = repo.FetchContext(ctx, &git.FetchOptions{RemoteName: "origin", Tags: git.AllTags, Force: true, Prune: true})
 	}
@@ -294,48 +310,69 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		warning := sanitizeGitError(err, remote)
 		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
-		http.Error(w, warning, 502)
+		status := http.StatusBadGateway
+		if errors.Is(err, errGitCacheLimit) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		http.Error(w, warning, status)
 		return
 	}
-	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes {
-		warning := "project caches exceeded the configured storage limit; cached refs were not changed"
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
-		http.Error(w, warning, http.StatusRequestEntityTooLarge)
-		return
-	}
-	if err = saveProjectRefs(p.db, id, p.repoPath(id), p.maxRefs); err != nil {
+	refs, err := projectRefsFromRepository(stage, p.maxRefs)
+	if err != nil {
 		warning := sanitizeGitError(err, remote)
 		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
 		http.Error(w, warning, 502)
 		return
 	}
-	now := time.Now().UTC()
-	_, err = p.db.Exec(`UPDATE projects SET last_fetched=?,warning='' WHERE id=?`, now.UnixNano(), id)
-	if err != nil {
-		http.Error(w, "fetch succeeded but status could not be saved", 500)
+	used, sizeErr := directorySize(p.root, 2*p.maxCacheBytes)
+	stageSize, stageErr := directorySize(stage, p.maxCacheBytes)
+	liveSize, liveErr := directorySize(p.repoPath(id), p.maxCacheBytes)
+	if sizeErr != nil || stageErr != nil || liveErr != nil || stageSize > p.maxCacheBytes || used < liveSize || used-liveSize > p.maxCacheBytes {
+		warning := "refreshed repository exceeds the configured persistent cache limit; previous cache retained"
+		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		http.Error(w, warning, http.StatusRequestEntityTooLarge)
 		return
 	}
+	now := time.Now().UTC()
+	backup := stage + ".previous"
+	if err = os.Rename(p.repoPath(id), backup); err != nil {
+		http.Error(w, "refreshed repository could not be safely promoted; previous cache retained", 500)
+		return
+	}
+	if err = os.Rename(stage, p.repoPath(id)); err != nil {
+		_ = os.Rename(backup, p.repoPath(id))
+		http.Error(w, "refreshed repository could not be safely promoted; previous cache retained", 500)
+		return
+	}
+	if err = replaceProjectMetadata(p.db, id, refs, now); err != nil {
+		_ = os.RemoveAll(p.repoPath(id))
+		_ = os.Rename(backup, p.repoPath(id))
+		http.Error(w, "refresh could not be committed; previous cache and refs restored", 500)
+		return
+	}
+	_ = os.RemoveAll(backup)
 	writeJSON(w, map[string]any{"lastFetched": now})
 }
 
 func saveProjectRefs(db *sql.DB, id, dir string, maxRefs int) error {
-	repo, err := git.PlainOpen(dir)
+	refs, err := projectRefsFromRepository(dir, maxRefs)
 	if err != nil {
 		return err
+	}
+	return replaceProjectMetadataRefs(db, id, refs)
+}
+
+func projectRefsFromRepository(dir string, maxRefs int) ([]projectRef, error) {
+	repo, err := git.PlainOpen(dir)
+	if err != nil {
+		return nil, err
 	}
 	refs, err := repo.References()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer refs.Close()
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err = tx.Exec(`DELETE FROM project_refs WHERE project_id=?`, id); err != nil {
-		return err
-	}
+	result := make([]projectRef, 0)
 	count := 0
 	checkedObjects := make(map[plumbing.Hash]struct{})
 	iterErr := refs.ForEach(func(ref *plumbing.Reference) error {
@@ -377,16 +414,53 @@ func saveProjectRefs(db *sql.DB, id, dir string, maxRefs int) error {
 		if err := verifyCompleteCommit(repo, c, checkedObjects, 100000); err != nil {
 			return err
 		}
-		_, e = tx.Exec(`INSERT INTO project_refs(project_id,kind,name,commit_id) VALUES(?,?,?,?)`, id, kind, shortName, c.Hash.String())
-		if e == nil {
-			count++
-		}
-		return e
+		result = append(result, projectRef{Kind: kind, Name: shortName, Commit: c.Hash.String()})
+		count++
+		return nil
 	})
 	if iterErr != nil {
-		return iterErr
+		return nil, iterErr
+	}
+	return result, nil
+}
+
+func replaceProjectMetadata(db *sql.DB, id string, refs []projectRef, fetched time.Time) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := replaceProjectMetadataRefsTx(tx, id, refs); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE projects SET last_fetched=?,warning='' WHERE id=?`, fetched.UnixNano(), id); err != nil {
+		return err
 	}
 	return tx.Commit()
+}
+
+func replaceProjectMetadataRefs(db *sql.DB, id string, refs []projectRef) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := replaceProjectMetadataRefsTx(tx, id, refs); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func replaceProjectMetadataRefsTx(tx *sql.Tx, id string, refs []projectRef) error {
+	if _, err := tx.Exec(`DELETE FROM project_refs WHERE project_id=?`, id); err != nil {
+		return err
+	}
+	for _, ref := range refs {
+		if _, err := tx.Exec(`INSERT INTO project_refs(project_id,kind,name,commit_id) VALUES(?,?,?,?)`, id, ref.Kind, ref.Name, ref.Commit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func verifyCompleteCommit(repo *git.Repository, commit *object.Commit, checked map[plumbing.Hash]struct{}, maxObjects int) error {
@@ -470,6 +544,9 @@ func sanitizeGitError(err error, remote string) string {
 	}
 	if errors.Is(err, errGitTransferTooLarge) || strings.Contains(lower, "transfer limit") {
 		return "repository transfer exceeded the configured byte limit"
+	}
+	if errors.Is(err, errGitCacheLimit) {
+		return "repository object storage exceeded the configured cache limit; the previous cache was retained"
 	}
 	if strings.Contains(lower, "authentication") || strings.Contains(lower, "authorization") {
 		return "repository could not be read anonymously; use a public HTTPS repository"

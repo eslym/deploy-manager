@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -67,6 +68,8 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	var redirectRequests atomic.Bool
 	var redirectedHits atomic.Int32
 	var gitRequests atomic.Int32
+	var measurePack atomic.Bool
+	var measuredPackBytes atomic.Int64
 	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gitRequests.Add(1)
 		if failRequests.Load() {
@@ -152,7 +155,11 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 			}
 			defer response.Close()
 			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
-			if err := response.Encode(w); err != nil && r.Context().Err() == nil && !strings.HasPrefix(r.URL.Path, "/partial.git/") {
+			writer := http.ResponseWriter(w)
+			if measurePack.Load() {
+				writer = &countingHTTPWriter{ResponseWriter: w, count: &measuredPackBytes}
+			}
+			if err := response.Encode(writer); err != nil && r.Context().Err() == nil && !strings.HasPrefix(r.URL.Path, "/partial.git/") {
 				t.Errorf("encode pack: %v", err)
 			}
 		default:
@@ -268,13 +275,24 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if lastSuccessful == nil {
 		t.Fatal("successful refresh has no timestamp")
 	}
+	// This highly compressible blob is much larger unpacked than the smart-HTTPS
+	// pack carrying it. The later ref-limit rejection must discard the staged
+	// fetch rather than leave new objects/refs in the live project cache.
+	compressibleCommit := commitFixturePayload(t, remoteDir, fixtureWorktree, strings.Repeat("z", 8<<20)).String()
 	for i := 0; i < 12; i++ {
 		name := plumbing.NewBranchReferenceName(fmt.Sprintf("refs-test/%02d", i))
-		if err := fixtureRepo.Storer.SetReference(plumbing.NewHashReference(name, plumbing.NewHash(featureAfter))); err != nil {
+		if err := fixtureRepo.Storer.SetReference(plumbing.NewHashReference(name, plumbing.NewHash(compressibleCommit))); err != nil {
 			t.Fatal(err)
 		}
 	}
+	liveCacheBeforeRejectedRefresh, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastFetchedBeforeRejectedRefresh := *lastSuccessful
+	measurePack.Store(true)
 	tooManyRefs := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	measurePack.Store(false)
 	if tooManyRefs.StatusCode != http.StatusBadGateway {
 		t.Fatalf("excessive refs refresh status %d: %s", tooManyRefs.StatusCode, responseText(tooManyRefs))
 	}
@@ -282,8 +300,40 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if !strings.Contains(strings.ToLower(refLimitMessage), "ref") {
 		t.Fatalf("excessive refs error is not actionable: %s", refLimitMessage)
 	}
+	if measuredPackBytes.Load() <= 0 || measuredPackBytes.Load() >= 1<<20 {
+		t.Fatalf("high-compressibility smart-HTTPS fixture pack bytes = %d, want positive and below the 1 MiB transfer ceiling", measuredPackBytes.Load())
+	}
 	if got := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID); !equalProjectRefs(refreshedRefs, got) {
 		t.Fatalf("excessive refs changed the successful cached refs: %#v", got)
+	}
+	projectAfterRejectedRefresh := listProjectsFromAPI(t, client, appServer.URL, cookie)[0]
+	if projectAfterRejectedRefresh.LastFetched == nil || !projectAfterRejectedRefresh.LastFetched.Equal(lastFetchedBeforeRejectedRefresh) {
+		t.Fatal("rejected refresh changed persistent last-fetched metadata")
+	}
+	liveCacheAfterRejectedRefresh, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveCacheAfterRejectedRefresh != liveCacheBeforeRejectedRefresh {
+		t.Fatal("rejected refresh changed on-disk project objects or refs")
+	}
+	cachedRepo, err := git.PlainOpen(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cachedCommit, err := cachedRepo.CommitObject(plumbing.NewHash(featureRef.Commit))
+	if err != nil {
+		t.Fatalf("previous cached commit became unavailable: %v", err)
+	}
+	cachedTree, err := cachedCommit.Tree()
+	if err != nil {
+		t.Fatalf("previous cached tree became unavailable: %v", err)
+	}
+	if _, err := cachedTree.File("README.md"); err != nil {
+		t.Fatalf("previous cached blob became unavailable: %v", err)
+	}
+	if persistentBytes, sizeErr := directorySize(app.projects.root, app.projects.maxCacheBytes); sizeErr != nil || persistentBytes > app.projects.maxCacheBytes {
+		t.Fatalf("failed refresh exceeded the persistent cache limit: bytes=%d err=%v", persistentBytes, sizeErr)
 	}
 	for i := 0; i < 12; i++ {
 		name := plumbing.NewBranchReferenceName(fmt.Sprintf("refs-test/%02d", i))
@@ -347,7 +397,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 	oldCacheLimit := app.projects.maxCacheBytes
-	app.projects.maxCacheBytes = usedCache + maxGitCacheGrowthFactor*app.projects.maxTransferBytes - 1
+	app.projects.maxCacheBytes = usedCache
 	requestsBeforeCacheLimit := gitRequests.Load()
 	cacheLimitedCreate := projectPost(t, restarted.Client(), restarted.URL, cookie, "/api/projects", `{"name":"budget limited","url":"`+remote.URL+`/repo.git"}`)
 	if cacheLimitedCreate.StatusCode != http.StatusRequestEntityTooLarge {
@@ -358,6 +408,72 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatal("cache budget was checked only after starting another repository transfer")
 	}
 	app.projects.maxCacheBytes = oldCacheLimit
+}
+
+type countingHTTPWriter struct {
+	http.ResponseWriter
+	count *atomic.Int64
+}
+
+func (w *countingHTTPWriter) Write(p []byte) (int, error) {
+	n, err := w.ResponseWriter.Write(p)
+	w.count.Add(int64(n))
+	return n, err
+}
+
+func TestBoundedGitFilesystemRejectsExpandedObjectWriteAtStorageBoundary(t *testing.T) {
+	root := t.TempDir()
+	fs := newBoundedGitFS(root, 64<<10)
+	file, err := fs.Create("objects/expanded")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 1<<20)
+	if _, err := file.Write(payload); !errors.Is(err, errGitCacheLimit) {
+		t.Fatalf("expanded object write error = %v, want cache limit", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	used, err := directorySize(root, 64<<10)
+	if err != nil || used > 64<<10 {
+		t.Fatalf("storage boundary exceeded 64 KiB: bytes=%d err=%v", used, err)
+	}
+}
+
+func digestProjectCache(root string) ([32]byte, error) {
+	h := sha256.New()
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		_, _ = io.WriteString(h, rel+"\x00")
+		if entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		_, _ = io.WriteString(h, info.Mode().String()+"\x00")
+		file, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(h, file)
+		closeErr := file.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		return closeErr
+	})
+	var digest [32]byte
+	copy(digest[:], h.Sum(nil))
+	return digest, err
 }
 
 func installTrustedSmartHTTPTestClient(t *testing.T, server *httptest.Server) {
@@ -436,6 +552,21 @@ func commitFixtureFile(t *testing.T, dir string, worktree *git.Worktree, author,
 		t.Fatal(err)
 	}
 	return returned
+}
+
+func commitFixturePayload(t *testing.T, dir string, worktree *git.Worktree, contents string) plumbing.Hash {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worktree.Add("README.md"); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := worktree.Commit("compressible fixture payload", &git.CommitOptions{Author: &object.Signature{Name: "fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return hash
 }
 
 func installAPITestSession(t *testing.T, app *App) string {

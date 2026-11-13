@@ -27,18 +27,20 @@ import (
 
 // Config controls durable administrator bootstrap. OPAQUEKeyPath must be external to SQLite.
 type Config struct {
-	DatabasePath             string
-	OPAQUEKeyPath            string
-	CanonicalOrigin          string
-	GrantTTL                 time.Duration
-	LoginTTL                 time.Duration
-	SessionTTL               time.Duration
-	RecentAuthTTL            time.Duration
-	AuthRequestsPerMinute    int
-	InsecureLocalHTTP        bool
-	Now                      func() time.Time
-	GitTimeout               time.Duration
-	GitMaxTransferBytes      int64
+	DatabasePath          string
+	OPAQUEKeyPath         string
+	CanonicalOrigin       string
+	GrantTTL              time.Duration
+	LoginTTL              time.Duration
+	SessionTTL            time.Duration
+	RecentAuthTTL         time.Duration
+	AuthRequestsPerMinute int
+	InsecureLocalHTTP     bool
+	Now                   func() time.Time
+	GitTimeout            time.Duration
+	GitMaxTransferBytes   int64
+	// GitMaxCacheBytes bounds persistent project-cache bytes. A refresh may
+	// temporarily add one staged project cache of at most this same size.
 	GitMaxCacheBytes         int64
 	GitMaxRefs               int
 	GitMaxAdvertisementBytes int64
@@ -120,7 +122,7 @@ func New(cfg Config) (*App, error) {
 			cfg.GitMaxAdvertisementBytes = cfg.GitMaxTransferBytes
 		}
 	}
-	if cfg.GitMaxTransferBytes < 1024 || cfg.GitMaxTransferBytes > 1<<30 || cfg.GitMaxCacheBytes < cfg.GitMaxTransferBytes*maxGitCacheGrowthFactor || cfg.GitMaxCacheBytes > 1<<40 || cfg.GitMaxRefs < 1 || cfg.GitMaxRefs > 100000 || cfg.GitMaxAdvertisementBytes < 1024 || cfg.GitMaxAdvertisementBytes > 64<<20 || cfg.GitMaxAdvertisementBytes > cfg.GitMaxTransferBytes {
+	if cfg.GitMaxTransferBytes < 1024 || cfg.GitMaxTransferBytes > 1<<30 || cfg.GitMaxCacheBytes < 1 || cfg.GitMaxCacheBytes > 1<<40 || cfg.GitMaxRefs < 1 || cfg.GitMaxRefs > 100000 || cfg.GitMaxAdvertisementBytes < 1024 || cfg.GitMaxAdvertisementBytes > 64<<20 || cfg.GitMaxAdvertisementBytes > cfg.GitMaxTransferBytes {
 		return nil, errors.New("Git transfer, cache, or reference limit is outside the supported range")
 	}
 	prior, err := pathExists(cfg.DatabasePath)

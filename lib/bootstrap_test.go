@@ -136,7 +136,7 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 func TestProjectResourceLimitsRequirePositiveBoundedValues(t *testing.T) {
 	for name, override := range map[string]func(*Config){
 		"transfer":      func(cfg *Config) { cfg.GitMaxTransferBytes = -1 },
-		"cache":         func(cfg *Config) { cfg.GitMaxCacheBytes = 1024 },
+		"cache":         func(cfg *Config) { cfg.GitMaxCacheBytes = -1 },
 		"refs":          func(cfg *Config) { cfg.GitMaxRefs = -1 },
 		"advertisement": func(cfg *Config) { cfg.GitMaxAdvertisementBytes = -1 },
 	} {
@@ -150,6 +150,16 @@ func TestProjectResourceLimitsRequirePositiveBoundedValues(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestProjectCacheLimitCanBeSmallerThanTransferLimit(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), GitMaxTransferBytes: 32 << 20, GitMaxCacheBytes: 1024}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("positive independently enforced cache limit rejected: %v", err)
+	}
+	app.Close()
 }
 
 func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
