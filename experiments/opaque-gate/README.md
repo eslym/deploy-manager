@@ -12,23 +12,20 @@ bun install --frozen-lockfile
 go test ./...
 bun run audit-artifact        # Fetch and verify registry tarball/provenance claims
 bun run test                 # Direct Bun artifact load + HTTP interoperability
-bun run browser              # Real Chromium HTTP interoperability + measurements
+bun run test-browser-gate     # Verify failed audit prevents browser startup
+bun run browser              # Audits artifact, runs Bun checks, then Chromium
+bun run test-vectors          # Download pinned Go source and run its RFC vectors
 ```
 
-`bun run browser` may need Chromium's Ubuntu shared libraries. `bash run-browser.sh` unpacks the required Ubuntu packages under `/tmp/opencode/opaque-gate-browser-libs` without installing system packages, then runs the browser test. The tests build the isolated Go server into `/tmp/opencode/opaque-gate-server` and bind only to loopback port 4179.
+`bun run browser` (or `bash run-browser.sh`) runs `audit-artifact` and the fast Bun protocol suite before attempting browser setup or starting Chromium; either failure stops the process. The shell wrapper may need Chromium's Ubuntu shared libraries. It unpacks required Ubuntu packages under `/tmp/opencode/opaque-gate-browser-libs` without installing system packages. It requires Bash, Bun, Playwright, and on the measured Ubuntu setup, `ldd`, `apt-get`, and `dpkg-deb`, plus network access for fetching missing packages. Package names and library paths are Ubuntu/x86-64-specific; portability to other distributions/platforms is not claimed. The tests build the isolated Go server into `/tmp/opencode/opaque-gate-server` and bind only to loopback port 4179.
 
-Run Bytemare's pinned upstream RFC-vector suite (the upstream test identifies these as the official OPAQUE vectors):
-
-```sh
-cd "$(go env GOPATH)/pkg/mod/github.com/bytemare/opaque@v0.18.0"
-go test ./...
-```
-
-Its `tests/TestOpaqueVectors` loads the shipped `tests/vectors.json`; source: [Bytemare v0.18.0 vectors_test.go](https://github.com/bytemare/opaque/blob/v0.18.0/tests/vectors_test.go) and [vectors.json](https://github.com/bytemare/opaque/blob/v0.18.0/tests/vectors.json). All packages passed in this environment. This is the upstream vector suite, not a separately authored vector runner.
+`bun run test-vectors` invokes `run-rfc-vectors.py`, which explicitly runs `go mod download -json github.com/bytemare/opaque@v0.18.0`, validates the returned module path/version and uses its returned `Dir` as the working directory for `go test ./...`. It does not assume a GOPATH module-cache layout or that the source was extracted by a prior command. In that pinned source, `tests/TestOpaqueVectors` loads the shipped `tests/vectors.json`; source: [Bytemare v0.18.0 vectors_test.go](https://github.com/bytemare/opaque/blob/v0.18.0/tests/vectors_test.go) and [vectors.json](https://github.com/bytemare/opaque/blob/v0.18.0/tests/vectors.json). This runs the upstream vector suite, not a separately authored vector runner.
 
 ## What the harness proves
 
 `server.go` is a minimal actual Bytemare v0.18.0 Go HTTP endpoint. `bun-test.mjs` loads and executes the pinned npm artifact directly in Bun; `browser-test.mjs` imports that same artifact in actual Chromium. Both exercise browser-style registration request → Go registration response → browser registration record → Go storage, then KE1 → Go KE2 → browser KE3 → Go `LoginFinish`. The browser run verified the final KE3 and confirms the client generated a session key; server acceptance of the KE3 MAC demonstrates matching AKE key derivation without transmitting either session key. It does not compare/return raw key material.
+
+The harness retains pending login MACs in an in-memory map without expiry or a cardinality limit. It is strictly a loopback-only, short-lived feasibility harness, not a deployable server: never expose it to an untrusted network or reuse this pending-state handling in application authentication. Before any such reuse, add bounded, expiring, one-use handshake state and tests.
 
 In the direct Bun run, registration and correct-password login complete; wrong password fails client envelope recovery; malformed (`AA`) and empty/truncated KE1 receive HTTP 400; a one-bit-modified KE3 receives HTTP 400. The real-browser run is intentionally narrower: one complete registration and one KE3-verified login, plus resource sampling. HTTP-body inspection in both paths found only protocol `value` and transaction `tx` fields, no password, serialized Serenity client state, client export key, or session key. The harness server does not log request bodies. This is a narrow protocol test, not a production-grade input-limiting/session/DoS or lifecycle review.
 
