@@ -1,6 +1,6 @@
 # Static site deployment manager — agreed design
 
-Design confirmed by the user on 2026-11-12. This records agreed requirements, not authorization to implement.
+Design confirmed by the user on 2026-11-12; frontend architecture corrected by the maintainer on 2026-11-13 to use the existing `web/` SPA embedded in Go. This records agreed requirements, not authorization to implement.
 
 ## Scope
 
@@ -56,8 +56,20 @@ Design confirmed by the user on 2026-11-12. This records agreed requirements, no
 - Publication paths must be real directories, not symlinks. Require the Linux atomic-exchange capabilities described below.
 - Retain fetched Git objects without automatic garbage collection. Show cache size and offer explicit cache recreation with a warning about loss of unreachable commits.
 - Target Linux only for v1.
-- Embed a server-rendered HTML dashboard with lightweight JavaScript into the Go executable; no separate frontend server or runtime Node.js installation.
+- Use the existing Bun-managed SvelteKit frontend in `web/` as a client-rendered single-page application (SPA), with its production output embedded in the Go executable. See the frontend delivery requirements below; no separate frontend server or runtime Node.js/Bun installation.
 - Expose dashboard endpoints and GitHub/Gitea webhook ingestion without a separately versioned public API or API tokens in v1.
+
+## Frontend delivery and Go integration
+
+- `web/` is the application frontend source of truth for registration, login, recovery, password changes, and the authenticated dashboard. Adapt the existing scaffold rather than introducing a parallel Go-template or hand-written JavaScript UI. This supersedes the earlier server-rendered-dashboard requirement.
+- Build a fully client-rendered SPA with SvelteKit's static adapter and SSR disabled at the root layout. All application business logic, persistence, authorization, and protocol endpoints run in Go; do not depend on SvelteKit server routes, server load functions, form actions, or a production JavaScript server.
+- The production build workflow installs frontend dependencies from `web/bun.lock`, builds `web/` before compiling Go, and embeds the generated HTML, JavaScript, CSS, WASM, and other required static assets using `go:embed`. Missing frontend output must fail the build rather than silently ship a placeholder or legacy UI. Document the combined build command and use it for release and browser-test artifacts. Bun/Node.js are build/development tools only; the distributed binary must run without the source tree or external asset directories.
+- Go serves embedded assets and the SPA shell on the same origin as its private dashboard/authentication HTTP endpoints. These internal endpoints are required for the SPA and are not a separately versioned public API or API-token product. Development may use Vite, but must preserve the production cookie, Origin, and CSRF security model.
+- Direct navigation and browser refresh on frontend routes, including `/register` and nested dashboard routes, must load the SPA. Restrict shell fallback to frontend GET/HEAD navigations; backend paths (including authentication protocol and webhook endpoints), missing assets, and unsupported methods retain their actual error/status semantics rather than returning HTML with success. Serve assets with correct MIME types; use revalidation for the shell and immutable caching only for content-hashed assets.
+- The shell and static assets contain no credentials or protected data. Client-side route guards are presentation only: Go must enforce sessions and authorization on every protected read and mutation, including direct HTTP requests. Preserve HTTPS, cookie, Origin/CSRF, rate-limit, and security-header protections through the migration.
+- Load the pinned OPAQUE browser module/WASM lazily only for authentication flows, including recent-authentication/password-change flows. Ordinary dashboard navigation must not import, preload, or initialize crypto through a shared bundle. Keep all assets first-party and embedded; initialization failure remains actionable and fail-closed, without password-post fallback. Preserve fragment-only setup/recovery grants: remove them from the visible URL before protected submission and never include them in resource URLs or routine logs.
+- Validate the actual combined production binary from an unrelated working directory with no frontend runtime or source assets available. Browser/HTTP tests must exercise SPA registration, direct-route reloads, missing-asset/backend errors, authentication-only crypto loading, and server-enforced protected access as those features land. Frontend checks and a standalone Vite preview alone do not demonstrate embedding.
+- Implementation status: the incorrect Go HTML/standalone-JavaScript bootstrap implementation was removed from history. Ticket #3 owns implementing bootstrap in `web/` and establishing the combined embedded build; #4 extends it to login and the protected dashboard. Bootstrap must include the required security protections and application/browser-test coverage. #25 and #26 remain required upgrade/distribution follow-ups, including assets bundled from `web/`.
 
 ## Confirmed publication and LFS refinements
 

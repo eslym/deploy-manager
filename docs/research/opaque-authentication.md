@@ -2,6 +2,8 @@
 
 Research date: **2026-11-12**. Planning only; no implementation, dependency selection, or change to the agreed design is authorized by this note. Scope: the single administrator, CLI-issued one-time bootstrap/recovery grants, browser registration, embedded server-rendered dashboard with lightweight JavaScript, and externally terminated HTTPS described in [the design](../design.md).
 
+**Frontend correction (2026-11-13):** the current [design](../design.md#frontend-delivery-and-go-integration) selects the existing `web/` SvelteKit client-rendered SPA, statically built and embedded in Go, instead of the server-rendered dashboard assumed by this historical research. The OPAQUE protocol and lifecycle requirements remain applicable; load crypto lazily for authentication flows rather than through the shared SPA bundle.
+
 ## Findings and recommendation
 
 **Implementation-stage update, 2026-11-13:** subsequent experiments demonstrated compatibility and the maintainer approved the pinned Go/browser dependencies with explicit risk acceptance. See [final gate findings](opaque-gate-findings.md), [accepted risks](opaque-accepted-risks.md) and [license obligations](dependency-license-compatibility.md). This initial research note remains a historical record; its unexecuted-test and pending-approval descriptions refer to the original research stage. Experiment code was removed after documenting the results.

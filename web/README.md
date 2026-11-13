@@ -1,56 +1,40 @@
-# sv
+# Deploy Manager frontend
 
-Everything you need to build a Svelte project, powered by [`sv`](https://github.com/sveltejs/cli).
+`web/` is the SvelteKit/TypeScript source for the application SPA, including
+authentication and the protected dashboard. The [agreed design](../docs/design.md#frontend-delivery-and-go-integration)
+requires client rendering and a static production build embedded in the Go
+executable, not a separately deployed frontend server.
 
-## Creating a project
+## Current status
 
-If you're seeing this, you've probably already done this step. Congrats!
+This directory is still a scaffold. The static adapter has a fallback configured,
+but the combined frontend/Go build and SPA application flows are not implemented.
+Current registration lives outside `web/` in Go-defined HTML and standalone JS.
+Existing ticket [#3](https://github.com/eslym/deploy-manager/issues/3) tracks its
+migration and build/embedding integration; #4 adds login and the protected
+dashboard. Do not treat a successful standalone frontend build as proof that
+the Go binary uses this frontend.
 
-```sh
-# create a new project
-npx sv create my-app
-```
+## Development and checks
 
-To recreate this project with the same configuration:
-
-```sh
-# recreate this project
-bun x sv@1.3.0 create --template minimal --types ts --add prettier tailwindcss="plugins:none" ai-tools="ide:opencode+optInSkills:none" --install bun .
-```
-
-## Adding features
-
-Add features to your project with `sv add`:
+Run from `web/`:
 
 ```sh
-npx sv add
+bun install --frozen-lockfile
+bun run dev
 ```
 
-For example, to add Tailwind CSS:
+Before integrating frontend changes:
 
 ```sh
-npx sv add tailwindcss
+bun run check
+bun run lint
+bun run build
 ```
 
-## Developing
-
-Once you've created a project and installed dependencies with `npm install` (or `pnpm install` or `yarn`), start a development server:
-
-```sh
-npm run dev
-
-# or start the server and open the app in a new browser tab
-npm run dev -- --open
-```
-
-## Building
-
-To create a production version of your app:
-
-```sh
-npm run build
-```
-
-You can preview the production build with `npm run preview`.
-
-> To deploy your app, you may need to install an [adapter](https://svelte.dev/docs/kit/adapters) for your target environment.
+Vite development/preview servers are development tools only. The migration
+must document and test the combined build: build this SPA first, then compile
+Go with its static output embedded. The resulting executable must serve the
+frontend and internal Go endpoints on one origin, work independently of the
+source tree, and require neither Bun nor Node.js at runtime. See the design
+for routing, security, lazy authentication assets, and distribution requirements.

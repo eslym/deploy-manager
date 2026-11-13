@@ -48,7 +48,7 @@ The exact historical Cargo graph, checksums, features and toolchain for the publ
 | Wazero Go-WASM backend probe | Rejected alternative, not a selected backend and not in the candidate's `go.mod`. | Do not count it as a product dependency. If its probe source/binary is distributed, inspect its exact pinned version and notices separately. |
 | Playwright | Browser-test tooling under `experiments/opaque-gate`, not product runtime. | Do not count it as a product dependency. If test tooling or its browsers are redistributed, inventory the exact package and browser/runtime license notices independently. |
 | Sigstore Cosign | External verifier used to validate provenance; no verifier binary is embedded in the candidate artifact. | Tool-use is not a product dependency. If a release workflow or package redistributes Cosign, its own license/notices become relevant. |
-| `web/` scaffold and `web/bun.lock` | Existing SvelteKit/Bun scaffold; design says the future dashboard is embedded and does not adopt this as its final frontend. | Deliberately not audited here; lockfile is not itself a complete third-party source/license inventory. Revisit only if scaffold assets/dependencies are selected or shipped. |
+| `web/` frontend and `web/bun.lock` | Selected as the embedded SPA frontend by the maintainer's 2026-11-13 correction to `docs/design.md`. | Not audited by this research. #26 must inventory actual bundled runtime components/assets and their required notices before distribution; the lockfile alone is not a complete shipped-component inventory. |
 
 No go-git or Git LFS product dependencies are examined here; they are unselected for this authentication license task.
 

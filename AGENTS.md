@@ -8,8 +8,8 @@
 
 ## Project layout and checks
 
-- The Go module is at the repository root (`github.com/eslym/deploy-manager`); `main.go` is currently a stub and application logic belongs in `lib/`.
-- `web/` is a separate Bun-managed SvelteKit scaffold, not yet the designed embedded dashboard. Run its checks from `web/`: `bun run check`, `bun run lint`, `bun run build`. See `web/AGENTS.md` for Svelte-specific tooling instructions.
+- The Go module is at the repository root (`github.com/eslym/deploy-manager`); application logic belongs in `lib/`.
+- `web/` is the Bun-managed SvelteKit SPA source for all application UI; embed its static production build in Go as required by `docs/design.md`. Ticket #3 owns bootstrap and the combined frontend/Go build; #4 extends it with login and the dashboard. Run frontend checks from `web/`: `bun run check`, `bun run lint`, `bun run build`. See `web/AGENTS.md` for Svelte-specific tooling instructions.
 - Run Go checks from the repository root with `go test ./...`; run `govulncheck ./...` for Go dependency vulnerability checks.
 
 ## Shared workflow
