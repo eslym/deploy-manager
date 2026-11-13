@@ -29,6 +29,8 @@ type projectManager struct {
 	mu      sync.Mutex
 }
 
+var configureTestGitTransport = func() error { return nil }
+
 type project struct {
 	ID          string     `json:"id"`
 	Name        string     `json:"name"`
@@ -44,6 +46,9 @@ type projectRef struct {
 }
 
 func newProjectManager(db *sql.DB, root string, timeout time.Duration) (*projectManager, error) {
+	if err := configureTestGitTransport(); err != nil {
+		return nil, fmt.Errorf("invalid test Git transport configuration: %w", err)
+	}
 	if timeout == 0 {
 		timeout = 2 * time.Minute
 	}
@@ -336,7 +341,13 @@ func writeJSONStatus(w http.ResponseWriter, status int, v any) {
 // a fetch to another origin, credentials, or an internal service.
 func init() {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+	transport := &http.Transport{Proxy: nil, DialContext: publicGitDialContext(dialer)}
+	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	installProjectHTTPSClient(client)
+}
+
+func publicGitDialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		conn, err := dialer.DialContext(ctx, network, address)
 		if err != nil {
 			return nil, err
@@ -348,7 +359,9 @@ func init() {
 			return nil, errors.New("repository host resolved to a non-public address")
 		}
 		return conn, nil
-	}}
-	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	}
+}
+
+func installProjectHTTPSClient(client *http.Client) {
 	gitclient.InstallProtocol("https", githttp.NewClientWithOptions(client, &githttp.ClientOptions{RedirectPolicy: githttp.NoFollowRedirects}))
 }

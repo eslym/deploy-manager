@@ -1,0 +1,144 @@
+package main
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/format/pktline"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp"
+	"github.com/go-git/go-git/v5/plumbing/transport"
+	gitserver "github.com/go-git/go-git/v5/plumbing/transport/server"
+)
+
+func main() {
+	listen := flag.String("listen", "127.0.0.1:18441", "HTTPS listen address")
+	cert := flag.String("tls-cert", "", "fixture TLS certificate")
+	key := flag.String("tls-key", "", "fixture TLS key")
+	data := flag.String("data", "", "fixture repository directory")
+	flag.Parse()
+	if *cert == "" || *key == "" || *data == "" {
+		fmt.Fprintln(os.Stderr, "--tls-cert, --tls-key, and --data are required")
+		os.Exit(2)
+	}
+	if err := serve(*listen, *cert, *key, *data); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func serve(address, cert, key, data string) error {
+	if err := os.MkdirAll(data, 0700); err != nil {
+		return err
+	}
+	repoPath := filepath.Join(data, "repo.git")
+	repo, err := git.PlainInitWithOptions(repoPath, &git.PlainInitOptions{InitOptions: git.InitOptions{DefaultBranch: plumbing.NewBranchReferenceName("main")}})
+	if err != nil {
+		return err
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+	commit := func(message string) (plumbing.Hash, error) {
+		if err := os.WriteFile(filepath.Join(repoPath, "index.html"), []byte("<!doctype html><title>"+message+"</title>\n"), 0600); err != nil {
+			return plumbing.ZeroHash, err
+		}
+		if _, err := worktree.Add("index.html"); err != nil {
+			return plumbing.ZeroHash, err
+		}
+		return worktree.Commit(message, &git.CommitOptions{Author: &object.Signature{Name: "Fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
+	}
+	if _, err := commit("main"); err != nil {
+		return err
+	}
+	feature := plumbing.NewBranchReferenceName("feature/search")
+	if err := worktree.Checkout(&git.CheckoutOptions{Branch: feature, Create: true}); err != nil {
+		return err
+	}
+	featureCommit, err := commit("feature search")
+	if err != nil {
+		return err
+	}
+	if _, err := repo.CreateTag("v1.0", featureCommit, nil); err != nil {
+		return err
+	}
+	if err := worktree.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("main")}); err != nil {
+		return err
+	}
+	endpoint, err := transport.NewEndpoint("https://" + address + "/repo.git")
+	if err != nil {
+		return err
+	}
+	backend := gitserver.NewServer(gitserver.MapLoader{endpoint.String(): repo.Storer})
+	var fail atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /__fixture/fail", func(w http.ResponseWriter, _ *http.Request) { fail.Store(true); w.WriteHeader(http.StatusNoContent) })
+	mux.HandleFunc("POST /__fixture/recover", func(w http.ResponseWriter, _ *http.Request) { fail.Store(false); w.WriteHeader(http.StatusNoContent) })
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if fail.Load() {
+			http.Error(w, "controlled fixture failure", http.StatusServiceUnavailable)
+			return
+		}
+		session, err := backend.NewUploadPackSession(endpoint, nil)
+		if err != nil {
+			http.Error(w, "upload-pack unavailable", 500)
+			return
+		}
+		defer session.Close()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/repo.git/info/refs" && r.URL.Query().Get("service") == "git-upload-pack":
+			advertisement, err := session.AdvertisedReferencesContext(r.Context())
+			if err != nil {
+				http.Error(w, "advertisement failed", 500)
+				return
+			}
+			advertisement.Prefix = [][]byte{[]byte("# service=git-upload-pack"), pktline.Flush}
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+			if err := advertisement.Encode(w); err != nil {
+				return
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/repo.git/git-upload-pack":
+			if _, err := session.AdvertisedReferencesContext(r.Context()); err != nil {
+				http.Error(w, "advertisement failed", 500)
+				return
+			}
+			request := packp.NewUploadPackRequest()
+			scanner := pktline.NewScanner(r.Body)
+			for scanner.Scan() {
+				line := string(scanner.Bytes())
+				if strings.HasPrefix(line, "want ") {
+					want := strings.SplitN(strings.TrimPrefix(line, "want "), "\x00", 2)[0]
+					request.Wants = append(request.Wants, plumbing.NewHash(strings.TrimSpace(want)))
+				} else if strings.HasPrefix(line, "have ") {
+					request.Haves = append(request.Haves, plumbing.NewHash(strings.TrimSpace(strings.TrimPrefix(line, "have "))))
+				}
+			}
+			if scanner.Err() != nil {
+				http.Error(w, "malformed upload-pack request", 400)
+				return
+			}
+			response, err := session.UploadPack(context.Background(), request)
+			if err != nil {
+				http.Error(w, "upload-pack failed", 500)
+				return
+			}
+			defer response.Close()
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
+			_ = response.Encode(w)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	server := &http.Server{Addr: address, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	return server.ListenAndServeTLS(cert, key)
+}
