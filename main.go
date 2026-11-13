@@ -1,3 +1,85 @@
 package main
 
-func main() {}
+import (
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/eslym/deploy-manager/lib"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: deploy-manager <setup|serve> [flags]")
+		os.Exit(2)
+	}
+	command := os.Args[1]
+	flags := flag.NewFlagSet(command, flag.ExitOnError)
+	data := flags.String("data", "./data", "application data directory")
+	listen := flags.String("listen", "127.0.0.1:8080", "HTTP(S) listen address")
+	base := flags.String("url", "", "externally reachable HTTPS base URL for setup link")
+	cert := flags.String("tls-cert", "", "TLS certificate (required for non-loopback serving)")
+	key := flags.String("tls-key", "", "TLS private key")
+	_ = flags.Parse(os.Args[2:])
+	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), InsecureLocalHTTP: true})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer app.Close()
+	switch command {
+	case "setup":
+		token, err := app.IssueRegistrationGrant()
+		if err != nil {
+			log.Fatal(err)
+		}
+		url := *base
+		if url == "" {
+			host, _, e := net.SplitHostPort(*listen)
+			if e != nil {
+				log.Fatal(e)
+			}
+			scheme := "https"
+			if *cert == "" {
+				if ip := net.ParseIP(host); ip == nil || !ip.IsLoopback() {
+					log.Fatal("HTTPS is required unless listening on loopback")
+				}
+				scheme = "http"
+			}
+			url = scheme + "://" + net.JoinHostPort(host, port(*listen))
+		}
+		link, err := app.RegistrationURL(url, token)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println(link)
+	case "serve":
+		server := &http.Server{Addr: *listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 1 << 16}
+		if *cert != "" || *key != "" {
+			if *cert == "" || *key == "" {
+				log.Fatal("both TLS certificate and key are required")
+			}
+			err = server.ListenAndServeTLS(*cert, *key)
+		} else {
+			host, _, e := net.SplitHostPort(*listen)
+			if e != nil {
+				log.Fatal(e)
+			}
+			ip := net.ParseIP(host)
+			if !(ip != nil && ip.IsLoopback() || host == "localhost") {
+				log.Fatal("HTTPS is required unless listening on loopback")
+			}
+			err = server.ListenAndServe()
+		}
+		if err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	default:
+		log.Fatalf("unknown command %q", command)
+	}
+}
+func port(address string) string { _, p, _ := net.SplitHostPort(address); return p }

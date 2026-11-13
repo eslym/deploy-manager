@@ -1,0 +1,11 @@
+{
+  "name": "deploy-manager-browser-tests",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "playwright": "1.65.0"
+  },
+  "scripts": {
+    "test": "bun run registration.mjs"
+  }
+}
