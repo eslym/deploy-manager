@@ -7,7 +7,7 @@ COPY web ./web
 RUN --mount=type=cache,id=deploy-manager-bun-1.4.4,target=/root/.bun/install/cache,sharing=locked \
     cd web && bun install --frozen-lockfile && bun run check && bun run lint && bun run build
 
-FROM mcr.microsoft.com/playwright:v1.65.0-noble
+FROM mcr.microsoft.com/playwright:v1.65.0-noble AS environment
 ARG GO_VERSION=1.26.11
 RUN --mount=type=cache,id=deploy-manager-apt-archives,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,id=deploy-manager-apt-lists,target=/var/lib/apt/lists,sharing=locked \
@@ -19,7 +19,10 @@ RUN --mount=type=cache,id=deploy-manager-apt-archives,target=/var/cache/apt,shar
     && rm /tmp/go.tar.gz
 
 ENV PATH="/usr/local/go/bin:${PATH}"
+COPY --from=oven/bun:1.4.4 /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /workspace
+
+FROM environment AS browser
 COPY --from=frontend /workspace/go.mod /workspace/go.sum /workspace/main.go ./
 COPY --from=frontend /workspace/lib ./lib
 COPY tests/browser ./tests/browser

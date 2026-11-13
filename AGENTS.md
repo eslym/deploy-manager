@@ -17,6 +17,7 @@
 
 - Go (root): `go test ./...`; dependency vulnerabilities: `govulncheck ./...`.
 - Frontend (from `web/`): `bun install --frozen-lockfile`, then `bun run check`, `bun run lint`, `bun run build`. `lint` is Prettier checking, not ESLint; there is no frontend test script yet.
+- Container tests: `docker compose -f tests/compose.yaml run --build --rm test`. Read `tests/README.md` for custom runs and cleanup. Keep the `deploy-manager-tests` project name to share Bun and Go cache volumes across worktrees; ordinary cleanup preserves volumes. Use this environment when Playwright system dependencies are unavailable on the host.
 
 ## Shared workflow
 

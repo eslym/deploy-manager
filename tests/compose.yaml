@@ -1,0 +1,30 @@
+name: deploy-manager-tests
+
+services:
+  test:
+    build:
+      context: ..
+      dockerfile: tests/browser/Dockerfile
+      target: environment
+    init: true
+    shm_size: 1gb
+    working_dir: /workspace
+    environment:
+      BUN_INSTALL_CACHE_DIR: /cache/bun
+      GOMODCACHE: /cache/go-mod
+      GOCACHE: /cache/go-build
+      CGO_ENABLED: "1"
+    volumes:
+      - type: bind
+        source: ..
+        target: /source
+        read_only: true
+      - bun-cache:/cache/bun
+      - go-mod-cache:/cache/go-mod
+      - go-build-cache:/cache/go-build
+    command: ["bash", "/source/tests/run.sh"]
+
+volumes:
+  bun-cache:
+  go-mod-cache:
+  go-build-cache:
