@@ -1,6 +1,6 @@
 module example.invalid/opaque-gate
 
-go 1.26.8
+go 1.26.11
 
 require github.com/bytemare/opaque v0.18.0
 
@@ -13,6 +13,6 @@ require (
 	github.com/bytemare/ksf v0.5.0 // indirect
 	github.com/bytemare/secp256k1 v0.3.0 // indirect
 	github.com/gtank/ristretto255 v0.2.0 // indirect
-	golang.org/x/crypto v0.49.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
+	golang.org/x/crypto v0.59.0 // indirect
+	golang.org/x/sys v0.50.0 // indirect
 )
