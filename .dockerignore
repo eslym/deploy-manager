@@ -1,0 +1,6 @@
+.git
+deploy-manager
+lib/web
+web/node_modules
+web/.svelte-kit
+tests/browser/node_modules

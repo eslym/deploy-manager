@@ -1,0 +1,7 @@
+[install]
+# Allow CPU-compatibility fixes without disabling the age gate for other packages.
+minimumReleaseAgeExcludes = [
+  "rolldown",
+  "@rolldown/binding-linux-x64-gnu",
+  "@rolldown/binding-linux-x64-musl",
+]

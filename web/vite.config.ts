@@ -14,7 +14,11 @@ export default defineConfig({
 			},
 
 			// Generate a static site for embedding in the Go application.
-			adapter: adapter({ fallback: 'index.html' })
+			adapter: adapter({
+				pages: '../lib/web',
+				assets: '../lib/web',
+				fallback: 'index.html'
+			})
 		})
 	]
 });

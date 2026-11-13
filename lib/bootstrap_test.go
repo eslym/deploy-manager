@@ -2,8 +2,6 @@ package lib
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -38,18 +36,53 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/register", nil)
 	req.RemoteAddr = "127.0.0.1:43210"
 	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Accept", "text/html")
 	res := httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
-	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), "Set up administrator") {
+	if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), "_app/immutable/entry/start.") {
 		t.Fatalf("registration page: %d %s", res.Code, res.Body.String())
 	}
-	if !strings.Contains(res.Body.String(), `src="/assets/register.js"`) {
-		t.Fatal("registration must use the local OPAQUE client")
+	if strings.Contains(res.Body.String(), grant) || !strings.Contains(res.Header().Get("Cache-Control"), "no-cache") {
+		t.Fatal("SPA shell must be public, grant-free, and revalidated")
 	}
+	if !strings.Contains(res.Header().Get("Content-Security-Policy"), "sha256-") {
+		t.Fatal("SPA shell must authorize only its exact inline boot script")
+	}
+	for _, route := range []string{"/register", "/dashboard/projects/nested"} {
+		deep := httptest.NewRequest(http.MethodGet, route, nil)
+		deep.RemoteAddr, deep.Host = "127.0.0.1:43210", "127.0.0.1:8080"
+		deep.Header.Set("Accept", "text/html")
+		response := httptest.NewRecorder()
+		app.Handler().ServeHTTP(response, deep)
+		if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), "_app/immutable/entry/start.") {
+			t.Fatalf("SPA route %s did not return shell: %d", route, response.Code)
+		}
+	}
+	missing := httptest.NewRecorder()
+	missingReq := httptest.NewRequest(http.MethodGet, "/_app/immutable/entry/missing.deadbeef.js", nil)
+	missingReq.Header.Set("Accept", "text/html")
+	app.Handler().ServeHTTP(missing, missingReq)
+	if missing.Code != http.StatusNotFound || strings.Contains(missing.Header().Get("Content-Type"), "text/html") {
+		t.Fatalf("missing JS must remain a 404, got %d (%s)", missing.Code, missing.Header().Get("Content-Type"))
+	}
+	unsupported := httptest.NewRecorder()
+	unsupportedReq := httptest.NewRequest(http.MethodPost, "/register", nil)
+	unsupportedReq.Header.Set("Accept", "text/html")
+	app.Handler().ServeHTTP(unsupported, unsupportedReq)
+	if unsupported.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST frontend navigation status = %d, want 405", unsupported.Code)
+	}
+	protocolMethod := httptest.NewRecorder()
+	app.Handler().ServeHTTP(protocolMethod, httptest.NewRequest(http.MethodGet, "/opaque/register/start", nil))
+	if protocolMethod.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET protocol endpoint status = %d, want 405", protocolMethod.Code)
+	}
+	assetURL := strings.Split(strings.Split(res.Body.String(), "href=\"")[1], "\"")[0]
 	asset := httptest.NewRecorder()
-	app.Handler().ServeHTTP(asset, httptest.NewRequest(http.MethodGet, "/assets/register.js", nil))
-	if strings.Contains(asset.Body.String(), `JSON.stringify({ password`) || !strings.Contains(asset.Body.String(), `start.registrationRequest`) {
-		t.Fatal("browser registration must send only OPAQUE protocol messages")
+	assetReq := httptest.NewRequest(http.MethodGet, assetURL, nil)
+	app.Handler().ServeHTTP(asset, assetReq)
+	if asset.Code != http.StatusOK || !strings.Contains(asset.Header().Get("Content-Type"), "javascript") || !strings.Contains(asset.Header().Get("Cache-Control"), "immutable") {
+		t.Fatalf("hashed entry asset %q headers/status incorrect: %d %v", assetURL, asset.Code, asset.Header())
 	}
 	if _, err := os.Stat(cfg.OPAQUEKeyPath); err != nil {
 		t.Fatalf("external key file not created: %v", err)
@@ -83,6 +116,7 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 	req = httptest.NewRequest(http.MethodGet, "/register", nil)
 	req.RemoteAddr = "127.0.0.1:43210"
 	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Accept", "text/html")
 	res = httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -105,6 +139,7 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	}
 	req := httptest.NewRequest(http.MethodGet, "/register", nil)
 	req.RemoteAddr, req.Host = "127.0.0.1:4321", "127.0.0.1:8080"
+	req.Header.Set("Accept", "text/html")
 	res := httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
@@ -134,6 +169,7 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	proxyReq := httptest.NewRequest(http.MethodGet, "/register", nil)
 	proxyReq.RemoteAddr, proxyReq.Host = "127.0.0.1:4321", "manager.example:443"
 	proxyReq.Header.Set("X-Forwarded-Proto", "https")
+	proxyReq.Header.Set("Accept", "text/html")
 	proxyRes := httptest.NewRecorder()
 	app.Handler().ServeHTTP(proxyRes, proxyReq)
 	if proxyRes.Code != http.StatusOK {
@@ -213,12 +249,5 @@ func TestOpaqueKeyMissingFailsClosed(t *testing.T) {
 	}
 	if _, err := New(cfg); err == nil {
 		t.Fatal("missing OPAQUE key must fail closed")
-	}
-}
-
-func TestEmbeddedOpaqueAssetIsPinnedArtifact(t *testing.T) {
-	digest := sha256.Sum256(opaqueAsset)
-	if got := hex.EncodeToString(digest[:]); got != "1e8d56383a77948e453085b6d4f52dcb9645f8bfff32395738b63d3a2e2fcb52" {
-		t.Fatalf("embedded OPAQUE asset digest = %s; pinned v1.1.0 artifact changed", got)
 	}
 }

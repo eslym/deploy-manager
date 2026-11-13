@@ -1,7 +1,22 @@
 # Administrator bootstrap
 
-Build with the pinned Go baseline (`go 1.26.11`) and CGO enabled for SQLite.
-The executable has two commands:
+The `web/` SvelteKit client-rendered SPA is the only application UI. It is built
+with the pinned Bun lockfile and embedded into the Go executable. The combined
+production build is:
+
+```sh
+./scripts/build.sh
+```
+
+It runs `bun install --frozen-lockfile`, builds the static SPA into `lib/web`,
+then compiles the SQLite-enabled Go executable. The `go:embed` directive makes
+missing build output a compile error; no Bun/Node runtime or external asset
+directory is used when the executable runs. On Linux hosts where the Vite native
+binding is incompatible with the CPU, `DM_BUILD_FRONTEND_IN_DOCKER=1
+./scripts/build.sh` runs the frontend build in the pinned Bun Alpine image and
+then compiles Go on the host.
+
+Issue a setup link and run the server:
 
 ```sh
 ./deploy-manager setup --data ./data --listen 127.0.0.1:8080
@@ -13,39 +28,66 @@ browser while the server is running. Loopback-only HTTP is available for local
 setup; non-loopback serving requires `--tls-cert` and `--tls-key`. Behind a
 local reverse proxy, pass an HTTPS setup URL with `--url` and proxy to a
 loopback listener; the application trusts `X-Forwarded-Proto: https` only from
-a loopback peer and still checks the request Origin.
+a loopback peer and checks the request Origin.
 
-Keep `opaque-server.key` with the SQLite database's backup generation. It is a
-separate mode-0600 file and is not stored in SQLite. Missing or mismatched
-OPAQUE key/profile generations fail closed. Back up both the data file and its
-external key together; there is no key-rotation or recovery command in this
+The setup grant is placed after `#` in the URL. The SPA removes the fragment
+from the visible URL before any protocol request and sends the grant only in
+same-origin, JSON POST bodies. The pinned `@serenity-kit/opaque@1.1.0` browser
+module is split into its own content-hashed chunk and loaded only when the user
+submits the registration form. The password and local OPAQUE state remain in
+the browser; initialization errors fail closed. Registration does not create a
+login session.
+
+The database stores only grant hashes and the administrator registration
+record/profile generation. Keep `opaque-server.key` with the matching SQLite
+backup generation. It is a separate mode-0600 file. Missing or mismatched
+OPAQUE key/profile generations fail closed. The repository-key encryption
+master key is independent. There is no key-rotation or recovery command in this
 bootstrap-only slice.
 
-The setup grant is placed after `#` in the registration URL, so the browser
-does not send it in the initial navigation or subsequent resource request URLs.
-The registration script removes the fragment from the visible URL before any
-POST and includes the grant only in the protected JSON request body. It never
-falls back to an unprotected registration request.
+The Go server serves the SPA shell and hashed assets from its embedded files.
+Direct frontend-route navigation uses the shell only for HTML GET/HEAD
+requests; missing assets and backend paths retain error semantics. The shell is
+revalidated, hashed assets are immutable, and the shell's inline boot script is
+authorized by a per-build CSP hash.
 
-The browser checks are in `tests/browser/`. Install the pinned test package
-with `cd tests/browser && bun install --frozen-lockfile`; run
-`node registration.mjs` where Go 1.26.11, CGO, and the Playwright 1.65.0
-Chromium dependencies are available. To use the pinned browser container from
-the repository root:
+## Validation
+
+Run frontend checks from `web/`:
+
+```sh
+bun install --frozen-lockfile
+bun run check
+bun run lint
+bun run build
+```
+
+Then run Go checks from the repository root:
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
+govulncheck ./...
+```
+
+For the production-binary browser regression test, build and run the supplied
+Docker image. It builds the SPA, compiles the combined executable, and runs
+Chromium with its supported system dependencies; the browser launches the
+binary from a temporary working directory without source-tree asset access:
 
 ```sh
 docker build -t deploy-manager-browser-tests -f tests/browser/Dockerfile .
-docker run --rm -v "$PWD:/workspace" deploy-manager-browser-tests
+docker run --rm deploy-manager-browser-tests
 ```
 
-The browser test covers fragment-only CLI grant issuance and absence from all
-browser request URLs, missing-grant and initialization failure, real
-Chromium-to-Go OPAQUE registration,
-concurrent grant consumption, restart durability, registration disablement,
-and absence of a session cookie/password transmission.
+The browser/HTTP checks cover client-route reloads, hashed assets and missing
+asset/backend statuses, lazy OPAQUE loading and initialization failure,
+fragment cleanup, grant expiry/reuse/concurrent consumption, no password or
+local-state transmission, no session cookie, registration disablement, and
+durability across restart.
 
-This implements bootstrap only. It does not implement login, sessions,
-password change, recovery, dashboard authorization, or an authenticated
-dashboard. See [`design.md`](design.md) for the remaining product requirements
-and [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for unresolved
-distribution/license follow-ups (#25 and #26).
+This implements administrator bootstrap only. Login, sessions, password
+changes, recovery, dashboard authorization and management remain outside this
+ticket. Preserve the dependency upgrade and license/notice follow-ups tracked
+by #25 and #26; see [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md).

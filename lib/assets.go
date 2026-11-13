@@ -1,12 +1,9 @@
 package lib
 
-import _ "embed"
+import "embed"
 
-// The ESM file is the byte-for-byte @serenity-kit/opaque@1.1.0 Ristretto build.
-// Its package-level MIT notice is retained beside the embedded asset.
+// The combined build generates this directory from the production SPA before Go
+// compilation. A missing build is a compile error, never a placeholder UI.
 //
-//go:embed assets/opaque.js
-var opaqueAsset []byte
-
-//go:embed assets/register.js
-var registerScript []byte
+//go:embed web web/_app
+var webAssets embed.FS
