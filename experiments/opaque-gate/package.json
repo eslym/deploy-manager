@@ -1,0 +1,19 @@
+{
+  "name": "opaque-gate",
+  "version": "1.0.0",
+  "description": "Isolated RFC 9807 feasibility experiment; not production authentication",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "dependencies": {
+    "@serenity-kit/opaque": "1.1.0"
+  },
+  "devDependencies": {
+    "playwright": "1.65.0"
+  }
+}
