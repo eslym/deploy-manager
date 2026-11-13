@@ -1,0 +1,57 @@
+# Isolated OPAQUE feasibility gate (not production authentication)
+
+This standalone module is not imported by the application and does not approve its dependencies. Evidence below is conditional feasibility evidence only. No application auth, bootstrap, session, recovery, or persistent-key behavior is implemented here.
+
+## Reproduce
+
+Environment measured: Ubuntu 26.04 x86-64, Go 1.26.8, Bun 1.4.4, Playwright 1.65.0, Chromium 158.0.8127.18 (headless). The Go dependency graph and Serenity package are pinned in `go.mod`/`go.sum` and `package.json`/`bun.lock`; use Bun, not npm:
+
+```sh
+go mod download
+bun install --frozen-lockfile
+go test ./...
+bun run audit-artifact        # Fetch and verify registry tarball/provenance claims
+bun run test                 # Direct Bun artifact load + HTTP interoperability
+bun run browser              # Real Chromium HTTP interoperability + measurements
+```
+
+`bun run browser` may need Chromium's Ubuntu shared libraries. `bash run-browser.sh` unpacks the required Ubuntu packages under `/tmp/opencode/opaque-gate-browser-libs` without installing system packages, then runs the browser test. The tests build the isolated Go server into `/tmp/opencode/opaque-gate-server` and bind only to loopback port 4179.
+
+Run Bytemare's pinned upstream RFC-vector suite (the upstream test identifies these as the official OPAQUE vectors):
+
+```sh
+cd "$(go env GOPATH)/pkg/mod/github.com/bytemare/opaque@v0.18.0"
+go test ./...
+```
+
+Its `tests/TestOpaqueVectors` loads the shipped `tests/vectors.json`; source: [Bytemare v0.18.0 vectors_test.go](https://github.com/bytemare/opaque/blob/v0.18.0/tests/vectors_test.go) and [vectors.json](https://github.com/bytemare/opaque/blob/v0.18.0/tests/vectors.json). All packages passed in this environment. This is the upstream vector suite, not a separately authored vector runner.
+
+## What the harness proves
+
+`server.go` is a minimal actual Bytemare v0.18.0 Go HTTP endpoint. `bun-test.mjs` loads and executes the pinned npm artifact directly in Bun; `browser-test.mjs` imports that same artifact in actual Chromium. Both exercise browser-style registration request → Go registration response → browser registration record → Go storage, then KE1 → Go KE2 → browser KE3 → Go `LoginFinish`. The browser run verified the final KE3 and confirms the client generated a session key; server acceptance of the KE3 MAC demonstrates matching AKE key derivation without transmitting either session key. It does not compare/return raw key material.
+
+In the direct Bun run, registration and correct-password login complete; wrong password fails client envelope recovery; malformed (`AA`) and empty/truncated KE1 receive HTTP 400; a one-bit-modified KE3 receives HTTP 400. The real-browser run is intentionally narrower: one complete registration and one KE3-verified login, plus resource sampling. HTTP-body inspection in both paths found only protocol `value` and transaction `tx` fields, no password, serialized Serenity client state, client export key, or session key. The harness server does not log request bodies. This is a narrow protocol test, not a production-grade input-limiting/session/DoS or lifecycle review.
+
+### Agreed interoperability profile observed
+
+- RFC 9807 OPAQUE-3DH; Ristretto255 OPRF with SHA-512 and Ristretto255 3DH group, HKDF-SHA-512, HMAC-SHA-512, SHA-512. Go uses `opaque.DefaultConfiguration()`; Serenity 1.1.0's default package is its Ristretto build.
+- Argon2id, version 0x13, explicitly configured as `iterations=1`, `memory=65536 KiB (64 MiB)`, `parallelism=4`; Serenity's custom KSF option, not the RFC's 2 GiB illustrative setting. The package uses a 16-byte all-zero salt and OPRF-output stretching. This is a tested candidate tradeoff, not an approved production policy.
+- Empty OPAQUE context on both implementations (`nil`/no custom context). No custom client or server identity strings; both use the protocol's default public-key identities. The harness-only server credential lookup label is UTF-8 `gate-user` and is not an OPAQUE identity sent by the browser.
+- Serenity serializes messages as URL-safe base64 without padding; Go decodes/encodes raw URL base64 around Bytemare's RFC message bytes. HTTP is local loopback JSON `{value: ...}`; login finish also carries a random transaction handle. Password and serialized client state remain in browser memory.
+
+## Browser measurements (one headless run)
+
+Chromium 158.0.8127.18 reported in the minimal run: package/WASM initialization **36.8 ms**; client registration start **6.2 ms**; Go registration exchange **4.1 ms**; registration finish/KSF **242.0 ms**; client login start **2.4 ms**; Go/HTTP KE2 exchange **4.2 ms**; client login finish/KSF **161.4 ms**; login start through client KE3 generation **168.0 ms**; post-test JS heap **10,000,000 bytes**. Chromium headless process-group RSS summed across six `chrome-headless-shell` processes was **437,036 KiB** after startup and **510,144 KiB** after the protocol test. RSS is a process snapshot, not peak RSS or a device-independent benchmark; the configured KSF alone requires a 64 MiB working set. No mobile-browser result is claimed. Timings vary by hardware/load and one sample is not a security calibration.
+
+## Artifact, provenance, dependency, and advisory evidence
+
+- Go: Bytemare `github.com/bytemare/opaque v0.18.0`; `go.sum` pins checksums and `go mod graph` gives the module graph. Upstream module says MIT and explicitly says it is not independently audited. The transitive Go module license files inspected are BSD-3-Clause Go Authors (`filippo.io/*`, `golang.org/x/*`, `gtank/ristretto255`) and MIT for the Bytemare modules. Retain those notices if approved.
+- Browser: the actual registry package is `@serenity-kit/opaque@1.1.0`, Bun-lock integrity `sha512-Y6v/+hRMn0MdMEk5+/ArM0vPIiFfFEbdTZc7oAx+cWyvGODGezAQ/sMjXBVogf7NsS9z9EV0Ve5paZCVULuedw==`, unpacked size 889,725 bytes, MIT, and zero declared runtime npm dependencies. `bun run audit-artifact` fetches and hashes the registry tarball, extracts/hashes ESM/CJS, and checks the SLSA statement subject digest against the tarball. Tarball measured 323,964 bytes; ESM 434,604 bytes (SHA-256 `1e8d56383a77948e453085b6d4f52dcb9645f8bfff32395738b63d3a2e2fcb52`); CJS 434,658 bytes (SHA-256 `903c6cfa9ee052a04102e21ea4f2f36da753572618765bb21a1a5cccd1b00442`). The Bun test independently rechecks both installed-file hashes before protocol execution. Bun reported no JS-package advisories (`bun audit`, 3 packages); this does not scan embedded Rust/WASM code.
+- Unlike the earlier assumption that no provenance evidence existed, npm registry metadata now exposes both a package signature and a Sigstore/SLSA provenance attestation. The attestation subject digest matches this tarball; its predicate points to `serenity-kit/opaque` release workflow `.github/workflows/release.yml`, workflow-dispatch run `21564684589` attempt 1, resolved commit `ca1cb22f03b9e456159ce367e2975124f87f5ad8`. The metadata/bundle was inspected, **not cryptographically verified locally**. This is useful source provenance, not proof of a reproducible WASM build.
+- The attested source commit has no `Cargo.lock`; its `Cargo.toml` allows semver resolution (including `opaque-ke = 4.0.0`, Argon2, wasm-bindgen, rand/getrandom; optional P-256 dependency). The release workflow installs the WASM toolchain and builds but the registry artifact contains only bundled JS/WASM, not the resolved Cargo lock/SBOM. I installed Rust 1.100.0 in `/tmp` and reconstructed a **current** graph from that source commit: `cargo tree --target wasm32-unknown-unknown -i crypto-bigint` resolves `opaque-ke 4.0.1 → elliptic-curve 0.13.8 → crypto-bigint 0.5.5`, with default `opaque-ke`/Ristretto features active. RUSTSEC-2026-0387 affects versions before 0.7.6. This makes the issue concrete in a present-day resolution, but does not establish which versions the February 2026 attested build actually used or which affected operations survive into/reach the published WASM. The reconstructed Cargo metadata has 103 packages (102 with manifest license expressions; the root source has MIT LICENSE), but that is not an exact-artifact license bill of materials. The artifact-specific graph, license closure, and advisory reachability therefore remain blockers. The advisory says practical exploitability depends on downstream algorithm/compiler/CPU and observation; no exploit was reproduced.
+- Registry does not publish `@serenity-kit/opaque@1.1.1` (query returned 404); 1.1.0 is the pinned artifact. Do not infer newer repository-side fixes are included.
+- `govulncheck` using Go 1.26.11 (downloaded as a scoped Go toolchain) found **0 reachable symbol vulnerabilities** and **0 vulnerable imported packages** for both this harness and `github.com/bytemare/opaque/...`, but 18 advisories in required modules that the scanned code does not appear to call. They are GO-2026-6355, 6354, 6303, 5932, 5033, 5024, 5023, 5021, 5020, 5019, 5018, 5017, 5016, 5015, 5014, 5013, 5006, 5005; 17 affect `golang.org/x/crypto v0.49.0` and one affects `golang.org/x/sys v0.42.0`. Most `x/crypto` fixes require v0.52.0 or later (newest listed fix is a 0.58.1 pre-release); `x/sys` fix is v0.44.0. Review/updating the transitive graph is actionable before adoption. An initial Go 1.26.8 scan additionally showed standard-library findings fixed by 1.26.11. `govulncheck` is not a cryptographic audit.
+
+## Decision
+
+**NO-GO for production dependency approval / authentication implementation.** The pinned pair is demonstrably wire-compatible for the tested browser-to-Go registration and KE3-verified login, and the Bun and Chromium paths are reproducible. No password or client-secret-state POST was observed. This resolves the basic interoperability uncertainty only. The exact Rust/WASM dependency closure and RUSTSEC-2026-0387 applicability are unresolved; Bytemare remains unaudited; the scanned Go toolchain/graph has actionable advisories; browser measurements are one desktop headless sample. The authorized human has not approved either dependency or accepted the unaudited risk. Keep issue #2 open and do not unblock application authentication. Lifecycle/replay/expiry/concurrency, production HTTPS/CSP/browser support, and independent security review remain out of scope for this experiment and required before shipping.
