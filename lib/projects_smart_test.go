@@ -275,21 +275,86 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if lastSuccessful == nil {
 		t.Fatal("successful refresh has no timestamp")
 	}
+	unchangedRefresh := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	if unchangedRefresh.StatusCode != http.StatusOK {
+		t.Fatalf("unchanged refresh status %d: %s", unchangedRefresh.StatusCode, responseText(unchangedRefresh))
+	}
+	unchangedRefresh.Body.Close()
+	lastSuccessful = listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched
 	// This highly compressible blob is much larger unpacked than the smart-HTTPS
-	// pack carrying it. The later ref-limit rejection must discard the staged
-	// fetch rather than leave new objects/refs in the live project cache.
+	// pack carrying it. Keep refs under their limit so the cache byte ceiling is
+	// the only gate that can reject this fetch.
 	compressibleCommit := commitFixturePayload(t, remoteDir, fixtureWorktree, strings.Repeat("z", 8<<20)).String()
+	liveCacheBeforeRejectedRefresh, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lastFetchedBeforeRejectedRefresh := *lastSuccessful
+	oldCacheLimit := app.projects.maxCacheBytes
+	liveBytes, err := directorySize(app.projects.repoPath(created.ID), oldCacheLimit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Leave only 1 KiB of staged-write headroom. The packed blob is far smaller
+	// than its expanded content but still exceeds this exact storage allowance.
+	app.projects.maxCacheBytes = liveBytes + 1024
+	measuredPackBytes.Store(0)
+	measurePack.Store(true)
+	cacheLimitedRefresh := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	measurePack.Store(false)
+	cacheLimitMessage := responseText(cacheLimitedRefresh)
+	cacheLimitedRefresh.Body.Close()
+	app.projects.maxCacheBytes = oldCacheLimit
+	if measuredPackBytes.Load() <= 1024 || measuredPackBytes.Load() >= 1<<20 {
+		t.Fatalf("high-compressibility smart-HTTPS pack bytes = %d, want >1 KiB storage headroom and <1 MiB transfer ceiling", measuredPackBytes.Load())
+	}
+	if cacheLimitedRefresh.StatusCode != http.StatusRequestEntityTooLarge || !strings.Contains(strings.ToLower(cacheLimitMessage), "cache limit") {
+		t.Fatalf("compressed-object cache limit status/message = %d, %q; want 413 with cache-limit class", cacheLimitedRefresh.StatusCode, cacheLimitMessage)
+	}
+	assertPreviousCache := func(reason string) {
+		t.Helper()
+		if got := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID); !equalProjectRefs(refreshedRefs, got) {
+			t.Fatalf("%s changed cached refs: %#v", reason, got)
+		}
+		projectAfter := listProjectsFromAPI(t, client, appServer.URL, cookie)[0]
+		if projectAfter.LastFetched == nil || !projectAfter.LastFetched.Equal(lastFetchedBeforeRejectedRefresh) {
+			t.Fatalf("%s changed persistent last-fetched metadata", reason)
+		}
+		digest, err := digestProjectCache(app.projects.repoPath(created.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if digest != liveCacheBeforeRejectedRefresh {
+			t.Fatalf("%s changed on-disk project objects or refs", reason)
+		}
+		cachedRepo, err := git.PlainOpen(app.projects.repoPath(created.ID))
+		if err != nil {
+			t.Fatal(err)
+		}
+		cachedCommit, err := cachedRepo.CommitObject(plumbing.NewHash(featureRef.Commit))
+		if err != nil {
+			t.Fatalf("%s lost previous cached commit: %v", reason, err)
+		}
+		cachedTree, err := cachedCommit.Tree()
+		if err != nil {
+			t.Fatalf("%s lost previous cached tree: %v", reason, err)
+		}
+		if _, err := cachedTree.File("README.md"); err != nil {
+			t.Fatalf("%s lost previous cached blob: %v", reason, err)
+		}
+		if persistentBytes, sizeErr := directorySize(app.projects.root, oldCacheLimit); sizeErr != nil || persistentBytes > oldCacheLimit {
+			t.Fatalf("%s exceeded persistent cache limit: bytes=%d err=%v", reason, persistentBytes, sizeErr)
+		}
+	}
+	assertPreviousCache("compressed-object cache-limit rejection")
+
 	for i := 0; i < 12; i++ {
 		name := plumbing.NewBranchReferenceName(fmt.Sprintf("refs-test/%02d", i))
 		if err := fixtureRepo.Storer.SetReference(plumbing.NewHashReference(name, plumbing.NewHash(compressibleCommit))); err != nil {
 			t.Fatal(err)
 		}
 	}
-	liveCacheBeforeRejectedRefresh, err := digestProjectCache(app.projects.repoPath(created.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	lastFetchedBeforeRejectedRefresh := *lastSuccessful
+	measuredPackBytes.Store(0)
 	measurePack.Store(true)
 	tooManyRefs := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
 	measurePack.Store(false)
@@ -297,44 +362,14 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("excessive refs refresh status %d: %s", tooManyRefs.StatusCode, responseText(tooManyRefs))
 	}
 	refLimitMessage := responseText(tooManyRefs)
+	tooManyRefs.Body.Close()
 	if !strings.Contains(strings.ToLower(refLimitMessage), "ref") {
 		t.Fatalf("excessive refs error is not actionable: %s", refLimitMessage)
 	}
 	if measuredPackBytes.Load() <= 0 || measuredPackBytes.Load() >= 1<<20 {
-		t.Fatalf("high-compressibility smart-HTTPS fixture pack bytes = %d, want positive and below the 1 MiB transfer ceiling", measuredPackBytes.Load())
+		t.Fatalf("ref-limit control pack bytes = %d, want positive and below 1 MiB", measuredPackBytes.Load())
 	}
-	if got := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID); !equalProjectRefs(refreshedRefs, got) {
-		t.Fatalf("excessive refs changed the successful cached refs: %#v", got)
-	}
-	projectAfterRejectedRefresh := listProjectsFromAPI(t, client, appServer.URL, cookie)[0]
-	if projectAfterRejectedRefresh.LastFetched == nil || !projectAfterRejectedRefresh.LastFetched.Equal(lastFetchedBeforeRejectedRefresh) {
-		t.Fatal("rejected refresh changed persistent last-fetched metadata")
-	}
-	liveCacheAfterRejectedRefresh, err := digestProjectCache(app.projects.repoPath(created.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if liveCacheAfterRejectedRefresh != liveCacheBeforeRejectedRefresh {
-		t.Fatal("rejected refresh changed on-disk project objects or refs")
-	}
-	cachedRepo, err := git.PlainOpen(app.projects.repoPath(created.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
-	cachedCommit, err := cachedRepo.CommitObject(plumbing.NewHash(featureRef.Commit))
-	if err != nil {
-		t.Fatalf("previous cached commit became unavailable: %v", err)
-	}
-	cachedTree, err := cachedCommit.Tree()
-	if err != nil {
-		t.Fatalf("previous cached tree became unavailable: %v", err)
-	}
-	if _, err := cachedTree.File("README.md"); err != nil {
-		t.Fatalf("previous cached blob became unavailable: %v", err)
-	}
-	if persistentBytes, sizeErr := directorySize(app.projects.root, app.projects.maxCacheBytes); sizeErr != nil || persistentBytes > app.projects.maxCacheBytes {
-		t.Fatalf("failed refresh exceeded the persistent cache limit: bytes=%d err=%v", persistentBytes, sizeErr)
-	}
+	assertPreviousCache("ref-limit rejection")
 	for i := 0; i < 12; i++ {
 		name := plumbing.NewBranchReferenceName(fmt.Sprintf("refs-test/%02d", i))
 		if err := fixtureRepo.Storer.RemoveReference(name); err != nil {
@@ -396,7 +431,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldCacheLimit := app.projects.maxCacheBytes
+	oldPersistentCacheLimit := app.projects.maxCacheBytes
 	app.projects.maxCacheBytes = usedCache
 	requestsBeforeCacheLimit := gitRequests.Load()
 	cacheLimitedCreate := projectPost(t, restarted.Client(), restarted.URL, cookie, "/api/projects", `{"name":"budget limited","url":"`+remote.URL+`/repo.git"}`)
@@ -407,7 +442,103 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if gitRequests.Load() != requestsBeforeCacheLimit || len(listProjectsFromAPI(t, restarted.Client(), restarted.URL, cookie)) != 1 {
 		t.Fatal("cache budget was checked only after starting another repository transfer")
 	}
-	app.projects.maxCacheBytes = oldCacheLimit
+	app.projects.maxCacheBytes = oldPersistentCacheLimit
+	failRequests.Store(false)
+	redirectRequests.Store(false)
+	cacheBeforeRollbackFailure, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.projects.cacheFS = &faultProjectCacheFS{
+		projectCacheFS:   osProjectCacheFS{},
+		failRenameTarget: app.projects.repoPath(created.ID),
+		failRenameCount:  2, // promotion fails, then restoration fails deterministically
+	}
+	requestsBeforeRollbackFailure := gitRequests.Load()
+	rollbackFailure := projectPost(t, restarted.Client(), restarted.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	rollbackMessage := responseText(rollbackFailure)
+	rollbackFailure.Body.Close()
+	if rollbackFailure.StatusCode != http.StatusServiceUnavailable || !strings.Contains(strings.ToLower(rollbackMessage), "restoration failed") {
+		t.Fatalf("rollback failure was not surfaced/blocked: status %d message %q", rollbackFailure.StatusCode, rollbackMessage)
+	}
+	requestsAfterRollbackFailure := gitRequests.Load()
+	if requestsAfterRollbackFailure <= requestsBeforeRollbackFailure {
+		t.Fatal("rollback-failure fixture did not reach smart HTTPS")
+	}
+	blockedRetry := projectPost(t, restarted.Client(), restarted.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	blockedMessage := responseText(blockedRetry)
+	blockedRetry.Body.Close()
+	if blockedRetry.StatusCode != http.StatusServiceUnavailable || !strings.Contains(strings.ToLower(blockedMessage), "blocked") || gitRequests.Load() != requestsAfterRollbackFailure {
+		t.Fatalf("cache recovery block was not enforced: status=%d message=%q requests=%d", blockedRetry.StatusCode, blockedMessage, gitRequests.Load())
+	}
+	if _, err := os.Stat(app.projects.repoPath(created.ID)); !os.IsNotExist(err) {
+		t.Fatalf("injected restoration failure should leave live path missing for recovery, stat error=%v", err)
+	}
+	if _, err := os.Stat(app.projects.refreshBackupPath(created.ID)); err != nil {
+		t.Fatalf("previous cache backup was not retained for recovery: %v", err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted.Close()
+	app, err = New(cfg)
+	if err != nil {
+		t.Fatalf("startup did not recover interrupted promotion: %v", err)
+	}
+	cookie = installAPITestSession(t, app)
+	recoveredServer := httptest.NewTLSServer(app.Handler())
+	defer recoveredServer.Close()
+	recoveredDigest, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recoveredDigest != cacheBeforeRollbackFailure {
+		t.Fatal("startup recovery did not restore previous cache contents")
+	}
+	if exists, err := app.projects.refreshIntentExists(created.ID); err != nil || exists {
+		t.Fatalf("startup left refresh journal pending: exists=%v err=%v", exists, err)
+	}
+
+	// Cleanup failures block further cache work; a restart removes the owned
+	// orphan stage before the application accepts requests again.
+	app.projects.cacheFS = &faultProjectCacheFS{projectCacheFS: osProjectCacheFS{}, failRemovePrefix: ".git-stage-refresh-"}
+	failRequests.Store(true)
+	requestsBeforeCleanupFailure := gitRequests.Load()
+	cleanupFailure := projectPost(t, recoveredServer.Client(), recoveredServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	cleanupMessage := responseText(cleanupFailure)
+	cleanupFailure.Body.Close()
+	if cleanupFailure.StatusCode != http.StatusServiceUnavailable || !strings.Contains(strings.ToLower(cleanupMessage), "staging cleanup failed") {
+		t.Fatalf("staging cleanup failure was hidden: status=%d message=%q", cleanupFailure.StatusCode, cleanupMessage)
+	}
+	if gitRequests.Load() <= requestsBeforeCleanupFailure {
+		t.Fatal("cleanup failure fixture did not reach the smart-HTTPS boundary")
+	}
+	blockedRetry = projectPost(t, recoveredServer.Client(), recoveredServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	blockedRetry.Body.Close()
+	if blockedRetry.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("cleanup-failed cache accepted retry: %d", blockedRetry.StatusCode)
+	}
+	if err := app.projects.reconcileCacheFiles(); err == nil {
+		t.Fatal("startup reconciliation accepted an orphan stage it could not remove")
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recoveredServer.Close()
+	app, err = New(cfg)
+	if err != nil {
+		t.Fatalf("startup did not remove orphan staged cache: %v", err)
+	}
+	defer app.Close()
+	entries, err := os.ReadDir(app.projects.root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), ".git-stage-") {
+			t.Fatalf("orphan cache stage survived startup reconciliation: %s", entry.Name())
+		}
+	}
 }
 
 type countingHTTPWriter struct {
@@ -419,6 +550,29 @@ func (w *countingHTTPWriter) Write(p []byte) (int, error) {
 	n, err := w.ResponseWriter.Write(p)
 	w.count.Add(int64(n))
 	return n, err
+}
+
+type faultProjectCacheFS struct {
+	projectCacheFS
+	failRenameTarget string
+	failRenameCount  int
+	failRemovePrefix string
+	renameAttempts   int
+}
+
+func (f *faultProjectCacheFS) Rename(oldPath, newPath string) error {
+	if newPath == f.failRenameTarget && f.renameAttempts < f.failRenameCount {
+		f.renameAttempts++
+		return errors.New("injected cache rename failure")
+	}
+	return f.projectCacheFS.Rename(oldPath, newPath)
+}
+
+func (f *faultProjectCacheFS) RemoveAll(path string) error {
+	if f.failRemovePrefix != "" && strings.HasPrefix(filepath.Base(path), f.failRemovePrefix) {
+		return errors.New("injected cache cleanup failure")
+	}
+	return f.projectCacheFS.RemoveAll(path)
 }
 
 func TestBoundedGitFilesystemRejectsExpandedObjectWriteAtStorageBoundary(t *testing.T) {

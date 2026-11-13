@@ -36,6 +36,8 @@ type projectManager struct {
 	maxRefs               int
 	maxAdvertisementBytes int64
 	mu                    sync.Mutex
+	cacheFS               projectCacheFS
+	blocked               string
 }
 
 const maxGitTreeObjectBytes = 16 << 20
@@ -93,12 +95,17 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration) (*project
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,remote_url TEXT NOT NULL,created_at INTEGER NOT NULL,last_fetched INTEGER,warning TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS project_refs(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,kind TEXT NOT NULL,name TEXT NOT NULL,commit_id TEXT NOT NULL,PRIMARY KEY(project_id,kind,name))`,
+		`CREATE TABLE IF NOT EXISTS project_refresh_journal(project_id TEXT PRIMARY KEY)`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			return nil, err
 		}
 	}
-	return &projectManager{db: db, root: root, timeout: timeout}, nil
+	manager := &projectManager{db: db, root: root, timeout: timeout, cacheFS: osProjectCacheFS{}}
+	if err := manager.reconcileCacheFiles(); err != nil {
+		return nil, fmt.Errorf("project cache recovery failed; refusing to start: %w", err)
+	}
+	return manager, nil
 }
 
 func safeRemote(raw string) (*url.URL, error) {
@@ -164,6 +171,9 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
+	buffered := newStagedResponseWriter(w)
+	defer buffered.Flush()
+	w = buffered
 	if !a.projectAuthorized(w, r, true) {
 		return
 	}
@@ -186,6 +196,10 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	p := a.projects
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.ensureCacheReady(); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	idBytes := make([]byte, 16)
 	if _, err = rand.Read(idBytes); err != nil {
 		http.Error(w, "project creation is temporarily unavailable", 500)
@@ -200,12 +214,16 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "project caches have no remaining space under the configured storage limit", http.StatusRequestEntityTooLarge)
 		return
 	}
-	stage, err := os.MkdirTemp(p.root, ".git-stage-")
+	stage, err := p.cacheFS.MkdirTemp(p.root, ".git-stage-create-")
 	if err != nil {
 		http.Error(w, "could not prepare bounded repository staging", 500)
 		return
 	}
-	defer os.RemoveAll(stage)
+	defer func() {
+		if cleanupErr := p.cleanupStage(stage); cleanupErr != nil {
+			buffered.replace(http.StatusServiceUnavailable, cleanupErr.Error())
+		}
+	}()
 	_, err = git.CloneContext(ctx, boundedStorage(stage, p.maxCacheBytes), nil, &git.CloneOptions{URL: remote, NoCheckout: true, Tags: git.AllTags})
 	if err != nil {
 		if errors.Is(err, errGitCacheLimit) {
@@ -219,7 +237,7 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "project caches exceed the configured storage limit", http.StatusRequestEntityTooLarge)
 		return
 	}
-	if err = os.Rename(stage, p.repoPath(id)); err != nil {
+	if err = p.cacheFS.Rename(stage, p.repoPath(id)); err != nil {
 		http.Error(w, "repository fetched but could not be promoted from staging", 500)
 		return
 	}
@@ -273,13 +291,24 @@ func (a *App) projectRefs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
+	buffered := newStagedResponseWriter(w)
+	defer buffered.Flush()
+	w = buffered
 	if !a.projectAuthorized(w, r, true) {
 		return
 	}
 	p := a.projects
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := p.ensureCacheReady(); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	id := r.PathValue("id")
+	if !validProjectID(id) {
+		http.NotFound(w, r)
+		return
+	}
 	var remote string
 	if p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote) != nil {
 		http.NotFound(w, r)
@@ -288,13 +317,17 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
 	ctx = withGitHTTPPolicy(ctx, p)
-	stage, err := os.MkdirTemp(p.root, ".git-stage-")
-	if err != nil {
+	stage := p.refreshStagePath(id)
+	if err := p.cacheFS.Mkdir(stage, 0700); err != nil {
 		http.Error(w, "could not prepare bounded repository staging", 500)
 		return
 	}
-	defer os.RemoveAll(stage)
-	if err = copyGitCache(p.repoPath(id), stage, p.maxCacheBytes); err != nil {
+	defer func() {
+		if cleanupErr := p.cleanupStage(stage); cleanupErr != nil {
+			buffered.replace(http.StatusServiceUnavailable, cleanupErr.Error())
+		}
+	}()
+	if err := copyGitCache(p.repoPath(id), stage, p.maxCacheBytes); err != nil {
 		warning := "could not stage the existing repository within the configured cache limit"
 		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
 		http.Error(w, warning, http.StatusRequestEntityTooLarge)
@@ -334,24 +367,56 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	backup := stage + ".previous"
-	if err = os.Rename(p.repoPath(id), backup); err != nil {
+	backup := p.refreshBackupPath(id)
+	if _, err = p.cacheFS.Lstat(backup); err == nil {
+		p.blocked = "an unresolved previous project cache exists; restart to reconcile before refreshing"
+		http.Error(w, p.blocked, http.StatusServiceUnavailable)
+		return
+	} else if !os.IsNotExist(err) {
+		http.Error(w, "could not inspect previous project cache", 500)
+		return
+	}
+	if err = p.markRefreshIntent(id); err != nil {
+		http.Error(w, "could not record refresh recovery state", 500)
+		return
+	}
+	if err = p.cacheFS.Rename(p.repoPath(id), backup); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, false); rollbackErr != nil {
+			p.blocked = "project cache state is ambiguous after promotion failure; project operations are blocked until restart recovery succeeds"
+			http.Error(w, p.blocked, http.StatusServiceUnavailable)
+			return
+		}
 		http.Error(w, "refreshed repository could not be safely promoted; previous cache retained", 500)
 		return
 	}
-	if err = os.Rename(stage, p.repoPath(id)); err != nil {
-		_ = os.Rename(backup, p.repoPath(id))
-		http.Error(w, "refreshed repository could not be safely promoted; previous cache retained", 500)
+	if err = p.cacheFS.Rename(stage, p.repoPath(id)); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
+			p.blocked = "project cache restoration failed; project operations are blocked until restart recovery succeeds"
+			http.Error(w, p.blocked, http.StatusServiceUnavailable)
+			return
+		}
+		http.Error(w, "refreshed repository could not be safely promoted; previous cache restored", 500)
 		return
 	}
 	if err = replaceProjectMetadata(p.db, id, refs, now); err != nil {
-		_ = os.RemoveAll(p.repoPath(id))
-		_ = os.Rename(backup, p.repoPath(id))
-		http.Error(w, "refresh could not be committed; previous cache and refs restored", 500)
-		return
+		pending, journalErr := p.refreshIntentExists(id)
+		if journalErr != nil || pending {
+			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
+				p.blocked = "refresh commit and cache restoration failed; project operations are blocked until restart recovery succeeds"
+				http.Error(w, p.blocked, http.StatusServiceUnavailable)
+				return
+			}
+			http.Error(w, "refresh could not be committed; previous cache and refs restored", 500)
+			return
+		}
 	}
-	_ = os.RemoveAll(backup)
-	writeJSON(w, map[string]any{"lastFetched": now})
+	cleanupWarning := ""
+	if err := p.removeOwnedPath(backup); err != nil {
+		p.blocked = "refresh committed but previous cache cleanup failed; restart to reconcile before further project changes"
+		cleanupWarning = p.blocked
+		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, cleanupWarning, id)
+	}
+	writeJSON(w, map[string]any{"lastFetched": now, "warning": cleanupWarning})
 }
 
 func saveProjectRefs(db *sql.DB, id, dir string, maxRefs int) error {
@@ -434,6 +499,9 @@ func replaceProjectMetadata(db *sql.DB, id string, refs []projectRef, fetched ti
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE projects SET last_fetched=?,warning='' WHERE id=?`, fetched.UnixNano(), id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM project_refresh_journal WHERE project_id=?`, id); err != nil {
 		return err
 	}
 	return tx.Commit()
