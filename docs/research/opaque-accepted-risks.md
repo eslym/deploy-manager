@@ -1,5 +1,7 @@
 # OPAQUE accepted risks
 
+The maintainer separately approved the pinned dependency selection on 2026-11-13; see [the final gate decision](opaque-gate-findings.md). Statements below limiting each individual acceptance do not negate that later approval. License/notice obligations and production security requirements remain. Experiment source and the tested dependency graph were removed from the current checkout and remain [archived](https://github.com/eslym/deploy-manager/tree/a069572/experiments/opaque-gate).
+
 ## Browser WASM malformed-argument memory leak
 
 - **Accepted by:** the project maintainer, explicitly in conversation on 2026-11-13.

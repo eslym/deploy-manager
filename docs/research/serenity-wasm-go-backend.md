@@ -4,13 +4,15 @@ Research and experiment date: **2026-11-13**. This answers whether embedding `@s
 
 ## Conclusion
 
+Status: this alternative was rejected under #24. The probe was removed at the maintainer's request; its code remains [archived in Git history](https://github.com/eslym/deploy-manager/tree/a069572/experiments/serenity-wasm-go). The native-Go/browser pairing was separately [approved](opaque-gate-findings.md); historical NO-GO statements below do not reverse that decision. Experiment commands are historical.
+
 **No—not as a direct Go/WASM server integration.** The exact published package is valid WebAssembly and includes server operations, but it is a wasm-bindgen JavaScript module, not a WASI module or a Go-callable C ABI. The probe compiled the WASM using wazero, then found **46 imports**, including JavaScript object/externref, exception, typed-array, and randomness shims (`__wbindgen_*`, `__wbg_getRandomValues`, `__wbg_crypto`); exports include `createServerSetup`, `startServerLogin`, and `finishServerLogin`. Wazero compilation is possible, but instantiation requires implementing the JavaScript ABI and its object/exception/memory conventions. It is not a meaningful drop-in “run the npm package in Go” capability.
 
 The less exotic options remain: use the package from its normal JS runtime (which design excludes as a production service process), write and audit a substantial JavaScript host compatibility layer, or build a **different** Rust/WASI or C-ABI wrapper around `opaque-ke`. The latter is not the exact published artifact, needs a new build/provenance/dependency review, and still brings Rust advisory and secret-lifecycle concerns. On current evidence, this adds integration and supply-chain risk rather than making the Bytemare Go + Serenity browser pairing more concrete. The recommendation remains **NO-GO for production approval** pending the existing security gates.
 
 ## Reproducible experiment
 
-Files: [`experiments/serenity-wasm-go/`](../../experiments/serenity-wasm-go/). It is a stand-alone wazero probe, separate from the earlier Bytemare compatibility experiment. It extracts the 1.1.0 WASM payload from the already installed, audited package, reports its SHA-256, and compiles/inspects module imports and exports.
+Archived files: [`experiments/serenity-wasm-go/`](https://github.com/eslym/deploy-manager/tree/a069572/experiments/serenity-wasm-go). This was a stand-alone wazero probe, separate from the Bytemare compatibility experiment. It extracted the 1.1.0 WASM payload, reported its SHA-256, and compiled/inspected module imports and exports. It did not audit the cryptography or execute authentication.
 
 The package integrity check was completed **before executing the Bun extractor**:
 
@@ -60,7 +62,7 @@ The npm package exposes server functions, but its server setup is a library-spec
 
 ## Comparative risk and remaining gates
 
-The [executed feasibility experiment](../../experiments/opaque-gate/README.md) records the browser-to-Go interoperability run and its scope; the earlier [research note](opaque-authentication.md) predates those runs. Native Bytemare keeps the server inside the intended Go process and uses Go's library API, avoiding a bespoke cross-runtime ABI. It is still explicitly unaudited and carries a Go dependency/toolchain review burden; that is not an endorsement. Serenity/WASM hosting would share the same need to establish RFC behavior and artifact security while adding JS ABI or wrapper code, another runtime/build chain, and more difficult secret/memory ownership. It does not resolve the published artifact's inherited Rust dependency/advisory questions. The exact 1.1.0 package remains pinned; repository-side later fixes must not be assumed present.
+The [gate findings](opaque-gate-findings.md) record the browser-to-Go interoperability run and its scope; the earlier [research note](opaque-authentication.md) predates those runs. Native Bytemare avoids a bespoke cross-runtime ABI but remains unaudited. Serenity/WASM hosting would add host/runtime integration and secret/memory ownership concerns without resolving the published artifact's dependency/advisory uncertainty. Later source fixes must not be assumed present in the 1.1.0 artifact.
 
 This probe did not test server setup persistence, registration/login through Go-hosted WASM, KE3 validation, wrong-password/tamper behavior, entropy failure, concurrency, memory costs, startup cost, or a browser. Those tests were not meaningful without first implementing a secure host ABI; passing the earlier Bytemare tests cannot be attributed to WASM. No cryptographic correctness is inferred from module compilation or symbol names.
 

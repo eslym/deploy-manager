@@ -4,6 +4,8 @@ Research date: **2026-11-13**. This is evidence for the isolated OPAQUE feasibil
 
 ## Result
 
+Final status: the maintainer subsequently approved the pinned dependency selection with [accepted risks](opaque-accepted-risks.md); see [gate findings](opaque-gate-findings.md). The experiment scripts have been removed at the maintainer's request. Reproduction commands below refer to [the archived experiment](https://github.com/eslym/deploy-manager/tree/a069572/experiments/opaque-gate), not this checkout; the initial NO-GO below is historical.
+
 The exact registry tarball `@serenity-kit/opaque@1.1.0` was downloaded and its SHA-512 verified against npm `dist.integrity` before signature/provenance checks. Both the npm package signature and SLSA/Sigstore provenance now pass cryptographic verification:
 
 - npm ECDSA P-256/SHA-256 signature over `@serenity-kit/opaque@1.1.0:sha512-Y6v/+hRMn0MdMEk5+/ArM0vPIiFfFEbdTZc7oAx+cWyvGODGezAQ/sMjXBVogf7NsS9z9EV0Ve5paZCVULuedw==` verifies against key ID `SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U`, obtained from the npm registry's HTTPS key endpoint.
@@ -42,4 +44,4 @@ The public Actions artifacts endpoint for run `21564684589` returned an empty ar
 
 - [npm package metadata](https://registry.npmjs.org/@serenity-kit/opaque/1.1.0), [npm signing keys](https://registry.npmjs.org/-/npm/v1/keys), [npm attestation bundle](https://registry.npmjs.org/-/npm/v1/attestations/%40serenity-kit%2Fopaque%401.1.0), and [published tarball](https://registry.npmjs.org/@serenity-kit/opaque/-/opaque-1.1.0.tgz).
 - [Sigstore Cosign verification documentation](https://docs.sigstore.dev/cosign/verifying/verify/), [attested GitHub workflow](https://github.com/serenity-kit/opaque/blob/ca1cb22f03b9e456159ce367e2975124f87f5ad8/.github/workflows/release.yml), and [Actions run](https://github.com/serenity-kit/opaque/actions/runs/21564684589).
-- [OPAQUE security follow-up](opaque-security-follow-up.md), [gate README](../../experiments/opaque-gate/README.md), and [confirmed design §101–108](../design.md#opaque-authentication-and-account-lifecycle).
+- [OPAQUE security follow-up](opaque-security-follow-up.md), [gate findings](opaque-gate-findings.md), and [confirmed design](../design.md#opaque-authentication-and-account-lifecycle).

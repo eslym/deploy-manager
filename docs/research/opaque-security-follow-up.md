@@ -1,6 +1,6 @@
 # OPAQUE feasibility security follow-up
 
-Research date: **2026-11-13**. This supplements (does not replace) [the OPAQUE feasibility research](opaque-authentication.md) and isolated [gate README](../../experiments/opaque-gate/README.md). This is evidence only: no dependency approval, production authentication implementation, risk acceptance, or change to the confirmed design is implied. The rejected Go-hosted Serenity WASM alternative (#24) was not pursued.
+Research date: **2026-11-13**. Historical investigation supplementing [the research](opaque-authentication.md) and [gate findings](opaque-gate-findings.md). The maintainer subsequently approved dependency selection with explicit risk acceptance; see the final gate decision. Initial NO-GO statements and pending-approval language below are historical. Experiment code was removed at the maintainer's request; commands refer to [the archived checkout](https://github.com/eslym/deploy-manager/tree/a069572/experiments/opaque-gate). Unknown build inputs remain unknown, and license/notice obligations still apply before distribution.
 
 ## Summary and decision
 
@@ -20,7 +20,7 @@ Research date: **2026-11-13**. This supplements (does not replace) [the OPAQUE f
 | Is the exact embedded Rust/WASM graph known? | **No.** No lockfile/SBOM/build-resolved dependency manifest was attached. |
 | Is `RUSTSEC-2026-0387` proven absent or unreachable in the artifact? | **No.** Current source reconstruction resolves affected `crypto-bigint 0.5.5`; artifact-specific reachability cannot be concluded. |
 | Is malformed-WASM memory-leak fix included? | **No.** Upstream 1.1.1 changelog lists it; registry returned 404 for 1.1.1 and 1.1.0 is the published artifact under review. |
-| Are the Go toolchain findings fixed in the checked-out experiment? | **Yes.** Subsequent remediation raised the minimum Go version to 1.26.11 and upgraded `x/crypto` to v0.59.0 and `x/sys` to v0.50.0. Symbol, package and module scans report no vulnerabilities; protocol/browser regressions passed. See the [remediation record](../../experiments/opaque-gate/go-security-remediation.md). |
+| Were the Go toolchain findings fixed in the experiment? | **Yes.** Subsequent remediation used Go 1.26.11, `x/crypto v0.59.0` and `x/sys v0.50.0`. Symbol, package and module scans reported no vulnerabilities; protocol/browser regressions passed. See the [remediation record](opaque-go-security-remediation.md). |
 
 ## Published artifact, provenance, build and licenses
 
@@ -46,7 +46,7 @@ The repository changelog reports a malformed-parameter WASM memory-leak fix in 1
 
 Ran `govulncheck ./...` in `experiments/opaque-gate` using the checked-out host Go 1.26.8. It exited 3 and reported **10 standard-library vulnerabilities**; explicit examples include GO-2026-6859 (`net/http`, fixed 1.26.11), GO-2026-6809 (`crypto/x509`, fixed 1.26.10), and eight more in `net/http`, `mime/multipart`, and `crypto/tls` fixed in 1.26.9 or later. It also reports 3 vulnerabilities in imported packages and 20 vulnerabilities in required modules not appearing called by scanned code. This is a new scan result, not a claim that the Go module graph was remediated. The previous run on Go 1.26.11 noted zero reachable symbol/imported-package vulnerabilities but remaining module-only findings; it must be rerun from this exact tree with the selected patched Go toolchain before relying on it.
 
-The initial investigation made no module/toolchain changes. **Subsequent remediation completed the upgrade and validation:** Go 1.26.11, `golang.org/x/crypto v0.59.0`, and `golang.org/x/sys v0.50.0`. Symbol-, package-, and module-scope scans report no vulnerabilities. Go test/vet, pinned upstream vectors, Bun integrity/protocol checks, browser gating and Chromium interoperability passed. Commands and results are in the [remediation record](../../experiments/opaque-gate/go-security-remediation.md). No production dependency is affected or approved by these experiment-only changes.
+The initial investigation made no module/toolchain changes. **Subsequent remediation completed the upgrade and validation:** Go 1.26.11, `golang.org/x/crypto v0.59.0`, and `golang.org/x/sys v0.50.0`. Symbol-, package-, and module-scope scans reported no vulnerabilities. Go test/vet, pinned upstream vectors, Bun integrity/protocol checks, browser gating and Chromium interoperability passed. Historical commands and results are in the [remediation record](opaque-go-security-remediation.md).
 
 ## Verification and remaining human decision
 
@@ -63,7 +63,7 @@ The initial investigation did not launch a browser or modify dependencies. The s
 
 **Resolved:** registry tarball identity against npm integrity; existence and decoded content of provenance claims; upstream run identity/status; the 1.1.1 publication gap; Go toolchain/dependency advisories in the isolated harness, with regression validation.
 
-**Remaining approval/compliance work:** overall dependency approval remains outstanding, and applicable license/notice obligations still apply. The maintainer has explicitly accepted the unaudited Bytemare implementation risk for v0.18.0. Exact WASM build closure and artifact-specific RustSec reachability remain unknown but their uncertainty is accepted within the pinned frontend scope; do not describe them as patched or proven safe. The frontend memory leak is separately accepted with an upgrade obligation. Issue #2 and dependent authentication work remain blocked pending the remaining gate decisions and requirements; no upstream request or rebuild is authorized by these acceptances.
+**Final status:** dependency selection is explicitly approved in the [gate decision](opaque-gate-findings.md). The documented security risks are accepted within their stated scopes, not proven absent. Applicable license/notice obligations remain before distribution, the frontend upgrade remains required under #25, and production authentication protections still require implementation and tests. No upstream request or rebuild is authorized.
 
 ## Primary sources
 
@@ -71,4 +71,4 @@ The initial investigation did not launch a browser or modify dependencies. The s
 - [Upstream release workflow](https://github.com/serenity-kit/opaque/blob/ca1cb22f03b9e456159ce367e2975124f87f5ad8/.github/workflows/release.yml), [attested source commit](https://github.com/serenity-kit/opaque/commit/ca1cb22f03b9e456159ce367e2975124f87f5ad8), [GitHub Actions run 21564684589](https://github.com/serenity-kit/opaque/actions/runs/21564684589), and [upstream changelog](https://github.com/serenity-kit/opaque/blob/main/CHANGELOG.md).
 - [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html) and [RustCrypto fix PR #1365](https://github.com/RustCrypto/crypto-bigint/pull/1365).
 - [Sigstore bundle verification](https://docs.sigstore.dev/cosign/verifying/verify/), [SLSA provenance verification](https://github.com/slsa-framework/slsa-verifier), and [npm provenance verification guidance](https://docs.npmjs.com/generating-provenance-statements/).
-- Prior source and protocol references: [OPAQUE research](opaque-authentication.md), [gate reproducibility/evidence](../../experiments/opaque-gate/README.md), and [confirmed design §101–108](../design.md#opaque-authentication-and-account-lifecycle).
+- Prior source and protocol references: [OPAQUE research](opaque-authentication.md), [gate findings and archived evidence](opaque-gate-findings.md), and [confirmed design](../design.md#opaque-authentication-and-account-lifecycle).

@@ -1,6 +1,6 @@
 # OPAQUE candidate dependency license compatibility
 
-Research date: **2026-11-13**. This is a scoped license/notice investigation for the isolated OPAQUE feasibility candidate, not dependency approval, legal advice, or a project licensing decision. The project has no product Go module yet; the Go versions below are the exact experiment graph in `experiments/opaque-gate/go.mod`/`go.sum` (Go 1.26.11). Existing uncommitted risk-acceptance edits were preserved. The design remains the authority for product scope.
+Research date: **2026-11-13**. This is a scoped license/notice investigation for the isolated OPAQUE feasibility candidate, not legal advice or a project licensing decision. Bytemare v0.18.0 + Serenity 1.1.0 have separately been approved for selection; this note does not clear unresolved license closure. The project has no product Go module yet; the Go versions below are the exact historical experiment graph (Go 1.26.11).
 
 ## Conclusion
 
@@ -67,7 +67,7 @@ This checklist is operational guidance, not a legal guarantee. No project `LICEN
 
 ## Primary evidence
 
-- Exact experiment graph and checksums: [`experiments/opaque-gate/go.mod`](../../experiments/opaque-gate/go.mod), [`go.sum`](../../experiments/opaque-gate/go.sum), and Go module source `LICENSE`/`PATENTS` files in the pinned module archives/cache.
+- Exact historical experiment graph and checksums: [`go.mod`](https://github.com/eslym/deploy-manager/blob/a069572/experiments/opaque-gate/go.mod), [`go.sum`](https://github.com/eslym/deploy-manager/blob/a069572/experiments/opaque-gate/go.sum), and Go module source `LICENSE`/`PATENTS` files in the pinned module archives/cache. The graph is evidence for that tested candidate, not license closure for the Serenity WASM.
 - Primary upstream Go sources: [Bytemare OPAQUE v0.18.0](https://github.com/bytemare/opaque/tree/v0.18.0), [filippo.io/edwards25519 v1.2.0](https://github.com/FiloSottile/edwards25519/tree/v1.2.0), [filippo.io/nistec v0.0.4](https://github.com/FiloSottile/nistec/tree/v0.0.4), [ristretto255 v0.2.0](https://github.com/gtank/ristretto255/tree/v0.2.0), and [golang.org/x/crypto](https://go.googlesource.com/crypto/).
 - Exact npm package metadata/tarball: [registry metadata](https://registry.npmjs.org/@serenity-kit/opaque/1.1.0), [published tarball](https://registry.npmjs.org/@serenity-kit/opaque/-/opaque-1.1.0.tgz), and [verified provenance record](opaque-provenance-verification.md).
 - Attested Rust source: [`Cargo.toml` at source commit](https://github.com/serenity-kit/opaque/blob/ca1cb22f03b9e456159ce367e2975124f87f5ad8/Cargo.toml); [opaque-ke crate manifest](https://github.com/novifinancial/opaque-ke/blob/main/opaque-ke/Cargo.toml); [RustCrypto argon2 crate manifest](https://github.com/RustCrypto/password-hashes/blob/master/argon2/Cargo.toml). These manifests establish declared license expressions, not resolved membership in the exact published build.

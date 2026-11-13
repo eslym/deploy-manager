@@ -4,6 +4,8 @@ Research date: **2026-11-13**. Public-read investigation only, targeting the npm
 
 ## Result
 
+Final status: the maintainer subsequently approved the pinned dependency selection with the scoped [accepted risks](opaque-accepted-risks.md); see [gate findings](opaque-gate-findings.md). No upstream contact or rebuild is authorized. NO-GO descriptions below are historical; the missing evidence remains missing rather than being established by approval.
+
 **Subsequent maintainer decision (2026-11-13):** accept the missing-build-records risk and resulting artifact-specific dependency/advisory uncertainty for the pinned browser candidate; do not contact upstream. See [the acceptance scope and limits](opaque-accepted-risks.md#published-browser-wasm-build-input-uncertainty). The request below is retained only as an unsent research artifact. Unknown build inputs remain unknown, not resolved by acceptance.
 
 **No public record located maps the exact Cargo resolution or generated WASM to the verified npm tarball.** The new checks went beyond the previously empty artifact-list lookup: they queried run/job metadata, attempted the public run-log download, inspected the attested commit's release workflow and build scripts, checked release assets, and searched public upstream issue/PR records for lockfile/SBOM/advisory discussion.

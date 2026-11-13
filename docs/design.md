@@ -100,6 +100,8 @@ Design confirmed by the user on 2026-11-12. This records agreed requirements, no
 
 ## OPAQUE authentication and account lifecycle
 
+Dependency selection approved by the maintainer on 2026-11-13: Bytemare Go v0.18.0 and the tested Serenity browser package v1.1.0, with the [gate findings](research/opaque-gate-findings.md) and [explicitly accepted risks](research/opaque-accepted-risks.md). The experiment code was removed at the maintainer's request; historical evidence remains linked from the findings. This approval does not waive license/notice obligations before distribution, the required upgrade when the frontend memory-leak fix is published, or production authentication/lifecycle security requirements below.
+
 - RFC 9807 is mandatory for registration and password login. Do not substitute a draft protocol or transmit passwords as a fallback.
 - Before dependency approval, run an isolated feasibility gate: verify exact Go/browser artifacts and security advisories, run RFC vectors and browser-to-Go registration/login tests, and measure browser resource costs. Bytemare Go with Serenity browser WASM is a candidate, not an approved or proven pairing. Unresolved security issues block shipping; unaudited implementation risk requires explicit acceptance or independent review.
 - Require JavaScript/WASM for authentication. Embed pinned first-party crypto assets in the executable and load them on authentication pages, not ordinary dashboard pages. Initialization failure produces a useful error, not a password-post fallback. HTTPS is mandatory.

@@ -1,8 +1,0 @@
-{
-  "name": "serenity-wasm-go-probe",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "inspect": "bun run extract-and-inspect.mjs"
-  }
-}

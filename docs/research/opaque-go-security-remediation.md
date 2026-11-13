@@ -1,5 +1,7 @@
 # Isolated Go advisory remediation
 
+Historical experiment record, retained after the maintainer approved dependency selection and requested removal of experiment code on 2026-11-13. The commands below refer to [the archived experiment](https://github.com/eslym/deploy-manager/tree/a069572/experiments/opaque-gate), not the current checkout. See the [final gate decision](opaque-gate-findings.md); the initial NO-GO at the end is historical.
+
 This change is limited to the OPAQUE feasibility experiment. It does not approve these dependencies for production or change the application dependency graph.
 
 ## Changes
