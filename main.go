@@ -15,7 +15,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: deploy-manager <setup|serve> [flags]")
+		fmt.Fprintln(os.Stderr, "usage: deploy-manager <setup|recover|serve> [flags]")
 		os.Exit(2)
 	}
 	command := os.Args[1]
@@ -29,15 +29,23 @@ func main() {
 	loginTTL := flags.Duration("login-ttl", 2*time.Minute, "maximum lifetime of an OPAQUE login handshake")
 	sessionTTL := flags.Duration("session-ttl", 12*time.Hour, "maximum lifetime of an authenticated session")
 	gitTimeout := flags.Duration("git-timeout", 2*time.Minute, "maximum duration of a repository fetch")
+	grantTTL := flags.Duration("grant-ttl", 15*time.Minute, "maximum lifetime of a setup or recovery link")
+	recentAuthTTL := flags.Duration("recent-auth-ttl", 5*time.Minute, "maximum age of OPAQUE authentication for credential changes")
+	authRate := flags.Int("auth-rate-per-minute", 20, "maximum authentication requests per client per minute")
 	_ = flags.Parse(os.Args[2:])
-	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), CanonicalOrigin: *origin, InsecureLocalHTTP: true, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, GitTimeout: *gitTimeout})
+	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout})
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer app.Close()
 	switch command {
-	case "setup":
-		token, err := app.IssueRegistrationGrant()
+	case "setup", "recover":
+		var token string
+		if command == "recover" {
+			token, err = app.IssueRecoveryGrant()
+		} else {
+			token, err = app.IssueRegistrationGrant()
+		}
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -56,7 +64,12 @@ func main() {
 			}
 			url = scheme + "://" + net.JoinHostPort(host, port(*listen))
 		}
-		link, err := app.RegistrationURL(url, token)
+		var link string
+		if command == "recover" {
+			link, err = app.RecoveryURL(url, token)
+		} else {
+			link, err = app.RegistrationURL(url, token)
+		}
 		if err != nil {
 			log.Fatal(err)
 		}

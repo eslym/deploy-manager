@@ -19,10 +19,17 @@ const (
 )
 
 type pendingLogin struct {
-	clientMAC []byte
-	expires   time.Time
-	origin    string
-	remoteIP  string
+	clientMAC  []byte
+	expires    time.Time
+	origin     string
+	remoteIP   string
+	generation int64
+}
+
+type sessionState struct {
+	expires         time.Time
+	generation      int64
+	authenticatedAt time.Time
 }
 
 func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
@@ -49,7 +56,8 @@ func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var registration []byte
-	if err = a.db.QueryRow(`SELECT registration_record FROM administrator WHERE id=1`).Scan(&registration); err != nil {
+	var generation int64
+	if err = a.db.QueryRow(`SELECT registration_record,credential_generation FROM administrator WHERE id=1`).Scan(&registration, &generation); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			http.Error(w, "login unavailable", http.StatusUnauthorized)
 		} else {
@@ -87,7 +95,7 @@ func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	a.logins[transaction] = pendingLogin{clientMAC: append([]byte(nil), output.ClientMAC...), expires: now.Add(a.cfg.LoginTTL), origin: r.Header.Get("Origin"), remoteIP: remoteIP}
+	a.logins[transaction] = pendingLogin{clientMAC: append([]byte(nil), output.ClientMAC...), expires: now.Add(a.cfg.LoginTTL), origin: r.Header.Get("Origin"), remoteIP: remoteIP, generation: generation}
 	a.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
@@ -140,17 +148,27 @@ func (a *App) loginFinish(w http.ResponseWriter, r *http.Request) {
 	digest := sha256.Sum256(token)
 	expires := a.cfg.Now().Add(a.cfg.SessionTTL)
 	a.mu.Lock()
+	if err := a.refreshCredentialGenerationLocked(); err != nil {
+		a.mu.Unlock()
+		http.Error(w, "login temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
 	for existing, expiry := range a.sessions {
-		if !expiry.After(a.cfg.Now()) {
+		if !expiry.expires.After(a.cfg.Now()) {
 			delete(a.sessions, existing)
 		}
+	}
+	if pending.generation != a.credentialGeneration {
+		a.mu.Unlock()
+		http.Error(w, "login could not be verified", http.StatusUnauthorized)
+		return
 	}
 	if len(a.sessions) >= 10000 {
 		a.mu.Unlock()
 		http.Error(w, "too many active sessions; try again shortly", http.StatusTooManyRequests)
 		return
 	}
-	a.sessions[digest] = expires
+	a.sessions[digest] = sessionState{expires: expires, generation: pending.generation, authenticatedAt: a.cfg.Now()}
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: base64.RawURLEncoding.EncodeToString(token), Path: "/", Expires: expires, MaxAge: int(a.cfg.SessionTTL.Seconds()), Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	w.Header().Set("Cache-Control", "no-store")
@@ -198,8 +216,11 @@ func (a *App) session(r *http.Request) ([32]byte, bool) {
 	digest := sha256.Sum256(token)
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	expires, ok := a.sessions[digest]
-	if !ok || !expires.After(a.cfg.Now()) {
+	if a.refreshCredentialGenerationLocked() != nil {
+		return [32]byte{}, false
+	}
+	state, ok := a.sessions[digest]
+	if !ok || !state.expires.After(a.cfg.Now()) || state.generation != a.credentialGeneration {
 		delete(a.sessions, digest)
 		return [32]byte{}, false
 	}

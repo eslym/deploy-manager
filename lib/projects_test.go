@@ -35,7 +35,7 @@ func TestProjectHTTPRejectsUnauthenticatedAndUnsupportedURLs(t *testing.T) {
 	token := []byte("0123456789abcdef0123456789abcdef")
 	digest := sha256.Sum256(token)
 	app.mu.Lock()
-	app.sessions[digest] = time.Now().Add(time.Hour)
+	app.sessions[digest] = sessionState{expires: time.Now().Add(time.Hour), generation: app.credentialGeneration, authenticatedAt: time.Now()}
 	app.mu.Unlock()
 	body := `{"name":"private","url":"https://user:secret@example.test/repo.git"}`
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/projects", strings.NewReader(body))
