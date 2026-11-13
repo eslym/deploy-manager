@@ -53,6 +53,8 @@ Follow-up: npm package-signature and Sigstore/SLSA cryptographic verification no
 
 ## Decision
 
+The maintainer has explicitly [accepted the unaudited Bytemare v0.18.0 implementation risk](../../docs/research/opaque-accepted-risks.md#unaudited-bytemare-opaque-implementation). This resolves that specific human risk-acceptance requirement, not overall dependency approval; historical statements below must be read with this update.
+
 Update: the maintainer has also [accepted the missing published-WASM build-records risk and consequent artifact-specific advisory uncertainty](../../docs/research/opaque-accepted-risks.md#published-browser-wasm-build-input-uncertainty) for the exact pinned frontend candidate. These unknowns remain unknown; no upstream contact is authorized. License obligations, unaudited Bytemare risk and overall dependency approval are not waived. The NO-GO below therefore remains pending the other gate requirements.
 
 The maintainer has [accepted the frontend malformed-argument WASM memory-leak risk](../../docs/research/opaque-accepted-risks.md), with an upgrade required as soon as the upstream fix is published. This limited acceptance does not waive any other security gate.

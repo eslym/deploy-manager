@@ -20,3 +20,12 @@ This risk acceptance removes only the requirement to wait for the memory-leak fi
 - **No upstream contact:** do not send the drafted maintainer request on the basis of this decision.
 - **Limits:** this does not waive applicable license or notice obligations, accept Bytemare's unaudited implementation risk, authorize backend WASM use, or grant overall production dependency approval. Any subsequently established exploitable vulnerability requires reassessment; it is not preaccepted by this uncertainty decision.
 - **Follow-up:** retain the pinned bytes and integrity/provenance evidence, reassess when upstream provides build records or a new candidate is evaluated, and keep the separate mandatory memory-leak upgrade obligation above. Do not replace missing build evidence with claims inferred from current semver resolution.
+
+## Unaudited Bytemare OPAQUE implementation
+
+- **Accepted by:** the project maintainer, explicitly in conversation on 2026-11-13.
+- **Affected candidate:** `github.com/bytemare/opaque v0.18.0`, used by the native-Go server candidate with the tested dependency graph in `experiments/opaque-gate/go.mod` and `go.sum`.
+- **Known risk:** upstream explicitly states that this implementation has not been independently audited. RFC vector success, browser/Bun interoperability and clean vulnerability scans do not establish cryptographic correctness or exclude implementation flaws, timing/side-channel weaknesses, or integration vulnerabilities. See the [pinned upstream disclaimer](https://github.com/bytemare/opaque/blob/v0.18.0/README.md).
+- **Scope of acceptance:** the absence of an independent audit and its residual implementation risk are knowingly accepted for this pinned candidate. This satisfies the design's explicit-human-acceptance alternative to independent review for this audit-risk decision; it does not claim an audit occurred or that the library is proven safe.
+- **Limits:** this is not overall production dependency approval, acceptance of a subsequently established vulnerability, a waiver of license obligations, or permission to omit the required application authentication/session/lifecycle protections and tests. Other risk acceptances above remain separately scoped.
+- **Follow-up:** retain exact version/dependency pins and test evidence, monitor upstream advisories and audit findings, reassess on implementation or cryptographic-profile changes, and review any newly established vulnerability before shipping affected code.

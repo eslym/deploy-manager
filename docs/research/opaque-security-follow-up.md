@@ -4,6 +4,8 @@ Research date: **2026-11-13**. This supplements (does not replace) [the OPAQUE f
 
 ## Summary and decision
 
+**Bytemare audit-risk decision (2026-11-13):** the maintainer now explicitly accepts the known risk of using unaudited `github.com/bytemare/opaque v0.18.0`. See [the scoped acceptance](opaque-accepted-risks.md#unaudited-bytemare-opaque-implementation). Earlier statements below requesting that acceptance are historical. Overall dependency approval and other gate/compliance requirements remain outstanding.
+
 **Maintainer risk-acceptance update (2026-11-13):** missing exact published-WASM build records and the resulting dependency/advisory uncertainty are now explicitly accepted for the pinned frontend candidate; no upstream request is authorized. See [accepted risks](opaque-accepted-risks.md#published-browser-wasm-build-input-uncertainty). Historical descriptions of these evidence gaps below remain accurate, but they are now accepted residual uncertainty rather than awaiting this specific human decision. This does not waive license obligations, accept Bytemare's unaudited risk, or approve production dependencies.
 
 **Subsequent verification update:** npm package and Sigstore/SLSA provenance signatures have now been cryptographically verified, including the expected workflow identity, subject digest and transparency proof. See [verification commands and trust assumptions](opaque-provenance-verification.md). The initial signature-verification gaps described below are historical, not remaining blockers. Go remediation is also complete as recorded below. Exact WASM build inputs, license closure, advisory applicability and audit-risk approval remain unresolved; the decision is still NO-GO.
@@ -61,7 +63,7 @@ The initial investigation did not launch a browser or modify dependencies. The s
 
 **Resolved:** registry tarball identity against npm integrity; existence and decoded content of provenance claims; upstream run identity/status; the 1.1.1 publication gap; Go toolchain/dependency advisories in the isolated harness, with regression validation.
 
-**Remaining approval/compliance work:** unaudited Bytemare risk requires independent review or explicit authorized acceptance, overall dependency approval remains outstanding, and applicable license/notice obligations still apply. Exact WASM build closure and artifact-specific RustSec reachability remain unknown but their uncertainty is now accepted within the pinned frontend scope; do not describe them as patched or proven safe. The frontend memory leak is separately accepted with an upgrade obligation. Issue #2 and dependent authentication work remain blocked pending the remaining gate decisions and requirements; no upstream request or rebuild is authorized by these acceptances.
+**Remaining approval/compliance work:** overall dependency approval remains outstanding, and applicable license/notice obligations still apply. The maintainer has explicitly accepted the unaudited Bytemare implementation risk for v0.18.0. Exact WASM build closure and artifact-specific RustSec reachability remain unknown but their uncertainty is accepted within the pinned frontend scope; do not describe them as patched or proven safe. The frontend memory leak is separately accepted with an upgrade obligation. Issue #2 and dependent authentication work remain blocked pending the remaining gate decisions and requirements; no upstream request or rebuild is authorized by these acceptances.
 
 ## Primary sources
 
