@@ -18,7 +18,9 @@ try {
   const setup = spawnSync(executable, ["setup", "--data", dir, "--listen", listen], { encoding: "utf8" });
   if (setup.status !== 0) throw new Error(setup.stderr || "CLI setup failed");
   const link = setup.stdout.trim();
-  if (!link.startsWith("http://127.0.0.1:18437/register?token=")) throw new Error("setup CLI did not issue a loopback setup URL");
+  const issuedURL = new URL(link);
+  const grant = issuedURL.hash.slice(1);
+  if (issuedURL.origin !== "http://127.0.0.1:18437" || issuedURL.pathname !== "/register" || issuedURL.search || !grant) throw new Error("setup CLI did not issue a fragment-only loopback setup URL");
   const failedInitSetup = spawnSync(executable, ["setup", "--data", dir, "--listen", listen], { encoding: "utf8" });
   if (failedInitSetup.status !== 0) throw new Error(failedInitSetup.stderr || "second setup grant failed");
   const failedInitLink = failedInitSetup.stdout.trim();
@@ -41,6 +43,8 @@ try {
   const browserPath = process.env.CHROMIUM_PATH || chromium.executablePath();
   browser = await chromium.launch({ headless: true, executablePath: browserPath, args: ["--no-sandbox"] });
   const context = await browser.newContext();
+  const observedURLs = [];
+  context.on("request", request => observedURLs.push(request.url()));
   const failedInitPage = await context.newPage();
   let initRequests = 0;
   failedInitPage.on("request", request => { if (request.method() === "POST") initRequests++; });
@@ -49,11 +53,18 @@ try {
   await failedInitPage.getByText(/Secure registration could not initialize/).waitFor({ timeout: 30000 });
   if (initRequests !== 0) throw new Error("initialization failure attempted to send a password or registration request");
   await failedInitPage.close();
+  const noGrantPage = await context.newPage();
+  let noGrantPosts = 0;
+  noGrantPage.on("request", request => { if (request.method() === "POST") noGrantPosts++; });
+  await noGrantPage.goto(`http://${listen}/register`);
+  await noGrantPage.getByText(/setup link is incomplete/).waitFor({ timeout: 30000 });
+  if (noGrantPosts !== 0) throw new Error("missing grant fell back to an unprotected registration request");
+  await noGrantPage.close();
   const page = await context.newPage();
   const postedBodies = [];
   page.on("request", request => { if (request.method() === "POST") postedBodies.push(request.postData() || ""); });
   let finishRaceStatuses;
-  await page.route("**/opaque/register/finish?*", async route => {
+  await page.route("**/opaque/register/finish", async route => {
     const results = await Promise.all([route.fetch(), route.fetch()]);
     finishRaceStatuses = results.map(result => result.status()).sort((a, b) => a - b);
     const accepted = results.find(result => result.status() === 204);
@@ -61,11 +72,14 @@ try {
     await route.fulfill({ response: accepted });
   });
   await page.goto(link);
+  if (new URL(page.url()).hash || !page.url().endsWith("/register")) throw new Error("browser did not remove the grant fragment from the visible URL");
   await page.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
   await page.getByLabel("Password").fill("Correct horse battery staple 2026!");
   await page.getByRole("button", { name: "Create administrator" }).click();
   await page.getByText("Administrator account created. Registration does not sign you in.").waitFor({ timeout: 60000 });
   if (JSON.stringify(finishRaceStatuses) !== JSON.stringify([204, 410])) throw new Error(`grant consumption race was not single-use: ${finishRaceStatuses}`);
+  if (observedURLs.some(url => url.includes(grant))) throw new Error("registration grant leaked into a browser request URL");
+  if (!postedBodies.length || postedBodies.some(body => !body.includes(grant))) throw new Error("grant was not sent with protected registration POST bodies");
   if (await context.cookies().then(c => c.length)) throw new Error("registration unexpectedly issued a session cookie");
   for (const body of postedBodies) {
     if (body.includes("Correct horse battery staple") || body.includes("clientRegistrationState") || body.includes("exportKey") || body.includes("sessionKey")) {
@@ -73,14 +87,14 @@ try {
     }
   }
   const setupReuse = await fetch(link);
-  if (setupReuse.status !== 410) throw new Error(`registration should be disabled after bootstrap (got ${setupReuse.status})`);
-  const issuedTokens = [new URL(link).searchParams.get("token"), new URL(failedInitLink).searchParams.get("token")];
+  if (setupReuse.status !== 404) throw new Error(`registration should be disabled after bootstrap (got ${setupReuse.status})`);
+  const issuedTokens = [grant, new URL(failedInitLink).hash.slice(1)];
   if (issuedTokens.some(token => serverOutput.includes(token))) throw new Error("setup grants appeared in routine application logs");
   server.kill("SIGTERM");
   await once(server, "exit");
   await startServer();
   const afterRestart = await fetch(link);
-  if (afterRestart.status !== 410) throw new Error(`registration state did not survive restart (got ${afterRestart.status})`);
+  if (afterRestart.status !== 404) throw new Error(`registration state did not survive restart (got ${afterRestart.status})`);
   const secondSetup = spawnSync(executable, ["setup", "--data", dir, "--listen", listen], { encoding: "utf8" });
   if (secondSetup.status === 0) throw new Error("CLI issued a new grant after administrator registration");
   await context.close();

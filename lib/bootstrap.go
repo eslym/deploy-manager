@@ -72,54 +72,9 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 	c := opaque.DefaultConfiguration()
-	var material *opaque.ServerKeyMaterial
-	var keyGeneration string
-	keyInfo, keyStatErr := os.Lstat(cfg.OPAQUEKeyPath)
-	if keyStatErr == nil && (!keyInfo.Mode().IsRegular() || keyInfo.Mode().Perm()&0077 != 0) {
-		return nil, errors.New("OPAQUE key file must be a regular file readable only by its owner")
-	}
-	data, err := os.ReadFile(cfg.OPAQUEKeyPath)
-	if err == nil {
-		if len(data) < len(opaqueKeyMagic)+16 || string(data[:len(opaqueKeyMagic)]) != opaqueKeyMagic {
-			return nil, errors.New("invalid OPAQUE key file format")
-		}
-		keyGeneration = base64.RawURLEncoding.EncodeToString(data[len(opaqueKeyMagic) : len(opaqueKeyMagic)+16])
-		material, err = c.DecodeServerKeyMaterial(data[len(opaqueKeyMagic)+16:])
-		if err != nil {
-			return nil, fmt.Errorf("decode OPAQUE key: %w", err)
-		}
-		// Bytemare's current SKM decoder rejects empty trailing identity vectors.
-		// The empty identity is the protocol default (server public key).
-		material.Identity = nil
-	} else if !os.IsNotExist(err) {
+	material, keyGeneration, err := loadOPAQUEServerKey(c, cfg.OPAQUEKeyPath, prior)
+	if err != nil {
 		return nil, err
-	} else if prior {
-		return nil, errors.New("OPAQUE key file is missing; refusing to regenerate authentication keys")
-	} else {
-		priv, pub := c.KeyGen()
-		material = &opaque.ServerKeyMaterial{PrivateKey: priv, PublicKeyBytes: pub.Encode(), OPRFGlobalSeed: c.GenerateOPRFSeed(), Identity: []byte("deploy-manager-keyfile")}
-		generation := make([]byte, 16)
-		if _, err = rand.Read(generation); err != nil {
-			return nil, err
-		}
-		keyGeneration = base64.RawURLEncoding.EncodeToString(generation)
-		encoded := append(append(append([]byte(nil), opaqueKeyMagic...), generation...), material.Encode()...)
-		material.Identity = nil
-		if err = writeExclusive(cfg.OPAQUEKeyPath, encoded); err != nil {
-			return nil, err
-		}
-		dir, openErr := os.Open(filepath.Dir(cfg.OPAQUEKeyPath))
-		if openErr != nil {
-			return nil, openErr
-		}
-		err = dir.Sync()
-		closeErr := dir.Close()
-		if err != nil {
-			return nil, err
-		}
-		if closeErr != nil {
-			return nil, closeErr
-		}
 	}
 	protocol, err := opaque.NewServer(c)
 	if err != nil {
@@ -187,6 +142,59 @@ func New(cfg Config) (*App, error) {
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
 	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, rate: make(map[string][]time.Time)}, nil
+}
+
+func loadOPAQUEServerKey(c *opaque.Configuration, path string, priorDatabase bool) (*opaque.ServerKeyMaterial, string, error) {
+	keyInfo, keyStatErr := os.Lstat(path)
+	if keyStatErr == nil && (!keyInfo.Mode().IsRegular() || keyInfo.Mode().Perm()&0077 != 0) {
+		return nil, "", errors.New("OPAQUE key file must be a regular file readable only by its owner")
+	}
+	data, err := os.ReadFile(path)
+	if err == nil {
+		if len(data) < len(opaqueKeyMagic)+16 || string(data[:len(opaqueKeyMagic)]) != opaqueKeyMagic {
+			return nil, "", errors.New("invalid OPAQUE key file format")
+		}
+		keyGeneration := base64.RawURLEncoding.EncodeToString(data[len(opaqueKeyMagic) : len(opaqueKeyMagic)+16])
+		material, err := c.DecodeServerKeyMaterial(data[len(opaqueKeyMagic)+16:])
+		if err != nil {
+			return nil, "", fmt.Errorf("decode OPAQUE key: %w", err)
+		}
+		// Bytemare's current SKM decoder rejects empty trailing identity vectors.
+		// The empty identity is the protocol default (server public key).
+		material.Identity = nil
+		return material, keyGeneration, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, "", err
+	}
+	if priorDatabase {
+		return nil, "", errors.New("OPAQUE key file is missing; refusing to regenerate authentication keys")
+	}
+	priv, pub := c.KeyGen()
+	material := &opaque.ServerKeyMaterial{PrivateKey: priv, PublicKeyBytes: pub.Encode(), OPRFGlobalSeed: c.GenerateOPRFSeed(), Identity: []byte("deploy-manager-keyfile")}
+	generation := make([]byte, 16)
+	if _, err := rand.Read(generation); err != nil {
+		return nil, "", err
+	}
+	keyGeneration := base64.RawURLEncoding.EncodeToString(generation)
+	encoded := append(append(append([]byte(nil), opaqueKeyMagic...), generation...), material.Encode()...)
+	material.Identity = nil
+	if err := writeExclusive(path, encoded); err != nil {
+		return nil, "", err
+	}
+	dir, openErr := os.Open(filepath.Dir(path))
+	if openErr != nil {
+		return nil, "", openErr
+	}
+	err = dir.Sync()
+	closeErr := dir.Close()
+	if err != nil {
+		return nil, "", err
+	}
+	if closeErr != nil {
+		return nil, "", closeErr
+	}
+	return material, keyGeneration, nil
 }
 
 const opaqueKeyMagic = "DMOPAQUE1"
@@ -269,9 +277,8 @@ func (a *App) RegistrationURL(base, token string) (string, error) {
 		return "", errors.New("registration URL must use HTTPS; HTTP is allowed only for loopback")
 	}
 	u.Path = "/register"
-	q := u.Query()
-	q.Set("token", token)
-	u.RawQuery = q.Encode()
+	u.RawQuery = ""
+	u.Fragment = token
 	return u.String(), nil
 }
 func isLoopback(h string) bool {
@@ -356,10 +363,6 @@ func (a *App) registerPage(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "too many registration attempts", http.StatusTooManyRequests)
 		return
 	}
-	if !a.validGrant(r.URL.Query().Get("token")) {
-		http.Error(w, "Registration link is invalid or expired. Request a new setup link with the local CLI.", http.StatusGone)
-		return
-	}
 	var n int
 	if err := a.db.QueryRow(`SELECT count(*) FROM administrator`).Scan(&n); err != nil {
 		http.Error(w, "registration is temporarily unavailable", http.StatusInternalServerError)
@@ -410,6 +413,7 @@ func (a *App) allow(r *http.Request) bool {
 }
 
 type protocolMessage struct {
+	Grant string `json:"grant"`
 	Value string `json:"value"`
 }
 
@@ -453,7 +457,7 @@ func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !a.validGrant(r.URL.Query().Get("token")) {
+	if !a.validGrant(m.Grant) {
 		http.Error(w, "invalid or expired grant", 410)
 		return
 	}
@@ -479,7 +483,7 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	token := r.URL.Query().Get("token")
+	token := m.Grant
 	b, e := decodeValue(m.Value)
 	if e != nil {
 		http.Error(w, "invalid protocol message", 400)

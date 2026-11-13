@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,7 +35,7 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 			t.Fatalf("registration grant persisted in plaintext in %s", filepath.Base(path))
 		}
 	}
-	req := httptest.NewRequest(http.MethodGet, "/register?token="+grant, nil)
+	req := httptest.NewRequest(http.MethodGet, "/register", nil)
 	req.RemoteAddr = "127.0.0.1:43210"
 	req.Host = "127.0.0.1:8080"
 	res := httptest.NewRecorder()
@@ -79,7 +80,7 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer app.Close()
-	req = httptest.NewRequest(http.MethodGet, "/register?token="+grant, nil)
+	req = httptest.NewRequest(http.MethodGet, "/register", nil)
 	req.RemoteAddr = "127.0.0.1:43210"
 	req.Host = "127.0.0.1:8080"
 	res = httptest.NewRecorder()
@@ -102,7 +103,7 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := httptest.NewRequest(http.MethodGet, "/register?token="+token, nil)
+	req := httptest.NewRequest(http.MethodGet, "/register", nil)
 	req.RemoteAddr, req.Host = "127.0.0.1:4321", "127.0.0.1:8080"
 	res := httptest.NewRecorder()
 	app.Handler().ServeHTTP(res, req)
@@ -110,8 +111,12 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 		t.Fatalf("fresh local grant rejected: %d", res.Code)
 	}
 	now = now.Add(2 * time.Minute)
+	expired := httptest.NewRequest(http.MethodPost, "/opaque/register/start", strings.NewReader(`{"grant":"`+token+`","value":"AA"}`))
+	expired.RemoteAddr, expired.Host = "127.0.0.1:4321", "127.0.0.1:8080"
+	expired.Header.Set("Origin", "http://127.0.0.1:8080")
+	expired.Header.Set("Content-Type", "application/json")
 	res = httptest.NewRecorder()
-	app.Handler().ServeHTTP(res, req)
+	app.Handler().ServeHTTP(res, expired)
 	if res.Code != http.StatusGone {
 		t.Fatalf("expired grant status = %d, want 410", res.Code)
 	}
@@ -126,7 +131,7 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxyReq := httptest.NewRequest(http.MethodGet, "/register?token="+proxyGrant, nil)
+	proxyReq := httptest.NewRequest(http.MethodGet, "/register", nil)
 	proxyReq.RemoteAddr, proxyReq.Host = "127.0.0.1:4321", "manager.example:443"
 	proxyReq.Header.Set("X-Forwarded-Proto", "https")
 	proxyRes := httptest.NewRecorder()
@@ -134,7 +139,7 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	if proxyRes.Code != http.StatusOK {
 		t.Fatalf("trusted HTTPS reverse proxy registration status = %d", proxyRes.Code)
 	}
-	csrf := httptest.NewRequest(http.MethodPost, "/opaque/register/start?token="+proxyGrant, strings.NewReader(`{"value":"AA"}`))
+	csrf := httptest.NewRequest(http.MethodPost, "/opaque/register/start", strings.NewReader(`{"grant":"`+proxyGrant+`","value":"AA"}`))
 	csrf.RemoteAddr, csrf.Host = "127.0.0.1:4321", "manager.example:443"
 	csrf.Header.Set("X-Forwarded-Proto", "https")
 	csrf.Header.Set("Origin", "https://attacker.example")
@@ -142,6 +147,30 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	app.Handler().ServeHTTP(csrfRes, csrf)
 	if csrfRes.Code != http.StatusForbidden {
 		t.Fatalf("cross-origin registration POST status = %d, want 403", csrfRes.Code)
+	}
+}
+
+func TestRegistrationURLKeepsGrantInFragment(t *testing.T) {
+	dir := t.TempDir()
+	app, err := New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	grant, err := app.IssueRegistrationGrant()
+	if err != nil {
+		t.Fatal(err)
+	}
+	link, err := app.RegistrationURL("http://localhost:8080", grant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u, err := url.Parse(link)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.RawQuery != "" || u.Fragment != grant {
+		t.Fatalf("registration URL = %q; grant must be fragment-only", link)
 	}
 }
 

@@ -21,6 +21,12 @@ OPAQUE key/profile generations fail closed. Back up both the data file and its
 external key together; there is no key-rotation or recovery command in this
 bootstrap-only slice.
 
+The setup grant is placed after `#` in the registration URL, so the browser
+does not send it in the initial navigation or subsequent resource request URLs.
+The registration script removes the fragment from the visible URL before any
+POST and includes the grant only in the protected JSON request body. It never
+falls back to an unprotected registration request.
+
 The browser checks are in `tests/browser/`. Install the pinned test package
 with `cd tests/browser && bun install --frozen-lockfile`; run
 `node registration.mjs` where Go 1.26.11, CGO, and the Playwright 1.65.0
@@ -32,8 +38,9 @@ docker build -t deploy-manager-browser-tests -f tests/browser/Dockerfile .
 docker run --rm -v "$PWD:/workspace" deploy-manager-browser-tests
 ```
 
-The browser test covers CLI grant
-issuance, initialization failure, real Chromium-to-Go OPAQUE registration,
+The browser test covers fragment-only CLI grant issuance and absence from all
+browser request URLs, missing-grant and initialization failure, real
+Chromium-to-Go OPAQUE registration,
 concurrent grant consumption, restart durability, registration disablement,
 and absence of a session cookie/password transmission.
 
