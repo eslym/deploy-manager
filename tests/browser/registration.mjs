@@ -12,7 +12,7 @@ const executable = join(dir, "deploy-manager");
 let server;
 let browser;
 let serverOutput = "";
-const testPassword = "Correct horse battery staple 2026!";
+let testPassword = "Correct horse battery staple 2026!";
 
 function redact(value, grant = "") {
   let text = String(value);
@@ -290,7 +290,7 @@ try {
   const secureOrigin = `https://127.0.0.1:${secureListen.split(":")[1]}`;
   const certificate = spawnSync("openssl", ["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert, "-subj", "/CN=localhost", "-addext", "subjectAltName=DNS:localhost,IP:127.0.0.1", "-days", "1"], { encoding: "utf8" });
   if (certificate.status !== 0) throw new Error(certificate.stderr || "Could not create test TLS certificate");
-  server = spawn(executable, ["serve", "--data", dir, "--listen", secureListen, "--tls-cert", cert, "--tls-key", key, "--origin", secureOrigin, "--login-ttl", "3s", "--session-ttl", "30s"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  server = spawn(executable, ["serve", "--data", dir, "--listen", secureListen, "--tls-cert", cert, "--tls-key", key, "--origin", secureOrigin, "--login-ttl", "3s", "--session-ttl", "30s", "--recent-auth-ttl", "1s", "--auth-rate-per-minute", "100"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   server.stdout.on("data", chunk => { serverOutput += chunk.toString(); });
   server.stderr.on("data", chunk => { serverOutput += chunk.toString(); });
   await new Promise((resolve, reject) => {
@@ -378,6 +378,9 @@ try {
   await authPage.getByLabel("Password").fill(testPassword);
   await authPage.getByRole("button", { name: "Sign in" }).click();
   await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  await authPage.waitForTimeout(1200);
+  const staleAuthChange = await authPage.evaluate(async () => (await fetch("/opaque/password/change/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value: "AA" }) })).status);
+  if (staleAuthChange !== 401) throw new Error(`password change accepted stale OPAQUE authentication (${staleAuthChange})`);
   if (await authPage.evaluate(() => globalThis.__cspViolations.length)) throw new Error(`CSP blocked dashboard resources: ${await authPage.evaluate(() => globalThis.__cspViolations.join(", "))}`);
   const sessionCookie = (await authContext.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session");
   if (!sessionCookie || !sessionCookie.secure || !sessionCookie.httpOnly || sessionCookie.sameSite !== "Strict") throw new Error("session cookie attributes are not Secure, HttpOnly, and SameSite=Strict");
@@ -414,9 +417,58 @@ try {
   await authPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
   if (await authPage.evaluate(async () => (await fetch("/api/session")).status) !== 401) throw new Error("logout did not revoke the server session");
 
+  const unauthenticatedChange = await authPage.evaluate(async () => (await fetch("/opaque/password/change/start", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ value: "AA" }) })).status);
+  if (unauthenticatedChange !== 401) throw new Error(`password change without recent OPAQUE auth returned ${unauthenticatedChange}`);
   await authPage.getByLabel("Password").fill(testPassword);
   await authPage.getByRole("button", { name: "Sign in" }).click();
   await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+
+  const inflightContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const inflightPage = await inflightContext.newPage();
+  await inflightPage.goto(`${secureOrigin}/login`, { waitUntil: "domcontentloaded" });
+  let staleLogin;
+  await inflightPage.route("**/opaque/login/finish", async route => {
+    staleLogin = JSON.parse(route.request().postData());
+    await route.fulfill({ status: 503, body: "held for credential replacement" });
+  });
+  await inflightPage.getByLabel("Password").fill(testPassword);
+  await inflightPage.getByRole("button", { name: "Sign in" }).click();
+  await inflightPage.getByText("Sign-in failed. Check your password and try again.").waitFor({ timeout: 30000 });
+  if (!staleLogin?.transaction) throw new Error("could not create a pre-replacement login handshake");
+  const secondSessionContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const secondSessionPage = await secondSessionContext.newPage();
+  await secondSessionPage.goto(`${secureOrigin}/login`, { waitUntil: "domcontentloaded" });
+  await secondSessionPage.getByLabel("Password").fill(testPassword);
+  await secondSessionPage.getByRole("button", { name: "Sign in" }).click();
+  await secondSessionPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+
+  const passwordChangeBodies = [];
+  const passwordLoginResults = [];
+  authPage.on("request", request => { if (request.method() === "POST") passwordChangeBodies.push(request.postData() || ""); });
+  authPage.on("response", response => { if (response.url().includes("/opaque/login/")) passwordLoginResults.push(`${new URL(response.url()).pathname}:${response.status()}`); });
+  await authPage.goto(`${secureOrigin}/account/password`, { waitUntil: "domcontentloaded" });
+  await authPage.getByLabel("Current password").fill(testPassword);
+  const changedPassword = "A new and very secure password 2026!";
+  await authPage.getByLabel("New password").fill(changedPassword);
+  await authPage.getByRole("button", { name: "Change password" }).click();
+  await authPage.getByText(/Password changed/).waitFor({ timeout: 60000 });
+  if (await authPage.evaluate(async () => (await fetch("/api/session")).status) !== 401) throw new Error("credential replacement did not revoke the current session");
+  if (await secondSessionPage.evaluate(async () => (await fetch("/api/session")).status) !== 401) throw new Error("credential replacement did not revoke another active session");
+  if (passwordChangeBodies.some(body => body.includes(testPassword) || body.includes(changedPassword) || body.includes("clientLoginState") || body.includes("clientRegistrationState") || body.includes("sessionKey"))) throw new Error("password change sent a password or local OPAQUE secret state");
+  const staleStatus = await authPage.evaluate(async payload => (await fetch("/opaque/login/finish", { method: "POST", headers: { "Content-Type": "application/json" }, body: payload })).status, JSON.stringify(staleLogin));
+  if (staleStatus !== 401) throw new Error(`pre-replacement login handshake issued a stale session (${staleStatus})`);
+  await inflightContext.close();
+  await secondSessionContext.close();
+  testPassword = changedPassword;
+  await authPage.getByRole("button", { name: "Continue to sign in" }).click();
+  await authPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
+  await authPage.getByLabel("Password").fill("Correct horse battery staple 2026!");
+  await authPage.getByRole("button", { name: "Sign in" }).click();
+  await authPage.getByText("Sign-in failed. Check your password and try again.").waitFor({ timeout: 30000 });
+  await authPage.getByLabel("Password").fill(testPassword);
+  await authPage.getByRole("button", { name: "Sign in" }).click();
+  try { await authPage.getByText(/signed in/).waitFor({ timeout: 30000 }); }
+  catch { throw new Error(`new password login failed: ${await authPage.locator('[role="status"]').allTextContents()} (${passwordLoginResults.join(",")})`); }
   const oldCookie = (await authContext.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session");
   if (!oldCookie) throw new Error("could not capture active session before restart");
 
@@ -436,7 +488,7 @@ try {
 
   server.kill("SIGTERM");
   await once(server, "exit");
-  server = spawn(executable, ["serve", "--data", dir, "--listen", secureListen, "--tls-cert", cert, "--tls-key", key, "--origin", secureOrigin], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  server = spawn(executable, ["serve", "--data", dir, "--listen", secureListen, "--tls-cert", cert, "--tls-key", key, "--origin", secureOrigin, "--recent-auth-ttl", "1s", "--auth-rate-per-minute", "100"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   server.stdout.on("data", chunk => { serverOutput += chunk.toString(); });
   server.stderr.on("data", chunk => { serverOutput += chunk.toString(); });
   await new Promise((resolve, reject) => {
@@ -453,10 +505,72 @@ try {
   const interruptedStatus = await httpsPostStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/opaque/login/finish", secureOrigin, interruptedLogin);
   if (interruptedStatus !== 401) throw new Error(`pre-restart login handshake survived restart: ${interruptedStatus}`);
   await pendingContext.close();
+
+  const expiredRecoveryCommand = spawnSync(executable, ["recover", "--data", dir, "--listen", secureListen, "--url", secureOrigin, "--grant-ttl", "1s"], { cwd: dir, encoding: "utf8" });
+  if (expiredRecoveryCommand.status !== 0) throw new Error(expiredRecoveryCommand.stderr || "short recovery CLI failed");
+  const expiredGrant = new URL(expiredRecoveryCommand.stdout.trim()).hash.slice(1);
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  const expiredRecoveryStatus = await httpsPostStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/opaque/register/start", secureOrigin, { grant: expiredGrant, value: "AA" });
+  if (expiredRecoveryStatus !== 410) throw new Error(`expired recovery grant returned ${expiredRecoveryStatus}, expected 410`);
+  const recoveryCommand = spawnSync(executable, ["recover", "--data", dir, "--listen", secureListen, "--url", secureOrigin], { cwd: dir, encoding: "utf8" });
+  if (recoveryCommand.status !== 0) throw new Error(recoveryCommand.stderr || "recovery CLI failed");
+  const recoveryLink = recoveryCommand.stdout.trim();
+  const recoveryURL = new URL(recoveryLink);
+  const recoveryGrant = recoveryURL.hash.slice(1);
+  if (recoveryURL.pathname !== "/recover" || recoveryURL.origin !== secureOrigin || !recoveryGrant || recoveryURL.search) throw new Error("recovery CLI did not issue a fragment-only recovery URL");
+  const recoveryContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const recoveryPage = await recoveryContext.newPage();
+  const recoveryBodies = [];
+  const recoveryURLs = [];
+  recoveryPage.on("request", request => { recoveryURLs.push(request.url()); if (request.method() === "POST") recoveryBodies.push(request.postData() || ""); });
+  await recoveryPage.goto(recoveryLink, { waitUntil: "domcontentloaded" });
+  await recoveryPage.getByLabel("Replace password").waitFor({ state: "visible", timeout: 30000 });
+  await recoveryPage.waitForFunction(() => location.hash === "", null, { timeout: 10000 });
+  if (recoveryPage.url().includes(recoveryGrant)) throw new Error("recovery grant remained in the visible URL");
+  const recoveredPassword = "Recovered with a stronger password 2026!";
+  await recoveryPage.getByLabel("Replace password").fill(recoveredPassword);
+  const injectedFailure = spawnSync("go", ["run", join(root, "tests/fault/sqlite-trigger.go"), join(dir, "state.sqlite"), "install"], { cwd: root, encoding: "utf8" });
+  if (injectedFailure.status !== 0) throw new Error(injectedFailure.stderr || "could not install replacement fault injection");
+  await recoveryPage.getByRole("button", { name: "Replace password" }).click();
+  await recoveryPage.getByText("Recovery could not be completed. Check your connection and try again.").waitFor({ timeout: 30000 });
+  const preservedContext = await browser.newContext({ ignoreHTTPSErrors: true });
+  const preservedPage = await preservedContext.newPage();
+  await preservedPage.goto(`${secureOrigin}/login`, { waitUntil: "domcontentloaded" });
+  await preservedPage.getByLabel("Password").fill(testPassword);
+  await preservedPage.getByRole("button", { name: "Sign in" }).click();
+  await preservedPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  await preservedContext.close();
+  const removeFailure = spawnSync("go", ["run", join(root, "tests/fault/sqlite-trigger.go"), join(dir, "state.sqlite"), "remove"], { cwd: root, encoding: "utf8" });
+  if (removeFailure.status !== 0) throw new Error(removeFailure.stderr || "could not remove replacement fault injection");
+  let recoveryRaceStatuses;
+  await recoveryPage.route("**/opaque/register/finish", async route => {
+    const results = await Promise.all([route.fetch(), route.fetch()]);
+    recoveryRaceStatuses = results.map(result => result.status()).sort((a, b) => a - b);
+    const accepted = results.find(result => result.status() === 204);
+    if (!accepted) throw new Error(`recovery race had no accepted request: ${recoveryRaceStatuses}`);
+    await route.fulfill({ response: accepted });
+  });
+  await recoveryPage.getByLabel("Replace password").fill(recoveredPassword);
+  await recoveryPage.getByRole("button", { name: "Replace password" }).click();
+  await recoveryPage.getByText("Administrator password replaced. You can close this page.").waitFor({ timeout: 60000 });
+  if (JSON.stringify(recoveryRaceStatuses) !== JSON.stringify([204, 410])) throw new Error(`recovery grant was not atomically consumed: ${recoveryRaceStatuses}`);
+  if (recoveryURLs.some(url => url.includes(recoveryGrant))) throw new Error("recovery grant leaked into a request URL");
+  if (!recoveryBodies.length || recoveryBodies.some(body => !body.includes(recoveryGrant) || body.includes(recoveredPassword) || body.includes("clientRegistrationState"))) throw new Error("recovery requests omitted grant or transmitted a password/client state");
+  const reusedRecovery = await httpsPostStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/opaque/register/start", secureOrigin, { grant: recoveryGrant, value: "AA" });
+  if (reusedRecovery !== 410) throw new Error(`spent recovery grant returned ${reusedRecovery}, expected 410`);
+  await recoveryPage.goto(`${secureOrigin}/login`, { waitUntil: "domcontentloaded" });
+  await recoveryPage.getByLabel("Password").fill(testPassword);
+  await recoveryPage.getByRole("button", { name: "Sign in" }).click();
+  await recoveryPage.getByText("Sign-in failed. Check your password and try again.").waitFor({ timeout: 30000 });
+  await recoveryPage.getByLabel("Password").fill(recoveredPassword);
+  await recoveryPage.getByRole("button", { name: "Sign in" }).click();
+  await recoveryPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  await recoveryContext.close();
+  if (serverOutput.includes(recoveryGrant)) throw new Error("recovery grant appeared in routine application logs");
   if (authBodies.some(body => body.includes(testPassword) || body.includes("clientLoginState") || body.includes("sessionKey"))) throw new Error("browser login traffic contained password or OPAQUE secret state");
   await authContext.close();
   await context.close();
-  console.log("combined-binary browser regression passed: embedded SPA, registration, OPAQUE login, one-use KE3, secure sessions, logout, CSRF, and restart invalidation");
+  console.log("combined-binary browser regression passed: registration, login, secure password change, recovery, atomic credential replacement, session/handshake revocation, and restart invalidation");
 } finally {
   await browser?.close();
   if (server && server.exitCode === null) {

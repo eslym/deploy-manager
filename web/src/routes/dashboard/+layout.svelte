@@ -35,6 +35,10 @@
 		>Deploy Manager</a
 	>
 	<div class="flex items-center gap-4">
+		<a
+			class="text-sm font-semibold text-[#214c30] underline underline-offset-4"
+			href="/account/password">Change password</a
+		>
 		<span class="sr-only" role="status" aria-live="polite">{status}</span>
 		<button
 			class="min-h-10 rounded-lg border border-[#aeb9ae] bg-white px-4 font-[inherit] font-semibold text-[#214c30] focus-visible:outline-3 focus-visible:outline-offset-2 focus-visible:outline-[#82b392] disabled:opacity-60"

@@ -27,26 +27,29 @@ import (
 
 // Config controls durable administrator bootstrap. OPAQUEKeyPath must be external to SQLite.
 type Config struct {
-	DatabasePath      string
-	OPAQUEKeyPath     string
-	CanonicalOrigin   string
-	GrantTTL          time.Duration
-	LoginTTL          time.Duration
-	SessionTTL        time.Duration
-	InsecureLocalHTTP bool
-	Now               func() time.Time
+	DatabasePath          string
+	OPAQUEKeyPath         string
+	CanonicalOrigin       string
+	GrantTTL              time.Duration
+	LoginTTL              time.Duration
+	SessionTTL            time.Duration
+	RecentAuthTTL         time.Duration
+	AuthRequestsPerMinute int
+	InsecureLocalHTTP     bool
+	Now                   func() time.Time
 }
 
 type App struct {
-	cfg           Config
-	db            *sql.DB
-	protocol      *opaque.Server
-	des           *opaque.Deserializer
-	keyGeneration string
-	mu            sync.Mutex
-	rate          map[string][]time.Time
-	logins        map[string]pendingLogin
-	sessions      map[[32]byte]time.Time
+	cfg                  Config
+	db                   *sql.DB
+	protocol             *opaque.Server
+	des                  *opaque.Deserializer
+	keyGeneration        string
+	credentialGeneration int64
+	mu                   sync.Mutex
+	rate                 map[string][]time.Time
+	logins               map[string]pendingLogin
+	sessions             map[[32]byte]sessionState
 }
 
 func New(cfg Config) (*App, error) {
@@ -71,17 +74,29 @@ func New(cfg Config) (*App, error) {
 	if cfg.GrantTTL == 0 {
 		cfg.GrantTTL = 15 * time.Minute
 	}
+	if cfg.RecentAuthTTL < 0 || cfg.RecentAuthTTL > 24*time.Hour {
+		return nil, errors.New("recent authentication lifetime is outside the supported range")
+	}
 	if cfg.LoginTTL == 0 {
 		cfg.LoginTTL = 2 * time.Minute
 	}
 	if cfg.SessionTTL == 0 {
 		cfg.SessionTTL = 12 * time.Hour
 	}
+	if cfg.RecentAuthTTL == 0 {
+		cfg.RecentAuthTTL = 5 * time.Minute
+	}
 	if cfg.GrantTTL < time.Second || cfg.GrantTTL > 24*time.Hour || cfg.LoginTTL < time.Second || cfg.LoginTTL > 10*time.Minute || cfg.SessionTTL < time.Second || cfg.SessionTTL > 30*24*time.Hour {
 		return nil, errors.New("grant, login, or session lifetime is outside the supported range")
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.AuthRequestsPerMinute == 0 {
+		cfg.AuthRequestsPerMinute = 20
+	}
+	if cfg.AuthRequestsPerMinute < 1 || cfg.AuthRequestsPerMinute > 1000 {
+		return nil, errors.New("authentication request limit must be between 1 and 1000 per minute")
 	}
 	prior, err := pathExists(cfg.DatabasePath)
 	if err != nil {
@@ -116,14 +131,26 @@ func New(cfg Config) (*App, error) {
 	}
 	db.SetMaxOpenConns(1)
 	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS registration_grants(token_hash BLOB PRIMARY KEY,expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS administrator(id INTEGER PRIMARY KEY CHECK(id=1),registration_record BLOB NOT NULL,profile_generation INTEGER NOT NULL,created_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS registration_grants(token_hash BLOB PRIMARY KEY,expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL,purpose TEXT NOT NULL DEFAULT 'setup',credential_generation INTEGER NOT NULL DEFAULT 0)`,
+		`CREATE TABLE IF NOT EXISTS administrator(id INTEGER PRIMARY KEY CHECK(id=1),registration_record BLOB NOT NULL,profile_generation INTEGER NOT NULL,credential_generation INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS opaque_profile(singleton INTEGER PRIMARY KEY CHECK(singleton=1),profile_generation INTEGER NOT NULL,key_generation TEXT NOT NULL,profile TEXT NOT NULL)`,
 	} {
 		if _, err = db.Exec(q); err != nil {
 			db.Close()
 			return nil, err
 		}
+	}
+	if err := ensureColumn(db, "registration_grants", "purpose", `TEXT NOT NULL DEFAULT 'setup'`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(db, "registration_grants", "credential_generation", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := ensureColumn(db, "administrator", "credential_generation", `INTEGER NOT NULL DEFAULT 1`); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if err = os.Chmod(cfg.DatabasePath, 0600); err != nil {
 		db.Close()
@@ -163,7 +190,36 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
-	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]time.Time)}, nil
+	var credentialGeneration int64
+	if err = db.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&credentialGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		db.Close()
+		return nil, err
+	}
+	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState)}, nil
+}
+
+func ensureColumn(db *sql.DB, table, column, definition string) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var def any
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+			return err
+		}
+		if name == column {
+			return rows.Err()
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
+	return err
 }
 
 func loadOPAQUEServerKey(c *opaque.Configuration, path string, priorDatabase bool) (*opaque.ServerKeyMaterial, string, error) {
@@ -251,6 +307,13 @@ func (a *App) Close() error { return a.db.Close() }
 
 // IssueRegistrationGrant returns a random one-time token; only its SHA-256 digest is stored.
 func (a *App) IssueRegistrationGrant() (string, error) {
+	return a.issueGrant("setup")
+}
+
+// IssueRecoveryGrant issues a fragment-only authorization to replace the existing administrator credential.
+func (a *App) IssueRecoveryGrant() (string, error) { return a.issueGrant("recovery") }
+
+func (a *App) issueGrant(purpose string) (string, error) {
 	tx, e := a.db.Begin()
 	if e != nil {
 		return "", e
@@ -260,8 +323,17 @@ func (a *App) IssueRegistrationGrant() (string, error) {
 	if e = tx.QueryRow(`SELECT count(*) FROM administrator`).Scan(&n); e != nil {
 		return "", e
 	}
-	if n != 0 {
+	if (purpose == "setup" && n != 0) || (purpose == "recovery" && n != 1) {
+		if purpose == "recovery" {
+			return "", errors.New("administrator is not registered")
+		}
 		return "", errors.New("administrator already registered")
+	}
+	var generation int64
+	if n == 1 {
+		if e = tx.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&generation); e != nil {
+			return "", e
+		}
 	}
 	now := a.cfg.Now()
 	if _, e = tx.Exec(`DELETE FROM registration_grants WHERE expires_at<?`, now.UnixNano()); e != nil {
@@ -279,7 +351,7 @@ func (a *App) IssueRegistrationGrant() (string, error) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(b)
 	h := sha256.Sum256([]byte(token))
-	if _, e = tx.Exec(`INSERT INTO registration_grants(token_hash,expires_at,created_at) VALUES(?,?,?)`, h[:], now.Add(a.cfg.GrantTTL).UnixNano(), now.UnixNano()); e != nil {
+	if _, e = tx.Exec(`INSERT INTO registration_grants(token_hash,expires_at,created_at,purpose,credential_generation) VALUES(?,?,?,?,?)`, h[:], now.Add(a.cfg.GrantTTL).UnixNano(), now.UnixNano(), purpose, generation); e != nil {
 		return "", e
 	}
 	if e = tx.Commit(); e != nil {
@@ -288,6 +360,14 @@ func (a *App) IssueRegistrationGrant() (string, error) {
 	return token, nil
 }
 func (a *App) RegistrationURL(base, token string) (string, error) {
+	return a.grantURL(base, token, "/register")
+}
+
+func (a *App) RecoveryURL(base, token string) (string, error) {
+	return a.grantURL(base, token, "/recover")
+}
+
+func (a *App) grantURL(base, token, route string) (string, error) {
 	u, e := url.Parse(base)
 	if e != nil {
 		return "", e
@@ -298,7 +378,7 @@ func (a *App) RegistrationURL(base, token string) (string, error) {
 	if u.Scheme != "https" && !(a.cfg.InsecureLocalHTTP && isLoopback(u.Hostname())) {
 		return "", errors.New("registration URL must use HTTPS; HTTP is allowed only for loopback")
 	}
-	u.Path = "/register"
+	u.Path = route
 	u.RawQuery = ""
 	u.Fragment = token
 	return u.String(), nil
@@ -312,6 +392,8 @@ func (a *App) Handler() http.Handler {
 	m := http.NewServeMux()
 	m.HandleFunc("POST /opaque/register/start", a.registerStart)
 	m.HandleFunc("POST /opaque/register/finish", a.registerFinish)
+	m.HandleFunc("POST /opaque/password/change/start", a.passwordChangeStart)
+	m.HandleFunc("POST /opaque/password/change/finish", a.passwordChangeFinish)
 	m.HandleFunc("POST /opaque/login/start", a.loginStart)
 	m.HandleFunc("POST /opaque/login/finish", a.loginFinish)
 	m.HandleFunc("GET /api/session", a.sessionStatus)
@@ -327,11 +409,11 @@ func (a *App) Handler() http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
-		if (r.URL.Path == "/login" || r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/")) && !a.https(r) {
+		if (r.URL.Path == "/login" || r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/") || r.URL.Path == "/account/password" || strings.HasPrefix(r.URL.Path, "/account/")) && !a.https(r) {
 			http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 			return
 		}
-		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && strings.TrimSuffix(r.URL.Path, "/") == "/register" && !a.secure(r) {
+		if (r.Method == http.MethodGet || r.Method == http.MethodHead) && (strings.TrimSuffix(r.URL.Path, "/") == "/register" || strings.TrimSuffix(r.URL.Path, "/") == "/recover") && !a.secure(r) {
 			http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 			return
 		}
@@ -534,15 +616,6 @@ func (a *App) requestScheme(r *http.Request) string {
 	}
 	return "http"
 }
-func (a *App) validGrant(token string) bool {
-	if len(token) < 32 || len(token) > 128 {
-		return false
-	}
-	h := sha256.Sum256([]byte(token))
-	var exp int64
-	e := a.db.QueryRow(`SELECT expires_at FROM registration_grants WHERE token_hash=?`, h[:]).Scan(&exp)
-	return e == nil && exp >= a.cfg.Now().UnixNano()
-}
 func (a *App) allow(r *http.Request) bool {
 	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 	now := a.cfg.Now()
@@ -571,7 +644,7 @@ func (a *App) allow(r *http.Request) bool {
 			old = append(old, t)
 		}
 	}
-	if len(old) >= 20 {
+	if len(old) >= a.cfg.AuthRequestsPerMinute {
 		a.rate[ip] = old
 		return false
 	}
@@ -634,11 +707,19 @@ func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "registration is temporarily unavailable", http.StatusInternalServerError)
 		return
 	}
+	purpose := "setup"
 	if registered {
-		http.Error(w, "registration is closed", http.StatusGone)
+		purpose = "recovery"
+	}
+	a.mu.Lock()
+	if err := a.refreshCredentialGenerationLocked(); err != nil {
+		a.mu.Unlock()
+		http.Error(w, "registration is temporarily unavailable", http.StatusInternalServerError)
 		return
 	}
-	if !a.validGrant(m.Grant) {
+	generation := a.credentialGeneration
+	a.mu.Unlock()
+	if !a.grantValid(m.Grant, purpose, generation) {
 		http.Error(w, "invalid or expired grant", 410)
 		return
 	}
@@ -680,6 +761,19 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hash := sha256.Sum256([]byte(token))
+	registered, e := a.HasAdministrator()
+	if e != nil {
+		http.Error(w, "registration unavailable", 500)
+		return
+	}
+	if registered {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.replaceCredential(w, hash[:], b, "recovery", [32]byte{})
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	tx, e := a.db.Begin()
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
@@ -696,7 +790,7 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	res, e := tx.Exec(`DELETE FROM registration_grants WHERE token_hash=? AND expires_at>=?`, hash[:], now)
+	res, e := tx.Exec(`DELETE FROM registration_grants WHERE token_hash=? AND purpose='setup' AND expires_at>=?`, hash[:], now)
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
@@ -710,11 +804,26 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "administrator already registered", 409)
 		return
 	}
+	if _, e = tx.Exec(`DELETE FROM registration_grants`); e != nil {
+		http.Error(w, "registration unavailable", 500)
+		return
+	}
 	if e = tx.Commit(); e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
+	a.credentialGeneration = 1
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *App) grantValid(token, purpose string, generation int64) bool {
+	if len(token) < 32 || len(token) > 128 {
+		return false
+	}
+	h := sha256.Sum256([]byte(token))
+	var exp, storedGeneration int64
+	err := a.db.QueryRow(`SELECT expires_at,credential_generation FROM registration_grants WHERE token_hash=? AND purpose=?`, h[:], purpose).Scan(&exp, &storedGeneration)
+	return err == nil && exp >= a.cfg.Now().UnixNano() && storedGeneration == generation
 }
 func (a *App) HasAdministrator() (bool, error) {
 	var n int
