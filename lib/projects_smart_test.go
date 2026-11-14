@@ -454,6 +454,8 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr != nil || string(content) != "race branch tip\n" {
 		t.Fatalf("restored branch target content=%q err=%v", content, readErr)
 	}
+	testTemporaryRollback(t, client, appServer.URL, cookie, branchDeployment.ID, featureAtCreate, branchPath)
+	testRollbackGraphAndRaces(t, client, appServer.URL, cookie, created.ID, branchDeployment.ID, featureAtCreate, branchPath, source)
 	publicationPath := filepath.Join(app.cfg.DeploymentRoot, deploymentCreated.ID)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
@@ -537,6 +539,11 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if delta := gitRequests.Load() - requestsBeforeAuthenticationFailure; delta != 1 {
 		t.Fatalf("permanent authentication failure made %d smart-HTTP requests, want exactly one", delta)
 	}
+	failStatus.Store(http.StatusUnauthorized)
+	failRequests.Store(true)
+	testRejectedRollbackKeepsLive(t, client, appServer.URL, cookie, branchDeployment.ID, featureAtCreate, branchPath)
+	failRequests.Store(false)
+	failStatus.Store(0)
 	if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr != nil || string(content) != "race branch tip\n" {
 		t.Fatalf("failed branch fetch changed live content: %q, err=%v", content, readErr)
 	}
@@ -1009,6 +1016,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	missingBranchResponse.Body.Close()
 	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, missingBranchJob.JobID, "failed")
+	testRejectedRollbackKeepsLive(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, featureAtCreate, branchPath)
 	if afterMissingBranch, identityErr := identity(branchPath); identityErr != nil || afterMissingBranch != beforeMissingBranch {
 		t.Fatalf("deleted branch changed the live publication: before=%+v after=%+v err=%v", beforeMissingBranch, afterMissingBranch, identityErr)
 	}
@@ -1056,6 +1064,16 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	webhookSecret, err := hex.DecodeString(webhookSetup.Secret)
 	if err != nil {
 		t.Fatal(err)
+	}
+	rollbackBeforePush := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/rollback", `{"commit":"`+featureAtCreate+`"}`)
+	var rollbackBeforePushJob struct{ JobID string }
+	if rollbackBeforePush.StatusCode != http.StatusAccepted || json.NewDecoder(rollbackBeforePush.Body).Decode(&rollbackBeforePushJob) != nil {
+		t.Fatalf("rollback before webhook status %d", rollbackBeforePush.StatusCode)
+	}
+	rollbackBeforePush.Body.Close()
+	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, rollbackBeforePushJob.JobID, "succeeded")
+	if content, err := os.ReadFile(filepath.Join(branchPath, "README.md")); err != nil || string(content) != "searchable feature\n" {
+		t.Fatalf("rollback before matching webhook content=%q err=%v", content, err)
 	}
 	webhookRepo, err := git.PlainOpen(remoteDir)
 	if err != nil {

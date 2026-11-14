@@ -1,4 +1,6 @@
 <script lang="ts">
+	import RollbackHistory from './RollbackHistory.svelte';
+
 	type Ref = { kind: 'branch' | 'tag'; name: string; commit: string };
 	type Project = { id: string; lastFetched: string | null };
 	type Deployment = {
@@ -365,6 +367,17 @@
 						>Change target</button
 					>
 				</div>
+				{#if item.targetKind === 'branch' && !['deleting', 'deletion_failed', 'recovery_required'].includes(item.status)}
+					{#key `${item.id}:${item.targetName}`}
+						<RollbackHistory
+							deploymentId={item.id}
+							deploymentName={item.name}
+							branch={item.targetName}
+							bind:busy
+							onqueued={() => load()}
+						/>
+					{/key}
+				{/if}
 				{#if item.error}<p role="alert" class="mt-2 text-sm text-red-800">{item.error}</p>{/if}
 				{#if jobs[item.id]?.[0]}<details class="mt-3">
 						<summary class="cursor-pointer text-sm font-semibold text-[#214c30]"
