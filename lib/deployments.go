@@ -48,6 +48,7 @@ type deploymentJob struct {
 	ID           string    `json:"id"`
 	DeploymentID string    `json:"deploymentId"`
 	Commit       string    `json:"commit"`
+	Force        bool      `json:"force"`
 	Status       string    `json:"status"`
 	Log          string    `json:"log"`
 	CreatedAt    time.Time `json:"createdAt"`
@@ -161,7 +162,7 @@ func (a *App) initDeployments() error {
 	a.publicationRootID = rootID
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS deployments(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,name TEXT NOT NULL,commit_id TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 1,live_commit TEXT NOT NULL DEFAULT '',live_dev INTEGER NOT NULL DEFAULT 0,live_ino INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'queued',error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(project_id,name))`,
-		`CREATE TABLE IF NOT EXISTS deployment_jobs(id TEXT PRIMARY KEY,deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,commit_id TEXT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL,log TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS deployment_jobs(id TEXT PRIMARY KEY,deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,commit_id TEXT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL,log TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,force_redeploy INTEGER NOT NULL DEFAULT 0)`,
 		`CREATE TABLE IF NOT EXISTS publication_intents(deployment_id TEXT PRIMARY KEY REFERENCES deployments(id) ON DELETE CASCADE,job_id TEXT NOT NULL,stage_name TEXT NOT NULL,had_old INTEGER NOT NULL,old_dev INTEGER NOT NULL,old_ino INTEGER NOT NULL,new_dev INTEGER NOT NULL,new_ino INTEGER NOT NULL,phase TEXT NOT NULL,created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS publication_cleanup(deployment_id TEXT NOT NULL,job_id TEXT NOT NULL,path_name TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,not_before INTEGER NOT NULL,last_error TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(deployment_id,job_id))`,
 		`CREATE TABLE IF NOT EXISTS deployment_removal_paths(deployment_id TEXT NOT NULL,path_name TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,last_error TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(deployment_id,path_name))`,
@@ -176,6 +177,9 @@ func (a *App) initDeployments() error {
 		if err := ensureColumn(a.db, "deployments", column.name, column.definition); err != nil {
 			return err
 		}
+	}
+	if err := ensureColumn(a.db, "deployment_jobs", "force_redeploy", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
 	}
 	if err := ensureColumn(a.db, "deployment_deletions", "retry_after", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
@@ -584,7 +588,8 @@ func (a *App) runDeploymentJob(jobID string) {
 	var generation int64
 	var projectID string
 	var createdAt, updatedAt int64
-	err := a.db.QueryRow(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.generation,d.live_commit,d.live_dev,d.live_ino,d.status,d.error,d.created_at,d.updated_at FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=? AND j.status='queued' AND j.generation=d.generation`, jobID).Scan(&d.ID, &projectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &generation, &d.LiveCommit, &d.LiveDev, &d.LiveIno, &d.Status, &d.Error, &createdAt, &updatedAt)
+	var forceRedeploy bool
+	err := a.db.QueryRow(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.generation,d.live_commit,d.live_dev,d.live_ino,d.status,d.error,d.created_at,d.updated_at,j.force_redeploy FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=? AND j.status='queued' AND j.generation=d.generation`, jobID).Scan(&d.ID, &projectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &generation, &d.LiveCommit, &d.LiveDev, &d.LiveIno, &d.Status, &d.Error, &createdAt, &updatedAt, &forceRedeploy)
 	if err != nil {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log='deployment was removed or its target changed',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 		return
@@ -608,18 +613,34 @@ func (a *App) runDeploymentJob(jobID string) {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before work began',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
-	if d.TargetKind == "branch" {
+	if d.TargetKind == "branch" || forceRedeploy {
 		if err := a.fetchProjectForBranch(ctx, d.ProjectID); err != nil {
-			message := "Could not fetch the configured branch; the current publication was kept"
+			message := "Could not refresh the configured Git target; the current publication was kept"
 			if errors.Is(err, errBranchFetchRetriesExhausted) {
 				message = fmt.Sprintf("Temporary repository transport failures persisted through %d bounded attempts; the current publication was kept", branchFetchMaxAttempts)
 			}
 			a.failJob(jobID, d.ID, generation, message)
 			return
 		}
-		if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name=?`, d.ProjectID, d.TargetName).Scan(&d.Commit); err != nil {
-			a.failJob(jobID, d.ID, generation, "The configured branch is missing from the cached repository; the current publication was kept")
-			return
+		if d.TargetKind == "branch" || d.TargetKind == "tag" {
+			kind := d.TargetKind
+			if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind=? AND name=?`, d.ProjectID, kind, d.TargetName).Scan(&d.Commit); err != nil {
+				a.failJob(jobID, d.ID, generation, "The configured Git target is missing from the refreshed repository; the current publication was kept")
+				return
+			}
+			if kind == "tag" {
+				// Hard re-deploy is the explicit tag-refresh operation. Persist its
+				// new pin after fetch, before export; later failures and restarts keep it.
+				result, updateErr := a.db.Exec(`UPDATE deployments SET commit_id=?,updated_at=? WHERE id=? AND generation=? AND target_kind='tag' AND target_name=?`, d.Commit, a.cfg.Now().UnixNano(), d.ID, generation, d.TargetName)
+				if updateErr != nil {
+					a.failJob(jobID, d.ID, generation, "The refreshed tag resolution could not be saved; the current publication was kept")
+					return
+				}
+				if affected, _ := result.RowsAffected(); affected != 1 {
+					_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before refreshed tag resolution was saved',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
+					return
+				}
+			}
 		}
 		if _, err := a.db.Exec(`UPDATE deployment_jobs SET commit_id=?,updated_at=? WHERE id=? AND status='queued'`, d.Commit, a.cfg.Now().UnixNano(), jobID); err != nil {
 			a.failJob(jobID, d.ID, generation, "The resolved branch commit could not be recorded; the current publication was kept")
@@ -630,7 +651,7 @@ func (a *App) runDeploymentJob(jobID string) {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
-	if d.LiveCommit == d.Commit {
+	if d.LiveCommit == d.Commit && !forceRedeploy {
 		if liveIdentity, identityErr := identity(a.deploymentPath(d.ID)); identityErr == nil && liveIdentity == (dirIdentity{Dev: d.LiveDev, Ino: d.LiveIno}) {
 			a.finishJob(jobID, d.ID, generation, "noop", "Already live at this commit", d.Commit)
 			return
@@ -1261,17 +1282,18 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 	if in.TargetKind == "" {
 		in.TargetKind = "commit"
 	}
-	if in.TargetKind != "branch" && in.TargetKind != "commit" {
-		http.Error(w, "choose a branch or commit target", 400)
+	if in.TargetKind != "branch" && in.TargetKind != "tag" && in.TargetKind != "commit" {
+		http.Error(w, "choose a branch, tag, or commit target", 400)
 		return
 	}
-	if in.TargetKind == "branch" {
+	if in.TargetKind == "branch" || in.TargetKind == "tag" {
+		kind := in.TargetKind
 		if in.TargetName == "" || len(in.TargetName) > 255 {
-			http.Error(w, "choose a cached branch", 400)
+			http.Error(w, "choose a cached Git target", 400)
 			return
 		}
-		if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name=?`, in.ProjectID, in.TargetName).Scan(&in.Commit); err != nil {
-			http.Error(w, "the selected branch is not in the cached branch list", 400)
+		if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind=? AND name=?`, in.ProjectID, kind, in.TargetName).Scan(&in.Commit); err != nil {
+			http.Error(w, "the selected target is not in the cached refs", 400)
 			return
 		}
 	} else if !validCommitTarget(in.Commit) {
@@ -1344,7 +1366,7 @@ func (a *App) deploymentJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	rows, err := a.db.Query(`SELECT id,deployment_id,commit_id,status,log,created_at,updated_at FROM deployment_jobs WHERE deployment_id=? ORDER BY created_at DESC LIMIT 100`, id)
+	rows, err := a.db.Query(`SELECT id,deployment_id,commit_id,status,log,created_at,updated_at,force_redeploy FROM deployment_jobs WHERE deployment_id=? ORDER BY created_at DESC LIMIT 100`, id)
 	if err != nil {
 		http.Error(w, "publication history is unavailable", 500)
 		return
@@ -1354,7 +1376,7 @@ func (a *App) deploymentJobs(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var j deploymentJob
 		var c, u int64
-		if rows.Scan(&j.ID, &j.DeploymentID, &j.Commit, &j.Status, &j.Log, &c, &u) != nil {
+		if rows.Scan(&j.ID, &j.DeploymentID, &j.Commit, &j.Status, &j.Log, &c, &u, &j.Force) != nil {
 			http.Error(w, "publication history is unavailable", 500)
 			return
 		}
@@ -1392,6 +1414,67 @@ func (a *App) deployNow(w http.ResponseWriter, r *http.Request) {
 	writeJSONStatus(w, 202, map[string]string{"jobId": job, "status": "queued"})
 }
 
+func (a *App) hardRedeploy(w http.ResponseWriter, r *http.Request) {
+	if !a.projectAuthorized(w, r, true) {
+		return
+	}
+	id := r.PathValue("id")
+	select {
+	case a.deploySlots <- struct{}{}:
+	default:
+		http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
+		return
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			<-a.deploySlots
+		}
+	}()
+	jobID, err := randomID()
+	if err != nil {
+		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		return
+	}
+	now := a.cfg.Now().UnixNano()
+	tx, err := a.db.Begin()
+	if err != nil {
+		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	var projectID, commit, status string
+	var generation int64
+	if err = tx.QueryRow(`SELECT project_id,commit_id,generation,status FROM deployments WHERE id=?`, id).Scan(&projectID, &commit, &generation, &status); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if status == "deleting" || status == "deletion_failed" {
+		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
+		return
+	}
+	generationUpdate, updateErr := tx.Exec(`UPDATE deployments SET generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, now, id, generation)
+	if updateErr != nil {
+		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		return
+	}
+	if affected, _ := generationUpdate.RowsAffected(); affected != 1 {
+		http.Error(w, "deployment target changed; refresh and try again", http.StatusConflict)
+		return
+	}
+	if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,force_redeploy) VALUES(?,?,?,?,'queued','Hard re-deploy queued; configured target will be refreshed',?,?,1)`, jobID, id, commit, generation+1, now, now); err != nil {
+		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		return
+	}
+	a.deployQueue <- jobID
+	reserved = false
+	writeJSONStatus(w, http.StatusAccepted, map[string]string{"jobId": jobID, "status": "queued"})
+}
+
 func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, true) {
 		return
@@ -1417,13 +1500,14 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	if input.TargetKind == "" {
 		input.TargetKind = "commit"
 	}
-	if input.TargetKind == "branch" {
-		if input.TargetName == "" || len(input.TargetName) > 255 || a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name=?`, projectID, input.TargetName).Scan(&input.Commit) != nil {
-			http.Error(w, "choose a branch from the cached branch list", http.StatusBadRequest)
+	if input.TargetKind == "branch" || input.TargetKind == "tag" {
+		kind := input.TargetKind
+		if input.TargetName == "" || len(input.TargetName) > 255 || a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind=? AND name=?`, projectID, kind, input.TargetName).Scan(&input.Commit) != nil {
+			http.Error(w, "choose a target from the cached refs", http.StatusBadRequest)
 			return
 		}
 	} else if input.TargetKind != "commit" || !validCommitTarget(input.Commit) {
-		http.Error(w, "choose a branch or full commit ID", http.StatusBadRequest)
+		http.Error(w, "choose a branch, tag, or full commit ID", http.StatusBadRequest)
 		return
 	}
 	if err := a.assertPublicationRoot(); err != nil {

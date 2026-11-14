@@ -678,17 +678,11 @@ func projectRefsFromRepository(dir string, maxRefs int) ([]projectRef, error) {
 		}
 		hash := ref.Hash()
 		if kind == "tag" {
-			if size, sizeErr := repo.Storer.EncodedObjectSize(hash); sizeErr == nil && size > maxGitCommitObjectBytes {
-				return errors.New("repository contains an oversized tag object")
+			target, peelErr := peelTagCommit(repo, hash)
+			if peelErr != nil {
+				return fmt.Errorf("tag %s does not resolve to a commit", shortName)
 			}
-			_, e := repo.TagObject(hash)
-			if e == nil {
-				target, e := repo.ResolveRevision(plumbing.Revision(name.String()))
-				if e != nil {
-					return fmt.Errorf("tag %s does not resolve to a commit", shortName)
-				}
-				hash = *target
-			}
+			hash = target
 		}
 		if size, sizeErr := repo.Storer.EncodedObjectSize(hash); sizeErr == nil && size > maxGitCommitObjectBytes {
 			return errors.New("repository contains an oversized commit object")
