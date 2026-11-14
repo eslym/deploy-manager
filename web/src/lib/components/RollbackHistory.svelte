@@ -82,6 +82,8 @@
 						: 'Rollback was rejected. Refresh branches and tags, then search the history again before retrying.'
 				);
 			}
+			// Complete the accepted request before refreshing deployment state.
+			await response.json();
 			queued = `Rollback to ${commit.shortId} queued. Follow its progress in Latest deployment.`;
 			selected = null;
 		} catch (cause) {

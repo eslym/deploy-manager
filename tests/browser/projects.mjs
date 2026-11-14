@@ -20,6 +20,24 @@ let fixture;
 let sshFixture;
 let browser;
 let appOutput = "";
+let releasePauseFailure;
+let currentStep = "initialization";
+function milestone(label) {
+  currentStep = label;
+  console.log(`[projects-browser] ${label}`);
+}
+
+async function withDeadline(promise, label, milliseconds = 10000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), milliseconds); })
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function httpsRequestStatus(host, port, path, method = "GET", body = "", headers = {}) {
   return new Promise((resolveStatus, reject) => {
@@ -28,6 +46,7 @@ function httpsRequestStatus(host, port, path, method = "GET", body = "", headers
       response.on("end", () => resolveStatus(response.statusCode));
     });
     request.on("error", reject);
+    request.setTimeout(5000, () => request.destroy(new Error("HTTPS fixture request timed out")));
     request.end(body);
   });
 }
@@ -84,10 +103,13 @@ try {
 
   browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH || chromium.executablePath(), args: ["--no-sandbox"] });
   const context = await browser.newContext({ ignoreHTTPSErrors: true });
+  context.setDefaultTimeout(10000);
+  context.setDefaultNavigationTimeout(15000);
   const page = await context.newPage();
   const pageErrors = [];
   page.on("pageerror", error => pageErrors.push(error.message));
 
+  milestone("register administrator");
   await page.goto(setupURL, { waitUntil: "domcontentloaded" });
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Create account" }).click();
@@ -106,6 +128,7 @@ try {
   }, "SSH Git fixture");
   await startApplication(cert, key, fixtureCert);
 
+  milestone("sign in over HTTPS");
   await page.goto(`https://${appListen}/login`, { waitUntil: "domcontentloaded" });
   const unauthenticated = await page.evaluate(async () => (await fetch("/api/projects")).status);
   if (unauthenticated !== 401) throw new Error(`unauthenticated project API read returned ${unauthenticated}`);
@@ -116,6 +139,7 @@ try {
   if (!sessionCookie) throw new Error("authenticated browser session cookie is missing");
   const crossOriginMutation = await httpsRequestStatus("127.0.0.1", 18440, "/api/ssh-hosts/approve", "POST", JSON.stringify({ host: "127.0.0.1", port: 18442, fingerprint: "SHA256:invalid", confirm: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" });
   if (crossOriginMutation !== 403) throw new Error(`cross-origin SSH approval returned ${crossOriginMutation}`);
+  milestone("create HTTPS project and retry webhook settings");
   await page.getByLabel("Project name").fill("Fixture site");
   await page.getByLabel("Repository URL").fill(fixtureURL);
   let webhookSettingsGets = 0;
@@ -150,6 +174,7 @@ try {
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   await page.getByText("v1.0", { exact: true }).waitFor();
 
+  milestone("configure LFS");
   await page.getByText("Fixture site", { exact: true }).click();
   await page.getByLabel("LFS server URL").waitFor();
   await page.getByLabel("LFS server URL").fill(`${fixtureURL}/info/lfs`);
@@ -168,6 +193,7 @@ try {
   }
   const crossOriginGitea = await httpsRequestStatus("127.0.0.1", 18440, giteaSettingsPath, "POST", JSON.stringify({ rotate: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" });
   if (crossOriginGitea !== 403) throw new Error(`cross-origin Gitea rotation returned ${crossOriginGitea}`);
+  milestone("configure and rotate Gitea webhook");
   const giteaWebhook = page.getByRole("region", { name: "Gitea webhook", exact: true });
   await giteaWebhook.getByRole("button", { name: "Set up webhook", exact: true }).click();
   await giteaWebhook.getByRole("heading", { name: "Add this webhook in Gitea" }).waitFor();
@@ -193,6 +219,7 @@ try {
   await page.getByText("Fixture site", { exact: true }).click();
   await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).waitFor();
   if ((await page.locator("body").innerText()).includes(rotatedGiteaSecret)) throw new Error("Gitea secret remained after dashboard reload");
+  milestone("create branch deployment");
   await page.getByLabel("Deployment name").fill("Production site");
   await page.locator("form").locator("select").selectOption("branch:feature/search");
   const deploymentResponse = page.waitForResponse(response => response.url().endsWith("/api/deployments") && response.request().method() === "POST");
@@ -217,24 +244,30 @@ try {
   const firstDirectoryIdentity = (await stat(publishedPath)).ino;
   const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
   const featureCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
+  milestone("open rollback history");
   await page.getByRole("button", { name: "Temporary rollback", exact: true }).click();
   const history = page.getByRole("region", { name: "Rollback history for Production site" });
   await history.getByText("Page 1", { exact: true }).waitFor();
   for (const [commit, title] of [[mainCommit, "main"], [featureCommit, "feature search"]]) {
+    milestone(`search rollback history: ${title}`);
     await history.getByLabel("Search commits").fill(commit);
     const searched = page.waitForResponse(response => response.url().includes(`/api/deployments/${deploymentID}/history?`));
     await history.getByRole("button", { name: "Search", exact: true }).click();
     if ((await searched).status() !== 200) throw new Error("rollback history search failed");
+    milestone(`select rollback commit: ${title}`);
     await history.getByRole("button", { name: `Roll back to ${commit.slice(0, 12)}`, exact: true }).click();
     await history.getByText(/The configured branch and automatic deployment remain unchanged/).waitFor();
     // Cancellation must not publish; the next confirmation uses the full ID.
     await history.getByRole("button", { name: "Cancel", exact: true }).click();
     await history.getByRole("button", { name: `Roll back to ${commit.slice(0, 12)}`, exact: true }).click();
     const rollbackResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/rollback`));
+    milestone(`confirm rollback: ${title}`);
     await history.getByRole("button", { name: "Confirm temporary rollback", exact: true }).click();
     const accepted = await rollbackResponse;
     if (accepted.status() !== 202 || accepted.request().postDataJSON().commit !== commit) throw new Error("rollback did not use the full selected commit ID");
-    const rollbackJob = await accepted.json();
+    // Headers alone do not prove that the browser completed this request.
+    // Keep the response body/job assertion bounded to catch unread responses.
+    const rollbackJob = await withDeadline(accepted.json(), "rollback acceptance response body");
     await waitFor(async () => {
       const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
       return jobs.find(job => job.id === rollbackJob.jobId)?.status === "succeeded";
@@ -244,6 +277,7 @@ try {
     const state = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
     if (state.targetKind !== "branch" || state.targetName !== "feature/search" || state.liveCommit !== commit) throw new Error("temporary rollback changed the branch target");
   }
+  milestone("change branch target and deploy no-op");
   await page.getByRole("button", { name: "Temporary rollback", exact: true }).click();
   await page.getByLabel("Target for Production site").selectOption("branch:main");
   const targetUpdate = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/target`));
@@ -258,15 +292,18 @@ try {
 
   const productionCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "Production site", exact: true }) });
   await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
-  let releasePauseFailure;
+  milestone("pause failure: intercept request");
   const pauseFailureGate = new Promise(resolveGate => { releasePauseFailure = resolveGate; });
   const pauseURL = `**/api/deployments/${deploymentID}/pause`;
   await page.route(pauseURL, async route => {
+    milestone("pause failure: request intercepted");
     await pauseFailureGate;
     await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE PAUSE ERROR" });
   });
   const rejectedPause = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/pause`));
+  milestone("pause failure: click Pause");
   await productionCard.getByRole("button", { name: "Pause", exact: true }).click();
+  milestone("pause failure: assert disabled and release request");
   if (!(await productionCard.getByRole("button", { name: "Pause", exact: true }).isDisabled())) throw new Error("Pause stayed enabled during its request");
   releasePauseFailure();
   if ((await rejectedPause).status() !== 500) throw new Error("Pause failure fixture did not run");
@@ -274,6 +311,7 @@ try {
   await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
   if ((await page.locator("body").innerText()).includes("SENSITIVE PAUSE ERROR")) throw new Error("Pause exposed an HTTP response body");
   await page.unroute(pauseURL);
+  milestone("pause, reload, manual deploy, resume");
   const pausedResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/pause`));
   await productionCard.getByRole("button", { name: "Pause", exact: true }).click();
   const paused = await pausedResponse;
@@ -305,6 +343,7 @@ try {
   if (await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).count()) throw new Error("tag search left a non-matching branch visible");
   await search.fill("");
 
+  milestone("create tag deployment and hard re-deploy");
   await page.getByLabel("Deployment name").fill("Tag release");
   await page.locator("form select").selectOption("tag:v1.0");
   const tagDeploymentResponse = page.waitForResponse(response => response.url().endsWith("/api/deployments") && response.request().method() === "POST");
@@ -327,6 +366,7 @@ try {
     return jobs[0]?.status === "succeeded" && (await stat(tagPath)).ino !== tagIdentity;
   }, "dashboard Hard re-deploy to recreate the tag publication");
 
+  milestone("refresh success and failure retention");
   const refreshResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
   await page.getByRole("button", { name: "Refresh branches and tags", exact: true }).click();
   const refreshed = await refreshResponse;
@@ -369,6 +409,7 @@ try {
   const failedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
   if (failedTimestamp !== timestampAfterReloadFailure) throw new Error("failed refresh changed last successful fetch time");
 
+  milestone("create SSH key, approve host, create SSH project");
   await page.getByLabel("Key name").fill("SSH browser key");
   await page.getByRole("button", { name: "Create Ed25519 key" }).click();
   await page.getByText("SSH browser key", { exact: true }).waitFor();
@@ -393,6 +434,7 @@ try {
   const sshProject = await page.evaluate(async () => (await (await fetch("/api/projects")).json()).find(project => project.name === "SSH fixture site"));
   const sshRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
+  milestone("configure private LFS and publish SSH deployment");
   await page.getByText("SSH fixture site", { exact: true }).click();
   await page.getByLabel("LFS server URL").fill(`${fixtureOrigin}/private-lfs`);
   await page.getByLabel("Object download origins").fill(fixtureOrigin);
@@ -421,6 +463,7 @@ try {
   const commitCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "SSH published site", exact: true }) });
   await commitCard.waitFor();
   if (await commitCard.getByRole("button", { name: /^(Pause|Resume)$/ }).count()) throw new Error("commit deployment showed branch-only automation controls");
+  milestone("deployment and project deletion confirmation");
   await page.getByRole("button", { name: "Delete", exact: true }).click();
   await page.getByText(/Delete “SSH published site” and remove its published files/).waitFor();
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
@@ -449,13 +492,23 @@ try {
   try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
   console.log("combined-binary authenticated project workflow passed: publication and deletion confirmation/cancel, private SSH/LFS publication, host trust, cross-origin mutation rejection, and cached-ref retention");
+} catch (error) {
+  console.error(`[projects-browser] failed during: ${currentStep}`);
+  throw error;
 } finally {
-  await browser?.close();
-  for (const child of [app, fixture, sshFixture]) {
-    if (child && child.exitCode === null) {
-      child.kill("SIGTERM");
-      await Promise.race([once(child, "exit"), new Promise(resolveExit => setTimeout(resolveExit, 1000))]);
+  releasePauseFailure?.();
+  // A broken browser action or route must not prevent fixture termination.
+  try {
+    await withDeadline(browser?.close(), "browser cleanup", 5000);
+  } finally {
+    for (const child of [app, fixture, sshFixture]) {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill("SIGTERM");
+        await Promise.race([exited, new Promise(resolveExit => setTimeout(resolveExit, 1000))]);
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      }
     }
+    await rm(dir, { recursive: true, force: true });
   }
-  await rm(dir, { recursive: true, force: true });
 }
