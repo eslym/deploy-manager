@@ -168,18 +168,12 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "choose a full 40-character commit ID", 400)
 		return
 	}
-	select {
-	case a.deploySlots <- struct{}{}:
-	default:
+	slot, ok := a.reserveDeploymentSlot()
+	if !ok {
 		http.Error(w, "publication queue is full", 503)
 		return
 	}
-	reserved := true
-	defer func() {
-		if reserved {
-			<-a.deploySlots
-		}
-	}()
+	defer slot.release()
 	id := r.PathValue("id")
 	job, err := randomID()
 	if err != nil {
@@ -214,7 +208,6 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.cancelDeploymentJobsBefore(id, generation+1)
-	a.deployQueue <- job
-	reserved = false
+	slot.enqueue(job)
 	writeJSONStatus(w, 202, map[string]string{"jobId": job, "status": "queued"})
 }

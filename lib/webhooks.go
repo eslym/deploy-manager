@@ -71,7 +71,19 @@ func (a *App) openProviderWebhookSecret(provider, projectID string, sealed []byt
 		return nil, errors.New("webhook secret unavailable")
 	}
 	nonce := sealed[:gcm.NonceSize()]
-	return gcm.Open(nil, nonce, sealed[gcm.NonceSize():], []byte(provider+"-webhook:"+projectID))
+	secret, err := gcm.Open(nil, nonce, sealed[gcm.NonceSize():], []byte(provider+"-webhook:"+projectID))
+	if err == nil && provider == githubWebhookProvider && len(secret) == 32 {
+		// Original GitHub records encrypted the random source, but setup showed
+		// its hex encoding. Normalize that unambiguous legacy format to the
+		// literal key the administrator entered in GitHub. Do not also accept
+		// signatures made with the undisplayed raw bytes. New records already
+		// encrypt the 64-character key; provider-bound AAD remains unchanged.
+		printable := make([]byte, hex.EncodedLen(len(secret)))
+		hex.Encode(printable, secret)
+		clear(secret)
+		secret = printable
+	}
+	return secret, err
 }
 
 func (a *App) githubWebhookSettings(w http.ResponseWriter, r *http.Request) {
