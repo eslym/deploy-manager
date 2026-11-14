@@ -87,7 +87,7 @@ func main() {
 		}
 		fmt.Println(link)
 	case "serve":
-		server := &http.Server{Addr: *listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, MaxHeaderBytes: 1 << 16}
+		server := &http.Server{Addr: *listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
 		if *cert != "" || *key != "" {
 			if *cert == "" || *key == "" {
 				log.Fatal("both TLS certificate and key are required")

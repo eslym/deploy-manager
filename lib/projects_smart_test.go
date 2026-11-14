@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,6 +62,12 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	var transientFailures atomic.Int32
 	var pauseBranchFetch atomic.Bool
 	branchFetchStarted := make(chan struct{})
+	var pauseWebhookFetch atomic.Bool
+	webhookFetchStarted := make(chan struct{})
+	resumeWebhookFetch := make(chan struct{})
+	var resumeWebhookOnce sync.Once
+	releaseWebhookFetch := func() { resumeWebhookOnce.Do(func() { close(resumeWebhookFetch) }) }
+	defer releaseWebhookFetch()
 	source, err := git.PlainOpen(remoteDir)
 	if err != nil {
 		t.Fatal(err)
@@ -77,6 +84,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	var measuredPackBytes atomic.Int64
 	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gitRequests.Add(1)
+		if pauseWebhookFetch.Load() && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") && pauseWebhookFetch.CompareAndSwap(true, false) {
+			close(webhookFetchStarted)
+			<-resumeWebhookFetch
+		}
 		if pauseBranchFetch.Load() && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") {
 			if pauseBranchFetch.CompareAndSwap(true, false) {
 				close(branchFetchStarted)
@@ -394,7 +405,13 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	select {
 	case <-stageReady:
 	case <-time.After(5 * time.Second):
-		t.Fatal("branch publication did not reach the staged-content boundary")
+		var jobStatus, jobLog, targetKind, targetName, live, branchTip string
+		var queued int
+		_ = app.db.QueryRow(`SELECT status,log FROM deployment_jobs WHERE id=?`, staleJob.JobID).Scan(&jobStatus, &jobLog)
+		_ = app.db.QueryRow(`SELECT target_kind,target_name,live_commit FROM deployments WHERE id=?`, branchDeployment.ID).Scan(&targetKind, &targetName, &live)
+		_ = app.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name='feature/search'`, created.ID).Scan(&branchTip)
+		_ = app.db.QueryRow(`SELECT count(*) FROM deployment_jobs WHERE status IN ('queued','running')`).Scan(&queued)
+		t.Fatalf("branch publication did not reach staged-content boundary: job=%s %q target=%s/%s live=%s cached=%s active=%d", jobStatus, jobLog, targetKind, targetName, live, branchTip, queued)
 	}
 	mainCommit = findProjectRef(initialRefs, "branch", "main").Commit
 	changed := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/target", `{"targetKind":"branch","targetName":"main","commit":"`+mainCommit+`"}`)
@@ -975,6 +992,118 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if afterMissingBranch, identityErr := identity(branchPath); identityErr != nil || afterMissingBranch != beforeMissingBranch {
 		t.Fatalf("deleted branch changed the live publication: before=%+v after=%+v err=%v", beforeMissingBranch, afterMissingBranch, identityErr)
 	}
+	// GitHub push automation follows the fetched branch tip, not a possibly stale
+	// event SHA, and independently updates every deployment following that branch.
+	featureBranch := plumbing.NewBranchReferenceName("feature/search")
+	if err := fixtureRepo.Storer.SetReference(plumbing.NewHashReference(featureBranch, plumbing.NewHash(featureAfter))); err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Storer.SetReference(plumbing.NewHashReference(featureBranch, plumbing.NewHash(featureAfter))); err != nil {
+		t.Fatal(err)
+	}
+	// A prior cache-cleanup scenario deliberately held the controlled Git
+	// server unavailable. Restore the fixture, then compare an ordinary manual
+	// branch deploy with the webhook-triggered fetch against this same remote.
+	failRequests.Store(false)
+	manualFetch := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/deploy", `{}`)
+	if manualFetch.StatusCode != http.StatusAccepted {
+		t.Fatalf("manual branch deploy status %d: %s", manualFetch.StatusCode, responseText(manualFetch))
+	}
+	var manualJob struct {
+		JobID string `json:"jobId"`
+	}
+	if err := json.NewDecoder(manualFetch.Body).Decode(&manualJob); err != nil {
+		t.Fatal(err)
+	}
+	manualFetch.Body.Close()
+	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, manualJob.JobID, "noop")
+	mirrorID, err := randomID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = app.db.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,target_kind,target_name,generation,status,created_at,updated_at) VALUES(?,?,?,?,'branch','feature/search',1,'live',?,?)`, mirrorID, created.ID, "feature-mirror", featureAfter, time.Now().UnixNano(), time.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+	app.mu.Lock()
+	clear(app.rate)
+	app.mu.Unlock()
+	setupResponse := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/projects/"+created.ID+"/github-webhook", `{"rotate":true}`)
+	var webhookSetup struct{ URL, Secret string }
+	if setupResponse.StatusCode != http.StatusCreated || json.NewDecoder(setupResponse.Body).Decode(&webhookSetup) != nil || len(webhookSetup.Secret) != 64 {
+		t.Fatalf("GitHub webhook setup status %d: %s", setupResponse.StatusCode, responseText(setupResponse))
+	}
+	setupResponse.Body.Close()
+	webhookSecret, err := hex.DecodeString(webhookSetup.Secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	webhookWorktree, err := webhookRepo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := webhookWorktree.Checkout(&git.CheckoutOptions{Branch: featureBranch, Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	latestTip := commitFixtureFile(t, remoteDir, webhookWorktree, "feature", "webhook latest tip").String()
+	if err := source.Storer.SetReference(plumbing.NewHashReference(featureBranch, plumbing.NewHash(latestTip))); err != nil {
+		t.Fatal(err)
+	}
+	stalePush := []byte(`{"ref":"refs/heads/feature/search","after":"` + featureAfter + `","deleted":false}`)
+	webhookURL := branchServer.URL + webhookSetup.URL
+	pauseWebhookFetch.Store(true)
+	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-delivery-1", "push", stalePush, webhookSecret); status != http.StatusNoContent {
+		t.Fatalf("signed push status = %d, want 204", status)
+	}
+	select {
+	case <-webhookFetchStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("webhook-triggered branch fetch did not reach the controlled pause")
+	}
+	for i := 2; i <= 9; i++ {
+		if status := sendGitHubWebhook(branchServer.Client(), webhookURL, fmt.Sprintf("github-burst-%d", i), "push", stalePush, webhookSecret); status != http.StatusNoContent {
+			t.Fatalf("burst delivery %d status = %d, want 204", i, status)
+		}
+	}
+	for _, deploymentID := range []string{branchDeployment.ID, mirrorID} {
+		var pending int
+		if err := app.db.QueryRow(`SELECT count(*) FROM deployment_jobs WHERE deployment_id=? AND durable=1 AND status IN ('queued','running')`, deploymentID).Scan(&pending); err != nil {
+			t.Fatal(err)
+		}
+		if pending > 2 {
+			t.Fatalf("webhook burst queued %d jobs for deployment %s, want at most one active plus one coalesced pending", pending, deploymentID)
+		}
+	}
+	releaseWebhookFetch()
+	for _, deploymentID := range []string{branchDeployment.ID, mirrorID} {
+		waitForLiveCommit(t, app, deploymentID, latestTip)
+		if content, readErr := os.ReadFile(filepath.Join(app.cfg.DeploymentRoot, deploymentID, "README.md")); readErr != nil || string(content) != "webhook latest tip\n" {
+			t.Fatalf("deployment %s did not publish current branch tip: %q err=%v", deploymentID, content, readErr)
+		}
+	}
+	mainBefore, err := identity(independentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-delivery-1", "push", stalePush, webhookSecret); status != http.StatusNoContent {
+		t.Fatalf("duplicate push status = %d, want 204", status)
+	}
+	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-tag-event", "create", []byte(`{"ref":"v2.0","ref_type":"tag"}`), webhookSecret); status != http.StatusNoContent {
+		t.Fatalf("tag event status = %d, want 204", status)
+	}
+	deletePush := []byte(`{"ref":"refs/heads/feature/search","after":"` + latestTip + `","deleted":true}`)
+	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-branch-deleted", "push", deletePush, webhookSecret); status != http.StatusNoContent {
+		t.Fatalf("branch deletion status = %d, want 204", status)
+	}
+	if after, identityErr := identity(independentPath); identityErr != nil || after != mainBefore {
+		t.Fatalf("unmatched branch/tag activity affected independent deployment: before=%+v after=%+v err=%v", mainBefore, after, identityErr)
+	}
+	if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr != nil || string(content) != "webhook latest tip\n" {
+		t.Fatalf("branch deletion changed the live publication: %q err=%v", content, readErr)
+	}
 }
 
 func waitForDeploymentWorkersIdle(t *testing.T, app *App) {
@@ -1021,6 +1150,24 @@ func waitForDeploymentJob(t *testing.T, client *http.Client, origin, cookie, dep
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("deployment job %s did not reach status %s (last=%s)", jobID, want, last)
+}
+
+func waitForLiveCommit(t *testing.T, app *App, deploymentID, commit string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var live string
+		if err := app.db.QueryRow(`SELECT live_commit FROM deployments WHERE id=?`, deploymentID).Scan(&live); err == nil && live == commit {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var live string
+	_ = app.db.QueryRow(`SELECT live_commit FROM deployments WHERE id=?`, deploymentID).Scan(&live)
+	var status, message, jobStatus, jobLog, jobCommit string
+	_ = app.db.QueryRow(`SELECT status,error FROM deployments WHERE id=?`, deploymentID).Scan(&status, &message)
+	_ = app.db.QueryRow(`SELECT status,log,commit_id FROM deployment_jobs WHERE deployment_id=? ORDER BY created_at DESC LIMIT 1`, deploymentID).Scan(&jobStatus, &jobLog, &jobCommit)
+	t.Fatalf("deployment %s live commit=%s status=%s error=%q latest-job=%s commit=%s %q, want latest branch tip %s", deploymentID, live, status, message, jobStatus, jobCommit, jobLog, commit)
 }
 
 type countingHTTPWriter struct {

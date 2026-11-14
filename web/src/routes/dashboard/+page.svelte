@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
 	import Deployments from '#lib/components/Deployments.svelte';
+	import GitHubWebhook from '#lib/components/GitHubWebhook.svelte';
 	type Project = {
 		id: string;
 		name: string;
@@ -691,6 +692,11 @@
 			</div>
 			<div class="md:col-span-2">
 				<Deployments projectId={selected} />
+			</div>
+			<div class="md:col-span-2">
+				{#key selected}
+					<GitHubWebhook projectId={selected} />
+				{/key}
 			</div>
 		{/if}
 	</section>
