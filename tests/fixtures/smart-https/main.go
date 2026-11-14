@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
@@ -19,6 +22,8 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	gitserver "github.com/go-git/go-git/v5/plumbing/transport/server"
 )
+
+var lfsPayload = []byte("fixture hydrated LFS asset\n")
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:18441", "HTTPS listen address")
@@ -56,6 +61,21 @@ func serve(address, cert, key, data string) error {
 		if _, err := worktree.Add("index.html"); err != nil {
 			return plumbing.ZeroHash, err
 		}
+		if message == "feature search" {
+			digest := sha256.Sum256(lfsPayload)
+			pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", hex.EncodeToString(digest[:]), len(lfsPayload))
+			if err := os.WriteFile(filepath.Join(repoPath, ".gitattributes"), []byte("*.dat filter=lfs\n"), 0600); err != nil {
+				return plumbing.ZeroHash, err
+			}
+			if err := os.WriteFile(filepath.Join(repoPath, "asset.dat"), []byte(pointer), 0600); err != nil {
+				return plumbing.ZeroHash, err
+			}
+			for _, name := range []string{".gitattributes", "asset.dat"} {
+				if _, err := worktree.Add(name); err != nil {
+					return plumbing.ZeroHash, err
+				}
+			}
+		}
 		return worktree.Commit(message, &git.CommitOptions{Author: &object.Signature{Name: "Fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
 	}
 	if _, err := commit("main"); err != nil {
@@ -84,6 +104,35 @@ func serve(address, cert, key, data string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /__fixture/fail", func(w http.ResponseWriter, _ *http.Request) { fail.Store(true); w.WriteHeader(http.StatusNoContent) })
 	mux.HandleFunc("POST /__fixture/recover", func(w http.ResponseWriter, _ *http.Request) { fail.Store(false); w.WriteHeader(http.StatusNoContent) })
+	mux.HandleFunc("POST /repo.git/info/lfs/objects/batch", func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Operation string `json:"operation"`
+			Objects   []struct {
+				OID  string `json:"oid"`
+				Size int64  `json:"size"`
+			} `json:"objects"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil || request.Operation != "download" || len(request.Objects) != 1 {
+			http.Error(w, "invalid LFS batch request", http.StatusBadRequest)
+			return
+		}
+		digest := sha256.Sum256(lfsPayload)
+		oid := hex.EncodeToString(digest[:])
+		if request.Objects[0].OID != oid || request.Objects[0].Size != int64(len(lfsPayload)) {
+			w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"error":{"code":404,"message":"not found"}}]}`, request.Objects[0].OID, request.Objects[0].Size)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+		_, _ = fmt.Fprintf(w, `{"transfer":"basic","objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q,"header":{"X-LFS-Action":"approved"}}}}]}`, oid, len(lfsPayload), "https://"+address+"/lfs/object?signature=fixture-secret")
+	})
+	mux.HandleFunc("GET /lfs/object", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("signature") != "fixture-secret" || r.Header.Get("X-LFS-Action") != "approved" {
+			http.Error(w, "invalid fixture action", http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write(lfsPayload)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if fail.Load() {
 			http.Error(w, "controlled fixture failure", http.StatusServiceUnavailable)

@@ -37,6 +37,16 @@
 	let search = $state('');
 	let error = $state('');
 	let busy = $state(false);
+	const lfsConfirmation = 'I independently verified these LFS destinations';
+	let lfsEndpoint = $state('');
+	let lfsOrigins = $state('');
+	let lfsAllowInternal = $state(false);
+	let lfsInternalConfirmation = $state(false);
+	let lfsSuggestedEndpoint = $state('');
+	let lfsLoading = $state(false);
+	let lfsBusy = $state(false);
+	let lfsError = $state('');
+	let lfsNotice = $state('');
 	let selected = $state('');
 	let visibleRefs = $derived(
 		(refs[selected] ?? []).filter((ref) =>
@@ -186,6 +196,63 @@
 	}
 	async function loadRefs(id: string) {
 		refs[id] = await request(`/api/projects/${id}/refs`);
+	}
+	async function loadLfsSettings(id: string) {
+		lfsLoading = true;
+		lfsError = '';
+		lfsEndpoint = '';
+		lfsOrigins = '';
+		lfsAllowInternal = false;
+		lfsInternalConfirmation = false;
+		lfsSuggestedEndpoint = '';
+		try {
+			const result: {
+				settings: { endpoint: string; objectOrigins: string[]; allowInternal: boolean };
+				suggestedEndpoint: string;
+			} = await request(`/api/projects/${id}/lfs`);
+			lfsEndpoint = result.settings.endpoint;
+			lfsOrigins = result.settings.objectOrigins.join('\n');
+			lfsAllowInternal = result.settings.allowInternal;
+			lfsSuggestedEndpoint = result.suggestedEndpoint;
+		} catch (cause) {
+			lfsError = cause instanceof Error ? cause.message : 'Could not load LFS settings.';
+		} finally {
+			lfsLoading = false;
+		}
+	}
+	async function saveLfsSettings(event: SubmitEvent) {
+		event.preventDefault();
+		if (lfsBusy || !selected) return;
+		if (
+			!window.confirm(
+				'Save these LFS destinations? Only continue if you independently verified them.'
+			)
+		)
+			return;
+		lfsBusy = true;
+		lfsError = '';
+		lfsNotice = '';
+		try {
+			await request(`/api/projects/${selected}/lfs`, {
+				method: 'POST',
+				body: JSON.stringify({
+					endpoint: lfsEndpoint,
+					objectOrigins: lfsOrigins
+						.split(/\r?\n/)
+						.map((origin) => origin.trim())
+						.filter(Boolean),
+					allowInternal: lfsAllowInternal,
+					confirmation: lfsConfirmation,
+					...(lfsAllowInternal ? { internalConfirmation: lfsConfirmation } : {})
+				})
+			});
+			await loadLfsSettings(selected);
+			lfsNotice = 'LFS settings saved.';
+		} catch (cause) {
+			lfsError = cause instanceof Error ? cause.message : 'Could not save LFS settings.';
+		} finally {
+			lfsBusy = false;
+		}
 	}
 	async function createProject(event: SubmitEvent) {
 		event.preventDefault();
@@ -424,6 +491,7 @@
 								onclick={() => {
 									selected = project.id;
 									search = '';
+									void loadLfsSettings(project.id);
 								}}
 								><span class="block font-semibold text-[#243528]">{project.name}</span><span
 									class="block truncate text-sm text-[#58645b]">{project.url}</span
@@ -488,6 +556,75 @@
 							>
 						</li>{:else}<li class="list-none py-4 text-[#58645b]">No matching refs.</li>{/each}
 				</ul>
+			</div>
+			<div class="rounded-xl border border-[#e1e6df] bg-white p-5 md:col-span-2">
+				<h2 class="m-0 text-xl font-semibold text-[#243528]">Git LFS destinations</h2>
+				<p class="mt-2 text-sm text-[#58645b]">
+					Choose the HTTPS server and exact HTTPS origins this project may use for LFS downloads.
+					Verify each destination independently before saving.
+				</p>
+				{#if lfsLoading}<p class="mt-4 text-sm text-[#58645b]">Loading settings…</p>{:else}
+					{#if lfsError}<p
+							role="alert"
+							class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+						>
+							{lfsError}
+						</p>{/if}
+					{#if lfsNotice}<p role="status" class="mt-4 text-sm text-[#214c30]">{lfsNotice}</p>{/if}
+					<form class="mt-4 grid gap-4" onsubmit={saveLfsSettings}>
+						<label class="grid gap-1 text-sm font-medium text-[#354238]" for="lfs-endpoint"
+							>LFS server URL
+							<input
+								id="lfs-endpoint"
+								class="min-h-11 rounded-lg border border-[#aeb9ae] px-3"
+								bind:value={lfsEndpoint}
+								placeholder="https://lfs.example.com/owner/repository.git/info/lfs"
+							/>
+						</label>
+						{#if lfsSuggestedEndpoint}
+							<div class="text-sm text-[#58645b]">
+								Suggestion (not approved): <code class="break-all">{lfsSuggestedEndpoint}</code>
+								<button
+									type="button"
+									class="ml-2 rounded-lg border border-[#aeb9ae] px-3 py-1 text-[#214c30]"
+									onclick={() => (lfsEndpoint = lfsSuggestedEndpoint)}>Use suggestion</button
+								>
+							</div>
+						{/if}
+						<label class="grid gap-1 text-sm font-medium text-[#354238]" for="lfs-origins"
+							>Object download origins
+							<textarea
+								id="lfs-origins"
+								class="min-h-28 rounded-lg border border-[#aeb9ae] p-3 font-mono text-sm"
+								bind:value={lfsOrigins}
+								placeholder="https://objects.example.com"
+								aria-describedby="lfs-origins-note"></textarea>
+						</label>
+						<p id="lfs-origins-note" class="-mt-3 text-sm text-[#58645b]">
+							Enter one exact HTTPS origin per line, such as https://objects.example.com:8443. Do
+							not include paths or credentials.
+						</p>
+						<label class="flex items-start gap-2 text-sm text-[#354238]">
+							<input type="checkbox" class="mt-1" bind:checked={lfsAllowInternal} />
+							<span>Allow downloads from internal network addresses</span>
+						</label>
+						{#if lfsAllowInternal}
+							<label
+								class="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm text-amber-950"
+							>
+								<input type="checkbox" class="mt-1" bind:checked={lfsInternalConfirmation} />
+								<span
+									>I independently verified the internal destinations and intend to allow them.</span
+								>
+							</label>
+						{/if}
+						<button
+							class="min-h-11 w-fit rounded-lg bg-[#214c30] px-5 font-semibold text-white disabled:opacity-60"
+							disabled={lfsBusy || (lfsAllowInternal && !lfsInternalConfirmation)}
+							>Save LFS settings</button
+						>
+					</form>
+				{/if}
 			</div>
 			<div class="md:col-span-2">
 				<Deployments projectId={selected} />

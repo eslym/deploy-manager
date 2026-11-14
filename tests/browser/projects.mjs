@@ -43,7 +43,7 @@ async function waitFor(check, label) {
 }
 
 async function startApplication(cert, key, gitCA) {
-  const env = { ...process.env, DEPLOY_MANAGER_TEST_GIT_CA: gitCA, DEPLOY_MANAGER_TEST_GIT_ORIGIN: fixtureOrigin };
+  const env = { ...process.env, DEPLOY_MANAGER_TEST_GIT_CA: gitCA, DEPLOY_MANAGER_TEST_GIT_ORIGIN: fixtureOrigin, DEPLOY_MANAGER_TEST_LFS_CA: gitCA };
   app = spawn(executable, ["serve", "--data", dir, "--listen", appListen, "--tls-cert", cert, "--tls-key", key, "--origin", `https://${appListen}`], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
   app.stdout.on("data", chunk => { appOutput += chunk.toString(); });
   app.stderr.on("data", chunk => { appOutput += chunk.toString(); });
@@ -125,6 +125,16 @@ try {
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   await page.getByText("v1.0", { exact: true }).waitFor();
 
+  await page.getByText("Fixture site", { exact: true }).click();
+  await page.getByLabel("LFS server URL").waitFor();
+  await page.getByLabel("LFS server URL").fill(`${fixtureURL}/info/lfs`);
+  await page.getByLabel("Object download origins").fill(fixtureOrigin);
+  await page.getByLabel("Allow downloads from internal network addresses").check();
+  await page.getByLabel("I independently verified the internal destinations and intend to allow them.").check();
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "Save LFS settings" }).click();
+  await page.getByText("LFS settings saved.").waitFor();
+
   const id = await page.evaluate(async () => (await (await fetch("/api/projects")).json())[0].id);
   await page.getByLabel("Deployment name").fill("Production site");
   await page.locator("form").locator("select").selectOption("feature/search");
@@ -135,8 +145,11 @@ try {
   await page.getByText("Production site", { exact: true }).waitFor();
   const deploymentID = await page.evaluate(async () => (await (await fetch("/api/deployments")).json())[0].id);
   try {
-    await waitFor(async () => {
-      try { return (await readFile(join(dir, "state.sqlite.publications", deploymentID, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n"; } catch { return false; }
+  await waitFor(async () => {
+      try {
+        const published = join(dir, "state.sqlite.publications", deploymentID);
+        return (await readFile(join(published, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n" && (await readFile(join(published, "asset.dat"), "utf8")) === "fixture hydrated LFS asset\n";
+      } catch { return false; }
     }, "published deployment files");
   } catch (error) {
     const state = await page.evaluate(async id => ({ deployment: await (await fetch("/api/deployments")).text(), jobs: await (await fetch(`/api/deployments/${id}/jobs`)).text() }), deploymentID);

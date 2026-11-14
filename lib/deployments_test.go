@@ -2,6 +2,9 @@ package lib
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -365,6 +368,76 @@ func TestExportFailsClosedOnCommitTrackedLFSSelection(t *testing.T) {
 	err = exportTrackedTree(context.Background(), repo, commit, out, exportLimits{files: 20, bytes: 1024, timeout: time.Second})
 	if err == nil || !strings.Contains(err.Error(), "LFS") {
 		t.Fatalf("selected LFS pointer export error=%v", err)
+	}
+}
+
+func TestExportHydratesCommittedLFSPointerIntoActualFile(t *testing.T) {
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	createSmartFixture(t, repoDir)
+	repo, err := git.PlainOpen(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worktree.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("feature/search")}); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("hydrated from the controlled HTTPS LFS server")
+	digest := sha256.Sum256(payload)
+	oid := hex.EncodeToString(digest[:])
+	pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", oid, len(payload))
+	for name, contents := range map[string]string{".gitattributes": "*.dat filter=lfs\n", "asset.dat": pointer} {
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := worktree.Add(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commitID, err := worktree.Commit("LFS tracked object", &git.CommitOptions{Author: &object.Signature{Name: "fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := repo.CommitObject(commitID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actionURL string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/lfs/objects/batch" {
+			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q}}}]}`, oid, len(payload), actionURL)
+			return
+		}
+		if r.URL.Path == "/object" {
+			_, _ = w.Write(payload)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	actionURL = server.URL + "/object"
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	oldRoots := lfsTestRootCAs
+	lfsTestRootCAs = pool
+	t.Cleanup(func() { lfsTestRootCAs = oldRoots })
+	hydrator, err := newLFSHydrator("0123456789abcdef0123456789abcdef", lfsProjectSettings{Endpoint: server.URL + "/lfs", ObjectOrigins: []string{server.URL}, AllowInternal: true, InternalAddresses: map[string][]string{server.URL: {"127.0.0.1"}}}, t.TempDir(), 1<<20, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "export")
+	if err = os.Mkdir(out, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = exportTrackedTree(context.Background(), repo, commit, out, exportLimits{files: 20, bytes: 1024, timeout: time.Second}, hydrator); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(filepath.Join(out, "asset.dat"))
+	if err != nil || string(got) != string(payload) {
+		t.Fatalf("published asset = %q, %v; want hydrated bytes", got, err)
 	}
 }
 

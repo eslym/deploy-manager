@@ -714,7 +714,11 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if err = os.Mkdir(stage, 0700); err != nil {
 		return err
 	}
-	if err = exportTrackedTree(ctx, repo, commit, stage, exportLimits{files: a.cfg.DeployMaxFiles, bytes: a.cfg.DeployMaxBytes, timeout: a.cfg.DeployTimeout}); err != nil {
+	hydrator, hydrateErr := a.projectLFSHydrator(d.ProjectID)
+	if hydrateErr != nil {
+		return errors.New("administrator-approved LFS settings are invalid")
+	}
+	if err = exportTrackedTree(ctx, repo, commit, stage, exportLimits{files: a.cfg.DeployMaxFiles, bytes: a.cfg.DeployMaxBytes, timeout: a.cfg.DeployTimeout}, hydrator); err != nil {
 		return err
 	}
 	if err = os.Chmod(stage, 0755); err != nil {
@@ -855,7 +859,7 @@ func sanitizePublicationError(err error) string {
 	s := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(s, "lfs"):
-		return "This commit uses Git LFS content that is not supported yet; no files were published"
+		return "Git LFS content could not be safely verified or hydrated; the current live files were kept"
 	case strings.Contains(s, "symbolic link") || strings.Contains(s, "symlink"):
 		return "This commit contains a symbolic link, which cannot be published"
 	case strings.Contains(s, "submodule") || strings.Contains(s, "gitlink"):

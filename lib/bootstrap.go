@@ -503,6 +503,8 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/logout", a.logout)
 	m.HandleFunc("GET /api/projects", a.listProjects)
 	m.HandleFunc("POST /api/projects", a.createProject)
+	m.HandleFunc("GET /api/projects/{id}/lfs", a.lfsSettings)
+	m.HandleFunc("POST /api/projects/{id}/lfs", a.lfsSettings)
 	m.HandleFunc("GET /api/projects/{id}/refs", a.projectRefs)
 	m.HandleFunc("POST /api/projects/{id}/refresh", a.refreshProject)
 	m.HandleFunc("POST /api/projects/{id}/key", a.assignProjectKey)
