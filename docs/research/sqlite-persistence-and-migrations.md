@@ -1,0 +1,184 @@
+# SQLite persistence and migration library fit
+
+Research/retrieval date: **2026-11-14**, using the task environment's date. Research only: no implementation, dependency selection approval, or confirmed-design changes. Primary upstream documentation and explicitly tagged source were inspected; the tags below are reproducible reference points, **not claims about the latest releases**. Recheck a proposed dependency's current release, security status, Go requirements, and resolved licenses before adoption.
+
+## Answer
+
+**Keep SQLite, `database/sql`, and the existing SQL. Adopt a migration library rather than writing a migration engine or replacing persistence with an ORM.** The best fit evaluated here is **pressly/goose's instance-based Provider API**, using embedded SQL migrations and the application's existing `*sql.DB`. Keep an application-owned, thin persistence/startup boundary for connection policy, key-material invariants, version compatibility, and error handling. Goose owns ordered execution and migration bookkeeping; it does not own deployment lifecycle or cryptographic initialization. [G1–G4]
+
+**Confirmed user scope:** the project is unpublished and unused; current development databases may be discarded. Therefore start with a complete **version-1 schema**, not a legacy importer. No historical unversioned-schema recognition, baseline stamping, or preservation of old development databases is required. Reset/rebootstrap must be an explicit development action, never the normal startup response to an unknown database or missing key. Future released versions still need safe forward migrations and fail-closed key/version checks. This clarification authorizes planning for disposable state, **not deleting any files in this research task**.
+
+`golang-migrate` is a credible alternative if an explicit persistent dirty-version state is preferred. `sql-migrate` is a smaller-concept alternative, but not dependency-free: its executor uses gorp. GORM and Ent are real compatible options, not prerequisites for migrations; introducing either now would expand the change into query/model mapping without solving application-specific data and external-key problems. sqlc is a separate optional query-code generator, **not an ORM or a migration executor**. [M1–M3] [S1–S2] [O1–O5]
+
+This recommendation concerns implementation reuse, not a new storage design. The agreed design already requires SQLite, durable accepted webhook work, restart reconciliation, and separately managed encryption/authentication keys. [R1]
+
+## What the application actually has
+
+The premise is **not “there is no database layer.”** There is already substantial persistence:
+
+| Area | Observed implementation |
+| --- | --- |
+| Driver and connection | `go.mod` pins `github.com/mattn/go-sqlite3 v1.14.24`; `lib/bootstrap.go:New` opens `database/sql` with `_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on` and `SetMaxOpenConns(1)`. It sets owner-only permissions on the DB and existing WAL/shared-memory files. [R2] |
+| Authentication schema | `New` creates `registration_grants`, `administrator`, and `opaque_profile`; additive `ensureColumn` upgrades grant purpose/generation and administrator credential generation. OPAQUE key/profile/account generations are checked before normal startup. [R2] |
+| Projects | `newProjectManager` creates projects, refs, refresh journal, SSH-key assignment, deletion, host-trust, and LFS settings tables. It adds LFS addresses and deletion/retry metadata, then reconciles cache files. [R3] |
+| Deployments | `initDeployments` creates deployment/job/publication-intent/cleanup/removal/deletion/archive tables, then adds target selection, force/rollback/durability/retry, automation, and live-directory identity fields. It also terminalizes interrupted jobs and performs publication/deletion reconciliation. [R4] |
+| Automation | `initDeploymentAutomation` adds pause/epoch fields. When `deployment_jobs.automatic` is absent, it adds it and backfills `automatic=1 WHERE durable=1 AND rollback_commit=''` in one transaction. This is a **data migration**, not just DDL. [R5] |
+| Repository keys | `initializeRepositoryKeyStore` conditionally creates two tables and a master-key verifier in a transaction, or requires both prior tables and their matching verifier. It authenticates every stored ciphertext before startup. [R6] |
+| Webhooks | `initWebhooks` creates provider-secret and delivery-deduplication tables. Secrets use the repository master key. Schema existence alone says nothing about stored-secret encoding compatibility. [R7] |
+
+`ensureColumn` inspects `PRAGMA table_info` and adds a column only if its name is absent. It does not validate an existing column's type/default/constraints, establish a global migration history, or make all startup DDL atomic. Distributed `CREATE TABLE IF NOT EXISTS` likewise does not prove that an existing table has the intended structure. The targeted problem is **schema evolution ownership and upgrade safety**, not replacing a database that is already working. [R2–R7]
+
+## Library comparison
+
+### Migration-focused choices
+
+| Choice and inspected source | Embedded, in-process integration | Transactions, tracking, failures, and locking | Fit here |
+| --- | --- | --- | --- |
+| **goose v3.24.1** | `NewProvider(dialect, db *sql.DB, fsys fs.FS, opts...)` explicitly supports `embed.FS`/`fs.Sub`; SQLite dialect is independent of the caller's SQL driver. Provider-local Go migrations are also supported. No migration CLI or SQL files need be installed on the production host. [G1–G2] | SQL migrations default to one transaction **per migration**, including its version insertion/deletion. Previously committed migrations remain committed if a later migration fails; Provider returns `PartialError` with applied/failed results. `NO TRANSACTION` opts out and loses that atomicity. Default version records have version/applied/timestamp fields, not SQL checksums or a persistent dirty bit. Provider operations have an instance mutex; session locking is **disabled unless configured**. [G2–G4] | **Recommended**: minimal disruption, explicit SQL plus transactional Go backfills where needed, instance configuration rather than package-global setup. Add application-level upgrade exclusion and compatibility preflight. |
+| **golang-migrate v4.18.2** | `source/iofs.New` reads an `fs.FS`; SQLite `database/sqlite3.WithInstance(existingDB, config)` and `migrate.NewWithInstance` compose into an embedded runner. This specific driver imports mattn/go-sqlite3; the similarly named pure-Go SQLite path is not necessary. [M1–M3] | SQLite driver wraps each migration body in a transaction unless `NoTxWrap` is set. Core separately writes target version with `dirty=true`, runs SQL, then writes `dirty=false`: schema transaction and final bookkeeping are **not one transaction**. Failed/interrupted execution can therefore require inspection even if SQLite rolled back the schema. Subsequent normal migration operations reject dirty state. Its SQLite `Lock` is an atomic boolean on the driver instance, **not an interprocess SQLite advisory lock**. Version storage is version/dirty, without content checksum. [M1–M2] | Good alternative, especially for teams already using its up/down SQL format and explicit dirty-state repair process. Do not treat `Force(version)` as a schema repair: it changes version state without executing migration SQL. [M2] |
+| **rubenv/sql-migrate v1.7.1** | `EmbedFileSystemMigrationSource` accepts `embed.FS`; `ExecContext` accepts an existing `*sql.DB` and dialect (`sqlite3`). Single files use `-- +migrate Up/Down`. [S1–S2] | By default the migration SQL and ID/time record share a gorp transaction; `notransaction` opts out. Returns an applied count plus error, so earlier migrations can already be committed. `MigrationRecord` contains ID/applied time, not checksum/dirty fields. The inspected plan/apply path provides no interprocess migration lock; the planner rejects recorded migration IDs missing from the source unless its corresponding ignore policy is used. [S2] | Viable simple executor, but fewer reasons to choose it over goose here, and it still brings an internal ORM-style dependency (gorp). “Lightweight” refers to interface/concepts, not a measured binary or dependency-size claim. |
+
+**Important qualifications:**
+
+- Do not assume these tools verify that applied SQL files remain unchanged. The inspected default records/execution paths above do not implement migration-content checksums. Keep published migrations immutable; enforce history review/CI comparison against the previously shipped migration set. A migration checksum also would not prove that a live database has no manual drift. [G3–G4] [M1–M2] [S2]
+- Goose's default missing/out-of-order policy rejects missing older migrations; keep that strict policy. It is not a substitute for an explicit application compatibility check against a database made by a newer binary. Check recorded versions and expected history before any upgrade. [G1–G2]
+- `SetMaxOpenConns(1)` serializes use of this pool, **not other processes**. SQLite's single-writer locking does not serialize a whole multi-migration plan and its key-file work. Adopt a process-wide data-directory/startup lock shared by serve/setup/recovery/upgrade entry points; prevent a serving old binary from overlapping an upgrade, not just two migrators from starting simultaneously. This is proposed application policy, not a library guarantee. [R2] [Q2]
+- Handle ownership explicitly: goose `Provider.Close()` closes the supplied database; golang-migrate `Close()` closes its database driver, whose SQLite `Close()` closes the supplied pool. Do not defer either immediately around migration if the application must keep using that same pool. [G1] [M1–M2]
+- Prefer transactional SQL and transactional Go migrations. The inspected goose Provider reserves a `*sql.Conn`; its source explicitly warns about nontransactional Go callbacks using `*sql.DB` with a single-connection pool and session locking. Never perform pool queries from inside a transaction callback that already holds the only connection. Verify any nontransactional path against the exact selected release instead of increasing the pool size to conceal an ownership error. [G3]
+
+### ORM and query-generation choices
+
+| Option | Verified capability | Why it is not the immediate solution |
+| --- | --- | --- |
+| **GORM** | Official SQLite driver supports `Config{Conn: ...}` with an existing SQL connection pool. Its normal driver uses mattn/go-sqlite3. `AutoMigrate` creates missing tables/constraints/columns/indexes and changes some column properties; it intentionally does not delete unused columns. Its migrator can rebuild SQLite tables by copy/drop/rename for operations not directly supported by its driver/runtime combination. [O1–O2] | Automatic convergence of models is not a reviewed sequence of data transforms or a safe legacy classifier. Mapping existing composite keys, singleton checks, BLOBs, nanosecond timestamps, explicit restrictive/cascading FKs, and multi-table job transactions requires careful work. These are project-specific assessment costs, not claims that GORM cannot represent them. GORM itself documents a move to versioned migrations as needs grow. [R2–R7] [O2] |
+| **Ent** | Supports an existing `*sql.DB` through `entsql.OpenDB` and a generated client's driver option. Ent's versioned migration documentation integrates Atlas, which generates SQL plans and a migration-directory integrity file (`atlas.sum`); generated formats can also target goose/golang-migrate. [O3–O4] | Useful if intentionally adopting generated entity/relationship APIs, but adds schema definitions, code generation, mapping, and potentially a separate migration planning tool. Not required merely to execute embedded SQL. Atlas checksums are an Atlas workflow property, not a property goose gains by executing an SQL file emitted by Atlas. [O4] |
+| **sqlc** | Generates typed Go queries from SQL; generated `DBTX` accepts `*sql.DB`/`*sql.Tx`, with `WithTx`. Parses migration formats including goose, golang-migrate, and sql-migrate, ignores down sections, and explicitly says it **does not perform database migrations**. [O5] | An optional later answer to repetitive scan/argument boilerplate. Keep SQL and transaction boundaries; introduce query-by-query if worthwhile, without coupling it to migration adoption. Use consistently zero-padded filenames if sqlc later reads numbered migrations, because its documented enumeration is lexicographic. [O5] |
+
+The useful custom code is therefore a **thin application-owned boundary**, not a universal repository/ORM abstraction: open/configure/validate the connection, classify the database, coordinate keys and upgrade exclusion, invoke the library, verify readiness, and close on failure. Keep domain operations and atomic multi-table transaction boundaries explicit. Avoid a parallel custom engine that parses scripts, sorts versions, records dirty/history state, retries locks, or implements generic down/repair operations: that would duplicate the libraries while still leaving all application-specific safety work to us.
+
+## SQLite-specific constraints no library removes
+
+1. **Use the actual runtime SQLite version.** Driver version and SQLite engine version are distinct. The default amalgamation in the currently pinned mattn v1.14.24 header identifies SQLite **3.46.1**; `libsqlite3` builds can instead use a system library. Inspect `SELECT sqlite_version()` and build options in upgrade tests. Do not copy newer SQL syntax from current docs and assume the pinned binary supports it. For example, current official SQLite documentation describes additional NOT NULL alteration syntax added after that amalgamation. GORM's general migration page also contains an older blanket statement about DROP COLUMN; use engine/driver source and versioned tests, not that statement as an engine capability matrix. [D1–D2] [Q1] [O2]
+2. **Ordinary additive changes can remain transactional.** SQLite restricts `ADD COLUMN`: a NOT NULL column needs a non-NULL default; adding a REFERENCES column with FK enforcement enabled requires a NULL default. Changes to keys/constraints/types can require a table rebuild. [Q1]
+3. **Foreign-key rebuilds need a dedicated plan.** SQLite's generalized safe procedure disables FKs before BEGIN if needed, creates a new table, copies data explicitly, drops the old table, renames the new one, reconstructs indexes/triggers/views, checks FKs, commits, then restores FK enforcement. Renaming the old table first can rewrite references incorrectly. `PRAGMA foreign_keys=OFF` inside a transaction silently has no effect. Disabling FKs and all rebuild SQL must use the same pinned connection, with no application traffic. [Q1] [Q3]
+4. **Do not casually mark a rebuild “NO TRANSACTION.”** That annotation only removes the runner's wrapper; it does not make the rebuild safe or align its bookkeeping with manual BEGIN/COMMIT. A planned pinned-connection pre/post step around a normal transactional migration, or a carefully tested explicit-transaction special case, may be needed. Preflight must check `foreign_key_check` results and abort before commit when nonempty, not just execute the PRAGMA without reading its rows. Ensure FK enforcement is restored and verified on success and error; otherwise close the connection and fail startup. No concrete rebuild is authorized by this report. [G3] [M1] [S2] [Q1] [Q3]
+5. **WAL is not multi-writer schema coordination.** Preserve synchronous FULL and enabled FKs; assert their effective values before releasing startup. WAL allows readers alongside a writer but only one writer at a time, still permits SQLITE_BUSY, and requires same-host shared memory. Choose bounded lock/context failure behavior; never continue with a partially upgraded store. [R2] [Q2–Q3]
+
+### Separate engine-maintenance finding
+
+The retrieved official WAL documentation identifies a WAL-reset corruption race affecting older SQLite versions, fixed in 3.51.3 and later (with named backports). It requires overlapping writers/checkpointers on two or more connections, potentially in separate processes. The pinned driver's default SQLite 3.46.1 predates that fix; a one-connection pool does not exclude another process or backup connection. **Before implementation, separately verify the shipped engine/build and plan its maintenance/security review.** A migration library does not fix engine defects. This report changes no dependency and does not claim an exploit or observed corruption in this project. [Q2] [D2]
+
+## Safe adoption of versioning
+
+The following is a proposed workflow, **not a claim that existing startup already does it**. Under the user's disposable-development-state clarification, use one reviewed initial migration representing the complete current schema. Do not ship a legacy importer or baseline-stamp existing unversioned files.
+
+### 1. Exclude concurrent application use and inspect before mutating
+
+Acquire upgrade/startup exclusion before schema or key-file mutation. Inspect whether the database path already existed, actual user tables/indexes/triggers/views, migration metadata, and the configured external files. Preserve the distinction between a genuinely new installation and an existing empty/partial database. In particular, the current OPAQUE missing-key refusal uses **database-file existence**, not whether an administrator row exists. Do not weaken it by treating “no migrations recorded” as “safe to generate new keys.” [R2]
+
+For versioned databases, reject malformed/dirty history, unsupported history gaps, unknown applied versions, or a maximum version above the binary's supported version **before mutations, cache/publication recovery, job updates, queue restoration, or worker startup**. Do not auto-down to the binary's known version. Source bookkeeping schemas differ among libraries; this guard belongs at the boundary and must have tests. [G1–G4] [M1–M2] [S2] [R2–R4]
+
+### 2. Create a complete version-1 schema; explicitly reset old development state
+
+Fold the currently scattered final table definitions and additive columns into migration 1: authentication purpose/generation fields; LFS addresses and deletion retries/identities; deployment targets/live identities; job force/rollback/durability/retry/provenance fields; automation pause/epochs; repository key and webhook tables. Preserve the current defaults, singleton checks, composite/unique keys, and RESTRICT/CASCADE actions. New empty job tables require no historical `automatic` backfill: create the column directly. [R2–R7]
+
+For a current unversioned development database, refuse normal startup with a clear development-reset/rebootstrap instruction. The explicitly chosen reset should create a separate empty data location or remove only specifically confirmed disposable paths; research performs neither. Rebootstrap the administrator and recreate repository credentials, host trust and webhook settings as needed. Prefer a fresh matched set of DB, OPAQUE key, and repository master in an isolated development directory. Do not erase externally managed/shared key files merely because a database is disposable; confirm ownership/scope first. If publications/cache state is retained, do not silently adopt it into the new empty database: use an explicit isolated root or separately confirmed cleanup/recovery plan. [R1–R7]
+
+After the first release, treat migration 1 as immutable and add forward migrations. Test supported released-version paths and data transformations instead of importing pre-versioned development snapshots. Unknown/unversioned schemas and manual drift remain startup errors, not permission to reset production data.
+
+### 3. Keep key validation and initialization distinct from generic schema creation
+
+**The repository-key ordering trap is critical.** Today `New` counts `repository_key_store`/`repository_keys` **before** `initializeRepositoryKeyStore`. If a new generic migration unconditionally creates those tables first, that detection will now report “prior store,” and fresh initialization can fail; worse, changing detection to ignore prior tables could regenerate keys for an existing encrypted store. The existing function also executes plain CREATE statements on the fresh path, so moving DDL without restructuring its responsibilities will collide. [R2] [R6]
+
+Record prior state before migration, under exclusion. Split responsibilities conceptually into structural migration, validating an existing external master/verifier/ciphertexts, and explicitly initializing a genuinely new binding. For prior versioned stores, verify binding **before** schema/data transformation and revalidate afterward. For fresh installs, securely load/create the master only under existing allowed rules; create the structural tables and establish their verifier as a deliberate initialization step before readiness. Treat a crash between key-file creation and DB commit as a tested resumable state, without replacing an already created key. Database transactions cannot atomically commit external file writes. [R2] [R6]
+
+Likewise preserve OPAQUE file validation, missing-key refusal, and exact key/profile/account-generation checks. Registration/recovery must not rotate the independent repository encryption key. Keep cryptographic initialization out of generic migration SQL, which cannot generate or validate the external key securely. Failed validation must start no workers and should leave an existing store unmodified. [R1–R2] [R6]
+
+### 4. Fresh install versus future versioned upgrade
+
+- **Fresh installation:** validate configuration/paths and new-install eligibility; establish required external key material; run the reviewed initial schema migration through the selected library; initialize the application-specific key/profile bindings; verify the full schema, FK integrity, generations, and ciphertexts before recovery/workers. No `IF NOT EXISTS` masking of unrelated user tables. Make interrupted initialization and key-file leftovers explicitly recoverable/fail-closed.
+- **Current unversioned development installation:** explicit reset/rebootstrap only; no preservation, normalization, baseline record, or `Force` path is required. Never invoke old startup constructors as a migration shortcut: they also perform runtime recovery. [R2–R6] [M2]
+- **Already versioned installation:** run only pending reviewed forward migrations after compatibility/key preflight; recheck invariants and readiness. Reopening at the current version is a no-op for migration history, not permission to skip integrity/key validation.
+
+Run all schema work before the current `newProjectManager` cache reconciliation and `initDeployments` job/publication recovery. Those routines will need their schema-creation responsibilities removed/separated in a future implementation; only once storage and keys are ready should interrupted jobs be reconciled, durable webhook jobs restored, workers started, and the HTTP application exposed. Application publication intents/reconciliation remain necessary; a schema transaction cannot coordinate an atomic filesystem directory exchange. [R2–R4] [R1]
+
+## Backup and operator recovery
+
+For future released stores that must be preserved, stop/quiesce application writers and key rotation/initialization before upgrade, and create a **consistent recovery set**. This is not a requirement to preserve the disposable current development databases:
+
+- Use SQLite's online backup API (or a verified `VACUUM INTO` workflow) for a database snapshot, or stop all connections and use a verified checkpoint/close-and-copy procedure. **Do not copy only the main `.db` while WAL is active.** Committed content can still reside in `-wal`; copying live DB/WAL files at different instants is not a coherent snapshot. `-shm` is reconstructible shared-memory metadata, not a substitute for the WAL. [Q2] [Q4]
+- Back up the separate OPAQUE key file and repository master file with owner-only protections, encryption/access controls appropriate for secrets, and matching database profile/key generations and repository verifier. Include webhook-secret decryptability in restore checks because it uses that same repository master. Never regenerate missing files as a recovery technique. [R1–R2] [R6–R7]
+- For a **whole application** restore, also account for publication directories and recorded device/inode identities, outstanding publication intents/deletion journals, and the Git/LFS objects needed to recreate a release. A DB/key snapshot alone is not an atomic snapshot of the publication filesystem; restoring to different inode identities must trigger the existing conservative reconciliation rather than blindly repeating an exchange. Coordinate filesystem snapshots/quiescence or document the explicit recovery procedure. [R1] [R3–R4]
+- Test opening a copied recovery set before upgrading the sole original. Preserve old binary/build identity and migration version in an operator manifest without exposing secrets. Prefer forward repair or restoring a matched backup after investigation; never automatically down-migrate or clear a dirty/version error to make startup proceed.
+
+## Adoption test matrix
+
+These are proposed upgrade gates, not tests executed by this documentation task.
+
+| Case | Required assertions |
+| --- | --- |
+| Fresh install, rerun, interrupted fresh initialization | Exact canonical schema/history; secure external keys and verifier/profile bindings; no accidental “prior store” detection from newly created tables; second run stable; crashes do not regenerate secrets. |
+| Explicit development reset and unversioned database refusal | Normal startup never deletes or stamps old state; reset/rebootstrap uses isolated or specifically confirmed disposable paths and a matched key set; no accidental adoption of old publications. |
+| Future supported released-version fixtures, empty and populated | Upgrade preserves or intentionally transforms IDs, ciphertexts, grants, OPAQUE records, trust, refs, targets, pauses, job provenance and filesystem journals; unchanged current-version reopen is stable. No pre-versioned development importer required. |
+| Fresh job provenance and future data transforms | Version 1 directly creates explicit automatic/manual provenance; durable manual and rollback jobs remain manual across restart and future upgrades. |
+| Stored-data compatibility independent of schema | `TestLegacyGitHubWebhookUsesDisplayedSecretAfterUpgrade` demonstrates legacy encrypted raw32 versus displayed hex64 secret/restart/rotation risk. Existing pre-release legacy coverage may remain as regression evidence, but preserving that old representation is not a new adoption requirement. Future released encoding changes need equivalent tests. [R8] |
+| Wrong defaults/types/FKs/checks, extra or missing objects, partial migration | Reject unknown drift; no silent constraint loss, automatic reset, workers or runtime recovery mutation. |
+| Missing/wrong/insecure/aliased key files; incomplete key tables; missing verifier; corrupt ciphertext; generation mismatch | Fail closed without replacing key material. Preserve `TestOpaqueKeyMissingFailsClosed`; test both fresh and existing repository-store classification before/after structural migrations. [R2] [R6] [R8] |
+| Future version, unknown applied migration, history gap/duplicate, dirty state where applicable | Older binary refuses before mutation, no automatic down/Force; diagnostic does not contain SQL parameters or secrets. |
+| Failed SQL/backfill, context cancellation, crash before/after migration commit/bookkeeping, disk full/read-only | Verify each library's actual atomicity/dirty behavior; earlier commits remain understandable; retry/repair only from a known state; failed migration never starts workers. |
+| FK table rebuild | Preserve children and restrictive/cascading actions, indexes/checks/views/triggers; rollback on invalid copied data or nonempty FK check; FK ON restored even on failures; single-connection pool never deadlocks. |
+| Two processes, serve plus setup/recovery, busy timeout | Exclusion covers old serving binary and external key side effects; bounded error/wait, never two concurrent upgrade plans or changed pool policy. |
+| Restart of accepted work and filesystem recovery | Preserve `TestNewFailsWhenAcceptedWebhookQueueCannotBeRestoredThenRestartsWork`, restart publication-identity tests, and `TestTemporaryRollbackSurvivesRestartWithoutUnsolicitedCatchUp`. Schema upgrades must not discard accepted work or publish unsolicited catch-up content. [R8] |
+| Backup/restore with uncheckpointed WAL and both external keys | Restored rows include WAL commits; login/key verification and webhook verification work; missing/mixed-generation backup members refuse; filesystem identity reconciliation stays conservative. |
+| Shipped embedded executable | Migrations available from an unrelated working directory with no migration/source files installed; execute on actual shipped SQLite build; inspect dependency notices and resolved graph. |
+
+## Dependency, licensing, and CGO implications
+
+- Current mattn/go-sqlite3 is MIT-licensed and requires CGO plus a C compiler to build; it does not imply installing a database server. Its default embedded amalgamation and optional system-library build are different runtime artifacts. **Keeping the driver does not newly introduce CGO**, and choosing goose does not require changing to a pure-Go driver. [D1–D3]
+- Inspected licenses: goose, golang-migrate, sql-migrate, GORM core, and sqlc are MIT; Ent is Apache-2.0. MIT requires retention of copyright/license notices; Apache-2.0 has its own license/notice conditions. These top-level licenses are not a complete transitive inventory. [L1–L6]
+- Goose's module lists many SQL drivers (including modernc SQLite) for its wider tool/test ecosystem; the Provider accepts the existing pool and does not require importing every driver into this executable. sql-migrate's module includes gorp and multiple driver/CLI dependencies. Distinguish the module graph/download or scanner footprint from the actual application import graph and linked binary. Audit both at the selected pin; do not present the migration library as “zero dependencies,” and do not import a CLI/all-drivers package unnecessarily. [G1] [G5] [S2–S3]
+- Ent adds generated entity code; sqlc adds generation tooling and generated queries but its shown `database/sql` runtime API does not require an ORM runtime. Keep build-time tooling separate from the embedded application's operational requirements. [O3–O5]
+
+**Decision:** adopt goose behind the thin startup boundary in a separately authorized implementation, starting with a complete version-1 schema and explicit disposable-development reset/rebootstrap. Key-safe initialization and future released-version upgrade tests remain acceptance gates; a legacy importer does not. Retain existing SQL; defer sqlc until query boilerplate warrants it. Do not build a custom migration engine or adopt an ORM solely to address schema upgrades.
+
+## Primary sources
+
+Local links refer to the inspected checkout; upstream links below are official project docs/source. All retrieved for this report on 2026-11-14; unversioned documentation can change.
+
+- **[R1]** [Confirmed design](../design.md), especially durable work/publication recovery and independent external keys; [domain glossary](../../GLOSSARY.md).
+- **[R2]** [go.mod](../../go.mod); [bootstrap.go](../../lib/bootstrap.go), `New`, `ensureColumn`, `loadOPAQUEServerKey`.
+- **[R3]** [projects.go](../../lib/projects.go), `newProjectManager`.
+- **[R4]** [deployments.go](../../lib/deployments.go), `initDeployments`, publication recovery and locking.
+- **[R5]** [automation.go](../../lib/automation.go), `initDeploymentAutomation`.
+- **[R6]** [repository_keys.go](../../lib/repository_keys.go), initialization, verifier, key loading and authenticated encryption.
+- **[R7]** [webhooks.go](../../lib/webhooks.go), schema and provider-secret encryption.
+- **[R8]** Existing upgrade/restart test inventory supplied by the parent research session: [webhook_upgrade_test.go](../../lib/webhook_upgrade_test.go), [bootstrap_test.go](../../lib/bootstrap_test.go), [deployments_test.go](../../lib/deployments_test.go), [rollback_restart_test.go](../../lib/rollback_restart_test.go). Named tests were not rerun for this report.
+- **[G1]** goose v3.24.1 [Provider API/source](https://github.com/pressly/goose/blob/v3.24.1/provider.go): existing pool, fs.FS, versions, status, close ownership.
+- **[G2]** goose v3.24.1 [README](https://github.com/pressly/goose/blob/v3.24.1/README.md) and [Provider options](https://github.com/pressly/goose/blob/v3.24.1/provider_options.go): SQL annotations, Go registration, optional locking and out-of-order policy.
+- **[G3]** goose v3.24.1 [Provider execution](https://github.com/pressly/goose/blob/v3.24.1/provider_run.go): connection/transaction ownership, version update, partial errors, single-connection Go callback warning.
+- **[G4]** goose v3.24.1 [SQLite version-table SQL](https://github.com/pressly/goose/blob/v3.24.1/internal/dialect/dialectquery/sqlite3.go).
+- **[G5]** goose v3.24.1 [go.mod](https://github.com/pressly/goose/blob/v3.24.1/go.mod).
+- **[M1]** golang-migrate v4.18.2 [SQLite3 driver](https://github.com/golang-migrate/migrate/blob/v4.18.2/database/sqlite3/sqlite3.go): `WithInstance`, transaction wrapping, local atomic lock, version/dirty table, close.
+- **[M2]** golang-migrate v4.18.2 [core](https://github.com/golang-migrate/migrate/blob/v4.18.2/migrate.go): `NewWithInstance`, dirty refusal, `runMigrations`, `Force`, close.
+- **[M3]** golang-migrate v4.18.2 [iofs source](https://github.com/golang-migrate/migrate/blob/v4.18.2/source/iofs/iofs.go).
+- **[S1]** sql-migrate v1.7.1 [README](https://github.com/rubenv/sql-migrate/blob/v1.7.1/README.md): embedded FS, dialects, SQL format, transaction opt-out.
+- **[S2]** sql-migrate v1.7.1 [executor, planner, migration records](https://github.com/rubenv/sql-migrate/blob/v1.7.1/migrate.go).
+- **[S3]** sql-migrate v1.7.1 [go.mod](https://github.com/rubenv/sql-migrate/blob/v1.7.1/go.mod).
+- **[O1]** GORM [connection documentation](https://gorm.io/docs/connecting_to_the_database.html); official SQLite driver v1.5.7 [source with `Config.Conn`](https://github.com/go-gorm/sqlite/blob/v1.5.7/sqlite.go).
+- **[O2]** GORM [migration documentation](https://gorm.io/docs/migration.html).
+- **[O3]** Ent [existing sql.DB integration](https://entgo.io/docs/sql-integration/).
+- **[O4]** Ent [versioned migrations, Atlas formats and directory integrity](https://entgo.io/docs/versioned-migrations/).
+- **[O5]** sqlc v1.31.1 documentation: [schema/migration parsing](https://docs.sqlc.dev/en/v1.31.1/howto/ddl.html), [generated DBTX and transactions](https://docs.sqlc.dev/en/v1.31.1/howto/transactions.html).
+- **[D1]** mattn/go-sqlite3 v1.14.24 [README](https://github.com/mattn/go-sqlite3/blob/v1.14.24/README.md): CGO, DSN options and system-library build.
+- **[D2]** mattn/go-sqlite3 v1.14.24 [amalgamation header, `SQLITE_VERSION`](https://github.com/mattn/go-sqlite3/blob/v1.14.24/sqlite3-binding.h).
+- **[D3]** mattn/go-sqlite3 v1.14.24 [MIT license](https://github.com/mattn/go-sqlite3/blob/v1.14.24/LICENSE).
+- **[Q1]** SQLite [ALTER TABLE and generalized rebuild procedure](https://www.sqlite.org/lang_altertable.html#otheralter).
+- **[Q2]** SQLite [WAL documentation](https://www.sqlite.org/wal.html), including concurrency, durability, persistent WAL state and WAL-reset bug.
+- **[Q3]** SQLite [foreign-key connection/transaction rules and DROP behavior](https://www.sqlite.org/foreignkeys.html).
+- **[Q4]** SQLite [online backup API and alternative snapshot mechanisms](https://www.sqlite.org/backup.html).
+- **[L1]** goose v3.24.1 [MIT license](https://github.com/pressly/goose/blob/v3.24.1/LICENSE).
+- **[L2]** golang-migrate v4.18.2 [MIT license](https://github.com/golang-migrate/migrate/blob/v4.18.2/LICENSE).
+- **[L3]** sql-migrate v1.7.1 [MIT license](https://github.com/rubenv/sql-migrate/blob/v1.7.1/LICENSE).
+- **[L4]** GORM core v1.25.12 [MIT license](https://github.com/go-gorm/gorm/blob/v1.25.12/LICENSE).
+- **[L5]** Ent v0.14.1 [Apache-2.0 license](https://github.com/ent/ent/blob/v0.14.1/LICENSE).
+- **[L6]** sqlc v1.27.0 [MIT license](https://github.com/sqlc-dev/sqlc/blob/v1.27.0/LICENSE). License source is a separately pinned inspection point, not a claim that this is the documentation version or latest release.
