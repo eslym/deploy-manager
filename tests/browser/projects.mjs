@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
+import { createHmac } from "node:crypto";
 import { chmod, copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { join, resolve } from "node:path";
@@ -137,8 +138,9 @@ try {
   await page.getByRole("heading", { name: "Branches and tags" }).waitFor({ timeout: 30000 });
   await page.getByRole("alert").filter({ hasText: "GitHub webhook settings could not be saved. Try again shortly." }).waitFor();
   const dashboardURLBeforeRetry = page.url();
-  await page.getByRole("button", { name: "Retry loading settings" }).click();
-  await page.getByRole("button", { name: "Set up webhook", exact: true }).waitFor();
+  const githubWebhook = page.getByRole("region", { name: "GitHub webhook", exact: true });
+  await githubWebhook.getByRole("button", { name: "Retry loading settings" }).click();
+  await githubWebhook.getByRole("button", { name: "Set up webhook", exact: true }).waitFor();
   if (await page.getByRole("alert").count()) throw new Error("the webhook settings load error remained after a successful retry");
   if (webhookSettingsGets !== 2) throw new Error(`webhook settings were requested ${webhookSettingsGets} times, expected one retry after the failed load`);
   if (webhookRotationPosts !== 0) throw new Error("retrying settings unexpectedly rotated the webhook secret");
@@ -159,6 +161,38 @@ try {
   await page.getByText("LFS settings saved.").waitFor();
 
   const id = await page.evaluate(async () => (await (await fetch("/api/projects")).json())[0].id);
+  const giteaSettingsPath = `/api/projects/${id}/gitea-webhook`;
+  for (const method of ["GET", "POST"]) {
+    const unauthenticatedStatus = await httpsRequestStatus("127.0.0.1", 18440, giteaSettingsPath, method, method === "POST" ? JSON.stringify({ rotate: true }) : "", { Origin: `https://${appListen}`, "Content-Type": "application/json" });
+    if (unauthenticatedStatus !== 401) throw new Error(`unauthenticated Gitea setup ${method} returned ${unauthenticatedStatus}`);
+  }
+  const crossOriginGitea = await httpsRequestStatus("127.0.0.1", 18440, giteaSettingsPath, "POST", JSON.stringify({ rotate: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" });
+  if (crossOriginGitea !== 403) throw new Error(`cross-origin Gitea rotation returned ${crossOriginGitea}`);
+  const giteaWebhook = page.getByRole("region", { name: "Gitea webhook", exact: true });
+  await giteaWebhook.getByRole("button", { name: "Set up webhook", exact: true }).click();
+  await giteaWebhook.getByRole("heading", { name: "Add this webhook in Gitea" }).waitFor();
+  const webhookSecret = () => giteaWebhook.locator("dl > div").filter({ has: page.locator("dt", { hasText: /^Secret$/ }) }).locator("code").innerText();
+  const firstGiteaSecret = await webhookSecret();
+  if (!firstGiteaSecret) throw new Error("Gitea setup did not show a signing secret");
+  await giteaWebhook.getByText(`https://${appListen}/webhooks/gitea/${id}`, { exact: true }).waitFor();
+  const giteaStatus = await page.evaluate(async path => await (await fetch(path)).json(), giteaSettingsPath);
+  if (!giteaStatus.configured || "secret" in giteaStatus) throw new Error("Gitea settings did not hide its configured secret");
+  async function sendGitea(secret, delivery) {
+    const body = JSON.stringify({ ref: "refs/heads/browser-unmatched", after: "a".repeat(40), deleted: false });
+    return httpsRequestStatus("127.0.0.1", 18440, `/webhooks/gitea/${id}`, "POST", body, { "Content-Type": "application/json", "X-Gitea-Delivery": delivery, "X-Gitea-Event": "push", "X-Gitea-Signature": createHmac("sha256", secret).update(body).digest("hex") });
+  }
+  if (await sendGitea(firstGiteaSecret, "browser-gitea-initial") !== 204) throw new Error("initial Gitea secret did not authenticate a push");
+  page.once("dialog", dialog => dialog.accept());
+  await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).click();
+  await waitFor(async () => (await webhookSecret()) !== firstGiteaSecret, "rotated Gitea secret");
+  const rotatedGiteaSecret = await webhookSecret();
+  if (!rotatedGiteaSecret) throw new Error("Gitea rotation did not show a new secret");
+  if (await sendGitea(firstGiteaSecret, "browser-gitea-old") !== 401) throw new Error("old Gitea secret still authenticated after rotation");
+  if (await sendGitea(rotatedGiteaSecret, "browser-gitea-new") !== 204) throw new Error("rotated Gitea secret did not authenticate a push");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByText("Fixture site", { exact: true }).click();
+  await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).waitFor();
+  if ((await page.locator("body").innerText()).includes(rotatedGiteaSecret)) throw new Error("Gitea secret remained after dashboard reload");
   await page.getByLabel("Deployment name").fill("Production site");
   await page.locator("form").locator("select").selectOption("branch:feature/search");
   const deploymentResponse = page.waitForResponse(response => response.url().endsWith("/api/deployments") && response.request().method() === "POST");
