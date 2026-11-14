@@ -104,6 +104,13 @@ try {
   };
   await startServer();
 
+  // A different listener must not bypass installation ownership. Routine setup
+  // and (below) account recovery still work while the owning daemon is live.
+  const secondDaemon = spawnSync(executable, ["serve", "--data", dir, "--listen", "127.0.0.1:0"], { cwd: dir, encoding: "utf8", timeout: 5000 });
+  if (secondDaemon.error || secondDaemon.status === 0 || !secondDaemon.stderr.includes("daemon ownership")) throw new Error(`second daemon was not promptly refused: ${secondDaemon.stderr}`);
+  const liveSetup = spawnSync(executable, ["setup", "--data", dir, "--listen", listen], { cwd: dir, encoding: "utf8", timeout: 5000 });
+  if (liveSetup.error || liveSetup.status !== 0 || !new URL(liveSetup.stdout.trim()).hash) throw new Error(liveSetup.stderr || "setup alongside daemon failed");
+
   const pageResponse = await fetch(`http://${listen}/register`, { headers: { Accept: "text/html" } });
   const shell = await pageResponse.text();
   if (pageResponse.status !== 200 || !shell.includes("_app/immutable/entry/start.")) throw new Error("registration route did not return the embedded SPA shell");

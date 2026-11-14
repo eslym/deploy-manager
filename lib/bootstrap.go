@@ -55,6 +55,8 @@ type Config struct {
 	WebhookMaxBodyBytes         int64
 	beforeRestoreDeploymentJobs func(*sql.DB) error
 	// storageFault is a per-startup test seam, never configured by the CLI or HTTP.
+	// "access" runs under the access guard before DB/key work, with a nil DB;
+	// "verify" runs after preparation and before storage readiness.
 	storageFault func(string, *sql.DB) error
 }
 
@@ -85,11 +87,18 @@ type App struct {
 	deploymentJobsMu     sync.Mutex
 	deploymentJobCancels map[string]activeDeploymentJob
 	webhookFault         func(string) error
+	daemonOwnership      *storageLock
+	storageAccess        *storageLock
+	storageCloseOnce     sync.Once
+	storageCloseErr      error
 }
 
 // prepareStorage performs only schema/key preparation and validation. Runtime
 // recovery and all background work belong to readyStorage.start.
 func prepareStorage(cfg Config) (*readyStorage, error) {
+	if err := validateStoragePaths(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
 	}
@@ -160,9 +169,20 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	if cfg.GitMaxTransferBytes < 1024 || cfg.GitMaxTransferBytes > 1<<30 || cfg.GitMaxCacheBytes < 1 || cfg.GitMaxCacheBytes > 1<<40 || cfg.GitMaxRefs < 1 || cfg.GitMaxRefs > 100000 || cfg.GitMaxAdvertisementBytes < 1024 || cfg.GitMaxAdvertisementBytes > 64<<20 || cfg.GitMaxAdvertisementBytes > cfg.GitMaxTransferBytes {
 		return nil, errors.New("Git transfer, cache, or reference limit is outside the supported range")
 	}
-	prior, err := pathExists(cfg.DatabasePath)
+	access, prior, err := acquireStorageAccess(cfg)
 	if err != nil {
 		return nil, err
+	}
+	accessTransferred := false
+	defer func() {
+		if !accessTransferred {
+			_ = access.Close()
+		}
+	}()
+	if cfg.storageFault != nil {
+		if err := cfg.storageFault("access", nil); err != nil {
+			return nil, err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0700); err != nil {
 		return nil, err
@@ -189,8 +209,16 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	if err != nil {
 		return nil, err
 	}
-	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String()
-	db, err := sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on")
+	// Parent traversal was rejected before any filesystem work, and access
+	// coordination validated the database directory without symlink ancestors.
+	// An absolute URL path selects that same file; a relative URL path would be
+	// encoded as a file://authority and rejected by SQLite.
+	sqlitePath, err := filepath.Abs(cfg.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(sqlitePath)}).String()
+	db, err := sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=1000&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -325,6 +353,12 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 		}
 	}
 	ready = true
+	if err := access.share(); err != nil {
+		_ = app.Close()
+		return nil, err
+	}
+	app.storageAccess = access
+	accessTransferred = true
 	return &readyStorage{app: app}, nil
 }
 
@@ -440,8 +474,11 @@ func (a *App) Close() error {
 			a.deployWG.Wait()
 		}
 	})
-	clear(a.repositoryMaster)
-	return a.db.Close()
+	a.storageCloseOnce.Do(func() {
+		clear(a.repositoryMaster)
+		a.storageCloseErr = errors.Join(a.db.Close(), a.storageAccess.Close(), a.daemonOwnership.Close())
+	})
+	return a.storageCloseErr
 }
 
 // IssueRegistrationGrant returns a random one-time token; only its SHA-256 digest is stored.

@@ -52,6 +52,9 @@ func TestStorageReadinessFaultClosesResourcesBeforeNormalWork(t *testing.T) {
 	want := errors.New("injected storage verification failure")
 	var opened *sql.DB
 	cfg.storageFault = func(phase string, db *sql.DB) error {
+		if phase == "access" {
+			return nil
+		}
 		if phase != "verify" {
 			t.Fatalf("unexpected fault phase %q", phase)
 		}
