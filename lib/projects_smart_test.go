@@ -635,6 +635,27 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if len(projects) != 1 || projects[0].ID != created.ID || projects[0].Warning == "" || projects[0].LastFetched == nil {
 		t.Fatalf("project config/status did not survive restart: %#v", projects)
 	}
+	deploymentsRequest, _ := http.NewRequest(http.MethodGet, restarted.URL+"/api/deployments", nil)
+	deploymentsRequest.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+	deploymentsResponse, err := restarted.Client().Do(deploymentsRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persistedDeployments []deployment
+	if err = json.NewDecoder(deploymentsResponse.Body).Decode(&persistedDeployments); err != nil {
+		deploymentsResponse.Body.Close()
+		t.Fatal(err)
+	}
+	deploymentsResponse.Body.Close()
+	persistedBranchTarget := false
+	for _, item := range persistedDeployments {
+		if item.ID == branchDeployment.ID && item.TargetKind == "branch" && item.TargetName == "feature/search" {
+			persistedBranchTarget = true
+		}
+	}
+	if !persistedBranchTarget {
+		t.Fatal("configured branch target did not survive application restart")
+	}
 	if got := projectRefsFromAPI(t, restarted.Client(), restarted.URL, cookie, created.ID); !equalProjectRefs(refreshedRefs, got) {
 		t.Fatalf("cached refs did not survive restart: %#v", got)
 	}
