@@ -41,6 +41,7 @@ type projectManager struct {
 	mu                    sync.Mutex
 	cacheMu               sync.RWMutex
 	lfsCacheMu            sync.Mutex
+	lfsAuthMu             sync.RWMutex
 	stateMu               sync.RWMutex
 	cacheFS               projectCacheFS
 	blocked               string
@@ -608,6 +609,8 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 	p := a.projects
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.lfsAuthMu.Lock()
+	defer p.lfsAuthMu.Unlock()
 	id := r.PathValue("id")
 	var remote string
 	if p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote) != nil {

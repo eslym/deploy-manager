@@ -6,6 +6,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -27,6 +29,7 @@ import (
 
 func main() {
 	listen := flag.String("listen", "127.0.0.1:18442", "listen address")
+	lfsHref := flag.String("lfs-href", "https://127.0.0.1:18441/private-lfs", "approved private LFS endpoint returned by the remote service")
 	flag.Parse()
 	root, err := os.MkdirTemp("", "deploy-manager-ssh-fixture-")
 	if err != nil {
@@ -67,7 +70,7 @@ func main() {
 		if err != nil {
 			return
 		}
-		go serveConnection(connection, config, endpoint, backend)
+		go serveConnection(connection, config, endpoint, backend, *lfsHref)
 	}
 }
 
@@ -88,8 +91,19 @@ func makeRepository(repository, root string) error {
 	if err = os.WriteFile(filepath.Join(workPath, "index.html"), []byte("SSH fixture site\n"), 0600); err != nil {
 		return err
 	}
-	if _, err = wt.Add("index.html"); err != nil {
+	payload := []byte("fixture hydrated LFS asset\n")
+	digest := sha256.Sum256(payload)
+	pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", hex.EncodeToString(digest[:]), len(payload))
+	if err = os.WriteFile(filepath.Join(workPath, ".gitattributes"), []byte("*.dat filter=lfs\n"), 0600); err != nil {
 		return err
+	}
+	if err = os.WriteFile(filepath.Join(workPath, "asset.dat"), []byte(pointer), 0600); err != nil {
+		return err
+	}
+	for _, name := range []string{"index.html", ".gitattributes", "asset.dat"} {
+		if _, err = wt.Add(name); err != nil {
+			return err
+		}
 	}
 	commit, err := wt.Commit("SSH fixture", &git.CommitOptions{Author: &object.Signature{Name: "Fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
 	if err != nil {
@@ -108,7 +122,7 @@ func makeRepository(repository, root string) error {
 	return bare.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.NewBranchReferenceName("main")))
 }
 
-func serveConnection(connection net.Conn, config *ssh.ServerConfig, endpoint *transport.Endpoint, backend transport.Transport) {
+func serveConnection(connection net.Conn, config *ssh.ServerConfig, endpoint *transport.Endpoint, backend transport.Transport, lfsHref string) {
 	defer connection.Close()
 	client, channels, requests, err := ssh.NewServerConn(connection, config)
 	if err != nil {
@@ -125,11 +139,11 @@ func serveConnection(connection net.Conn, config *ssh.ServerConfig, endpoint *tr
 		if err != nil {
 			continue
 		}
-		go serveSession(channel, requests, endpoint, backend)
+		go serveSession(channel, requests, endpoint, backend, lfsHref)
 	}
 }
 
-func serveSession(channel ssh.Channel, requests <-chan *ssh.Request, endpoint *transport.Endpoint, backend transport.Transport) {
+func serveSession(channel ssh.Channel, requests <-chan *ssh.Request, endpoint *transport.Endpoint, backend transport.Transport, lfsHref string) {
 	defer channel.Close()
 	for request := range requests {
 		if request.Type != "exec" {
@@ -137,7 +151,17 @@ func serveSession(channel ssh.Channel, requests <-chan *ssh.Request, endpoint *t
 			continue
 		}
 		var command struct{ Value string }
-		if ssh.Unmarshal(request.Payload, &command) != nil || !strings.HasPrefix(command.Value, "git-upload-pack ") {
+		if ssh.Unmarshal(request.Payload, &command) != nil {
+			_ = request.Reply(false, nil)
+			return
+		}
+		if command.Value == "git-lfs-authenticate '/repo.git' download" {
+			_ = request.Reply(true, nil)
+			_, _ = fmt.Fprintf(channel, `{"href":%q,"header":{"Authorization":"Bearer ssh-fixture-private-lfs"},"expires_in":60}`, lfsHref)
+			_, _ = channel.SendRequest("exit-status", false, ssh.Marshal(struct{ Status uint32 }{0}))
+			return
+		}
+		if !strings.HasPrefix(command.Value, "git-upload-pack ") {
 			_ = request.Reply(false, nil)
 			return
 		}

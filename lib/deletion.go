@@ -369,6 +369,8 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 	p := a.projects
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.lfsAuthMu.Lock()
+	defer p.lfsAuthMu.Unlock()
 	id := r.PathValue("id")
 	if !validProjectID(id) {
 		http.NotFound(w, r)
@@ -545,9 +547,11 @@ func (a *App) retryProjectDeletions() {
 	rows.Close()
 	for _, v := range xs {
 		a.projects.mu.Lock()
+		a.projects.lfsAuthMu.Lock()
 		a.projects.cacheMu.Lock()
 		_ = a.finishProjectDeletion(v.id, v.identity, v.lfs)
 		a.projects.cacheMu.Unlock()
+		a.projects.lfsAuthMu.Unlock()
 		a.projects.mu.Unlock()
 	}
 }

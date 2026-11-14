@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/sys/unix"
 )
 
@@ -38,15 +39,18 @@ type lfsProjectSettings struct {
 }
 
 type lfsHydrator struct {
-	projectID    string
-	settings     lfsProjectSettings
-	cacheRoot    string
-	cacheBase    string
-	cacheBudget  int64
-	cacheLock    *sync.Mutex
-	cacheAllowed func() error
-	maxObject    int64
-	client       *http.Client
+	projectID        string
+	settings         lfsProjectSettings
+	cacheRoot        string
+	cacheBase        string
+	cacheBudget      int64
+	cacheLock        *sync.Mutex
+	cacheAllowed     func() error
+	maxObject        int64
+	client           *http.Client
+	sshLifecycleLock func() func()
+	sshAuth          func(context.Context) (lfsAuthCredentials, error)
+	now              func() time.Time
 }
 
 type lfsBatchRequest struct {
@@ -105,7 +109,7 @@ func newLFSHydratorWithBudget(projectID string, settings lfsProjectSettings, roo
 		TLSClientConfig: &tls.Config{RootCAs: lfsTestRootCAs, MinVersion: tls.VersionTLS12},
 		DialContext:     lfsPolicyDialer{allowInternal: settings.AllowInternal, internalAddresses: addressSets(settings.InternalAddresses)}.DialContext,
 	}
-	return &lfsHydrator{projectID: projectID, settings: settings, cacheRoot: filepath.Join(root, "lfs-cache", projectID), cacheBase: root, cacheBudget: cacheBudget, cacheLock: cacheLock, maxObject: maxObject, client: &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	return &lfsHydrator{projectID: projectID, settings: settings, cacheRoot: filepath.Join(root, "lfs-cache", projectID), cacheBase: root, cacheBudget: cacheBudget, cacheLock: cacheLock, maxObject: maxObject, now: time.Now, client: &http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }
 
 func validateLFSEndpoint(raw string) (*url.URL, error) {
@@ -225,6 +229,10 @@ func (h *lfsHydrator) hydrate(ctx context.Context, pointer lfsPointer) (string, 
 	}
 	if h.cacheLock == nil {
 		return "", errors.New("LFS cache lifecycle is unavailable")
+	}
+	if h.sshLifecycleLock != nil {
+		release := h.sshLifecycleLock()
+		defer release()
 	}
 	h.cacheLock.Lock()
 	defer h.cacheLock.Unlock()
@@ -419,6 +427,19 @@ func openLFSCacheFile(name string) (*os.File, error) {
 
 func (h *lfsHydrator) fetch(ctx context.Context, pointer lfsPointer, destination string, writeBudget int64) (retErr error) {
 	endpoint, _ := url.Parse(h.settings.Endpoint)
+	var credentials lfsAuthCredentials
+	defer func() { clearLFSStringHeaders(credentials.headers) }()
+	if h.sshAuth != nil {
+		var err error
+		credentials, err = h.sshAuth(ctx)
+		if err != nil {
+			return errors.New("private SSH LFS authentication failed; verify the key, host approval, and service capability")
+		}
+		if credentials.endpoint == nil || !credentials.expires.After(h.now()) {
+			return errors.New("private SSH LFS credentials expired before the batch request")
+		}
+		endpoint = credentials.endpoint
+	}
 	batchURL := *endpoint
 	batchURL.Path = strings.TrimRight(batchURL.Path, "/") + "/objects/batch"
 	body, err := json.Marshal(lfsBatchRequest{Operation: "download", Transfers: []string{"basic"}, HashAlgo: "sha256", Objects: []lfsBatchObject{{OID: pointer.OID, Size: pointer.Size}}})
@@ -431,11 +452,22 @@ func (h *lfsHydrator) fetch(ctx context.Context, pointer lfsPointer, destination
 	}
 	req.Header.Set("Accept", "application/vnd.git-lfs+json")
 	req.Header.Set("Content-Type", "application/vnd.git-lfs+json")
+	for key, value := range credentials.headers {
+		if !validLFSActionHeader(key, value) {
+			return errors.New("SSH LFS authentication returned unsafe headers")
+		}
+		req.Header.Set(key, value)
+	}
+	if !credentials.expires.IsZero() && !credentials.expires.After(h.now()) {
+		return errors.New("private SSH LFS credentials expired before the batch request")
+	}
 	response, err := h.client.Do(req)
+	clearLFSHeaders(req.Header)
 	if err != nil {
 		return errors.New("LFS batch request failed")
 	}
 	batch, readErr := io.ReadAll(io.LimitReader(response.Body, maxLFSBatchBytes+1))
+	defer clear(batch)
 	closeErr := response.Body.Close()
 	if readErr != nil || closeErr != nil || len(batch) > maxLFSBatchBytes || response.StatusCode != http.StatusOK {
 		return errors.New("LFS batch response was invalid")
@@ -456,12 +488,10 @@ func (h *lfsHydrator) fetch(ctx context.Context, pointer lfsPointer, destination
 	if !ok {
 		return errors.New("LFS download action is missing")
 	}
+	defer clearLFSStringHeaders(action.Header)
 	objectURL, err := validateLFSActionURL(action.Href, h.settings)
 	if err != nil {
 		return errors.New("LFS download origin is not approved")
-	}
-	if originOf(objectURL) != originOf(endpoint) && len(action.Header) != 0 {
-		return errors.New("LFS action headers cannot be sent to a different object origin")
 	}
 	get, err := http.NewRequestWithContext(ctx, http.MethodGet, objectURL.String(), nil)
 	if err != nil {
@@ -473,7 +503,11 @@ func (h *lfsHydrator) fetch(ctx context.Context, pointer lfsPointer, destination
 		}
 		get.Header.Set(key, value)
 	}
+	if !credentials.expires.IsZero() && !credentials.expires.After(h.now()) {
+		return errors.New("private SSH LFS credentials expired before the object request")
+	}
 	response, err = h.client.Do(get)
+	clearLFSHeaders(get.Header)
 	if err != nil {
 		return errors.New("LFS payload download failed")
 	}
@@ -502,12 +536,19 @@ func (h *lfsHydrator) fetch(ctx context.Context, pointer lfsPointer, destination
 		_ = tmp.Close()
 		return errors.New("LFS payload failed exact size or SHA-256 verification")
 	}
+	if !credentials.expires.IsZero() && !credentials.expires.After(h.now()) {
+		_ = tmp.Close()
+		return errors.New("private SSH LFS credentials expired during the object request")
+	}
 	if err = tmp.Sync(); err != nil {
 		_ = tmp.Close()
 		return errors.New("LFS cache could not be synchronized")
 	}
 	if err = tmp.Close(); err != nil {
 		return errors.New("LFS cache could not be closed")
+	}
+	if !credentials.expires.IsZero() && !credentials.expires.After(h.now()) {
+		return errors.New("private SSH LFS credentials expired before cache commit")
 	}
 	if err = os.Rename(tmpName, destination); err != nil {
 		return errors.New("verified LFS payload could not be committed to cache")
@@ -519,6 +560,22 @@ func (h *lfsHydrator) fetch(ctx context.Context, pointer lfsPointer, destination
 		return fmt.Errorf("verified LFS cache entry failed post-commit validation")
 	}
 	return nil
+}
+
+func clearLFSHeaders(headers http.Header) {
+	for name := range headers {
+		for i := range headers[name] {
+			headers[name][i] = ""
+		}
+		delete(headers, name)
+	}
+}
+
+func clearLFSStringHeaders(headers map[string]string) {
+	for name := range headers {
+		headers[name] = ""
+		delete(headers, name)
+	}
 }
 
 type lfsCacheWriter struct {
@@ -573,8 +630,11 @@ func validateLFSActionURL(raw string, settings lfsProjectSettings) (*url.URL, er
 func validLFSActionHeader(key, value string) bool {
 	key = http.CanonicalHeaderKey(key)
 	switch key {
-	case "", "Host", "Connection", "Proxy-Authorization", "Proxy-Authenticate", "Transfer-Encoding", "Upgrade", "Trailer", "Content-Length":
+	case "", "Host", "Connection", "Keep-Alive", "Te", "Proxy", "Proxy-Connection", "Proxy-Authorization", "Proxy-Authenticate", "Forwarded", "Cookie", "Cookie2", "Set-Cookie", "Set-Cookie2", "Transfer-Encoding", "Upgrade", "Trailer", "Content-Length":
 		return false
 	}
-	return !strings.ContainsAny(key+value, "\r\n\x00")
+	if strings.HasPrefix(key, "X-Forwarded-") || key == "X-Real-Ip" {
+		return false
+	}
+	return httpguts.ValidHeaderFieldName(key) && httpguts.ValidHeaderFieldValue(value)
 }

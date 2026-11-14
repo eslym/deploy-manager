@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -169,6 +170,33 @@ func TestLFSRejectsRedirectsAndCorruptPayloads(t *testing.T) {
 	}
 }
 
+func TestLFSRejectsUntrustedTLSBeforeMakingAnHTTPRequest(t *testing.T) {
+	requests := atomic.Int64{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	oldRoots := lfsTestRootCAs
+	lfsTestRootCAs = nil
+	t.Cleanup(func() { lfsTestRootCAs = oldRoots })
+	settings := lfsProjectSettings{Endpoint: server.URL + "/lfs", ObjectOrigins: []string{server.URL}, AllowInternal: true, InternalAddresses: map[string][]string{server.URL: {"127.0.0.1"}}}
+	hydrator, err := newLFSHydrator("6123456789abcdef0123456789abcdef", settings, t.TempDir(), 1<<20, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte("must not be downloaded over untrusted TLS")
+	digest := sha256.Sum256(payload)
+	_, err = hydrator.hydrate(context.Background(), lfsPointer{OID: hex.EncodeToString(digest[:]), Size: int64(len(payload))})
+	if err == nil || requests.Load() != 0 {
+		t.Fatalf("untrusted TLS was accepted or reached HTTP handler: err=%v requests=%d", err, requests.Load())
+	}
+	entries, readErr := os.ReadDir(hydrator.cacheRoot)
+	if readErr != nil || len(entries) != 0 {
+		t.Fatalf("untrusted TLS left cache files: entries=%v err=%v", entries, readErr)
+	}
+}
+
 func TestLFSAddressPolicyAndActionOriginCredentialScope(t *testing.T) {
 	for _, raw := range []string{"127.0.0.1", "10.0.0.1"} {
 		ip := netip.MustParseAddr(raw)
@@ -280,6 +308,165 @@ func TestAnonymousLFSHTTPSDownloadCachesVerifiedContent(t *testing.T) {
 	if _, err = limited.hydrate(context.Background(), lfsPointer{OID: oid, Size: int64(len(payload))}); err == nil {
 		t.Fatal("payload was written beyond the configured cache budget")
 	}
+}
+
+func TestPrivateLFSCredentialsAreScopedToBatchAndVerifiedCacheIsReusable(t *testing.T) {
+	payload := []byte("private repository payload")
+	digest := sha256.Sum256(payload)
+	oid := hex.EncodeToString(digest[:])
+	objectServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer object-only" {
+			t.Errorf("approved action credential missing or batch credential leaked: %q", r.Header.Get("Authorization"))
+		}
+		_, _ = w.Write(payload)
+	}))
+	defer objectServer.Close()
+	var actionURL string
+	batchRequests := 0
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/lfs/objects/batch":
+			batchRequests++
+			if r.Header.Get("Authorization") != "Bearer ephemeral-test-secret" {
+				t.Errorf("private LFS batch authorization missing: %q", r.Header.Get("Authorization"))
+			}
+			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q,"header":{"Authorization":"Bearer object-only"}}}}]}`, oid, len(payload), actionURL)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	actionURL = objectServer.URL + "/object?signature=private-test-signature"
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	pool.AddCert(objectServer.Certificate())
+	oldRoots := lfsTestRootCAs
+	lfsTestRootCAs = pool
+	t.Cleanup(func() { lfsTestRootCAs = oldRoots })
+	settings := lfsProjectSettings{Endpoint: server.URL + "/lfs", ObjectOrigins: []string{server.URL, objectServer.URL}, AllowInternal: true, InternalAddresses: map[string][]string{server.URL: {"127.0.0.1"}, objectServer.URL: {"127.0.0.1"}}}
+	root := t.TempDir()
+	hydrator, err := newLFSHydrator("3123456789abcdef0123456789abcdef", settings, root, 1<<20, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authCalls := 0
+	hydrator.sshAuth = func(context.Context) (lfsAuthCredentials, error) {
+		authCalls++
+		return lfsAuthCredentials{endpoint: mustLFSURL(t, settings.Endpoint), headers: map[string]string{"Authorization": "Bearer ephemeral-test-secret"}, expires: time.Now().Add(time.Minute)}, nil
+	}
+	pointer := lfsPointer{OID: oid, Size: int64(len(payload))}
+	cache, err := hydrator.hydrate(context.Background(), pointer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(cache); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("private payload = %q, %v", got, err)
+	}
+	restarted, err := newLFSHydrator("3123456789abcdef0123456789abcdef", settings, root, 1<<20, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted.sshAuth = hydrator.sshAuth
+	if _, err = restarted.hydrate(context.Background(), pointer); err != nil || batchRequests != 1 || authCalls != 1 {
+		t.Fatalf("verified cache reuse made an auth/network request: batches=%d auth=%d err=%v", batchRequests, authCalls, err)
+	}
+}
+
+func TestPrivateLFSCredentialExpiryDuringBatchStopsWithoutRetryOrCacheWrite(t *testing.T) {
+	payload := []byte("expiring private object")
+	digest := sha256.Sum256(payload)
+	oid := hex.EncodeToString(digest[:])
+	base := time.Now().UTC()
+	clock := atomic.Int64{}
+	clock.Store(base.UnixNano())
+	var actionURL string
+	objectRequests := atomic.Int64{}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/lfs/objects/batch" {
+			clock.Store(base.Add(2 * time.Second).UnixNano())
+			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q}}}]}`, oid, len(payload), actionURL)
+			return
+		}
+		objectRequests.Add(1)
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+	actionURL = server.URL + "/object"
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	oldRoots := lfsTestRootCAs
+	lfsTestRootCAs = pool
+	t.Cleanup(func() { lfsTestRootCAs = oldRoots })
+	settings := lfsProjectSettings{Endpoint: server.URL + "/lfs", ObjectOrigins: []string{server.URL}, AllowInternal: true, InternalAddresses: map[string][]string{server.URL: {"127.0.0.1"}}}
+	hydrator, err := newLFSHydrator("4123456789abcdef0123456789abcdef", settings, t.TempDir(), 1<<20, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hydrator.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	authCalls := 0
+	hydrator.sshAuth = func(context.Context) (lfsAuthCredentials, error) {
+		authCalls++
+		return lfsAuthCredentials{endpoint: mustLFSURL(t, settings.Endpoint), expires: base.Add(time.Second)}, nil
+	}
+	if _, err = hydrator.hydrate(context.Background(), lfsPointer{OID: oid, Size: int64(len(payload))}); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired in-flight credentials returned %v", err)
+	}
+	entries, err := os.ReadDir(hydrator.cacheRoot)
+	if err != nil || len(entries) != 0 || authCalls != 1 || objectRequests.Load() != 0 {
+		t.Fatalf("expiry was retried or left cached data: entries=%v auth=%d object=%d err=%v", entries, authCalls, objectRequests.Load(), err)
+	}
+}
+
+func TestPrivateLFSCredentialExpiryDuringObjectRequestDoesNotCommitCache(t *testing.T) {
+	payload := []byte("slow private object")
+	digest := sha256.Sum256(payload)
+	oid := hex.EncodeToString(digest[:])
+	base := time.Now().UTC()
+	clock := atomic.Int64{}
+	clock.Store(base.UnixNano())
+	var actionURL string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/lfs/objects/batch" {
+			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q}}}]}`, oid, len(payload), actionURL)
+			return
+		}
+		clock.Store(base.Add(2 * time.Second).UnixNano())
+		_, _ = w.Write(payload)
+	}))
+	defer server.Close()
+	actionURL = server.URL + "/object"
+	pool := x509.NewCertPool()
+	pool.AddCert(server.Certificate())
+	oldRoots := lfsTestRootCAs
+	lfsTestRootCAs = pool
+	t.Cleanup(func() { lfsTestRootCAs = oldRoots })
+	settings := lfsProjectSettings{Endpoint: server.URL + "/lfs", ObjectOrigins: []string{server.URL}, AllowInternal: true, InternalAddresses: map[string][]string{server.URL: {"127.0.0.1"}}}
+	hydrator, err := newLFSHydrator("5123456789abcdef0123456789abcdef", settings, t.TempDir(), 1<<20, 5*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hydrator.now = func() time.Time { return time.Unix(0, clock.Load()).UTC() }
+	authCalls := 0
+	hydrator.sshAuth = func(context.Context) (lfsAuthCredentials, error) {
+		authCalls++
+		return lfsAuthCredentials{endpoint: mustLFSURL(t, settings.Endpoint), expires: base.Add(time.Second)}, nil
+	}
+	if _, err = hydrator.hydrate(context.Background(), lfsPointer{OID: oid, Size: int64(len(payload))}); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("credentials expiring during object download returned %v", err)
+	}
+	entries, err := os.ReadDir(hydrator.cacheRoot)
+	if err != nil || len(entries) != 0 || authCalls != 1 {
+		t.Fatalf("expired object request committed cache or retried auth: entries=%v auth=%d err=%v", entries, authCalls, err)
+	}
+}
+
+func mustLFSURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }
 
 func TestEffectiveLFSAttributesNestedPrecedenceAndMacros(t *testing.T) {

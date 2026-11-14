@@ -352,6 +352,8 @@ func (a *App) deleteRepositoryKey(w http.ResponseWriter, r *http.Request) {
 	}
 	a.projects.mu.Lock()
 	defer a.projects.mu.Unlock()
+	a.projects.lfsAuthMu.Lock()
+	defer a.projects.lfsAuthMu.Unlock()
 	id := r.PathValue("id")
 	tx, err := a.db.Begin()
 	if err != nil {
