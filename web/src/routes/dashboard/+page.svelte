@@ -489,7 +489,9 @@
 						</li>{:else}<li class="list-none py-4 text-[#58645b]">No matching refs.</li>{/each}
 				</ul>
 			</div>
-			<Deployments projectId={selected} refs={refs[selected] ?? []} />
+			<div class="md:col-span-2">
+				<Deployments projectId={selected} refs={refs[selected] ?? []} />
+			</div>
 		{/if}
 	</section>
 </main>

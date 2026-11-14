@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
 	type Ref = { kind: string; name: string; commit: string };
 	type Deployment = {
 		id: string;
@@ -20,6 +19,8 @@
 	let commit = $state('');
 	let error = $state('');
 	let busy = $state(false);
+	let loadInProgress = false;
+	let loadVersion = 0;
 	let commits = $derived.by(() => {
 		const unique: Record<string, string[]> = {};
 		for (const ref of refs)
@@ -43,19 +44,28 @@
 			);
 		return response.status === 204 ? null : response.json();
 	}
-	async function load() {
+	async function load(id = projectId) {
+		if (loadInProgress) return;
+		loadInProgress = true;
+		const version = loadVersion;
 		try {
 			const all: Deployment[] = await request('/api/deployments');
-			deployments = all.filter((item) => item.projectId === projectId);
-			for (const item of deployments) targetSelections[item.id] ??= item.commit;
+			if (version !== loadVersion || id !== projectId) return;
+			const currentDeployments = all.filter((item) => item.projectId === id);
+			deployments = currentDeployments;
+			for (const item of currentDeployments) targetSelections[item.id] ??= item.commit;
 			const loaded = await Promise.all(
-				deployments.map(
+				currentDeployments.map(
 					async (item) => [item.id, await request(`/api/deployments/${item.id}/jobs`)] as const
 				)
 			);
+			if (version !== loadVersion || id !== projectId) return;
 			jobs = Object.fromEntries(loaded);
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not load deployments.';
+			if (version === loadVersion && id === projectId)
+				error = cause instanceof Error ? cause.message : 'Could not load deployments.';
+		} finally {
+			loadInProgress = false;
 		}
 	}
 	async function create(event: SubmitEvent) {
@@ -105,10 +115,21 @@
 			busy = false;
 		}
 	}
-	onMount(() => {
-		void load();
-		const poll = window.setInterval(() => void load(), 2000);
-		return () => window.clearInterval(poll);
+	$effect(() => {
+		const id = projectId;
+		const version = ++loadVersion;
+		let active = true;
+		let timeout: number;
+		const poll = async () => {
+			if (!active || version !== loadVersion) return;
+			await load(id);
+			if (active && version === loadVersion) timeout = window.setTimeout(poll, 2000);
+		};
+		void poll();
+		return () => {
+			active = false;
+			window.clearTimeout(timeout);
+		};
 	});
 </script>
 

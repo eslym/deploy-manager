@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -76,6 +78,164 @@ func TestExportPublishesDotfilesAndRejectsTrackedSymlinks(t *testing.T) {
 	}
 }
 
+// TestPublicationCrashChild is run in a separate Go test process by
+// TestPublicationProcessCrashesReconcileDirectoryIdentity. os.Exit deliberately
+// bypasses App.Close and deferred cleanup, unlike a returned injected error.
+func TestPublicationCrashChild(t *testing.T) {
+	point := os.Getenv("PUBLICATION_CRASH_POINT")
+	if point == "" {
+		return
+	}
+	cfg := Config{DatabasePath: os.Getenv("PUBLICATION_CRASH_DB"), OPAQUEKeyPath: os.Getenv("PUBLICATION_CRASH_KEY"), DeployGracePeriod: time.Nanosecond}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app.startDeploymentWorkers()
+	publicationFaultPoint = func(at string) error {
+		if at == point {
+			os.Exit(86)
+		}
+		return nil
+	}
+	jobID, err := app.enqueueDeployment(os.Getenv("PUBLICATION_CRASH_DEPLOYMENT"), os.Getenv("PUBLICATION_CRASH_COMMIT"), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		var status string
+		if err := app.db.QueryRow(`SELECT status FROM deployment_jobs WHERE id=?`, jobID).Scan(&status); err == nil && status != "queued" && status != "running" {
+			if point == "after-cleanup" && status == "succeeded" {
+				time.Sleep(2 * time.Millisecond)
+				if err := app.cleanupPublications(true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Fatalf("publication completed with status %q without reaching crash point %s", status, point)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("publication did not reach crash point %s", point)
+}
+
+func TestPublicationProcessCrashesReconcileDirectoryIdentity(t *testing.T) {
+	points := []string{"after-stage-fsync", "after-intent", "after-exchange", "after-directory-fsync", "before-state", "after-state", "after-cleanup"}
+	for _, hadOld := range []bool{false, true} {
+		for _, point := range points {
+			if point == "after-cleanup" && !hadOld {
+				continue
+			}
+			t.Run(fmt.Sprintf("old-%t/%s", hadOld, point), func(t *testing.T) {
+				base := t.TempDir()
+				repoDir := filepath.Join(base, "fixture")
+				commitID := createSmartFixture(t, repoDir)
+				cfg := Config{DatabasePath: filepath.Join(base, "state.sqlite"), OPAQUEKeyPath: filepath.Join(base, "opaque.key"), DeployTimeout: 5 * time.Second}
+				app, err := New(cfg)
+				if err != nil {
+					t.Fatal(err)
+				}
+				deploymentID := strings.Repeat("d", 32)
+				projectID := strings.Repeat("e", 32)
+				now := time.Now().UnixNano()
+				if _, err := app.db.Exec(`INSERT INTO projects(id,name,remote_url,created_at,last_fetched,warning) VALUES(?,?,?,?,?,'')`, projectID, "fixture", "https://example.test/repo.git", now, now); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.MkdirAll(app.projects.repoPath(projectID), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := copyGitCache(repoDir, app.projects.repoPath(projectID), 64<<20); err != nil {
+					t.Fatal(err)
+				}
+				liveCommit := ""
+				liveDev, liveIno := uint64(0), uint64(0)
+				if hadOld {
+					if err := os.MkdirAll(app.deploymentPath(deploymentID), 0755); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(app.deploymentPath(deploymentID), "old.html"), []byte("old-live"), 0644); err != nil {
+						t.Fatal(err)
+					}
+					oldID, err := identity(app.deploymentPath(deploymentID))
+					if err != nil {
+						t.Fatal(err)
+					}
+					liveCommit, liveDev, liveIno = strings.Repeat("0", 40), oldID.Dev, oldID.Ino
+				}
+				if _, err := app.db.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,generation,live_commit,live_dev,live_ino,status,created_at,updated_at) VALUES(?,?,?, ?,1,?,?,?,'live',?,?)`, deploymentID, projectID, "crash-test", commitID, liveCommit, liveDev, liveIno, now, now); err != nil {
+					t.Fatal(err)
+				}
+				if err := app.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				cmd := exec.Command(os.Args[0], "-test.run=^TestPublicationCrashChild$")
+				cmd.Env = append(os.Environ(), "PUBLICATION_CRASH_POINT="+point, "PUBLICATION_CRASH_DB="+cfg.DatabasePath, "PUBLICATION_CRASH_KEY="+cfg.OPAQUEKeyPath, "PUBLICATION_CRASH_DEPLOYMENT="+deploymentID, "PUBLICATION_CRASH_COMMIT="+commitID)
+				output, err := cmd.CombinedOutput()
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) || exitErr.ExitCode() != 86 {
+					t.Fatalf("child did not exit at crash point %q (err=%v): %s", point, err, output)
+				}
+
+				app, err = New(cfg)
+				if err != nil {
+					t.Fatalf("restart reconciliation at %s: %v", point, err)
+				}
+				path := app.deploymentPath(deploymentID)
+				liveID, liveErr := identity(path)
+				shouldSwitch := point == "after-exchange" || point == "after-directory-fsync" || point == "before-state" || point == "after-state" || point == "after-cleanup"
+				if shouldSwitch {
+					if liveErr != nil {
+						t.Fatalf("new publication missing after %s: %v", point, liveErr)
+					}
+					if b, e := os.ReadFile(filepath.Join(path, "README.md")); e != nil || string(b) != "searchable feature\n" {
+						t.Fatalf("new live content after %s = %q, %v", point, b, e)
+					}
+				} else if hadOld {
+					if liveErr != nil || liveID != (dirIdentity{Dev: liveDev, Ino: liveIno}) {
+						t.Fatalf("old publication changed before switch at %s: id=%+v err=%v", point, liveID, liveErr)
+					}
+				} else if !os.IsNotExist(liveErr) {
+					t.Fatalf("first publication became visible before switch at %s: %v", point, liveErr)
+				}
+				firstIdentity := liveID
+				if shouldSwitch {
+					firstIdentity = liveID
+				}
+				if err := app.Close(); err != nil {
+					t.Fatal(err)
+				}
+				app, err = New(cfg)
+				if err != nil {
+					t.Fatalf("second restart reconciliation at %s: %v", point, err)
+				}
+				defer app.Close()
+				if shouldSwitch {
+					secondIdentity, e := identity(path)
+					if e != nil || secondIdentity != firstIdentity {
+						t.Fatalf("restart repeated/lost switch at %s: first=%+v second=%+v err=%v", point, firstIdentity, secondIdentity, e)
+					}
+				}
+				var intents int
+				if err := app.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, deploymentID).Scan(&intents); err != nil || intents != 0 {
+					t.Fatalf("intent remains after reconciliation: %d, %v", intents, err)
+				}
+				var jobStatus string
+				if err := app.db.QueryRow(`SELECT status FROM deployment_jobs WHERE deployment_id=? ORDER BY created_at DESC LIMIT 1`, deploymentID).Scan(&jobStatus); err != nil {
+					t.Fatal(err)
+				}
+				wantJobStatus := "failed"
+				if point == "after-state" || point == "after-cleanup" {
+					wantJobStatus = "succeeded"
+				}
+				if jobStatus != wantJobStatus {
+					t.Fatalf("interrupted job status=%q, want %q", jobStatus, wantJobStatus)
+				}
+			})
+		}
+	}
+}
+
 func TestCommitTargetRequiresFullSHA1ObjectID(t *testing.T) {
 	for _, target := range []string{"abc", "", "012345678901234567890123456789012345678Z", "012345678901234567890123456789012345678901"} {
 		if validCommitTarget(target) {
@@ -84,6 +244,75 @@ func TestCommitTargetRequiresFullSHA1ObjectID(t *testing.T) {
 	}
 	if !validCommitTarget("0123456789012345678901234567890123456789") {
 		t.Fatal("rejected full SHA-1 commit id")
+	}
+}
+
+func TestPublicationCleanupResumesAfterRestartAfterManyFailures(t *testing.T) {
+	base := t.TempDir()
+	now := time.Now()
+	cfg := Config{DatabasePath: filepath.Join(base, "state.sqlite"), OPAQUEKeyPath: filepath.Join(base, "opaque.key"), Now: func() time.Time { return now }}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strings.Repeat("b", 32)
+	job := strings.Repeat("c", 32)
+	if err := os.MkdirAll(app.deploymentPath(id), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(app.stagePath(id, job), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(app.stagePath(id, job), "old.html"), []byte("old"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldID, err := identity(app.stagePath(id, job))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.Exec(`INSERT INTO publication_cleanup(deployment_id,job_id,path_name,dev,ino,not_before,last_error,attempts) VALUES(?,?,?,?,?,?,?,0)`, id, job, "."+id+".stage-"+job, oldID.Dev, oldID.Ino, now.Add(-time.Second).UnixNano(), ""); err != nil {
+		t.Fatal(err)
+	}
+	previousFault := publicationFaultPoint
+	defer func() { publicationFaultPoint = previousFault }()
+	publicationFaultPoint = func(point string) error {
+		if point == "before-cleanup" {
+			return errors.New("temporary cleanup failure")
+		}
+		return nil
+	}
+	for i := 0; i < 9; i++ {
+		if err := app.cleanupPublications(false); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(time.Hour)
+	}
+	var attempts int
+	if err := app.db.QueryRow(`SELECT attempts FROM publication_cleanup WHERE deployment_id=? AND job_id=?`, id, job).Scan(&attempts); err != nil || attempts != 9 {
+		t.Fatalf("persisted cleanup attempts=%d err=%v", attempts, err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A fresh process has no in-memory retry state. The persisted obligation
+	// must still be eligible and complete once the filesystem permits cleanup.
+	app, err = New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	publicationFaultPoint = nil
+	now = now.Add(time.Hour)
+	if err := app.cleanupPublications(true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(app.stagePath(id, job)); !os.IsNotExist(err) {
+		t.Fatalf("cleanup did not resume after restart: %v", err)
+	}
+	var remaining int
+	if err := app.db.QueryRow(`SELECT count(*) FROM publication_cleanup WHERE deployment_id=? AND job_id=?`, id, job).Scan(&remaining); err != nil || remaining != 0 {
+		t.Fatalf("cleanup obligation remaining=%d err=%v", remaining, err)
 	}
 }
 
