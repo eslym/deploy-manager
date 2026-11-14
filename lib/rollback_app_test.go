@@ -239,9 +239,13 @@ func testRollbackGraphAndRaces(t *testing.T, client *http.Client, origin, cookie
 		case <-time.After(5 * time.Second):
 			t.Fatal("publication did not stage")
 		}
+		olderPending := []string{queue("deploy", ""), queue("deploy", "")}
 		job = queue("rollback", side.String())
 		close(release)
 		waitForDeploymentJob(t, client, origin, cookie, id, stale, "superseded")
+		for _, pending := range olderPending {
+			waitForDeploymentJob(t, client, origin, cookie, id, pending, "superseded")
+		}
 		waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
 		setPublicationFaultPoint(previous)
 		assertContent("searchable feature\n")
