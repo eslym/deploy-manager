@@ -29,20 +29,23 @@ var commitIDPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 func validCommitTarget(id string) bool { return commitIDPattern.MatchString(id) }
 
 type deployment struct {
-	ID          string    `json:"id"`
-	ProjectID   string    `json:"projectId"`
-	Name        string    `json:"name"`
-	Commit      string    `json:"commit"`
-	TargetKind  string    `json:"targetKind"`
-	TargetName  string    `json:"targetName,omitempty"`
-	LiveCommit  string    `json:"liveCommit,omitempty"`
-	LiveDev     uint64    `json:"-"`
-	LiveIno     uint64    `json:"-"`
-	Status      string    `json:"status"`
-	Error       string    `json:"error,omitempty"`
-	Publication string    `json:"publicationPath"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	ID               string `json:"id"`
+	ProjectID        string `json:"projectId"`
+	Name             string `json:"name"`
+	Commit           string `json:"commit"`
+	TargetKind       string `json:"targetKind"`
+	TargetName       string `json:"targetName,omitempty"`
+	AutomationPaused bool   `json:"automationPaused"`
+	automatic        bool
+	automationEpoch  int64
+	LiveCommit       string    `json:"liveCommit,omitempty"`
+	LiveDev          uint64    `json:"-"`
+	LiveIno          uint64    `json:"-"`
+	Status           string    `json:"status"`
+	Error            string    `json:"error,omitempty"`
+	Publication      string    `json:"publicationPath"`
+	CreatedAt        time.Time `json:"createdAt"`
+	UpdatedAt        time.Time `json:"updatedAt"`
 }
 
 type deploymentJob struct {
@@ -186,6 +189,9 @@ func (a *App) initDeployments() error {
 		return err
 	}
 	if err := ensureColumn(a.db, "deployment_jobs", "retry_enqueued", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := a.initDeploymentAutomation(); err != nil {
 		return err
 	}
 	if err := ensureColumn(a.db, "deployment_deletions", "retry_after", `INTEGER NOT NULL DEFAULT 0`); err != nil {
@@ -629,7 +635,7 @@ func (a *App) runDeploymentJob(jobID string) {
 	var projectID string
 	var createdAt, updatedAt int64
 	var forceRedeploy bool
-	err := a.db.QueryRow(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.generation,d.live_commit,d.live_dev,d.live_ino,d.status,d.error,d.created_at,d.updated_at,j.force_redeploy FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=? AND j.status='queued' AND j.generation=d.generation`, jobID).Scan(&d.ID, &projectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &generation, &d.LiveCommit, &d.LiveDev, &d.LiveIno, &d.Status, &d.Error, &createdAt, &updatedAt, &forceRedeploy)
+	err := a.db.QueryRow(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.generation,d.live_commit,d.live_dev,d.live_ino,d.status,d.error,d.created_at,d.updated_at,j.force_redeploy,j.automatic,j.automation_epoch FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=? AND j.status='queued' AND j.generation=d.generation`, jobID).Scan(&d.ID, &projectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &generation, &d.LiveCommit, &d.LiveDev, &d.LiveIno, &d.Status, &d.Error, &createdAt, &updatedAt, &forceRedeploy, &d.automatic, &d.automationEpoch)
 	if err != nil {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log='deployment was removed or its target changed',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 		return
@@ -698,6 +704,18 @@ func (a *App) runDeploymentJob(jobID string) {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
+	if d.automatic {
+		var paused bool
+		var epoch int64
+		if err := a.db.QueryRow(`SELECT automation_paused,automation_epoch FROM deployments WHERE id=?`, d.ID).Scan(&paused, &epoch); err != nil {
+			a.failJob(jobID, d.ID, generation, "Automatic deployment status could not be checked; the current publication was kept")
+			return
+		}
+		if paused || epoch != d.automationEpoch {
+			a.finishAutomaticFetch(jobID, d.ID, generation, paused)
+			return
+		}
+	}
 	if d.LiveCommit == d.Commit && !forceRedeploy {
 		if liveIdentity, identityErr := identity(a.deploymentPath(d.ID)); identityErr == nil && liveIdentity == (dirIdentity{Dev: d.LiveDev, Ino: d.LiveIno}) {
 			a.finishJob(jobID, d.ID, generation, "noop", "Already live at this commit", d.Commit)
@@ -722,7 +740,11 @@ func (a *App) runDeploymentJob(jobID string) {
 			if cleanupErr := a.cleanupUnpublishedStage(d.ID, jobID); cleanupErr != nil {
 				log.Printf("cannot clean superseded publication stage for deployment %s: %v", d.ID, cleanupErr)
 			}
-			_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+			if d.automatic {
+				a.finishAutomaticFetch(jobID, d.ID, generation, false)
+			} else {
+				_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+			}
 			return
 		}
 		if cleanupErr := a.cleanupUnpublishedStage(d.ID, jobID); cleanupErr != nil {
@@ -892,10 +914,12 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	var currentCommit string
 	var currentGeneration int64
 	var currentStatus string
-	if err = tx.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&currentCommit, &currentGeneration, &currentStatus); err != nil {
+	var paused bool
+	var epoch int64
+	if err = tx.QueryRow(`SELECT commit_id,generation,status,automation_paused,automation_epoch FROM deployments WHERE id=?`, d.ID).Scan(&currentCommit, &currentGeneration, &currentStatus, &paused, &epoch); err != nil {
 		return errors.New("deployment was deleted before publication")
 	}
-	if currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && currentCommit != d.Commit) {
+	if currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && currentCommit != d.Commit) || (d.automatic && (paused || epoch != d.automationEpoch)) {
 		return errors.New("publication target changed; job superseded")
 	}
 	if err = fault("before-intent"); err != nil {
@@ -918,11 +942,20 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 		return err
 	}
 	defer boundaryTx.Rollback()
-	guard, err := boundaryTx.Exec(`UPDATE deployments SET updated_at=updated_at WHERE id=? AND generation=?`, d.ID, generation)
+	guard, err := boundaryTx.Exec(`UPDATE deployments SET updated_at=updated_at WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed') AND (?=0 OR (automation_paused=0 AND automation_epoch=?))`, d.ID, generation, boolInt(d.automatic), d.automationEpoch)
 	if err != nil {
 		return err
 	}
 	if changed, _ := guard.RowsAffected(); changed != 1 {
+		// No namespace operation has happened. Remove only this job's intent
+		// while holding the same write transaction, so cleanup is safe now and
+		// a subsequent manual publication does not require restart recovery.
+		if _, err = boundaryTx.Exec(`DELETE FROM publication_intents WHERE deployment_id=? AND job_id=?`, d.ID, jobID); err != nil {
+			return err
+		}
+		if err = boundaryTx.Commit(); err != nil {
+			return err
+		}
 		return errors.New("publication target changed; job superseded")
 	}
 	if hadOld {
@@ -1272,7 +1305,7 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),(SELECT last_error FROM deployment_deletions x WHERE x.deployment_id=d.id),''),d.created_at,d.updated_at FROM deployments d ORDER BY d.created_at,d.id`)
+	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),(SELECT last_error FROM deployment_deletions x WHERE x.deployment_id=d.id),''),d.created_at,d.updated_at,d.automation_paused FROM deployments d ORDER BY d.created_at,d.id`)
 	if err != nil {
 		http.Error(w, "deployments are temporarily unavailable", 500)
 		return
@@ -1282,7 +1315,7 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var d deployment
 		var c, u int64
-		if err = rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &d.LiveCommit, &d.Status, &d.Error, &c, &u); err != nil {
+		if err = rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &d.LiveCommit, &d.Status, &d.Error, &c, &u, &d.AutomationPaused); err != nil {
 			http.Error(w, "deployments are temporarily unavailable", 500)
 			return
 		}
@@ -1609,7 +1642,7 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "this deployment already has that target", http.StatusConflict)
 		return
 	}
-	res, err := tx.Exec(`UPDATE deployments SET commit_id=?,target_kind=?,target_name=?,generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, input.Commit, input.TargetKind, input.TargetName, now, id, generation)
+	res, err := tx.Exec(`UPDATE deployments SET commit_id=?,target_kind=?,target_name=?,automation_paused=CASE WHEN ?='branch' THEN automation_paused ELSE 0 END,generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, input.Commit, input.TargetKind, input.TargetName, input.TargetKind, now, id, generation)
 	if err != nil {
 		http.Error(w, "deployment target could not be saved", 500)
 		return
