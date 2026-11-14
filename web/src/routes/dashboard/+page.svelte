@@ -95,7 +95,7 @@
 		} catch (cause) {
 			keyError = cause instanceof Error ? cause.message : 'Could not save the repository key.';
 		} finally {
-			// Do not keep a second copy of the private key after submission.
+			// The textarea is cleared before submission; this request-local string remains until the request settles and cannot be securely zeroed.
 			keyBusy = false;
 		}
 	}
