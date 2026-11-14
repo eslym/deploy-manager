@@ -299,12 +299,14 @@ func (a *App) webhookSecret(projectID string) ([]byte, error) {
 // the process stopped. Keep that job's interruption visible, then persist one
 // fresh latest-tip request for the still-configured branch on the next start.
 func (a *App) requeueInterruptedWebhookJobs() error {
+	// Rollback jobs are durable too, but interruption must never convert an
+	// explicit commit selection into an unsolicited branch-tip catch-up.
 	tx, err := a.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT j.id,d.id,d.commit_id,d.generation,j.automation_epoch FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.status='failed' AND j.durable=1 AND j.automatic=1 AND j.retry_enqueued=0 AND j.log LIKE '%interrupted by service restart%' AND d.target_kind='branch' AND d.status NOT IN ('deleting','deletion_failed') ORDER BY j.created_at`)
+	rows, err := tx.Query(`SELECT j.id,d.id,d.commit_id,d.generation,j.automation_epoch FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.status='failed' AND j.durable=1 AND j.automatic=1 AND j.rollback_commit='' AND j.retry_enqueued=0 AND j.log LIKE '%interrupted by service restart%' AND d.target_kind='branch' AND d.status NOT IN ('deleting','deletion_failed') ORDER BY j.created_at`)
 	if err != nil {
 		return err
 	}
@@ -398,7 +400,8 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 		rows.Close()
 		for _, target := range targets {
 			var pending string
-			err = tx.QueryRow(`SELECT id FROM deployment_jobs WHERE deployment_id=? AND status='queued' AND automatic=1 AND generation=? AND automation_epoch=? ORDER BY created_at DESC LIMIT 1`, target.id, target.generation, target.epoch).Scan(&pending)
+			// A later webhook is separate tip work, not a coalesced rollback.
+			err = tx.QueryRow(`SELECT id FROM deployment_jobs WHERE deployment_id=? AND status='queued' AND automatic=1 AND rollback_commit='' AND generation=? AND automation_epoch=? ORDER BY created_at DESC LIMIT 1`, target.id, target.generation, target.epoch).Scan(&pending)
 			if err == nil {
 				if _, err = tx.Exec(`UPDATE deployment_jobs SET log='Latest branch update queued',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), pending); err != nil {
 					return err

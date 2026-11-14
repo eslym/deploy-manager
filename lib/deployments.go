@@ -29,6 +29,7 @@ var commitIDPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 func validCommitTarget(id string) bool { return commitIDPattern.MatchString(id) }
 
 type deployment struct {
+	Rollback         bool   `json:"-"`
 	ID               string `json:"id"`
 	ProjectID        string `json:"projectId"`
 	Name             string `json:"name"`
@@ -91,15 +92,16 @@ func fault(point string) error {
 
 type activeDeploymentJob struct {
 	deploymentID string
+	generation   int64
 	cancel       context.CancelFunc
 }
 
-func (a *App) registerDeploymentJob(jobID, deploymentID string, cancel context.CancelFunc) func() {
+func (a *App) registerDeploymentJob(jobID, deploymentID string, generation int64, cancel context.CancelFunc) func() {
 	a.deploymentJobsMu.Lock()
 	if a.deploymentJobCancels == nil {
 		a.deploymentJobCancels = make(map[string]activeDeploymentJob)
 	}
-	a.deploymentJobCancels[jobID] = activeDeploymentJob{deploymentID: deploymentID, cancel: cancel}
+	a.deploymentJobCancels[jobID] = activeDeploymentJob{deploymentID: deploymentID, generation: generation, cancel: cancel}
 	a.deploymentJobsMu.Unlock()
 	return func() {
 		a.deploymentJobsMu.Lock()
@@ -109,10 +111,16 @@ func (a *App) registerDeploymentJob(jobID, deploymentID string, cancel context.C
 }
 
 func (a *App) cancelDeploymentJobs(deploymentID string) {
+	a.cancelDeploymentJobsBefore(deploymentID, 0)
+}
+
+// A zero cutoff cancels all work (deletion); rollback cancels only generations
+// it superseded, never a later explicit Deploy accepted in the meantime.
+func (a *App) cancelDeploymentJobsBefore(deploymentID string, generation int64) {
 	a.deploymentJobsMu.Lock()
 	var cancel []context.CancelFunc
 	for _, job := range a.deploymentJobCancels {
-		if job.deploymentID == deploymentID {
+		if job.deploymentID == deploymentID && (generation == 0 || job.generation < generation) {
 			cancel = append(cancel, job.cancel)
 		}
 	}
@@ -183,6 +191,9 @@ func (a *App) initDeployments() error {
 		}
 	}
 	if err := ensureColumn(a.db, "deployment_jobs", "force_redeploy", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := ensureColumn(a.db, "deployment_jobs", "rollback_commit", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if err := ensureColumn(a.db, "deployment_jobs", "durable", `INTEGER NOT NULL DEFAULT 0`); err != nil {
@@ -635,17 +646,26 @@ func (a *App) runDeploymentJob(jobID string) {
 	var projectID string
 	var createdAt, updatedAt int64
 	var forceRedeploy bool
+	var rollbackCommit string
+	if err := a.db.QueryRow(`SELECT rollback_commit FROM deployment_jobs WHERE id=?`, jobID).Scan(&rollbackCommit); err != nil {
+		return
+	}
 	err := a.db.QueryRow(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.generation,d.live_commit,d.live_dev,d.live_ino,d.status,d.error,d.created_at,d.updated_at,j.force_redeploy,j.automatic,j.automation_epoch FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=? AND j.status='queued' AND j.generation=d.generation`, jobID).Scan(&d.ID, &projectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &generation, &d.LiveCommit, &d.LiveDev, &d.LiveIno, &d.Status, &d.Error, &createdAt, &updatedAt, &forceRedeploy, &d.automatic, &d.automationEpoch)
 	if err != nil {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log='deployment was removed or its target changed',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
 	d.ProjectID = projectID
+	d.Rollback = rollbackCommit != ""
 	d.CreatedAt = time.Unix(0, createdAt).UTC()
 	d.UpdatedAt = time.Unix(0, updatedAt).UTC()
 	d.Publication = a.deploymentPath(d.ID)
-	unregister := a.registerDeploymentJob(jobID, d.ID, cancel)
+	unregister := a.registerDeploymentJob(jobID, d.ID, generation, cancel)
 	defer unregister()
+	if err := fault("before-job-lock"); err != nil {
+		a.failJob(jobID, d.ID, generation, "publication locking was interrupted")
+		return
+	}
 	unlock, err := a.lockDeployment(d.ID)
 	if err != nil {
 		a.failJob(jobID, d.ID, generation, "publication locking is unavailable")
@@ -662,7 +682,9 @@ func (a *App) runDeploymentJob(jobID string) {
 	var liveTarget string
 	var currentGeneration int64
 	var currentStatus string
-	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
+	// Another job in this generation may have published while this worker was
+	// waiting for the deployment lock (notably a preceding rollback).
+	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status,live_commit,live_dev,live_ino FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus, &d.LiveCommit, &d.LiveDev, &d.LiveIno); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before work began',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
@@ -675,7 +697,19 @@ func (a *App) runDeploymentJob(jobID string) {
 			a.failJob(jobID, d.ID, generation, message)
 			return
 		}
-		if d.TargetKind == "branch" || d.TargetKind == "tag" {
+		if d.Rollback {
+			d.Commit = rollbackCommit
+			a.projects.cacheMu.RLock()
+			repo, openErr := git.PlainOpen(a.projects.repoPath(d.ProjectID))
+			if openErr == nil {
+				openErr = rollbackAncestor(ctx, repo, d.TargetName, d.Commit)
+			}
+			a.projects.cacheMu.RUnlock()
+			if openErr != nil {
+				a.failJob(jobID, d.ID, generation, "Rollback commit is unavailable or no longer an ancestor of the refreshed branch; live files were kept")
+				return
+			}
+		} else if d.TargetKind == "branch" || d.TargetKind == "tag" {
 			kind := d.TargetKind
 			if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind=? AND name=?`, d.ProjectID, kind, d.TargetName).Scan(&d.Commit); err != nil {
 				a.failJob(jobID, d.ID, generation, "The configured Git target is missing from the refreshed repository; the current publication was kept")
@@ -716,7 +750,7 @@ func (a *App) runDeploymentJob(jobID string) {
 			return
 		}
 	}
-	if d.LiveCommit == d.Commit && !forceRedeploy {
+	if d.LiveCommit == d.Commit && !forceRedeploy && !d.Rollback {
 		if liveIdentity, identityErr := identity(a.deploymentPath(d.ID)); identityErr == nil && liveIdentity == (dirIdentity{Dev: d.LiveDev, Ino: d.LiveIno}) {
 			a.finishJob(jobID, d.ID, generation, "noop", "Already live at this commit", d.Commit)
 			return
@@ -737,6 +771,13 @@ func (a *App) runDeploymentJob(jobID string) {
 	err = a.publish(ctx, jobID, d, generation)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "target changed") {
+			// Supersession can arrive after intent is durable but before the
+			// generation guard permits the switch. Reconcile that known outcome
+			// under the deployment lock before the replacement worker proceeds.
+			if recoveryErr := a.reconcilePublicationsFor(d.ID); recoveryErr != nil {
+				log.Printf("cannot reconcile superseded publication for deployment %s: %v", d.ID, recoveryErr)
+				return
+			}
 			if cleanupErr := a.cleanupUnpublishedStage(d.ID, jobID); cleanupErr != nil {
 				log.Printf("cannot clean superseded publication stage for deployment %s: %v", d.ID, cleanupErr)
 			}
@@ -852,7 +893,12 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	// Cache promotion takes the matching write lock; the scheduler queue itself
 	// never holds the project protocol mutex.
 	pm.cacheMu.RLock()
-	defer pm.cacheMu.RUnlock()
+	cacheLocked := true
+	defer func() {
+		if cacheLocked {
+			pm.cacheMu.RUnlock()
+		}
+	}()
 	if err := pm.ensureCacheReady(); err != nil {
 		return err
 	}
@@ -892,8 +938,26 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if err = syncDirectory(a.cfg.DeploymentRoot); err != nil {
 		return err
 	}
+	pm.cacheMu.RUnlock()
+	cacheLocked = false
 	if err = fault("after-stage-fsync"); err != nil {
 		return err
+	}
+	// A newer successful fetch may have promoted a force-pushed graph while
+	// content was prepared. Hold its snapshot through the namespace switch.
+	pm.cacheMu.RLock()
+	cacheLocked = true
+	if err := pm.ensureCacheReady(); err != nil {
+		return err
+	}
+	if d.Rollback {
+		latestRepo, openErr := git.PlainOpen(pm.repoPath(d.ProjectID))
+		if openErr != nil {
+			return errors.New("rollback repository unavailable")
+		}
+		if err = rollbackAncestor(ctx, latestRepo, d.TargetName, d.Commit); err != nil {
+			return err
+		}
 	}
 	newID, err := identity(stage)
 	if err != nil {
@@ -1033,6 +1097,8 @@ func boolInt(v bool) int {
 func sanitizePublicationError(err error) string {
 	s := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(s, "rollback"):
+		return "Rollback commit is unavailable or no longer an ancestor of the configured branch; the current live files were kept"
 	case strings.Contains(s, "private ssh lfs authentication"):
 		return "Private repository LFS authentication failed. Verify the repository key and approved SSH host key, and confirm the server provides git-lfs-authenticate. Pure-SSH LFS transfers are not supported. Existing published files were kept."
 	case strings.Contains(s, "lfs"):

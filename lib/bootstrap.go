@@ -546,6 +546,8 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("GET /api/deployments", a.listDeployments)
 	m.HandleFunc("POST /api/deployments", a.createDeployment)
 	m.HandleFunc("POST /api/deployments/{id}/deploy", a.deployNow)
+	m.HandleFunc("GET /api/deployments/{id}/history", a.rollbackHistory)
+	m.HandleFunc("POST /api/deployments/{id}/rollback", a.temporaryRollback)
 	m.HandleFunc("POST /api/deployments/{id}/pause", a.pauseDeployment)
 	m.HandleFunc("POST /api/deployments/{id}/resume", a.resumeDeployment)
 	m.HandleFunc("POST /api/deployments/{id}/hard-redeploy", a.hardRedeploy)

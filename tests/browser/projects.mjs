@@ -216,6 +216,35 @@ try {
   const publishedPath = join(dir, "state.sqlite.publications", deploymentID);
   const firstDirectoryIdentity = (await stat(publishedPath)).ino;
   const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
+  const featureCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
+  await page.getByRole("button", { name: "Temporary rollback", exact: true }).click();
+  const history = page.getByRole("region", { name: "Rollback history for Production site" });
+  await history.getByText("Page 1", { exact: true }).waitFor();
+  for (const [commit, title] of [[mainCommit, "main"], [featureCommit, "feature search"]]) {
+    await history.getByLabel("Search commits").fill(commit);
+    const searched = page.waitForResponse(response => response.url().includes(`/api/deployments/${deploymentID}/history?`));
+    await history.getByRole("button", { name: "Search", exact: true }).click();
+    if ((await searched).status() !== 200) throw new Error("rollback history search failed");
+    await history.getByRole("button", { name: `Roll back to ${commit.slice(0, 12)}`, exact: true }).click();
+    await history.getByText(/The configured branch and automatic deployment remain unchanged/).waitFor();
+    // Cancellation must not publish; the next confirmation uses the full ID.
+    await history.getByRole("button", { name: "Cancel", exact: true }).click();
+    await history.getByRole("button", { name: `Roll back to ${commit.slice(0, 12)}`, exact: true }).click();
+    const rollbackResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/rollback`));
+    await history.getByRole("button", { name: "Confirm temporary rollback", exact: true }).click();
+    const accepted = await rollbackResponse;
+    if (accepted.status() !== 202 || accepted.request().postDataJSON().commit !== commit) throw new Error("rollback did not use the full selected commit ID");
+    const rollbackJob = await accepted.json();
+    await waitFor(async () => {
+      const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+      return jobs.find(job => job.id === rollbackJob.jobId)?.status === "succeeded";
+    }, "recorded rollback completion");
+    await waitFor(async () => (await readFile(join(publishedPath, "index.html"), "utf8")) === `<!doctype html><title>${title}</title>\n`, "dashboard rollback publication");
+    if (title === "feature search" && (await readFile(join(publishedPath, "asset.dat"), "utf8")) !== "fixture hydrated LFS asset\n") throw new Error("rollback did not recreate LFS content");
+    const state = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
+    if (state.targetKind !== "branch" || state.targetName !== "feature/search" || state.liveCommit !== commit) throw new Error("temporary rollback changed the branch target");
+  }
+  await page.getByRole("button", { name: "Temporary rollback", exact: true }).click();
   await page.getByLabel("Target for Production site").selectOption("branch:main");
   const targetUpdate = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/target`));
   await page.getByRole("button", { name: "Change target" }).click();

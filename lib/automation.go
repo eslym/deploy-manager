@@ -61,7 +61,7 @@ func (a *App) initDeploymentAutomation() error {
 		if _, err = tx.Exec(`ALTER TABLE deployment_jobs ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`UPDATE deployment_jobs SET automatic=1 WHERE durable=1`); err != nil {
+		if _, err = tx.Exec(`UPDATE deployment_jobs SET automatic=1 WHERE durable=1 AND rollback_commit=''`); err != nil {
 			return err
 		}
 		return tx.Commit()

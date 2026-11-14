@@ -176,6 +176,11 @@ func TestPublicationCrashChild(t *testing.T) {
 	}
 	setPublicationFaultPoint(func(at string) error {
 		if at == point {
+			// Expose the committed-success / worker-return interval instead of
+			// relying on the OS scheduler to occasionally hit that ordering.
+			if at == "after-state" {
+				time.Sleep(50 * time.Millisecond)
+			}
 			os.Exit(86)
 		}
 		return nil
@@ -188,6 +193,12 @@ func TestPublicationCrashChild(t *testing.T) {
 	for time.Now().Before(deadline) {
 		var status string
 		if err := app.db.QueryRow(`SELECT status FROM deployment_jobs WHERE id=?`, jobID).Scan(&status); err == nil && status != "queued" && status != "running" {
+			// Success is committed before the after-state fault hook runs. It
+			// cannot prove that the worker returned without hitting that hook.
+			if point == "after-state" && status == "succeeded" {
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
 			if point == "after-cleanup" && status == "succeeded" {
 				time.Sleep(2 * time.Millisecond)
 				if err := app.cleanupPublications(true); err != nil {
