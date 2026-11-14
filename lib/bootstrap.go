@@ -29,6 +29,7 @@ import (
 type Config struct {
 	DatabasePath          string
 	OPAQUEKeyPath         string
+	RepositoryKeyPath     string
 	CanonicalOrigin       string
 	GrantTTL              time.Duration
 	LoginTTL              time.Duration
@@ -58,12 +59,16 @@ type App struct {
 	logins               map[string]pendingLogin
 	sessions             map[[32]byte]sessionState
 	projects             *projectManager
+	repositoryMaster     []byte
 	registrationTxs      map[string]registrationTransaction
 }
 
 func New(cfg Config) (*App, error) {
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
+	}
+	if cfg.RepositoryKeyPath == "" {
+		cfg.RepositoryKeyPath = cfg.DatabasePath + ".repository-master-key"
 	}
 	if cfg.CanonicalOrigin != "" {
 		origin, err := url.Parse(cfg.CanonicalOrigin)
@@ -74,6 +79,10 @@ func New(cfg Config) (*App, error) {
 	dbPath, keyPath := filepath.Clean(cfg.DatabasePath), filepath.Clean(cfg.OPAQUEKeyPath)
 	if keyPath == dbPath || keyPath == dbPath+"-wal" || keyPath == dbPath+"-shm" {
 		return nil, errors.New("OPAQUE key must be separate from SQLite")
+	}
+	masterPath := filepath.Clean(cfg.RepositoryKeyPath)
+	if masterPath == dbPath || masterPath == dbPath+"-wal" || masterPath == dbPath+"-shm" || masterPath == keyPath {
+		return nil, errors.New("repository key master file must be separate from SQLite and the OPAQUE key")
 	}
 	if dbInfo, dbErr := os.Stat(dbPath); dbErr == nil {
 		if keyInfo, keyErr := os.Stat(keyPath); keyErr == nil && os.SameFile(dbInfo, keyInfo) {
@@ -135,6 +144,9 @@ func New(cfg Config) (*App, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.OPAQUEKeyPath), 0700); err != nil {
 		return nil, err
 	}
+	if err := os.MkdirAll(filepath.Dir(cfg.RepositoryKeyPath), 0700); err != nil {
+		return nil, err
+	}
 	c := opaque.DefaultConfiguration()
 	material, keyGeneration, err := loadOPAQUEServerKey(c, cfg.OPAQUEKeyPath, prior)
 	if err != nil {
@@ -183,6 +195,20 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	var priorRepositoryKeyStore int
+	if err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('repository_key_store','repository_keys')`).Scan(&priorRepositoryKeyStore); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err = initializeRepositoryKeyStore(db, cfg.RepositoryKeyPath, priorRepositoryKeyStore != 0); err != nil {
+		db.Close()
+		return nil, err
+	}
+	repositoryMaster, err := loadRepositoryMasterKey(cfg.RepositoryKeyPath, true)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	for _, suffix := range []string{"-wal", "-shm"} {
 		if path := cfg.DatabasePath + suffix; fileInfo(path) {
 			if err = os.Chmod(path, 0600); err != nil {
@@ -228,7 +254,17 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
-	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, registrationTxs: make(map[string]registrationTransaction)}, nil
+	if masterInfo, masterErr := os.Lstat(cfg.RepositoryKeyPath); masterErr == nil {
+		if dbInfo, dbErr := os.Stat(dbPath); dbErr == nil && os.SameFile(masterInfo, dbInfo) {
+			db.Close()
+			return nil, errors.New("repository key master file must not share the SQLite database file")
+		}
+		if opaqueInfo, opaqueErr := os.Stat(cfg.OPAQUEKeyPath); opaqueErr == nil && os.SameFile(masterInfo, opaqueInfo) {
+			db.Close()
+			return nil, errors.New("repository key master file must not share the OPAQUE key file")
+		}
+	}
+	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}, nil
 }
 
 func ensureColumn(db *sql.DB, table, column, definition string) error {
@@ -336,7 +372,7 @@ func writeExclusive(path string, b []byte) error {
 	}
 	return f.Close()
 }
-func (a *App) Close() error { return a.db.Close() }
+func (a *App) Close() error { clear(a.repositoryMaster); return a.db.Close() }
 
 // IssueRegistrationGrant returns a random one-time token; only its SHA-256 digest is stored.
 func (a *App) IssueRegistrationGrant() (string, error) {
@@ -435,6 +471,8 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/projects", a.createProject)
 	m.HandleFunc("GET /api/projects/{id}/refs", a.projectRefs)
 	m.HandleFunc("POST /api/projects/{id}/refresh", a.refreshProject)
+	m.HandleFunc("GET /api/repository-keys", a.listRepositoryKeys)
+	m.HandleFunc("POST /api/repository-keys", a.addRepositoryKey)
 	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if a.cfg.CanonicalOrigin != "" {
 			origin, _ := url.Parse(a.cfg.CanonicalOrigin)

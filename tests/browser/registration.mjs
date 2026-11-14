@@ -1,10 +1,11 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { copyFile, mkdtemp, rm, chmod } from "node:fs/promises";
+import { copyFile, mkdtemp, rm, chmod, readFile } from "node:fs/promises";
 import { chromium } from "playwright";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { request as httpsRequest } from "node:https";
+import { generateKeyPairSync } from "node:crypto";
 
 const root = new URL("../../", import.meta.url).pathname;
 const dir = await mkdtemp(join(tmpdir(), "deploy-manager-browser-"));
@@ -43,6 +44,14 @@ function httpsPostStatus(hostname, port, path, origin, body) {
     req.on("error", reject);
     req.end(payload);
   });
+}
+
+function repositoryKeyState() {
+  const helper = process.env.REPOSITORY_KEY_STATE_BINARY;
+  if (!helper) throw new Error("repository-key-state test helper is required");
+  const result = spawnSync(helper, [join(dir, "state.sqlite"), join(dir, "repository-key-master.key")], { encoding: "utf8" });
+  if (result.status !== 0) throw new Error("repository key durability check failed");
+  return JSON.parse(result.stdout);
 }
 
 async function navigate(page, url, options = {}) {
@@ -399,6 +408,34 @@ try {
   if (authenticated !== 200) throw new Error(`authenticated session check returned ${authenticated}`);
   await authPage.goto(`${secureOrigin}/dashboard/projects/nested`, { waitUntil: "domcontentloaded" });
   await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
+  await authPage.goto(`${secureOrigin}/dashboard`);
+  await authPage.getByRole("heading", { name: "Repository keys" }).waitFor({ timeout: 30000 });
+  await authPage.getByLabel("Key name").fill("generated integration key");
+  await authPage.getByRole("button", { name: "Create Ed25519 key" }).click();
+  await authPage.getByText("generated integration key").waitFor({ timeout: 30000 });
+  const rejectedKeyText = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nnot-a-key\n-----END ENCRYPTED PRIVATE KEY-----";
+  await authPage.getByLabel("Name for imported key").fill("rejected key");
+  await authPage.getByLabel("Private key").fill(rejectedKeyText);
+  await authPage.getByRole("button", { name: "Import private key" }).click();
+  await authPage.getByRole("alert").waitFor({ timeout: 30000 });
+  if ((await authPage.locator("body").innerText()).includes("not-a-key")) throw new Error("rejected private key was echoed into the dashboard");
+  const importedPair = generateKeyPairSync("ed25519");
+  const importedPrivateKey = importedPair.privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  await authPage.getByLabel("Name for imported key").fill("imported integration key");
+  await authPage.getByLabel("Private key").fill(importedPrivateKey);
+  await authPage.getByRole("button", { name: "Import private key" }).click();
+  await authPage.getByText("imported integration key").waitFor({ timeout: 30000 });
+  if (await authPage.getByLabel("Private key").inputValue()) throw new Error("imported private key remained in the browser form");
+  const listedKeys = await authPage.evaluate(async () => (await (await fetch("/api/repository-keys")).json()));
+  if (listedKeys.length !== 2 || listedKeys.some(key => !key.publicKey || !key.fingerprint || Object.keys(key).some(field => /private|ciphertext/i.test(field)))) throw new Error("key list did not contain only public metadata");
+  if ((await authPage.locator("body").innerText()).includes(importedPrivateKey)) throw new Error("private key appeared in dashboard content");
+  for (const suffix of ["state.sqlite", "state.sqlite-wal"]) {
+    try { if ((await readFile(join(dir, suffix))).includes(Buffer.from(importedPrivateKey))) throw new Error("private key appeared in SQLite database/WAL"); }
+    catch (error) { if (error?.code !== "ENOENT") throw error; }
+  }
+  if (serverOutput.includes(importedPrivateKey)) throw new Error("private key appeared in application logs");
+  const repositoryKeysBeforeCredentials = repositoryKeyState();
+  if (repositoryKeysBeforeCredentials.keys.length !== 2 || repositoryKeysBeforeCredentials.keys.some(key => !key.usable)) throw new Error("saved repository keys could not be decrypted and used in-process");
   await authPage.reload({ waitUntil: "domcontentloaded" });
   await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
   await authPage.waitForFunction(async () => (await fetch("/api/session")).status === 401, null, { timeout: 35000 });
@@ -462,6 +499,7 @@ try {
   await authPage.getByLabel("New password").fill(changedPassword);
   await authPage.getByRole("button", { name: "Change password" }).click();
   await authPage.getByText(/Password changed/).waitFor({ timeout: 60000 });
+  if (JSON.stringify(repositoryKeyState()) !== JSON.stringify(repositoryKeysBeforeCredentials)) throw new Error("password change altered repository key master/ciphertext or usability");
   if (await authPage.evaluate(async () => (await fetch("/api/session")).status) !== 401) throw new Error("credential replacement did not revoke the current session");
   if (await secondSessionPage.evaluate(async () => (await fetch("/api/session")).status) !== 401) throw new Error("credential replacement did not revoke another active session");
   if (passwordChangeBodies.some(body => body.includes(testPassword) || body.includes(changedPassword) || body.includes("clientLoginState") || body.includes("clientRegistrationState") || body.includes("sessionKey"))) throw new Error("password change sent a password or local OPAQUE secret state");
@@ -512,6 +550,7 @@ try {
     };
     poll();
   });
+  if (JSON.stringify(repositoryKeyState()) !== JSON.stringify(repositoryKeysBeforeCredentials)) throw new Error("repository keys did not survive application restart");
   const interruptedStatus = await httpsPostStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/opaque/login/finish", secureOrigin, interruptedLogin);
   if (interruptedStatus !== 401) throw new Error(`pre-restart login handshake survived restart: ${interruptedStatus}`);
   await pendingContext.close();
@@ -571,6 +610,7 @@ try {
   await recoveryPage.getByLabel("Replace password").fill(recoveredPassword);
   await recoveryPage.getByRole("button", { name: "Replace password" }).click();
   await recoveryPage.getByText("Administrator password replaced. You can close this page.").waitFor({ timeout: 60000 });
+  if (JSON.stringify(repositoryKeyState()) !== JSON.stringify(repositoryKeysBeforeCredentials)) throw new Error("CLI recovery altered repository key master/ciphertext or usability");
   if (JSON.stringify(recoveryRaceStatuses) !== JSON.stringify([204, 410])) throw new Error(`recovery grant was not atomically consumed: ${recoveryRaceStatuses}`);
   if (recoveryURLs.some(url => url.includes(recoveryGrant))) throw new Error("recovery grant leaked into a request URL");
   if (!recoveryBodies.length || recoveryBodies.some(body => body.includes(recoveredPassword) || body.includes("clientRegistrationState"))) throw new Error("recovery requests transmitted a password or client state");

@@ -132,8 +132,12 @@ func (a *App) projectAuthorized(w http.ResponseWriter, r *http.Request, mutation
 		http.Error(w, "authentication required", http.StatusUnauthorized)
 		return false
 	}
-	if mutation && (r.Method != http.MethodPost || !a.originOK(r) || !a.allow(r)) {
+	if mutation && (r.Method != http.MethodPost || !a.originOK(r)) {
 		http.Error(w, "request rejected", http.StatusForbidden)
+		return false
+	}
+	if mutation && !a.allow(r) {
+		http.Error(w, "too many requests; try again shortly", http.StatusTooManyRequests)
 		return false
 	}
 	return true

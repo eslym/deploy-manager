@@ -26,6 +26,7 @@ func main() {
 	origin := flags.String("origin", "", "canonical HTTPS origin used by the application")
 	cert := flags.String("tls-cert", "", "TLS certificate (required for non-loopback serving)")
 	key := flags.String("tls-key", "", "TLS private key")
+	repositoryMaster := flags.String("repository-key-master", "", "external repository-key encryption key file (defaults inside the data directory)")
 	loginTTL := flags.Duration("login-ttl", 2*time.Minute, "maximum lifetime of an OPAQUE login handshake")
 	sessionTTL := flags.Duration("session-ttl", 12*time.Hour, "maximum lifetime of an authenticated session")
 	gitTimeout := flags.Duration("git-timeout", 2*time.Minute, "maximum duration of a repository fetch")
@@ -33,7 +34,11 @@ func main() {
 	recentAuthTTL := flags.Duration("recent-auth-ttl", 5*time.Minute, "maximum age of OPAQUE authentication for credential changes")
 	authRate := flags.Int("auth-rate-per-minute", 20, "maximum authentication requests per client per minute")
 	_ = flags.Parse(os.Args[2:])
-	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout})
+	repositoryMasterPath := *repositoryMaster
+	if repositoryMasterPath == "" {
+		repositoryMasterPath = filepath.Join(*data, "repository-key-master.key")
+	}
+	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout})
 	if err != nil {
 		log.Fatal(err)
 	}
