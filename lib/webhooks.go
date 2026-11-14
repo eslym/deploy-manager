@@ -20,12 +20,14 @@ import (
 )
 
 const githubWebhookProvider = "github"
+const giteaWebhookProvider = "gitea"
 
 var webhookDeliveryID = regexp.MustCompile(`^[A-Za-z0-9-]{1,128}$`)
 
 func (a *App) initWebhooks() error {
 	for _, query := range []string{
 		`CREATE TABLE IF NOT EXISTS project_webhooks(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,secret BLOB NOT NULL,created_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS project_gitea_webhooks(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,secret BLOB NOT NULL,created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS webhook_deliveries(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,provider TEXT NOT NULL,delivery_id TEXT NOT NULL,event TEXT NOT NULL,outcome TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(project_id,provider,delivery_id))`,
 	} {
 		if _, err := a.db.Exec(query); err != nil {
@@ -44,6 +46,10 @@ func (a *App) webhookCipher() (cipher.AEAD, error) {
 }
 
 func (a *App) sealWebhookSecret(projectID string, secret []byte) ([]byte, error) {
+	return a.sealProviderWebhookSecret(githubWebhookProvider, projectID, secret)
+}
+
+func (a *App) sealProviderWebhookSecret(provider, projectID string, secret []byte) ([]byte, error) {
 	gcm, err := a.webhookCipher()
 	if err != nil {
 		return nil, err
@@ -52,26 +58,48 @@ func (a *App) sealWebhookSecret(projectID string, secret []byte) ([]byte, error)
 	if _, err = rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return gcm.Seal(nonce, nonce, secret, []byte("github-webhook:"+projectID)), nil
+	return gcm.Seal(nonce, nonce, secret, []byte(provider+"-webhook:"+projectID)), nil
 }
 
 func (a *App) openWebhookSecret(projectID string, sealed []byte) ([]byte, error) {
+	return a.openProviderWebhookSecret(githubWebhookProvider, projectID, sealed)
+}
+
+func (a *App) openProviderWebhookSecret(provider, projectID string, sealed []byte) ([]byte, error) {
 	gcm, err := a.webhookCipher()
 	if err != nil || len(sealed) < gcm.NonceSize() {
 		return nil, errors.New("webhook secret unavailable")
 	}
 	nonce := sealed[:gcm.NonceSize()]
-	return gcm.Open(nil, nonce, sealed[gcm.NonceSize():], []byte("github-webhook:"+projectID))
+	return gcm.Open(nil, nonce, sealed[gcm.NonceSize():], []byte(provider+"-webhook:"+projectID))
 }
 
 func (a *App) githubWebhookSettings(w http.ResponseWriter, r *http.Request) {
+	a.providerWebhookSettings(w, r, githubWebhookProvider)
+}
+
+func (a *App) giteaWebhookSettings(w http.ResponseWriter, r *http.Request) {
+	a.providerWebhookSettings(w, r, giteaWebhookProvider)
+}
+
+// Keep existing GitHub encrypted records intact; each provider has its own
+// per-project credential. Table names are application constants, never input.
+func webhookSettingsTable(provider string) string {
+	if provider == giteaWebhookProvider {
+		return "project_gitea_webhooks"
+	}
+	return "project_webhooks"
+}
+
+func (a *App) providerWebhookSettings(w http.ResponseWriter, r *http.Request, provider string) {
 	id := r.PathValue("id")
+	table := webhookSettingsTable(provider)
 	if r.Method == http.MethodGet {
 		if !a.projectAuthorized(w, r, false) {
 			return
 		}
 		var configured int
-		if err := a.db.QueryRow(`SELECT count(*) FROM project_webhooks WHERE project_id=?`, id).Scan(&configured); err != nil {
+		if err := a.db.QueryRow(`SELECT count(*) FROM `+table+` WHERE project_id=?`, id).Scan(&configured); err != nil {
 			http.Error(w, "webhook settings are unavailable", http.StatusInternalServerError)
 			return
 		}
@@ -82,7 +110,7 @@ func (a *App) githubWebhookSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		writeJSON(w, map[string]any{"configured": configured != 0, "url": "/webhooks/github/" + id})
+		writeJSON(w, map[string]any{"configured": configured != 0, "url": "/webhooks/" + provider + "/" + id})
 		return
 	}
 	if !a.projectAuthorized(w, r, true) {
@@ -107,7 +135,10 @@ func (a *App) githubWebhookSettings(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "webhook secret could not be created", http.StatusInternalServerError)
 		return
 	}
-	sealed, err := a.sealWebhookSecret(id, secret)
+	// Webhook providers sign with the literal value copied into their Secret
+	// field. Encrypt that printable key, not its decoded random source bytes.
+	printableSecret := hex.EncodeToString(secret)
+	sealed, err := a.sealProviderWebhookSecret(provider, id, []byte(printableSecret))
 	if err != nil {
 		http.Error(w, "webhook secret could not be protected", http.StatusInternalServerError)
 		return
@@ -123,7 +154,7 @@ func (a *App) githubWebhookSettings(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO project_webhooks(project_id,secret,created_at) VALUES(?,?,?) ON CONFLICT(project_id) DO UPDATE SET secret=excluded.secret,created_at=excluded.created_at`, id, sealed, a.cfg.Now().UnixNano()); err != nil {
+	if _, err = tx.Exec(`INSERT INTO `+table+`(project_id,secret,created_at) VALUES(?,?,?) ON CONFLICT(project_id) DO UPDATE SET secret=excluded.secret,created_at=excluded.created_at`, id, sealed, a.cfg.Now().UnixNano()); err != nil {
 		http.Error(w, "webhook secret could not be saved", http.StatusInternalServerError)
 		return
 	}
@@ -132,7 +163,7 @@ func (a *App) githubWebhookSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSONStatus(w, http.StatusCreated, map[string]string{"url": "/webhooks/github/" + id, "secret": hex.EncodeToString(secret)})
+	writeJSONStatus(w, http.StatusCreated, map[string]string{"url": "/webhooks/" + provider + "/" + id, "secret": printableSecret})
 	clear(secret)
 }
 
@@ -143,6 +174,14 @@ type githubPush struct {
 }
 
 func (a *App) githubWebhook(w http.ResponseWriter, r *http.Request) {
+	a.providerWebhook(w, r, githubWebhookProvider)
+}
+
+func (a *App) giteaWebhook(w http.ResponseWriter, r *http.Request) {
+	a.providerWebhook(w, r, giteaWebhookProvider)
+}
+
+func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider string) {
 	if r.Method != http.MethodPost || !a.https(r) {
 		http.Error(w, "request rejected", http.StatusForbidden)
 		return
@@ -155,25 +194,38 @@ func (a *App) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	deliveryID := r.Header.Get("X-GitHub-Delivery")
 	event := r.Header.Get("X-GitHub-Event")
 	signature := r.Header.Get("X-Hub-Signature-256")
+	if provider == giteaWebhookProvider {
+		deliveryID = r.Header.Get("X-Gitea-Delivery")
+		event = r.Header.Get("X-Gitea-Event")
+		signature = r.Header.Get("X-Gitea-Signature")
+	}
 	if !webhookDeliveryID.MatchString(deliveryID) || len(event) == 0 || len(event) > 64 || strings.ContainsAny(event, "\r\n\x00") {
 		http.Error(w, "invalid webhook headers", http.StatusBadRequest)
 		return
 	}
-	if len(signature) != 71 || !strings.HasPrefix(signature, "sha256=") {
+	if provider == githubWebhookProvider {
+		if !strings.HasPrefix(signature, "sha256=") {
+			http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+			return
+		}
+		signature = strings.TrimPrefix(signature, "sha256=")
+	}
+	if len(signature) != 64 {
 		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
 		return
 	}
-	expectedSignature, err := hex.DecodeString(signature[len("sha256="):])
+	expectedSignature, err := hex.DecodeString(signature)
 	if err != nil || len(expectedSignature) != sha256.Size {
 		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
 		return
 	}
-	sealed, err := a.webhookSecret(projectID)
+	var sealed []byte
+	err = a.db.QueryRow(`SELECT secret FROM `+webhookSettingsTable(provider)+` WHERE project_id=?`, projectID).Scan(&sealed)
 	if err != nil {
 		http.Error(w, "webhook is not configured", http.StatusNotFound)
 		return
 	}
-	secret, err := a.openWebhookSecret(projectID, sealed)
+	secret, err := a.openProviderWebhookSecret(provider, projectID, sealed)
 	if err != nil {
 		http.Error(w, "webhook is unavailable", http.StatusInternalServerError)
 		return
@@ -190,7 +242,7 @@ func (a *App) githubWebhook(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	secret, err = a.openWebhookSecret(projectID, sealed)
+	secret, err = a.openProviderWebhookSecret(provider, projectID, sealed)
 	if err != nil {
 		http.Error(w, "webhook is unavailable", http.StatusInternalServerError)
 		return
@@ -206,15 +258,17 @@ func (a *App) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	branch := ""
 	deleted := false
 	if event == "push" {
-		if err := json.Unmarshal(body, &push); err != nil || len(push.Ref) > 1024 || !strings.HasPrefix(push.Ref, "refs/heads/") || !plumbing.ReferenceName(push.Ref).IsBranch() || !validCommitTarget(push.After) {
+		if err := json.Unmarshal(body, &push); err != nil || len(push.Ref) > 1024 || plumbing.ReferenceName(push.Ref).Validate() != nil || !validCommitTarget(push.After) || (!plumbing.ReferenceName(push.Ref).IsBranch() && !(provider == giteaWebhookProvider && plumbing.ReferenceName(push.Ref).IsTag())) {
 			http.Error(w, "invalid push event", http.StatusBadRequest)
 			return
 		}
-		branch = strings.TrimPrefix(push.Ref, "refs/heads/")
-		deleted = push.Deleted
+		if plumbing.ReferenceName(push.Ref).IsBranch() {
+			branch = strings.TrimPrefix(push.Ref, "refs/heads/")
+		}
+		deleted = push.Deleted || push.After == strings.Repeat("0", 40)
 	}
 	clear(body)
-	if err := a.recordGitHubDelivery(projectID, deliveryID, event, branch, deleted); err != nil {
+	if err := a.recordWebhookDelivery(provider, projectID, deliveryID, event, branch, deleted); err != nil {
 		if errors.Is(err, errWebhookQueueFull) {
 			http.Error(w, "webhook work queue is full", http.StatusServiceUnavailable)
 		} else {
@@ -295,7 +349,7 @@ func (a *App) requeueInterruptedWebhookJobs() error {
 	return tx.Commit()
 }
 
-func (a *App) recordGitHubDelivery(projectID, deliveryID, event, branch string, deleted bool) error {
+func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, branch string, deleted bool) error {
 	reservedSlots := 0
 	keepSlots := false
 	defer func() {
@@ -311,7 +365,7 @@ func (a *App) recordGitHubDelivery(projectID, deliveryID, event, branch string, 
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`INSERT INTO webhook_deliveries(project_id,provider,delivery_id,event,outcome,created_at) VALUES(?,?,?,?,?,?)`, projectID, githubWebhookProvider, deliveryID, event, "ignored", a.cfg.Now().UnixNano()); err != nil {
+	if _, err = tx.Exec(`INSERT INTO webhook_deliveries(project_id,provider,delivery_id,event,outcome,created_at) VALUES(?,?,?,?,?,?)`, projectID, provider, deliveryID, event, "ignored", a.cfg.Now().UnixNano()); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
 			return nil
 		}
@@ -319,7 +373,7 @@ func (a *App) recordGitHubDelivery(projectID, deliveryID, event, branch string, 
 	}
 	outcome := "ignored"
 	jobIDs := make([]string, 0)
-	if event == "push" && !deleted {
+	if event == "push" && branch != "" && !deleted {
 		rows, queryErr := tx.Query(`SELECT id,generation,commit_id FROM deployments WHERE project_id=? AND target_kind='branch' AND target_name=? AND status NOT IN ('deleting','deletion_failed') ORDER BY id`, projectID, branch)
 		if queryErr != nil {
 			return queryErr
@@ -365,7 +419,7 @@ func (a *App) recordGitHubDelivery(projectID, deliveryID, event, branch string, 
 			if idErr != nil {
 				return idErr
 			}
-			if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable) VALUES(?,?,?,?,'queued','Verified GitHub branch update',?,?,1)`, jobID, target.id, target.commit, target.generation, a.cfg.Now().UnixNano(), a.cfg.Now().UnixNano()); err != nil {
+			if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable) VALUES(?,?,?,?,'queued',?,?,?,1)`, jobID, target.id, target.commit, target.generation, "Verified "+provider+" branch update", a.cfg.Now().UnixNano(), a.cfg.Now().UnixNano()); err != nil {
 				return err
 			}
 			if _, err = tx.Exec(`UPDATE deployments SET status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, a.cfg.Now().UnixNano(), target.id, target.generation); err != nil {
@@ -377,7 +431,7 @@ func (a *App) recordGitHubDelivery(projectID, deliveryID, event, branch string, 
 			outcome = "queued"
 		}
 	}
-	if _, err = tx.Exec(`UPDATE webhook_deliveries SET outcome=? WHERE project_id=? AND provider=? AND delivery_id=?`, outcome, projectID, githubWebhookProvider, deliveryID); err != nil {
+	if _, err = tx.Exec(`UPDATE webhook_deliveries SET outcome=? WHERE project_id=? AND provider=? AND delivery_id=?`, outcome, projectID, provider, deliveryID); err != nil {
 		return err
 	}
 	if a.webhookFault != nil {
@@ -389,7 +443,7 @@ func (a *App) recordGitHubDelivery(projectID, deliveryID, event, branch string, 
 		// SQLite may report an uncertain commit outcome. Only treat it as accepted
 		// after checking the durable receipt; otherwise GitHub must retry.
 		var accepted int
-		if verifyErr := a.db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE project_id=? AND provider=? AND delivery_id=?`, projectID, githubWebhookProvider, deliveryID).Scan(&accepted); verifyErr != nil || accepted != 1 {
+		if verifyErr := a.db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE project_id=? AND provider=? AND delivery_id=?`, projectID, provider, deliveryID).Scan(&accepted); verifyErr != nil || accepted != 1 {
 			return fmt.Errorf("commit outcome unavailable: %w", err)
 		}
 	}
