@@ -1,13 +1,14 @@
 package main
 
 import (
+	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/eslym/deploy-manager/lib"
@@ -41,11 +42,18 @@ func main() {
 	deployGrace := flags.Duration("deploy-grace-period", 60*time.Second, "minimum time before replaced files are cleaned up")
 	jobRetention := flags.Duration("job-retention", 30*24*time.Hour, "how long publication job details and logs are retained")
 	_ = flags.Parse(os.Args[2:])
+	// Preserve caller traversal until the storage boundary validates it. Join
+	// would erase "link/.." and silently select a different installation.
+	dataDir := *data
+	if dataDir == "" {
+		dataDir = "."
+	}
+	dataPath := func(name string) string { return dataDir + string(os.PathSeparator) + name }
 	repositoryMasterPath := *repositoryMaster
 	if repositoryMasterPath == "" {
-		repositoryMasterPath = filepath.Join(*data, "repository-key-master.key")
+		repositoryMasterPath = dataPath("repository-key-master.key")
 	}
-	cfg := lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention}
+	cfg := lib.Config{DatabasePath: dataPath("state.sqlite"), OPAQUEKeyPath: dataPath("opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention}
 	switch command {
 	case "setup", "recover":
 		app, err := lib.NewGrantIssuer(cfg)
@@ -88,33 +96,63 @@ func main() {
 		}
 		fmt.Println(link)
 	case "serve":
-		app, err := lib.New(cfg)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer app.Close()
-		server := &http.Server{Addr: *listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
-		if *cert != "" || *key != "" {
-			if *cert == "" || *key == "" {
-				log.Fatal("both TLS certificate and key are required")
-			}
-			err = server.ListenAndServeTLS(*cert, *key)
-		} else {
-			host, _, e := net.SplitHostPort(*listen)
-			if e != nil {
-				log.Fatal(e)
-			}
-			ip := net.ParseIP(host)
-			if !(ip != nil && ip.IsLoopback() || host == "localhost") {
-				log.Fatal("HTTPS is required unless listening on loopback")
-			}
-			err = server.ListenAndServe()
-		}
-		if err != http.ErrServerClosed {
+		if err := serve(cfg, *listen, *cert, *key); err != nil {
 			log.Fatal(err)
 		}
 	default:
 		log.Fatalf("unknown command %q", command)
 	}
 }
+
+// Establish transport prerequisites before constructing anything that can open
+// application data. A locked installation needs only this transport and a tiny
+// handler; it must not construct the normal application to report maintenance.
+func serve(cfg lib.Config, address, cert, key string) error {
+	var tlsConfig *tls.Config
+	if cert != "" || key != "" {
+		if cert == "" || key == "" {
+			return errors.New("both TLS certificate and key are required")
+		}
+		pair, err := tls.LoadX509KeyPair(cert, key)
+		if err != nil {
+			return errors.New("cannot load TLS certificate/key pair")
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
+	} else {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+		ip := net.ParseIP(host)
+		if !(ip != nil && ip.IsLoopback() || host == "localhost") {
+			return errors.New("HTTPS is required unless listening on loopback")
+		}
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	daemon, err := lib.OpenDaemon(cfg)
+	if err != nil {
+		return err
+	}
+	defer daemon.Close()
+	if daemon.Locked() {
+		log.Print(lib.ErrMaintenance)
+	}
+	// OPTIONS * must reach the daemon handler, including during maintenance,
+	// rather than net/http's default server-wide success response.
+	server := &http.Server{Handler: daemon.Handler(), DisableGeneralOptionsHandler: true, TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
+	if tlsConfig != nil {
+		err = server.ServeTLS(listener, "", "")
+	} else {
+		err = server.Serve(listener)
+	}
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
 func port(address string) string { _, p, _ := net.SplitHostPort(address); return p }

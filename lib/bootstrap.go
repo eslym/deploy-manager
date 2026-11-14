@@ -99,6 +99,9 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	if err := validateStoragePaths(cfg); err != nil {
 		return nil, err
 	}
+	if err := CheckMaintenance(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
 	}
@@ -118,11 +121,6 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	masterPath := filepath.Clean(cfg.RepositoryKeyPath)
 	if masterPath == dbPath || masterPath == dbPath+"-wal" || masterPath == dbPath+"-shm" || masterPath == keyPath {
 		return nil, errors.New("repository key master file must be separate from SQLite and the OPAQUE key")
-	}
-	if dbInfo, dbErr := os.Stat(dbPath); dbErr == nil {
-		if keyInfo, keyErr := os.Stat(keyPath); keyErr == nil && os.SameFile(dbInfo, keyInfo) {
-			return nil, errors.New("OPAQUE key must not share the SQLite database file")
-		}
 	}
 	if cfg.GrantTTL == 0 {
 		cfg.GrantTTL = 15 * time.Minute
@@ -179,6 +177,11 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 			_ = access.Close()
 		}
 	}()
+	if dbInfo, dbErr := os.Stat(dbPath); dbErr == nil {
+		if keyInfo, keyErr := os.Stat(keyPath); keyErr == nil && os.SameFile(dbInfo, keyInfo) {
+			return nil, errors.New("OPAQUE key must not share the SQLite database file")
+		}
+	}
 	if cfg.storageFault != nil {
 		if err := cfg.storageFault("access", nil); err != nil {
 			return nil, err
