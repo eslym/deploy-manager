@@ -57,6 +57,8 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	partialStore := missingObjectStorer{Storer: partialRepo.Storer, missing: partialFile.Hash}
 	var failRequests atomic.Bool
+	var failStatus atomic.Int32
+	var transientFailures atomic.Int32
 	var pauseBranchFetch atomic.Bool
 	branchFetchStarted := make(chan struct{})
 	source, err := git.PlainOpen(remoteDir)
@@ -83,7 +85,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 			}
 		}
 		if failRequests.Load() {
-			http.Error(w, "fixture deliberately unavailable", http.StatusServiceUnavailable)
+			status := int(failStatus.Load())
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, "fixture deliberately unavailable", status)
+			return
+		}
+		if remaining := transientFailures.Load(); remaining > 0 && transientFailures.CompareAndSwap(remaining, remaining-1) {
+			http.Error(w, "fixture temporarily unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		requestEndpoint, requestBackend := endpoint, backend
@@ -225,6 +235,8 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 	deploymentResponse.Body.Close()
+	// Creation fetch must survive a one-shot smart-HTTP 503 and publish normally.
+	transientFailures.Store(1)
 	branchDeploymentResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments", `{"projectId":"`+created.ID+`","name":"branch-production","targetKind":"branch","targetName":"feature/search","commit":"`+featureAtCreate+`"}`)
 	if branchDeploymentResponse.StatusCode != http.StatusCreated {
 		t.Fatalf("branch deployment creation status %d: %s", branchDeploymentResponse.StatusCode, responseText(branchDeploymentResponse))
@@ -315,23 +327,59 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if after, identityErr := identity(branchPath); identityErr != nil || after != branchIdentity {
 		t.Fatalf("no-op recreated the live directory: before=%+v after=%+v err=%v", branchIdentity, after, identityErr)
 	}
+	if transientFailures.Load() != 0 {
+		t.Fatal("creation fetch did not reach the controlled transient failure")
+	}
+	// A second branch target shares the repository cache while retaining its own
+	// destination; publishing it must not replace the feature deployment.
+	app.mu.Lock()
+	clear(app.rate)
+	app.mu.Unlock()
+	mainCommit := findProjectRef(initialRefs, "branch", "main").Commit
+	independentResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments", `{"projectId":"`+created.ID+`","name":"main-production","targetKind":"branch","targetName":"main","commit":"`+mainCommit+`"}`)
+	if independentResponse.StatusCode != http.StatusCreated {
+		t.Fatalf("independent branch deployment status %d: %s", independentResponse.StatusCode, responseText(independentResponse))
+	}
+	var independentDeployment struct {
+		ID    string `json:"id"`
+		JobID string `json:"jobId"`
+	}
+	if err := json.NewDecoder(independentResponse.Body).Decode(&independentDeployment); err != nil {
+		t.Fatal(err)
+	}
+	independentResponse.Body.Close()
+	waitForDeploymentJob(t, client, appServer.URL, cookie, independentDeployment.ID, independentDeployment.JobID, "succeeded")
+	independentPath := filepath.Join(app.cfg.DeploymentRoot, independentDeployment.ID)
+	independentDeadline := time.Now().Add(5 * time.Second)
+	for {
+		if content, readErr := os.ReadFile(filepath.Join(independentPath, "README.md")); readErr == nil && string(content) == "main content\n" {
+			break
+		}
+		if time.Now().After(independentDeadline) {
+			t.Fatal("independent main deployment did not publish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr != nil || string(content) != "searchable feature\n" {
+		t.Fatalf("publishing main target changed feature destination: %q, %v", content, readErr)
+	}
 	// Pause a real branch publication after export, change its target through
 	// the protected HTTP API, then verify the stale prepared tree never becomes
 	// live and the new target is published instead.
 	addSmartFixtureCommit(t, remoteDir, "race branch tip")
+	waitForDeploymentWorkersIdle(t, app)
 	stageReady, resumeStage := make(chan struct{}), make(chan struct{})
 	var pauseOnce sync.Once
 	var resumeOnce sync.Once
 	resume := func() { resumeOnce.Do(func() { close(resumeStage) }) }
 	defer resume()
-	previousFault := publicationFaultPoint
-	publicationFaultPoint = func(point string) error {
+	previousFault := setPublicationFaultPoint(func(point string) error {
 		if point == "after-stage-fsync" {
 			pauseOnce.Do(func() { close(stageReady); <-resumeStage })
 		}
 		return nil
-	}
-	defer func() { publicationFaultPoint = previousFault }()
+	})
+	defer func() { setPublicationFaultPoint(previousFault) }()
 	staleRequest := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/deploy", `{}`)
 	if staleRequest.StatusCode != http.StatusAccepted {
 		t.Fatalf("racing branch deploy status %d: %s", staleRequest.StatusCode, responseText(staleRequest))
@@ -348,7 +396,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("branch publication did not reach the staged-content boundary")
 	}
-	mainCommit := findProjectRef(initialRefs, "branch", "main").Commit
+	mainCommit = findProjectRef(initialRefs, "branch", "main").Commit
 	changed := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/target", `{"targetKind":"branch","targetName":"main","commit":"`+mainCommit+`"}`)
 	if changed.StatusCode != http.StatusAccepted {
 		resume()
@@ -446,6 +494,9 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	featureAfter := commitFixtureFile(t, remoteDir, fixtureWorktree, "feature", string(largePayload)).String()
 	lastSuccessfulBeforeOversizedRefresh := listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched
+	failStatus.Store(http.StatusUnauthorized)
+	failRequests.Store(true)
+	requestsBeforeAuthenticationFailure := gitRequests.Load()
 	failedFetch := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/deploy", `{}`)
 	if failedFetch.StatusCode != http.StatusAccepted {
 		t.Fatalf("branch deploy after remote update status %d: %s", failedFetch.StatusCode, responseText(failedFetch))
@@ -458,6 +509,11 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	failedFetch.Body.Close()
 	waitForDeploymentJob(t, client, appServer.URL, cookie, branchDeployment.ID, failedFetchJob.JobID, "failed")
+	failRequests.Store(false)
+	failStatus.Store(0)
+	if delta := gitRequests.Load() - requestsBeforeAuthenticationFailure; delta != 1 {
+		t.Fatalf("permanent authentication failure made %d smart-HTTP requests, want exactly one", delta)
+	}
 	if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr != nil || string(content) != "race branch tip\n" {
 		t.Fatalf("failed branch fetch changed live content: %q, err=%v", content, readErr)
 	}
@@ -921,9 +977,26 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 }
 
+func waitForDeploymentWorkersIdle(t *testing.T, app *App) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var active int
+		if err := app.db.QueryRow(`SELECT count(*) FROM deployment_jobs WHERE status IN ('queued','running')`).Scan(&active); err != nil {
+			t.Fatal(err)
+		}
+		if active == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("deployment jobs did not settle before fault injection")
+}
+
 func waitForDeploymentJob(t *testing.T, client *http.Client, origin, cookie, deploymentID, jobID, want string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
+	last := "not listed"
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequest(http.MethodGet, origin+"/api/deployments/"+deploymentID+"/jobs", nil)
 		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
@@ -938,13 +1011,16 @@ func waitForDeploymentJob(t *testing.T, client *http.Client, origin, cookie, dep
 			t.Fatal(err)
 		}
 		for _, job := range jobs {
+			if job.ID == jobID {
+				last = job.Status + ": " + job.Log
+			}
 			if job.ID == jobID && job.Status == want {
 				return
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("deployment job %s did not reach status %s", jobID, want)
+	t.Fatalf("deployment job %s did not reach status %s (last=%s)", jobID, want, last)
 }
 
 type countingHTTPWriter struct {

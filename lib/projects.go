@@ -940,6 +940,10 @@ type limitedResponseTransport struct {
 	base http.RoundTripper
 }
 
+type transientGitHTTPError struct{ status int }
+
+func (e transientGitHTTPError) Error() string { return "temporary Git server response" }
+
 func (t limitedResponseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	base := t.base
 	if base == nil {
@@ -948,6 +952,10 @@ func (t limitedResponseTransport) RoundTrip(req *http.Request) (*http.Response, 
 	response, err := base.RoundTrip(req)
 	if err != nil {
 		return nil, err
+	}
+	if response.StatusCode >= http.StatusInternalServerError && response.StatusCode <= 599 {
+		_ = response.Body.Close()
+		return nil, transientGitHTTPError{status: response.StatusCode}
 	}
 	policy, ok := req.Context().Value(gitHTTPPolicyKey{}).(gitHTTPPolicy)
 	if !ok || policy.transferBytes <= 0 || policy.advertisementBytes <= 0 {
@@ -959,6 +967,12 @@ func (t limitedResponseTransport) RoundTrip(req *http.Request) (*http.Response, 
 	}
 	response.Body = &limitedResponseBody{ReadCloser: response.Body, limit: policy.transferBytes}
 	if req.Method == http.MethodGet && strings.HasSuffix(req.URL.Path, "/info/refs") && req.URL.Query().Get("service") == "git-upload-pack" {
+		// Preserve the actual HTTP status for go-git's typed transport error.
+		// Treating an outage response as a malformed Git advertisement obscures
+		// transient 5xx failures and prevents safe bounded retry classification.
+		if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+			return response, nil
+		}
 		contentType := strings.TrimSpace(strings.Split(response.Header.Get("Content-Type"), ";")[0])
 		if contentType != "application/x-git-upload-pack-advertisement" {
 			_ = response.Body.Close()

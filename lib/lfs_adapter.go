@@ -23,6 +23,11 @@ type lfsPointer struct {
 // files are processed from the repository root toward the file, and rules are
 // reduced in order so later rules and deeper files take precedence.
 func effectiveLFSAttribute(files map[string]string, file string) (bool, error) {
+	work := 0
+	return effectiveLFSAttributeWithBudget(files, file, &work)
+}
+
+func effectiveLFSAttributeWithBudget(files map[string]string, file string, work *int) (bool, error) {
 	file = path.Clean(strings.TrimPrefix(file, "/"))
 	if file == "." || strings.HasPrefix(file, "../") {
 		return false, errors.New("invalid tracked path for attribute lookup")
@@ -35,8 +40,11 @@ func effectiveLFSAttribute(files map[string]string, file string) (bool, error) {
 	for i := range parts {
 		levels = append(levels, path.Join(parts[:i+1]...))
 	}
-	macros := gitattr.NewMacroProcessor()
+	macros := map[string][]*gitattr.Attr{
+		"binary": {{K: "diff", V: "false"}, {K: "merge", V: "false"}, {K: "text", V: "false"}},
+	}
 	filter := ""
+	steps := 0
 	for _, dir := range levels {
 		name := ".gitattributes"
 		if dir != "" {
@@ -46,12 +54,32 @@ func effectiveLFSAttribute(files map[string]string, file string) (bool, error) {
 		if !ok {
 			continue
 		}
+		for _, rawLine := range strings.Split(contents, "\n") {
+			trimmed := strings.TrimSpace(rawLine)
+			if strings.HasPrefix(trimmed, "!") {
+				return false, errors.New("committed attributes contain a forbidden negative pattern")
+			}
+		}
 		lines, _, err := gitattr.ParseLines(strings.NewReader(contents))
 		if err != nil {
 			return false, errors.New("committed attributes are malformed")
 		}
-		processed := macros.ProcessLines(lines, dir == "")
-		for _, line := range processed {
+		if dir == "" {
+			for _, line := range lines {
+				if macro, ok := line.(gitattr.MacroLine); ok {
+					macros[macro.Macro()] = macro.Attrs()
+				}
+			}
+		}
+		for _, raw := range lines {
+			line, ok := raw.(gitattr.PatternLine)
+			if !ok {
+				continue
+			}
+			(*work)++
+			if *work > maxLFSAttributeWork {
+				return false, errors.New("committed attribute matching exceeds the work limit")
+			}
 			rel := file
 			if dir != "" {
 				if rel == dir {
@@ -65,7 +93,11 @@ func effectiveLFSAttribute(files map[string]string, file string) (bool, error) {
 			if !line.Pattern().Match(rel) {
 				continue
 			}
-			for _, attr := range line.Attrs() {
+			attrs, err := expandGitAttributes(line.Attrs(), macros, nil, &steps)
+			if err != nil {
+				return false, err
+			}
+			for _, attr := range attrs {
 				if attr.K != "filter" {
 					continue
 				}
@@ -79,6 +111,46 @@ func effectiveLFSAttribute(files map[string]string, file string) (bool, error) {
 	}
 	return filter == "lfs", nil
 }
+
+const maxLFSAttributeWork = 10_000_000
+
+// Git expands set macros recursively, preserving assignment order and the
+// macro's own attribute assignment. Unset and unspecified macro names are
+// ordinary attributes, not invocations. Bound work and reject cyclic graphs.
+func expandGitAttributes(attrs []*gitattr.Attr, macros map[string][]*gitattr.Attr, stack map[string]bool, steps *int) ([]*gitattr.Attr, error) {
+	const maxAttributeExpansions = 10000
+	var out []*gitattr.Attr
+	for _, attr := range attrs {
+		(*steps)++
+		if *steps > maxAttributeExpansions {
+			return nil, errors.New("committed attributes exceed expansion limit")
+		}
+		if attr.V == "true" && !attr.Unspecified {
+			if body, ok := macros[attr.K]; ok {
+				if stack[attr.K] {
+					return nil, errors.New("committed attributes contain a macro cycle")
+				}
+				if stack == nil {
+					stack = make(map[string]bool)
+				}
+				if len(stack) >= maxAttributeExpansionDepth {
+					return nil, errors.New("committed attribute macro nesting exceeds the limit")
+				}
+				stack[attr.K] = true
+				expanded, err := expandGitAttributes(body, macros, stack, steps)
+				delete(stack, attr.K)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, expanded...)
+			}
+		}
+		out = append(out, attr)
+	}
+	return out, nil
+}
+
+const maxAttributeExpansionDepth = 256
 
 const maxLFSPointerBytes = 1024
 

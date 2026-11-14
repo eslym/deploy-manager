@@ -64,10 +64,22 @@ type exportLimits struct {
 type publicationFault func(string) error
 
 var publicationFaultPoint publicationFault
+var publicationFaultMu sync.RWMutex
+
+func setPublicationFaultPoint(next publicationFault) publicationFault {
+	publicationFaultMu.Lock()
+	previous := publicationFaultPoint
+	publicationFaultPoint = next
+	publicationFaultMu.Unlock()
+	return previous
+}
 
 func fault(point string) error {
-	if publicationFaultPoint != nil {
-		return publicationFaultPoint(point)
+	publicationFaultMu.RLock()
+	current := publicationFaultPoint
+	publicationFaultMu.RUnlock()
+	if current != nil {
+		return current(point)
 	}
 	return nil
 }
@@ -598,7 +610,11 @@ func (a *App) runDeploymentJob(jobID string) {
 	}
 	if d.TargetKind == "branch" {
 		if err := a.fetchProjectForBranch(ctx, d.ProjectID); err != nil {
-			a.failJob(jobID, d.ID, generation, "Could not fetch the configured branch; the current publication was kept")
+			message := "Could not fetch the configured branch; the current publication was kept"
+			if errors.Is(err, errBranchFetchRetriesExhausted) {
+				message = fmt.Sprintf("Temporary repository transport failures persisted through %d bounded attempts; the current publication was kept", branchFetchMaxAttempts)
+			}
+			a.failJob(jobID, d.ID, generation, message)
 			return
 		}
 		if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name=?`, d.ProjectID, d.TargetName).Scan(&d.Commit); err != nil {

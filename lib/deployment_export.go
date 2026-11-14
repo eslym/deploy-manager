@@ -39,6 +39,7 @@ func exportTrackedTree(ctx context.Context, repo *git.Repository, commit *object
 	var total int64
 	entries := 0
 	seen := map[string]bool{}
+	attributeWork := 0
 	var walk func(*object.Tree, string, int) error
 	walk = func(t *object.Tree, prefix string, depth int) error {
 		if depth > 256 {
@@ -100,7 +101,7 @@ func exportTrackedTree(ctx context.Context, repo *git.Repository, commit *object
 				if blob.Size < 0 || blob.Size > limits.bytes-total {
 					return errors.New("export exceeds configured byte limit")
 				}
-				selected, attrErr := effectiveLFSAttribute(attributes, rel)
+				selected, attrErr := effectiveLFSAttributeWithBudget(attributes, rel, &attributeWork)
 				if attrErr != nil {
 					return attrErr
 				}
@@ -227,6 +228,7 @@ func committedAttributes(repo *git.Repository, root *object.Tree, maxEntries int
 	files := make(map[string]string)
 	count := 0
 	var totalAttributeBytes int64
+	totalAttributeRules := 0
 	var walk func(*object.Tree, string, int) error
 	walk = func(tree *object.Tree, prefix string, depth int) error {
 		if depth > 256 {
@@ -273,6 +275,10 @@ func committedAttributes(repo *git.Repository, root *object.Tree, maxEntries int
 				closeErr := reader.Close()
 				if readErr != nil || closeErr != nil || int64(len(contents)) != blob.Size || len(contents) > 1<<20 {
 					return errors.New("committed .gitattributes could not be read safely")
+				}
+				totalAttributeRules += strings.Count(string(contents), "\n") + 1
+				if totalAttributeRules > 100_000 {
+					return errors.New("committed attributes exceed the rule-count limit")
 				}
 				files[rel] = string(contents)
 				totalAttributeBytes += blob.Size

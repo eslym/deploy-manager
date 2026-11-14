@@ -96,12 +96,12 @@ func TestPublicationCrashChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	app.startDeploymentWorkers()
-	publicationFaultPoint = func(at string) error {
+	setPublicationFaultPoint(func(at string) error {
 		if at == point {
 			os.Exit(86)
 		}
 		return nil
-	}
+	})
 	jobID, err := app.enqueueDeployment(os.Getenv("PUBLICATION_CRASH_DEPLOYMENT"), os.Getenv("PUBLICATION_CRASH_COMMIT"), 1)
 	if err != nil {
 		t.Fatal(err)
@@ -278,14 +278,13 @@ func TestPublicationCleanupResumesAfterRestartAfterManyFailures(t *testing.T) {
 	if _, err := app.db.Exec(`INSERT INTO publication_cleanup(deployment_id,job_id,path_name,dev,ino,not_before,last_error,attempts) VALUES(?,?,?,?,?,?,?,0)`, id, job, "."+id+".stage-"+job, oldID.Dev, oldID.Ino, now.Add(-time.Second).UnixNano(), ""); err != nil {
 		t.Fatal(err)
 	}
-	previousFault := publicationFaultPoint
-	defer func() { publicationFaultPoint = previousFault }()
-	publicationFaultPoint = func(point string) error {
+	previousFault := setPublicationFaultPoint(func(point string) error {
 		if point == "before-cleanup" {
 			return errors.New("temporary cleanup failure")
 		}
 		return nil
-	}
+	})
+	defer func() { setPublicationFaultPoint(previousFault) }()
 	for i := 0; i < 9; i++ {
 		if err := app.cleanupPublications(false); err != nil {
 			t.Fatal(err)
@@ -309,7 +308,7 @@ func TestPublicationCleanupResumesAfterRestartAfterManyFailures(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer app.Close()
-	publicationFaultPoint = nil
+	setPublicationFaultPoint(nil)
 	nowMu.Lock()
 	now = now.Add(time.Hour)
 	nowMu.Unlock()
@@ -389,13 +388,22 @@ func TestExportHydratesCommittedLFSPointerIntoActualFile(t *testing.T) {
 	digest := sha256.Sum256(payload)
 	oid := hex.EncodeToString(digest[:])
 	pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", oid, len(payload))
-	for name, contents := range map[string]string{".gitattributes": "*.dat filter=lfs\n", "asset.dat": pointer} {
+	if err := os.Mkdir(filepath.Join(repoDir, "nested"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{".gitattributes": "[attr]one two\n[attr]two filter=lfs\n", "nested/.gitattributes": "*.dat one\n", "nested/asset.dat": pointer, "unselected.dat": pointer} {
 		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(contents), 0600); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := worktree.Add(name); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := os.MkdirAll(filepath.Join(repoDir, ".git", "info"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".git", "info", "attributes"), []byte("unselected.dat filter=lfs\n"), 0600); err != nil {
+		t.Fatal(err)
 	}
 	commitID, err := worktree.Commit("LFS tracked object", &git.CommitOptions{Author: &object.Signature{Name: "fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
 	if err != nil {
@@ -435,9 +443,12 @@ func TestExportHydratesCommittedLFSPointerIntoActualFile(t *testing.T) {
 	if err = exportTrackedTree(context.Background(), repo, commit, out, exportLimits{files: 20, bytes: 1024, timeout: time.Second}, hydrator); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(out, "asset.dat"))
+	got, err := os.ReadFile(filepath.Join(out, "nested", "asset.dat"))
 	if err != nil || string(got) != string(payload) {
 		t.Fatalf("published asset = %q, %v; want hydrated bytes", got, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(out, "unselected.dat")); err != nil || string(got) != pointer {
+		t.Fatalf("repository-local attributes changed an unselected file: %q, %v", got, err)
 	}
 }
 
@@ -465,13 +476,12 @@ func TestRestartReconcilesCompletedFirstDirectorySwitchByIdentity(t *testing.T) 
 			cookie := installAPITestSession(t, app)
 			server := httptest.NewTLSServer(app.Handler())
 			client := server.Client()
-			previousFault := publicationFaultPoint
-			publicationFaultPoint = func(point string) error {
+			previousFault := setPublicationFaultPoint(func(point string) error {
 				if point == faultAt {
 					return errors.New("simulated process interruption")
 				}
 				return nil
-			}
+			})
 			response := projectPost(t, client, server.URL, cookie, "/api/deployments", `{"projectId":"`+projectID+`","name":"recovery","commit":"`+commitID+`"}`)
 			if response.StatusCode != http.StatusCreated {
 				t.Fatalf("create status %d: %s", response.StatusCode, responseText(response))
@@ -495,7 +505,7 @@ func TestRestartReconcilesCompletedFirstDirectorySwitchByIdentity(t *testing.T) 
 				}
 				time.Sleep(10 * time.Millisecond)
 			}
-			publicationFaultPoint = previousFault
+			setPublicationFaultPoint(previousFault)
 			path := app.deploymentPath(created.ID)
 			_, beforeRestartErr := os.Stat(path)
 			server.Close()
@@ -507,7 +517,7 @@ func TestRestartReconcilesCompletedFirstDirectorySwitchByIdentity(t *testing.T) 
 				t.Fatalf("reconcile after switched-first-publication crash: %v", err)
 			}
 			defer app.Close()
-			defer func() { publicationFaultPoint = previousFault }()
+			defer func() { setPublicationFaultPoint(previousFault) }()
 			var liveCommit, status, jobStatus string
 			if err := app.db.QueryRow(`SELECT live_commit,status FROM deployments WHERE id=?`, created.ID).Scan(&liveCommit, &status); err != nil {
 				t.Fatal(err)

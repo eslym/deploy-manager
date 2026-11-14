@@ -110,18 +110,18 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 	if _, err = os.Stat(filepath.Join(app.deploymentPath(firstID), "index.html")); err != nil {
 		t.Fatalf("cancelled deletion changed publication: %v", err)
 	}
-	publicationFaultPoint = func(point string) error {
+	setPublicationFaultPoint(func(point string) error {
 		if point == "before-deployment-remove" {
 			return errors.New("injected removal failure")
 		}
 		return nil
-	}
+	})
 	response = projectPost(t, server.Client(), server.URL, cookie, path, `{"confirm":true}`)
 	response.Body.Close()
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("failed cleanup status=%d", response.StatusCode)
 	}
-	publicationFaultPoint = nil
+	setPublicationFaultPoint(nil)
 	listReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/deployments", nil)
 	listReq.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
 	listResponse, err := server.Client().Do(listReq)
@@ -311,12 +311,12 @@ func TestProjectDeletionCrashChild(t *testing.T) {
 	if point == "" {
 		return
 	}
-	publicationFaultPoint = func(at string) error {
+	setPublicationFaultPoint(func(at string) error {
 		if at == point {
 			os.Exit(86)
 		}
 		return nil
-	}
+	})
 	app, err := New(Config{DatabasePath: os.Getenv("PROJECT_DELETE_CRASH_DB"), OPAQUEKeyPath: os.Getenv("PROJECT_DELETE_CRASH_KEY")})
 	if err != nil {
 		t.Fatal(err)
@@ -394,12 +394,12 @@ func TestDeploymentDeletionCrashChild(t *testing.T) {
 	if point == "" {
 		return
 	}
-	publicationFaultPoint = func(at string) error {
+	setPublicationFaultPoint(func(at string) error {
 		if at == point {
 			os.Exit(86)
 		}
 		return nil
-	}
+	})
 	app, err := New(Config{DatabasePath: os.Getenv("DEPLOYMENT_DELETE_CRASH_DB"), OPAQUEKeyPath: os.Getenv("DEPLOYMENT_DELETE_CRASH_KEY")})
 	if err != nil {
 		t.Fatal(err)
@@ -504,14 +504,14 @@ func deletionRaceAt(t *testing.T, pausePoint string) {
 	}
 	reached, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	publicationFaultPoint = func(point string) error {
+	setPublicationFaultPoint(func(point string) error {
 		if point == pausePoint {
 			once.Do(func() { close(reached) })
 			<-release
 		}
 		return nil
-	}
-	defer func() { publicationFaultPoint = nil }()
+	})
+	defer func() { setPublicationFaultPoint(nil) }()
 	jobID, err := app.enqueueDeployment(deploymentID, commit, 1)
 	if err != nil {
 		t.Fatal(err)

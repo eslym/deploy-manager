@@ -3,19 +3,86 @@ package lib
 import (
 	"context"
 	"errors"
+	"net"
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
 
 	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 )
+
+var errBranchFetchRetriesExhausted = errors.New("temporary branch fetch failures exhausted the bounded retry policy")
+
+type transientGitNetworkError struct{}
+
+func (transientGitNetworkError) Error() string { return "temporary Git network failure" }
+
+const branchFetchMaxAttempts = 3
 
 // fetchProjectForBranch refreshes the project's shared bare cache using the
 // same bounded staging and journaled promotion policy as an explicit refresh.
 // Ref metadata is only committed after the refreshed object store is promoted.
 func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
+	var err error
+	for attempt := 1; attempt <= branchFetchMaxAttempts; attempt++ {
+		err = a.fetchProjectForBranchAttempt(ctx, id)
+		if err == nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !retryableBranchFetch(err) {
+			return err
+		}
+		if attempt == branchFetchMaxAttempts {
+			return errBranchFetchRetriesExhausted
+		}
+		delay := time.Duration(attempt) * 100 * time.Millisecond
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return err
+}
+
+func retryableBranchFetch(err error) bool {
+	if err == nil {
+		return false
+	}
+	var serverErr transientGitHTTPError
+	if errors.As(err, &serverErr) {
+		return serverErr.status >= 500 && serverErr.status <= 599
+	}
+	var networkErr transientGitNetworkError
+	if errors.As(err, &networkErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout() || netErr.Temporary()
+	}
+	var statusErr interface{ StatusCode() int }
+	if errors.As(err, &statusErr) {
+		status := statusErr.StatusCode()
+		return status >= 500 && status <= 599
+	}
+	var unexpected *plumbing.UnexpectedError
+	if errors.As(err, &unexpected) && unexpected.Err != nil {
+		return retryableBranchFetch(unexpected.Err)
+	}
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ETIMEDOUT)
+}
+
+func (a *App) fetchProjectForBranchAttempt(ctx context.Context, id string) error {
 	p := a.projects
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -71,6 +138,13 @@ func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
 		return errors.New("project repository is unavailable")
 	}
 	if err = repo.FetchContext(withGitHTTPPolicy(ctx, p), &git.FetchOptions{RemoteName: "origin", Tags: git.AllTags, Force: true, Prune: true, Auth: auth}); err != nil && err != git.NoErrAlreadyUpToDate {
+		if retryableBranchFetch(err) {
+			var serverErr transientGitHTTPError
+			if errors.As(err, &serverErr) {
+				return serverErr
+			}
+			return transientGitNetworkError{}
+		}
 		return errors.New(sanitizeGitError(err, remote))
 	}
 	if err = ctx.Err(); err != nil {

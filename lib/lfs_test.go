@@ -293,7 +293,16 @@ func TestEffectiveLFSAttributesNestedPrecedenceAndMacros(t *testing.T) {
 		{"nested override", map[string]string{".gitattributes": "*.bin filter=lfs\n", "nested/.gitattributes": "a.bin -filter\n"}, "nested/a.bin", false},
 		{"slash pattern", map[string]string{".gitattributes": "nested/*.bin filter=lfs\n"}, "nested/a.bin", true},
 		{"macro unset", map[string]string{".gitattributes": "[attr]large filter=lfs -diff\n*.bin large !filter\n"}, "a.bin", false},
+		{"recursive macro", map[string]string{".gitattributes": "[attr]one two\n[attr]two filter=lfs\n*.bin one\n"}, "a.bin", true},
+		{"nested recursive macro", map[string]string{".gitattributes": "[attr]one two\n[attr]two filter=lfs\n", "nested/.gitattributes": "a.bin one\n"}, "nested/a.bin", true},
+		{"nested macro definition ignored", map[string]string{".gitattributes": "*.bin filter=other\n", "nested/.gitattributes": "[attr]local filter=lfs\na.bin local\n"}, "nested/a.bin", false},
 		{"attribute value override", map[string]string{".gitattributes": "*.bin filter=lfs\n*.bin filter=other\n"}, "a.bin", false},
+		{"unrelated assignment preserves filter", map[string]string{".gitattributes": "*.bin filter=lfs\nx.bin text\n"}, "x.bin", true},
+		{"explicit unset overrides ancestor", map[string]string{".gitattributes": "*.bin filter=lfs\n", "nested/.gitattributes": "x.bin -filter\n"}, "nested/x.bin", false},
+		{"explicit unspecified overrides ancestor", map[string]string{".gitattributes": "*.bin filter=lfs\n", "nested/.gitattributes": "x.bin !filter\n"}, "nested/x.bin", false},
+		{"double star directory match", map[string]string{".gitattributes": "**/deep/*.bin filter=lfs\n"}, "a/b/deep/file.bin", true},
+		{"quoted space pattern", map[string]string{".gitattributes": "\"a b.bin\" filter=lfs\n"}, "a b.bin", true},
+		{"trailing slash directory pattern is not recursive", map[string]string{".gitattributes": "nested/ filter=lfs\n"}, "nested/file.bin", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,5 +311,17 @@ func TestEffectiveLFSAttributesNestedPrecedenceAndMacros(t *testing.T) {
 				t.Fatalf("effectiveLFSAttribute() = %v, %v; want %v", got, err, tc.want)
 			}
 		})
+	}
+}
+
+func TestEffectiveLFSAttributesRejectsForbiddenNegativePatterns(t *testing.T) {
+	if _, err := effectiveLFSAttribute(map[string]string{".gitattributes": "!private.bin filter=lfs\n"}, "private.bin"); err == nil {
+		t.Fatal("forbidden negative attribute pattern was accepted")
+	}
+}
+
+func TestEffectiveLFSAttributesRejectsMacroCycles(t *testing.T) {
+	if _, err := effectiveLFSAttribute(map[string]string{".gitattributes": "[attr]one two\n[attr]two one\n*.bin one\n"}, "a.bin"); err == nil {
+		t.Fatal("cyclic macro expansion was accepted")
 	}
 }
