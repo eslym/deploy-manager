@@ -30,6 +30,16 @@ local reverse proxy, pass an HTTPS setup URL with `--url` and proxy to a
 loopback listener; the application trusts `X-Forwarded-Proto: https` only from
 a loopback peer and checks the request Origin.
 
+The confirmed singleton policy applies only to the main daemon, not local CLI
+utilities. Setup and password-recovery grant issuance must remain usable while
+the daemon is running when the CLI executable supports the database's exact
+schema version. A maintenance lock or version mismatch must fail without issuing
+a grant, modifying application state, or attempting migration. CLI utilities do
+not start daemon workers or perform publication/cache recovery. Initialization,
+schema maintenance, and offline database restoration must exclude all database
+users; compatible routine CLI use does not require stopping the daemon. These
+are the confirmed #27 requirements, not a claim that its implementation is done.
+
 The setup grant is placed after `#` in the URL. The SPA removes the fragment
 from the visible URL before any protocol request and sends the grant only in
 same-origin, JSON POST bodies. The pinned `@serenity-kit/opaque@1.1.0` browser

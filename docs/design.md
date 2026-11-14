@@ -35,6 +35,7 @@ Design confirmed by the user on 2026-11-12; frontend architecture corrected by t
 
 ## Confirmed lifecycle and operations
 
+- Run at most one main daemon per installation. Compatible local CLI utilities, including setup and password-recovery grant issuance, may run alongside that daemon; they must not start daemon workers or perform cache/publication recovery. Before accessing application data, CLI commands must respect maintenance state and verify that the database schema exactly matches the version supported by their executable. A mismatch fails nonzero without mutation, migration, downgrade, or repair. Fresh initialization and schema maintenance require separate cross-process exclusion from all database users; the daemon's lifetime singleton lock must not exclude compatible CLI commands. Maintenance-locked commands still refuse, and offline database restoration requires stopping the daemon and all CLI users. This maintainer correction (2026-11-15, #27) supersedes any earlier all-command singleton proposal.
 - Ordinary Deploy fetches and resolves branch targets, but uses the saved commit for tag/commit targets. If the target commit is already live, record a no-op rather than recreating files.
 - Creating a deployment or changing its Git target automatically queues publication.
 - Deployment deletion requires confirmation and removes its published files. Project deletion is blocked while deployments exist; repository keys cannot be deleted while assigned.
