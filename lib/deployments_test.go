@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -21,7 +22,85 @@ import (
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
+
+func TestNewFailsWhenAcceptedWebhookQueueCannotBeRestoredThenRestartsWork(t *testing.T) {
+	base := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(base, "state.sqlite"), OPAQUEKeyPath: filepath.Join(base, "opaque.key"), DeployTimeout: time.Second}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectID := strings.Repeat("a", 32)
+	deploymentID := strings.Repeat("b", 32)
+	jobID := strings.Repeat("c", 32)
+	now := time.Now().UnixNano()
+	if _, err := app.db.Exec(`INSERT INTO projects(id,name,remote_url,created_at,last_fetched,warning) VALUES(?,?,?,?,?,'')`, projectID, "accepted-work", "https://example.test/repo.git", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,target_kind,target_name,generation,status,created_at,updated_at) VALUES(?,?,?,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa','branch','main',1,'queued',?,?)`, deploymentID, projectID, "production", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable) VALUES(?,?,? ,1,'queued','Verified GitHub branch update',?,?,1)`, jobID, deploymentID, strings.Repeat("a", 40), now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	faultConfig := cfg
+	faultConfig.beforeRestoreDeploymentJobs = func(db *sql.DB) error {
+		db.SetMaxOpenConns(1)
+		conn, err := db.Conn(context.Background())
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+		return conn.Raw(func(driverConn any) error {
+			conn, ok := driverConn.(*sqlite3.SQLiteConn)
+			if !ok {
+				return fmt.Errorf("unexpected SQLite connection %T", driverConn)
+			}
+			conn.RegisterAuthorizer(func(op int, arg1, _, _ string) int {
+				if op == sqlite3.SQLITE_READ && arg1 == "deployment_jobs" {
+					return sqlite3.SQLITE_DENY
+				}
+				return sqlite3.SQLITE_OK
+			})
+			return nil
+		})
+	}
+	if failed, err := New(faultConfig); err == nil {
+		_ = failed.Close()
+		t.Fatal("startup succeeded while restoration of accepted work was denied")
+	}
+
+	app, err = New(cfg)
+	if err != nil {
+		t.Fatalf("restart with readable queue failed: %v", err)
+	}
+	defer app.Close()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var status string
+		if err := app.db.QueryRow(`SELECT status FROM deployment_jobs WHERE id=?`, jobID).Scan(&status); err != nil {
+			t.Fatal(err)
+		}
+		if status == "failed" || status == "superseded" || status == "succeeded" {
+			var count int
+			if err := app.db.QueryRow(`SELECT count(*) FROM deployment_jobs WHERE id=? AND durable=1`, jobID).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("restored accepted job count = %d, want exactly one", count)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("durable accepted work remained queued after a successful restart")
+}
 
 func TestExportPublishesDotfilesAndRejectsTrackedSymlinks(t *testing.T) {
 	repoDir := filepath.Join(t.TempDir(), "repo")
@@ -95,7 +174,6 @@ func TestPublicationCrashChild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	app.startDeploymentWorkers()
 	setPublicationFaultPoint(func(at string) error {
 		if at == point {
 			os.Exit(86)

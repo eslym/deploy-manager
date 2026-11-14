@@ -42,17 +42,18 @@ type Config struct {
 	GitMaxTransferBytes   int64
 	// GitMaxCacheBytes bounds persistent project-cache bytes. A refresh may
 	// temporarily add one staged project cache of at most this same size.
-	GitMaxCacheBytes         int64
-	GitMaxRefs               int
-	GitMaxAdvertisementBytes int64
-	DeploymentRoot           string
-	DeployMaxFiles           int
-	DeployMaxBytes           int64
-	DeployTimeout            time.Duration
-	DeployConcurrency        int
-	DeployGracePeriod        time.Duration
-	JobRetention             time.Duration
-	WebhookMaxBodyBytes      int64
+	GitMaxCacheBytes            int64
+	GitMaxRefs                  int
+	GitMaxAdvertisementBytes    int64
+	DeploymentRoot              string
+	DeployMaxFiles              int
+	DeployMaxBytes              int64
+	DeployTimeout               time.Duration
+	DeployConcurrency           int
+	DeployGracePeriod           time.Duration
+	JobRetention                time.Duration
+	WebhookMaxBodyBytes         int64
+	beforeRestoreDeploymentJobs func(*sql.DB) error
 }
 
 type App struct {
@@ -301,8 +302,19 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	if app.cfg.beforeRestoreDeploymentJobs != nil {
+		if err := app.cfg.beforeRestoreDeploymentJobs(db); err != nil {
+			_ = app.Close()
+			return nil, fmt.Errorf("prepare deployment queue recovery: %w", err)
+		}
+	}
+	restoredJobs, err := restoreQueuedDeploymentJobs(db, deploymentQueueCapacity)
+	if err != nil {
+		_ = app.Close()
+		return nil, fmt.Errorf("restore accepted deployment work: %w", err)
+	}
 	app.retryProjectDeletions()
-	app.startDeploymentWorkers()
+	app.startDeploymentWorkers(restoredJobs)
 	app.deployWG.Add(1)
 	go app.publicationCleanupLoop()
 	return app, nil

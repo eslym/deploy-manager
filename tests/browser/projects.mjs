@@ -117,11 +117,34 @@ try {
   if (crossOriginMutation !== 403) throw new Error(`cross-origin SSH approval returned ${crossOriginMutation}`);
   await page.getByLabel("Project name").fill("Fixture site");
   await page.getByLabel("Repository URL").fill(fixtureURL);
+  let webhookSettingsGets = 0;
+  let webhookRotationPosts = 0;
+  await page.route("**/api/projects/*/github-webhook", async route => {
+    if (route.request().method() === "GET") {
+      if (webhookSettingsGets++ === 0) {
+        await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "RAW_WEBHOOK_ERROR_SENTINEL" }) });
+        return;
+      }
+    } else if (route.request().method() === "POST") {
+      webhookRotationPosts++;
+    }
+    await route.continue();
+  });
   const createResponse = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Add repository" }).click();
   const created = await createResponse;
   if (created.status() !== 201) throw new Error(`project creation returned ${created.status()}: ${await created.text()}\n${appOutput}`);
   await page.getByRole("heading", { name: "Branches and tags" }).waitFor({ timeout: 30000 });
+  await page.getByRole("alert").filter({ hasText: "GitHub webhook settings could not be saved. Try again shortly." }).waitFor();
+  const dashboardURLBeforeRetry = page.url();
+  await page.getByRole("button", { name: "Retry loading settings" }).click();
+  await page.getByRole("button", { name: "Set up webhook", exact: true }).waitFor();
+  if (await page.getByRole("alert").count()) throw new Error("the webhook settings load error remained after a successful retry");
+  if (webhookSettingsGets !== 2) throw new Error(`webhook settings were requested ${webhookSettingsGets} times, expected one retry after the failed load`);
+  if (webhookRotationPosts !== 0) throw new Error("retrying settings unexpectedly rotated the webhook secret");
+  if (page.url() !== dashboardURLBeforeRetry) throw new Error("retrying webhook settings navigated away from the dashboard");
+  if ((await page.locator("body").innerText()).includes("RAW_WEBHOOK_ERROR_SENTINEL")) throw new Error("raw webhook error response was shown in the dashboard");
+  await page.unroute("**/api/projects/*/github-webhook");
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   await page.getByText("v1.0", { exact: true }).waitFor();
 

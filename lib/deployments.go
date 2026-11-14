@@ -3,6 +3,7 @@ package lib
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -562,23 +563,40 @@ func randomID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func (a *App) startDeploymentWorkers() {
-	a.deployQueue = make(chan string, 160)
+const deploymentQueueCapacity = 160
+
+func restoreQueuedDeploymentJobs(db *sql.DB, capacity int) ([]string, error) {
+	rows, err := db.Query(`SELECT id FROM deployment_jobs WHERE status='queued' AND durable=1 ORDER BY created_at,id LIMIT ?`, capacity)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+func (a *App) startDeploymentWorkers(restoredJobs []string) {
+	a.deployQueue = make(chan string, deploymentQueueCapacity)
 	a.deployStop = make(chan struct{})
 	a.deploySem = make(chan struct{}, a.cfg.DeployConcurrency)
 	a.deploySlots = make(chan struct{}, cap(a.deployQueue))
-	rows, err := a.db.Query(`SELECT id FROM deployment_jobs WHERE status='queued' AND durable=1 ORDER BY created_at,id LIMIT ?`, cap(a.deployQueue))
-	if err != nil {
-		log.Printf("could not restore accepted webhook work: %v", err)
-	} else {
-		for rows.Next() {
-			var id string
-			if rows.Scan(&id) == nil {
-				a.deploySlots <- struct{}{}
-				a.deployQueue <- id
-			}
-		}
-		_ = rows.Close()
+	for _, id := range restoredJobs {
+		a.deploySlots <- struct{}{}
+		a.deployQueue <- id
 	}
 	for i := 0; i < a.cfg.DeployConcurrency; i++ {
 		a.deployWG.Add(1)

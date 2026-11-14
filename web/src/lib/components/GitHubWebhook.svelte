@@ -6,6 +6,7 @@
 	let secret = $state('');
 	let error = $state('');
 	let busy = $state(false);
+	let loading = $state(true);
 	let copied = $state('');
 	let loadVersion = 0;
 
@@ -28,6 +29,8 @@
 	}
 
 	async function load(id: string, version: number) {
+		loading = true;
+		error = '';
 		try {
 			const result: Settings = await request(`/api/projects/${id}/github-webhook`);
 			if (version === loadVersion && id === projectId)
@@ -35,6 +38,8 @@
 		} catch (cause) {
 			if (version === loadVersion && id === projectId)
 				error = cause instanceof Error ? cause.message : 'Could not load webhook settings.';
+		} finally {
+			if (version === loadVersion && id === projectId) loading = false;
 		}
 	}
 
@@ -94,6 +99,18 @@
 		>
 			{error}
 		</p>{/if}
+	{#if error && !settings}
+		<button
+			class="mt-3 rounded-lg border border-[#aeb9ae] px-4 py-2 font-semibold disabled:opacity-60"
+			onclick={() => void load(projectId, ++loadVersion)}
+			disabled={loading}
+		>
+			{loading ? 'Loading settings…' : 'Retry loading settings'}
+		</button>
+	{/if}
+	{#if loading && !settings}<p class="mt-3 text-sm text-[#58645b]" role="status">
+			Loading webhook settings…
+		</p>{/if}
 	{#if settings}
 		<p class="mt-3 text-sm text-[#354238]">
 			{settings.configured
@@ -103,7 +120,7 @@
 		<button
 			class="mt-3 min-h-10 rounded-lg bg-[#214c30] px-4 font-semibold text-white disabled:opacity-60"
 			onclick={rotate}
-			disabled={busy}>{settings.configured ? 'Rotate secret' : 'Set up webhook'}</button
+			disabled={busy || loading}>{settings.configured ? 'Rotate secret' : 'Set up webhook'}</button
 		>
 	{/if}
 	{#if secret && settings}
