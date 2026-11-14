@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -88,33 +90,63 @@ func main() {
 		}
 		fmt.Println(link)
 	case "serve":
-		app, err := lib.New(cfg)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer app.Close()
-		server := &http.Server{Addr: *listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
-		if *cert != "" || *key != "" {
-			if *cert == "" || *key == "" {
-				log.Fatal("both TLS certificate and key are required")
-			}
-			err = server.ListenAndServeTLS(*cert, *key)
-		} else {
-			host, _, e := net.SplitHostPort(*listen)
-			if e != nil {
-				log.Fatal(e)
-			}
-			ip := net.ParseIP(host)
-			if !(ip != nil && ip.IsLoopback() || host == "localhost") {
-				log.Fatal("HTTPS is required unless listening on loopback")
-			}
-			err = server.ListenAndServe()
-		}
-		if err != http.ErrServerClosed {
+		if err := serve(cfg, *listen, *cert, *key); err != nil {
 			log.Fatal(err)
 		}
 	default:
 		log.Fatalf("unknown command %q", command)
 	}
 }
+
+// Establish transport prerequisites before constructing anything that can open
+// application data. A locked installation needs only this transport and a tiny
+// handler; it must not construct the normal application to report maintenance.
+func serve(cfg lib.Config, address, cert, key string) error {
+	var tlsConfig *tls.Config
+	if cert != "" || key != "" {
+		if cert == "" || key == "" {
+			return errors.New("both TLS certificate and key are required")
+		}
+		pair, err := tls.LoadX509KeyPair(cert, key)
+		if err != nil {
+			return errors.New("cannot load TLS certificate/key pair")
+		}
+		tlsConfig = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
+	} else {
+		host, _, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+		ip := net.ParseIP(host)
+		if !(ip != nil && ip.IsLoopback() || host == "localhost") {
+			return errors.New("HTTPS is required unless listening on loopback")
+		}
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return err
+	}
+	defer listener.Close()
+	handler := lib.MaintenanceHandler()
+	app, err := lib.New(cfg)
+	if errors.Is(err, lib.ErrMaintenance) {
+		log.Print(lib.ErrMaintenance)
+	} else if err != nil {
+		return err
+	} else {
+		defer app.Close()
+		handler = app.Handler()
+	}
+	server := &http.Server{Handler: handler, TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
+	if tlsConfig != nil {
+		err = server.ServeTLS(listener, "", "")
+	} else {
+		err = server.Serve(listener)
+	}
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
 func port(address string) string { _, p, _ := net.SplitHostPort(address); return p }

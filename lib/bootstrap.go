@@ -99,6 +99,9 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	if err := validateStoragePaths(cfg); err != nil {
 		return nil, err
 	}
+	if err := CheckMaintenance(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
 	}
