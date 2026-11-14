@@ -260,6 +260,24 @@ try {
     // Cancellation must not publish; the next confirmation uses the full ID.
     await history.getByRole("button", { name: "Cancel", exact: true }).click();
     await history.getByRole("button", { name: `Roll back to ${commit.slice(0, 12)}`, exact: true }).click();
+    if (title === "main") {
+      const rollbackURL = `**/api/deployments/${deploymentID}/rollback`;
+      for (const [label, body] of [["malformed JSON", "{RAW_ROLLBACK_ERROR"], ["null response", "null"], ["missing job ID", "{}"], ["non-string job ID", '{"jobId":42}'], ["blank job ID", '{"jobId":"   "}']]) {
+        milestone(`reject rollback acceptance: ${label}`);
+        await page.route(rollbackURL, route => route.fulfill({ status: 202, contentType: "application/json", body }));
+        try {
+          const invalidResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/rollback`));
+          await history.getByRole("button", { name: "Confirm temporary rollback", exact: true }).click();
+          if ((await invalidResponse).status() !== 202) throw new Error("invalid rollback acceptance fixture did not run");
+          await history.getByRole("alert").filter({ hasText: "Could not confirm the rollback request. Check Latest deployment before retrying." }).waitFor();
+          if (await history.getByRole("status").filter({ hasText: /Rollback to .* queued/ }).count()) throw new Error(`${label} incorrectly showed rollback queued`);
+          if (await history.getByRole("button", { name: "Confirm temporary rollback", exact: true }).isDisabled()) throw new Error(`${label} left rollback controls disabled`);
+          if ((await history.innerText()).includes("RAW_ROLLBACK_ERROR")) throw new Error("rollback exposed a malformed HTTP response body");
+        } finally {
+          await page.unroute(rollbackURL);
+        }
+      }
+    }
     const rollbackResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/rollback`));
     milestone(`confirm rollback: ${title}`);
     await history.getByRole("button", { name: "Confirm temporary rollback", exact: true }).click();

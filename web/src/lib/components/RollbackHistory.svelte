@@ -83,7 +83,18 @@
 				);
 			}
 			// Complete the accepted request before refreshing deployment state.
-			await response.json();
+			const accepted: unknown = await response.json().catch(() => null);
+			if (
+				!accepted ||
+				typeof accepted !== 'object' ||
+				!('jobId' in accepted) ||
+				typeof accepted.jobId !== 'string' ||
+				!accepted.jobId.trim()
+			) {
+				throw new Error(
+					'Could not confirm the rollback request. Check Latest deployment before retrying.'
+				);
+			}
 			queued = `Rollback to ${commit.shortId} queued. Follow its progress in Latest deployment.`;
 			selected = null;
 		} catch (cause) {
