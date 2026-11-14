@@ -181,6 +181,12 @@ func (a *App) initDeployments() error {
 	if err := ensureColumn(a.db, "deployment_jobs", "force_redeploy", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
+	if err := ensureColumn(a.db, "deployment_jobs", "durable", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := ensureColumn(a.db, "deployment_jobs", "retry_enqueued", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	if err := ensureColumn(a.db, "deployment_deletions", "retry_after", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
@@ -197,8 +203,11 @@ func (a *App) initDeployments() error {
 	}
 	// Jobs interrupted by process termination are terminalized separately from
 	// filesystem intent reconciliation, which uses observed inode identities.
-	_, err = a.db.Exec(`UPDATE deployment_jobs SET status='failed',log=CASE WHEN log='' THEN 'interrupted by service restart' ELSE substr(log || char(10) || 'interrupted by service restart',1,8192) END,updated_at=? WHERE status IN ('queued','running')`, d.Now().UnixNano())
+	_, err = a.db.Exec(`UPDATE deployment_jobs SET status='failed',log=CASE WHEN log='' THEN 'interrupted by service restart' ELSE substr(log || char(10) || 'interrupted by service restart',1,8192) END,updated_at=? WHERE status='running' OR (status='queued' AND durable=0)`, d.Now().UnixNano())
 	if err != nil {
+		return err
+	}
+	if err := a.requeueInterruptedWebhookJobs(); err != nil {
 		return err
 	}
 	if err := a.reconcilePublications(); err != nil {
@@ -554,10 +563,23 @@ func randomID() (string, error) {
 }
 
 func (a *App) startDeploymentWorkers() {
-	a.deployQueue = make(chan string, 128)
+	a.deployQueue = make(chan string, 160)
 	a.deployStop = make(chan struct{})
 	a.deploySem = make(chan struct{}, a.cfg.DeployConcurrency)
 	a.deploySlots = make(chan struct{}, cap(a.deployQueue))
+	rows, err := a.db.Query(`SELECT id FROM deployment_jobs WHERE status='queued' AND durable=1 ORDER BY created_at,id LIMIT ?`, cap(a.deployQueue))
+	if err != nil {
+		log.Printf("could not restore accepted webhook work: %v", err)
+	} else {
+		for rows.Next() {
+			var id string
+			if rows.Scan(&id) == nil {
+				a.deploySlots <- struct{}{}
+				a.deployQueue <- id
+			}
+		}
+		_ = rows.Close()
+	}
 	for i := 0; i < a.cfg.DeployConcurrency; i++ {
 		a.deployWG.Add(1)
 		go func() {
@@ -606,11 +628,18 @@ func (a *App) runDeploymentJob(jobID string) {
 		return
 	}
 	defer unlock()
+	claimed, claimErr := a.db.Exec(`UPDATE deployment_jobs SET status='running',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
+	if claimErr != nil {
+		return
+	}
+	if claimedRows, _ := claimed.RowsAffected(); claimedRows != 1 {
+		return
+	}
 	var liveTarget string
 	var currentGeneration int64
 	var currentStatus string
 	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
-		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before work began',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
+		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before work began',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
 	if d.TargetKind == "branch" || forceRedeploy {
@@ -637,18 +666,18 @@ func (a *App) runDeploymentJob(jobID string) {
 					return
 				}
 				if affected, _ := result.RowsAffected(); affected != 1 {
-					_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before refreshed tag resolution was saved',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
+					_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before refreshed tag resolution was saved',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
 					return
 				}
 			}
 		}
-		if _, err := a.db.Exec(`UPDATE deployment_jobs SET commit_id=?,updated_at=? WHERE id=? AND status='queued'`, d.Commit, a.cfg.Now().UnixNano(), jobID); err != nil {
+		if _, err := a.db.Exec(`UPDATE deployment_jobs SET commit_id=?,updated_at=? WHERE id=? AND status='running'`, d.Commit, a.cfg.Now().UnixNano(), jobID); err != nil {
 			a.failJob(jobID, d.ID, generation, "The resolved branch commit could not be recorded; the current publication was kept")
 			return
 		}
 	}
 	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
-		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
+		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
 	if d.LiveCommit == d.Commit && !forceRedeploy {
@@ -659,13 +688,6 @@ func (a *App) runDeploymentJob(jobID string) {
 			a.failJob(jobID, d.ID, generation, "The live publication path is not a safe directory")
 			return
 		}
-	}
-	result, err := a.db.Exec(`UPDATE deployment_jobs SET status='running',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
-	if err != nil {
-		return
-	}
-	if affected, _ := result.RowsAffected(); affected != 1 {
-		return
 	}
 	if _, err = a.db.Exec(`UPDATE deployments SET status='publishing',error='' WHERE id=? AND generation=?`, d.ID, generation); err != nil {
 		return

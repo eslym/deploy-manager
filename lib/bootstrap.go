@@ -52,6 +52,7 @@ type Config struct {
 	DeployConcurrency        int
 	DeployGracePeriod        time.Duration
 	JobRetention             time.Duration
+	WebhookMaxBodyBytes      int64
 }
 
 type App struct {
@@ -80,6 +81,7 @@ type App struct {
 	deployLocks          sync.Map
 	deploymentJobsMu     sync.Mutex
 	deploymentJobCancels map[string]activeDeploymentJob
+	webhookFault         func(string) error
 }
 
 func New(cfg Config) (*App, error) {
@@ -284,6 +286,17 @@ func New(cfg Config) (*App, error) {
 		}
 	}
 	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	if app.cfg.WebhookMaxBodyBytes == 0 {
+		app.cfg.WebhookMaxBodyBytes = 1 << 20
+	}
+	if app.cfg.WebhookMaxBodyBytes < 1024 || app.cfg.WebhookMaxBodyBytes > 16<<20 {
+		db.Close()
+		return nil, errors.New("webhook body limit must be between 1 KiB and 16 MiB")
+	}
+	if err := app.initWebhooks(); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if err := app.initDeployments(); err != nil {
 		db.Close()
 		return nil, err
@@ -508,6 +521,9 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/projects", a.createProject)
 	m.HandleFunc("GET /api/projects/{id}/lfs", a.lfsSettings)
 	m.HandleFunc("POST /api/projects/{id}/lfs", a.lfsSettings)
+	m.HandleFunc("GET /api/projects/{id}/github-webhook", a.githubWebhookSettings)
+	m.HandleFunc("POST /api/projects/{id}/github-webhook", a.githubWebhookSettings)
+	m.HandleFunc("POST /webhooks/github/{id}", a.githubWebhook)
 	m.HandleFunc("POST /api/projects/{id}/delete", a.deleteProject)
 	m.HandleFunc("GET /api/projects/{id}/refs", a.projectRefs)
 	m.HandleFunc("POST /api/projects/{id}/refresh", a.refreshProject)
@@ -532,7 +548,7 @@ func (a *App) Handler() http.Handler {
 				return
 			}
 		}
-		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/api/") {
+		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/webhooks/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		if (r.URL.Path == "/login" || r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/") || r.URL.Path == "/account/password" || strings.HasPrefix(r.URL.Path, "/account/")) && !a.https(r) {

@@ -44,7 +44,7 @@ async function waitFor(check, label) {
 
 async function startApplication(cert, key, gitCA) {
   const env = { ...process.env, DEPLOY_MANAGER_TEST_GIT_CA: gitCA, DEPLOY_MANAGER_TEST_GIT_ORIGIN: fixtureOrigin, DEPLOY_MANAGER_TEST_LFS_CA: gitCA };
-  app = spawn(executable, ["serve", "--data", dir, "--listen", appListen, "--tls-cert", cert, "--tls-key", key, "--origin", `https://${appListen}`], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
+  app = spawn(executable, ["serve", "--data", dir, "--listen", appListen, "--tls-cert", cert, "--tls-key", key, "--origin", `https://${appListen}`, "--auth-rate-per-minute", "1000"], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
   app.stdout.on("data", chunk => { appOutput += chunk.toString(); });
   app.stderr.on("data", chunk => { appOutput += chunk.toString(); });
   await waitFor(async () => (await httpsRequestStatus("127.0.0.1", 18440, "/api/session")) === 401, "application server");
@@ -65,7 +65,7 @@ try {
   if (!grant || !setupURL.startsWith(`http://${appListen}/register#`)) throw new Error("CLI did not issue a fragment-only local setup grant");
 
   // Register through the application before starting its HTTPS-only login flow.
-  app = spawn(executable, ["serve", "--data", dir, "--listen", appListen], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  app = spawn(executable, ["serve", "--data", dir, "--listen", appListen, "--auth-rate-per-minute", "1000"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   app.stdout.on("data", chunk => { appOutput += chunk.toString(); });
   app.stderr.on("data", chunk => { appOutput += chunk.toString(); });
   await waitFor(async () => {
