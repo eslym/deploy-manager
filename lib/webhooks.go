@@ -306,18 +306,19 @@ func (a *App) requeueInterruptedWebhookJobs() error {
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT j.id,d.id,d.commit_id,d.generation FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.status='failed' AND j.durable=1 AND j.rollback_commit='' AND j.retry_enqueued=0 AND j.log LIKE '%interrupted by service restart%' AND d.target_kind='branch' AND d.status NOT IN ('deleting','deletion_failed') ORDER BY j.created_at`)
+	rows, err := tx.Query(`SELECT j.id,d.id,d.commit_id,d.generation,j.automation_epoch FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.status='failed' AND j.durable=1 AND j.automatic=1 AND j.rollback_commit='' AND j.retry_enqueued=0 AND j.log LIKE '%interrupted by service restart%' AND d.target_kind='branch' AND d.status NOT IN ('deleting','deletion_failed') ORDER BY j.created_at`)
 	if err != nil {
 		return err
 	}
 	type interrupted struct {
 		job, deployment, commit string
 		generation              int64
+		epoch                   int64
 	}
 	var items []interrupted
 	for rows.Next() {
 		var item interrupted
-		if err = rows.Scan(&item.job, &item.deployment, &item.commit, &item.generation); err != nil {
+		if err = rows.Scan(&item.job, &item.deployment, &item.commit, &item.generation, &item.epoch); err != nil {
 			rows.Close()
 			return err
 		}
@@ -339,10 +340,10 @@ func (a *App) requeueInterruptedWebhookJobs() error {
 		if _, err = tx.Exec(`UPDATE deployment_jobs SET retry_enqueued=1 WHERE id=? AND retry_enqueued=0`, item.job); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable) VALUES(?,?,?,?,'queued','Recovered accepted branch update after restart',?,?,1)`, jobID, item.deployment, item.commit, item.generation, now, now); err != nil {
+		if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable,automatic,automation_epoch) VALUES(?,?,?,?,'queued','Recovered accepted branch update after restart',?,?,1,1,?)`, jobID, item.deployment, item.commit, item.generation, now, now, item.epoch); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`UPDATE deployments SET status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, now, item.deployment, item.generation); err != nil {
+		if _, err = tx.Exec(`UPDATE deployments SET status=CASE WHEN automation_paused=0 THEN 'queued' ELSE status END,error=CASE WHEN automation_paused=0 THEN '' ELSE error END,updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, now, item.deployment, item.generation); err != nil {
 			return err
 		}
 	}
@@ -374,18 +375,19 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 	outcome := "ignored"
 	jobIDs := make([]string, 0)
 	if event == "push" && branch != "" && !deleted {
-		rows, queryErr := tx.Query(`SELECT id,generation,commit_id FROM deployments WHERE project_id=? AND target_kind='branch' AND target_name=? AND status NOT IN ('deleting','deletion_failed') ORDER BY id`, projectID, branch)
+		rows, queryErr := tx.Query(`SELECT id,generation,commit_id,automation_epoch FROM deployments WHERE project_id=? AND target_kind='branch' AND target_name=? AND status NOT IN ('deleting','deletion_failed') ORDER BY id`, projectID, branch)
 		if queryErr != nil {
 			return queryErr
 		}
 		type target struct {
 			id, commit string
 			generation int64
+			epoch      int64
 		}
 		var targets []target
 		for rows.Next() {
 			var x target
-			if err = rows.Scan(&x.id, &x.generation, &x.commit); err != nil {
+			if err = rows.Scan(&x.id, &x.generation, &x.commit, &x.epoch); err != nil {
 				rows.Close()
 				return err
 			}
@@ -399,7 +401,7 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 		for _, target := range targets {
 			var pending string
 			// A later webhook is separate tip work, not a coalesced rollback.
-			err = tx.QueryRow(`SELECT id FROM deployment_jobs WHERE deployment_id=? AND status='queued' AND durable=1 AND rollback_commit='' ORDER BY created_at DESC LIMIT 1`, target.id).Scan(&pending)
+			err = tx.QueryRow(`SELECT id FROM deployment_jobs WHERE deployment_id=? AND status='queued' AND automatic=1 AND rollback_commit='' AND generation=? AND automation_epoch=? ORDER BY created_at DESC LIMIT 1`, target.id, target.generation, target.epoch).Scan(&pending)
 			if err == nil {
 				if _, err = tx.Exec(`UPDATE deployment_jobs SET log='Latest branch update queued',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), pending); err != nil {
 					return err
@@ -419,10 +421,10 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 			if idErr != nil {
 				return idErr
 			}
-			if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable) VALUES(?,?,?,?,'queued',?,?,?,1)`, jobID, target.id, target.commit, target.generation, "Verified "+provider+" branch update", a.cfg.Now().UnixNano(), a.cfg.Now().UnixNano()); err != nil {
+			if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable,automatic,automation_epoch) VALUES(?,?,?,?,'queued',?,?,?,1,1,?)`, jobID, target.id, target.commit, target.generation, "Verified "+provider+" branch update", a.cfg.Now().UnixNano(), a.cfg.Now().UnixNano(), target.epoch); err != nil {
 				return err
 			}
-			if _, err = tx.Exec(`UPDATE deployments SET status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, a.cfg.Now().UnixNano(), target.id, target.generation); err != nil {
+			if _, err = tx.Exec(`UPDATE deployments SET status=CASE WHEN automation_paused=0 THEN 'queued' ELSE status END,error=CASE WHEN automation_paused=0 THEN '' ELSE error END,updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, a.cfg.Now().UnixNano(), target.id, target.generation); err != nil {
 				return err
 			}
 			jobIDs = append(jobIDs, jobID)

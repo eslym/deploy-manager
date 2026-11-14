@@ -343,6 +343,98 @@ func testRollbackGraphAndRaces(t *testing.T, client *http.Client, origin, cookie
 	})
 	defer setPublicationFaultPoint(previous)
 	hardRedeployAndWait(t, client, origin, cookie, id, path, nil)
+	setPublicationFaultPoint(previous)
+	testTemporaryRollbackPreservesPause(t, client, origin, cookie, projectID, id, oldCommit, path)
+}
+
+func testTemporaryRollbackPreservesPause(t *testing.T, client *http.Client, origin, cookie, projectID, id, commit, path string) {
+	t.Helper()
+	pause := projectPost(t, client, origin, cookie, "/api/deployments/"+id+"/pause", `{}`)
+	if pause.StatusCode != 200 {
+		t.Fatalf("pause before rollback status %d: %s", pause.StatusCode, responseText(pause))
+	}
+	pause.Body.Close()
+	assertPaused := func() {
+		request, _ := http.NewRequest("GET", origin+"/api/deployments", nil)
+		request.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+		response, err := client.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var deployments []deployment
+		if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		for _, item := range deployments {
+			if item.ID == id {
+				if !item.AutomationPaused || item.TargetKind != "branch" || item.TargetName != "feature/search" {
+					t.Fatalf("temporary rollback changed branch automation: %+v", item)
+				}
+				return
+			}
+		}
+		t.Fatal("deployment missing")
+	}
+	rollback := projectPost(t, client, origin, cookie, "/api/deployments/"+id+"/rollback", `{"commit":"`+commit+`"}`)
+	var queued struct{ JobID string }
+	if rollback.StatusCode != 202 || json.NewDecoder(rollback.Body).Decode(&queued) != nil {
+		t.Fatalf("paused rollback status %d", rollback.StatusCode)
+	}
+	rollback.Body.Close()
+	waitForDeploymentJob(t, client, origin, cookie, id, queued.JobID, "succeeded")
+	assertPaused()
+	for _, provider := range []string{"github", "gitea"} {
+		response := projectPost(t, client, origin, cookie, "/api/projects/"+projectID+"/"+provider+"-webhook", `{"rotate":true}`)
+		var settings struct{ URL, Secret string }
+		if response.StatusCode != 201 || json.NewDecoder(response.Body).Decode(&settings) != nil {
+			t.Fatalf("paused rollback webhook settings %d", response.StatusCode)
+		}
+		response.Body.Close()
+		body := []byte(`{"ref":"refs/heads/feature/search","after":"` + commit + `"}`)
+		send := sendGitHubWebhook
+		if provider == "gitea" {
+			send = sendGiteaWebhook
+		}
+		if status := send(client, origin+settings.URL, "paused-temporary-rollback-"+provider, "push", body, []byte(settings.Secret)); status != 204 {
+			t.Fatalf("paused %s webhook status %d", provider, status)
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for {
+			request, _ := http.NewRequest("GET", origin+"/api/deployments/"+id+"/jobs", nil)
+			request.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+			response, err := client.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var jobs []deploymentJob
+			err = json.NewDecoder(response.Body).Decode(&jobs)
+			response.Body.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(jobs) > 0 && jobs[0].ID != queued.JobID && jobs[0].Status == "noop" {
+				queued.JobID = jobs[0].ID
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("paused %s webhook did not finish fetch-only: %+v", provider, jobs)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if content, err := os.ReadFile(filepath.Join(path, "README.md")); err != nil || string(content) != "searchable feature\n" {
+			t.Fatalf("paused webhook replaced rollback content %q: %v", content, err)
+		}
+		assertPaused()
+	}
+	testRejectedRollbackKeepsLive(t, client, origin, cookie, id, strings.Repeat("f", 40), path)
+	assertPaused()
+	resume := projectPost(t, client, origin, cookie, "/api/deployments/"+id+"/resume", `{}`)
+	if resume.StatusCode != 202 || json.NewDecoder(resume.Body).Decode(&queued) != nil {
+		t.Fatalf("resume after rollback status %d", resume.StatusCode)
+	}
+	resume.Body.Close()
+	waitForDeploymentJob(t, client, origin, cookie, id, queued.JobID, "succeeded")
 }
 
 func testRejectedRollbackKeepsLive(t *testing.T, client *http.Client, origin, cookie, id, commit, path string) {

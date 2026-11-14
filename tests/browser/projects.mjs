@@ -251,6 +251,45 @@ try {
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
   await page.getByText(/Latest deployment: noop/).waitFor({ timeout: 10000 });
 
+  const productionCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "Production site", exact: true }) });
+  await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
+  let releasePauseFailure;
+  const pauseFailureGate = new Promise(resolveGate => { releasePauseFailure = resolveGate; });
+  const pauseURL = `**/api/deployments/${deploymentID}/pause`;
+  await page.route(pauseURL, async route => {
+    await pauseFailureGate;
+    await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE PAUSE ERROR" });
+  });
+  const rejectedPause = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/pause`));
+  await productionCard.getByRole("button", { name: "Pause", exact: true }).click();
+  if (!(await productionCard.getByRole("button", { name: "Pause", exact: true }).isDisabled())) throw new Error("Pause stayed enabled during its request");
+  releasePauseFailure();
+  if ((await rejectedPause).status() !== 500) throw new Error("Pause failure fixture did not run");
+  await page.getByRole("alert").filter({ hasText: "The request could not be completed. Try again shortly." }).waitFor();
+  await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
+  if ((await page.locator("body").innerText()).includes("SENSITIVE PAUSE ERROR")) throw new Error("Pause exposed an HTTP response body");
+  await page.unroute(pauseURL);
+  const pausedResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/pause`));
+  await productionCard.getByRole("button", { name: "Pause", exact: true }).click();
+  const paused = await pausedResponse;
+  if (!paused.ok() || (await paused.json()).automationPaused !== true) throw new Error("Pause did not persist automation state");
+  await productionCard.getByText("Automatic deployment paused", { exact: true }).waitFor();
+  await page.reload();
+  await page.getByText("Fixture site", { exact: true }).click();
+  await productionCard.getByText("Automatic deployment paused", { exact: true }).waitFor();
+  const manualWhilePaused = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/deploy`));
+  await productionCard.getByRole("button", { name: "Deploy", exact: true }).click();
+  if ((await manualWhilePaused).status() !== 202) throw new Error("manual Deploy was blocked while paused");
+  await productionCard.getByText(/Latest deployment: noop/).waitFor();
+  const stillPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id).automationPaused, deploymentID);
+  if (!stillPaused) throw new Error("manual Deploy cleared automation pause");
+  const resumedResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/resume`));
+  await productionCard.getByRole("button", { name: "Resume", exact: true }).click();
+  const resumed = await resumedResponse;
+  const resumeBody = await resumed.json();
+  if (resumed.status() !== 202 || resumeBody.automationPaused !== false || !resumeBody.jobId || resumeBody.status !== "queued") throw new Error("Resume did not enable automation and queue deployment");
+  await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
+
   const initialTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
   const search = page.getByLabel("Search branches and tags");
   await search.fill("feature/search");
@@ -273,6 +312,7 @@ try {
     try { return (await readFile(join(tagPath, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n"; } catch { return false; }
   }, "tag-target publication from the dashboard");
   const tagCard = page.locator("li").filter({ hasText: "Tag release" });
+  if (await tagCard.getByRole("button", { name: /^(Pause|Resume)$/ }).count()) throw new Error("tag deployment showed branch-only automation controls");
   const tagIdentity = (await stat(tagPath)).ino;
   const hardRedeployResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${tagDeployment.id}/hard-redeploy`));
   await tagCard.getByRole("button", { name: "Hard re-deploy", exact: true }).click();
@@ -373,6 +413,9 @@ try {
     if (privateJobLog.includes(secret) || appOutput.includes(secret)) throw new Error(`private LFS secret reached an application or job log (${secret})`);
   }
   const sshPublishedPath = join(dir, "state.sqlite.publications", sshDeployment.body.id);
+  const commitCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "SSH published site", exact: true }) });
+  await commitCard.waitFor();
+  if (await commitCard.getByRole("button", { name: /^(Pause|Resume)$/ }).count()) throw new Error("commit deployment showed branch-only automation controls");
   await page.getByRole("button", { name: "Delete", exact: true }).click();
   await page.getByText(/Delete “SSH published site” and remove its published files/).waitFor();
   await page.getByRole("button", { name: "Cancel", exact: true }).click();

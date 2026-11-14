@@ -8,6 +8,7 @@
 		projectId: string;
 		name: string;
 		targetKind: string;
+		automationPaused: boolean;
 		targetName: string;
 		commit: string;
 		liveCommit?: string;
@@ -156,6 +157,22 @@
 			busy = false;
 		}
 	}
+	async function setAutomationPaused(id: string, paused: boolean) {
+		if (busy || deployments.find((item) => item.id === id)?.targetKind !== 'branch') return;
+		busy = true;
+		error = '';
+		try {
+			await request(`/api/deployments/${id}/${paused ? 'pause' : 'resume'}`, {
+				method: 'POST',
+				body: '{}'
+			});
+			await load();
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not update automatic deployment.';
+		} finally {
+			busy = false;
+		}
+	}
 	async function changeTarget(id: string) {
 		const target = refs.find((ref) => key(ref) === targetSelections[id]);
 		if (busy || !target) return;
@@ -281,7 +298,26 @@
 						<p class="mt-1 text-sm text-[#58645b]">
 							{item.status === 'live' ? 'Live' : item.status}
 						</p>
+						{#if item.targetKind === 'branch'}
+							<p class="mt-1 text-sm font-medium text-[#354238]">
+								{item.automationPaused
+									? 'Automatic deployment paused'
+									: 'Automatic deployment enabled'}
+							</p>
+							{#if item.automationPaused}
+								<p class="mt-1 text-sm text-[#58645b]">
+									Manual Deploy remains available. Resume deploys the latest branch tip.
+								</p>
+							{/if}
+						{/if}
 					</div>
+					{#if item.targetKind === 'branch'}
+						<button
+							class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold text-[#214c30] disabled:opacity-60"
+							onclick={() => setAutomationPaused(item.id, !item.automationPaused)}
+							disabled={busy}>{item.automationPaused ? 'Resume' : 'Pause'}</button
+						>
+					{/if}
 					<button
 						class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold text-[#214c30] disabled:opacity-60"
 						onclick={() => deploy(item.id)}
