@@ -133,8 +133,92 @@ func TestLockedCommandServesMaintenanceOverTLS(t *testing.T) {
 		t.Fatalf("TLS maintenance response: %d %v", res.StatusCode, res.Header)
 	}
 	entries, err := os.ReadDir(data)
-	if err != nil || len(entries) != 1 || entries[0].Name() != "state.sqlite.maintenance.json" {
+	if err != nil || len(entries) != 2 || entries[0].Name() != "state.sqlite.daemon.lock" || entries[1].Name() != "state.sqlite.maintenance.json" {
 		t.Fatalf("TLS locked start initialized state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestLockedDaemonRetainsSingletonOwnership(t *testing.T) {
+	binary := buildCommand(t)
+	data := t.TempDir()
+	if err := os.WriteFile(filepath.Join(data, "state.sqlite.maintenance.json"), []byte("interrupted maintenance"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	startCommand(t, binary, data, freeAddress(t))
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binary, "serve", "--data", data, "--listen", freeAddress(t)).CombinedOutput()
+	if err == nil || ctx.Err() != nil || !strings.Contains(string(out), "daemon ownership unavailable") {
+		t.Fatalf("second locked daemon was not refused promptly: err=%v context=%v out=%q", err, ctx.Err(), out)
+	}
+	for _, command := range []string{"setup", "recover"} {
+		out, err := boundedCommand(t, binary, command, "--data", data).CombinedOutput()
+		if err == nil || !strings.Contains(string(out), "maintenance-locked") || strings.Contains(string(out), "daemon ownership") {
+			t.Fatalf("%s did not refuse maintenance independently of daemon ownership: %v %q", command, err, out)
+		}
+	}
+	for _, name := range []string{"state.sqlite", "state.sqlite.access.lock", "opaque-server.key", "repository-key-master.key"} {
+		if _, err := os.Lstat(filepath.Join(data, name)); !os.IsNotExist(err) {
+			t.Errorf("locked daemon/CLI accessed application state %s: %v", name, err)
+		}
+	}
+}
+
+func TestCLIRechecksMarkerAfterWaitingForStorageAccess(t *testing.T) {
+	binary := buildCommand(t)
+	data := t.TempDir()
+	if out, err := boundedCommand(t, binary, "setup", "--data", data, "--url", "https://example.test").CombinedOutput(); err != nil {
+		t.Fatalf("initialize installation: %v %s", err, out)
+	}
+	// Act as a maintenance owner. The CLI must pass its marker preflight and
+	// reach the access guard before we create the marker and release exclusion.
+	access, err := os.OpenFile(filepath.Join(data, "state.sqlite.access.lock"), os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer access.Close()
+	if err := unix.Flock(int(access.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	arrival, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(arrival)
+	if _, err := unix.InotifyAddWatch(arrival, access.Name(), unix.IN_OPEN); err != nil {
+		t.Fatal(err)
+	}
+	protected, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(protected)
+	for _, name := range []string{"state.sqlite", "opaque-server.key", "repository-key-master.key"} {
+		if _, err := unix.InotifyAddWatch(protected, filepath.Join(data, name), unix.IN_OPEN|unix.IN_MODIFY|unix.IN_ATTRIB); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := boundedCommand(t, binary, "setup", "--data", data, "--url", "https://example.test")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	if n, err := unix.Poll([]unix.PollFd{{Fd: int32(arrival), Events: unix.POLLIN}}, 5000); err != nil || n == 0 {
+		t.Fatalf("CLI did not reach storage access: n=%d err=%v", n, err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "state.sqlite.maintenance.json"), []byte("upgrade interrupted while CLI waited"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(access.Fd()), unix.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err == nil || stdout.Len() != 0 || !strings.Contains(stderr.String(), "maintenance-locked") {
+		t.Fatalf("CLI bypassed marker created while waiting: err=%v stdout=%q stderr=%q", err, &stdout, &stderr)
+	}
+	if n, err := unix.Read(protected, make([]byte, 65536)); n > 0 || err != unix.EAGAIN {
+		t.Fatalf("CLI touched database or keys after new maintenance marker: events=%d err=%v", n, err)
 	}
 }
 
@@ -380,15 +464,12 @@ func TestUnsafeMaintenancePathsFailClosed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			address := freeAddress(t)
-			startCommand(t, binary, data, address)
-			res, err := http.Get("http://" + address + "/")
-			if err != nil {
-				t.Fatal(err)
-			}
-			res.Body.Close()
-			if res.StatusCode != 503 {
-				t.Fatalf("unsafe marker path served status %d", res.StatusCode)
+			// Unsafe installation directories cannot establish daemon ownership.
+			// This infrastructure failure must refuse rather than serve without
+			// singleton protection, even though the TCP listener itself can bind.
+			out, err := boundedCommand(t, binary, "serve", "--data", data, "--listen", freeAddress(t)).CombinedOutput()
+			if err == nil || !strings.Contains(string(out), "unsafe coordination directory") {
+				t.Fatalf("unsafe installation did not fail closed: err=%v out=%q", err, out)
 			}
 			for _, command := range []string{"setup", "recover"} {
 				out, err := boundedCommand(t, binary, command, "--data", data).CombinedOutput()
@@ -419,5 +500,38 @@ func TestReservedMaintenancePathCannotBecomeApplicationState(t *testing.T) {
 				})
 			}
 		}
+	}
+}
+
+func TestCommandRejectsTraversalWithoutRetargetingInstallation(t *testing.T) {
+	binary := buildCommand(t)
+	for _, command := range []string{"setup", "recover", "serve"} {
+		t.Run(command, func(t *testing.T) {
+			base := t.TempDir()
+			trusted, other := filepath.Join(base, "trusted"), filepath.Join(base, "other")
+			if err := os.MkdirAll(filepath.Join(other, "nested"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(trusted, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(filepath.Join(other, "nested"), filepath.Join(trusted, "link")); err != nil {
+				t.Fatal(err)
+			}
+			// Do not filepath.Join this argument: preserving the original kernel
+			// traversal is precisely what the command must do until validation.
+			data := trusted + "/link/../installation"
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, binary, command, "--data", data, "--listen", freeAddress(t), "--url", "https://example.test").CombinedOutput()
+			if err == nil || ctx.Err() != nil || !strings.Contains(string(out), "path components") {
+				t.Fatalf("%s accepted or cleaned traversal: err=%v context=%v out=%q", command, err, ctx.Err(), out)
+			}
+			for _, parent := range []string{trusted, other} {
+				if _, err := os.Lstat(filepath.Join(parent, "installation")); !os.IsNotExist(err) {
+					t.Errorf("command touched installation under %s: %v", parent, err)
+				}
+			}
+		})
 	}
 }

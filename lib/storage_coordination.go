@@ -67,11 +67,11 @@ func acquireStorageAccess(cfg Config) (*storageLock, bool, error) {
 		_ = l.Close()
 		return nil, false, err
 	}
-	prior, err := pathExists(cfg.DatabasePath)
+	prior, err := inspectGuardedStorage(cfg)
 	if err == nil && !prior {
 		err = l.acquire(unix.LOCK_EX)
 		if err == nil {
-			prior, err = pathExists(cfg.DatabasePath)
+			prior, err = inspectGuardedStorage(cfg)
 		}
 	}
 	if err != nil {
@@ -79,6 +79,26 @@ func acquireStorageAccess(cfg Config) (*storageLock, bool, error) {
 		return nil, false, err
 	}
 	return l, prior, nil
+}
+
+// inspectGuardedStorage requires shared or exclusive access. Marker detection
+// precedes even database identity/existence inspection. Recheck after changing
+// lock modes, since an exclusive maintenance owner may have run while waiting.
+func inspectGuardedStorage(cfg Config) (bool, error) {
+	if err := CheckMaintenance(cfg); err != nil {
+		return false, err
+	}
+	var db unix.Stat_t
+	if err := unix.Lstat(cfg.DatabasePath, &db); err != nil {
+		if err == unix.ENOENT {
+			return false, nil
+		}
+		return false, err
+	}
+	if db.Mode&unix.S_IFMT != unix.S_IFREG || db.Nlink != 1 || db.Uid != uint32(os.Geteuid()) {
+		return false, fmt.Errorf("database must be an owned regular file without aliases")
+	}
+	return true, nil
 }
 
 func (l *storageLock) acquire(mode int) error {
@@ -135,19 +155,8 @@ func openCoordinationFile(cfg Config, suffix string) (*os.File, error) {
 	if parent.Uid != uint32(os.Geteuid()) || parent.Mode&0022 != 0 {
 		return nil, fmt.Errorf("database directory must be owned by the current user and not writable by others")
 	}
-	// Daemon ownership must remain usable for marker-locked HTTP serving
-	// without even inspecting the database. Validate its identity only at the
-	// database-access boundary, after the separate marker preflight (#30).
-	if suffix == ".access.lock" {
-		var db unix.Stat_t
-		if err := unix.Fstatat(dir, filepath.Base(dbPath), &db, unix.AT_SYMLINK_NOFOLLOW); err == nil {
-			if db.Mode&unix.S_IFMT != unix.S_IFREG || db.Nlink != 1 || db.Uid != uint32(os.Geteuid()) {
-				return nil, fmt.Errorf("database must be an owned regular file without aliases")
-			}
-		} else if err != unix.ENOENT {
-			return nil, err
-		}
-	}
+	// Neither lock-file open may inspect application data. Database identity is
+	// checked only after access acquisition and its protected marker recheck.
 	name := filepath.Base(dbPath) + suffix
 	fd, err := unix.Openat(dir, name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0600)
 	if err != nil {

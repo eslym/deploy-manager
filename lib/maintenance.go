@@ -14,7 +14,15 @@ var ErrMaintenance = errors.New("installation is maintenance-locked; stop all da
 
 // MaintenancePath is reserved beside the database, independently of key paths.
 // Marker writing/durability belongs to storage maintenance, not this reader.
-func MaintenancePath(cfg Config) string { return cfg.DatabasePath + ".maintenance.json" }
+func MaintenancePath(cfg Config) (string, error) {
+	if err := validateStoragePaths(cfg); err != nil {
+		return "", err
+	}
+	if cfg.DatabasePath == "" {
+		return "", errors.New("database path is required")
+	}
+	return cfg.DatabasePath + ".maintenance.json", nil
+}
 
 // CheckMaintenance performs no database, key or marker-content reads. Any marker
 // entry (including malformed, unreadable, symlink or non-regular entries) locks
@@ -22,10 +30,11 @@ func MaintenancePath(cfg Config) string { return cfg.DatabasePath + ".maintenanc
 // Callers coordinating database access must recheck under their access guard and
 // retain that guard until all application data access has finished.
 func CheckMaintenance(cfg Config) error {
-	if cfg.DatabasePath == "" {
-		return errors.New("database path is required")
+	path, err := MaintenancePath(cfg)
+	if err != nil {
+		return err
 	}
-	path, err := filepath.Abs(MaintenancePath(cfg))
+	path, err = filepath.Abs(path)
 	if err != nil {
 		return ErrMaintenance
 	}

@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/eslym/deploy-manager/lib"
@@ -43,11 +42,18 @@ func main() {
 	deployGrace := flags.Duration("deploy-grace-period", 60*time.Second, "minimum time before replaced files are cleaned up")
 	jobRetention := flags.Duration("job-retention", 30*24*time.Hour, "how long publication job details and logs are retained")
 	_ = flags.Parse(os.Args[2:])
+	// Preserve caller traversal until the storage boundary validates it. Join
+	// would erase "link/.." and silently select a different installation.
+	dataDir := *data
+	if dataDir == "" {
+		dataDir = "."
+	}
+	dataPath := func(name string) string { return dataDir + string(os.PathSeparator) + name }
 	repositoryMasterPath := *repositoryMaster
 	if repositoryMasterPath == "" {
-		repositoryMasterPath = filepath.Join(*data, "repository-key-master.key")
+		repositoryMasterPath = dataPath("repository-key-master.key")
 	}
-	cfg := lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention}
+	cfg := lib.Config{DatabasePath: dataPath("state.sqlite"), OPAQUEKeyPath: dataPath("opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention}
 	switch command {
 	case "setup", "recover":
 		app, err := lib.NewGrantIssuer(cfg)
@@ -127,17 +133,15 @@ func serve(cfg lib.Config, address, cert, key string) error {
 		return err
 	}
 	defer listener.Close()
-	handler := lib.MaintenanceHandler()
-	app, err := lib.New(cfg)
-	if errors.Is(err, lib.ErrMaintenance) {
-		log.Print(lib.ErrMaintenance)
-	} else if err != nil {
+	daemon, err := lib.OpenDaemon(cfg)
+	if err != nil {
 		return err
-	} else {
-		defer app.Close()
-		handler = app.Handler()
 	}
-	server := &http.Server{Handler: handler, TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
+	defer daemon.Close()
+	if daemon.Locked() {
+		log.Print(lib.ErrMaintenance)
+	}
+	server := &http.Server{Handler: daemon.Handler(), TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
 	if tlsConfig != nil {
 		err = server.ServeTLS(listener, "", "")
 	} else {
