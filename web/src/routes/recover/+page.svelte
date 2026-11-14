@@ -1,8 +1,29 @@
 <script lang="ts">
-	import { clearSetupGrant, getSetupGrant, setupGrant } from '../../lib/setup-grant.svelte.js';
+	import { afterNavigate, goto } from '$app/navigation';
+	import {
+		beginSetupGrantSanitizing,
+		clearSetupGrant,
+		getSetupGrant,
+		markSetupGrantReady,
+		setupGrant
+	} from '../../lib/setup-grant.svelte.js';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
+	afterNavigate((navigation) => {
+		const target = navigation.to?.url;
+		if (!target || target.pathname !== '/recover' || !target.hash) return;
+		if (!getSetupGrant() || !beginSetupGrantSanitizing()) return;
+
+		const cleanURL = new URL(target);
+		cleanURL.hash = '';
+		void goto(cleanURL, { replace: true, shallow: true })
+			.then(() => {
+				if (window.location.href === cleanURL.href) markSetupGrantReady();
+				else clearSetupGrant();
+			})
+			.catch(clearSetupGrant);
+	});
 	let grantAvailable = $derived(data.hasGrant && setupGrant.ready);
 	let status = $state('');
 	let statusMessage = $derived(

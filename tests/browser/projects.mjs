@@ -255,8 +255,34 @@ try {
   await waitFor(async () => {
     try { return (await readFile(join(dir, "state.sqlite.publications", sshDeployment.body.id, "index.html"), "utf8")) === "SSH fixture site\n"; } catch { return false; }
   }, "SSH cached-object publication");
+  const sshPublishedPath = join(dir, "state.sqlite.publications", sshDeployment.body.id);
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await page.getByText(/Delete “SSH published site” and remove its published files/).waitFor();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  if ((await readFile(join(sshPublishedPath, "index.html"), "utf8")) !== "SSH fixture site\n") throw new Error("cancelling deployment deletion changed its publication");
+  await page.getByRole("button", { name: "Delete project" }).click();
+  await page.getByText(/Projects with deployments cannot be deleted/).waitFor();
+  const blockedProjectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/delete`));
+  await page.getByRole("button", { name: "Confirm delete" }).click();
+  if ((await blockedProjectDelete).status() !== 409) throw new Error("project deletion was not blocked while a deployment existed");
+  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id))) throw new Error("blocked project deletion removed the project");
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  const deploymentDelete = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${sshDeployment.body.id}/delete`));
+  await page.getByRole("button", { name: "Confirm delete" }).click();
+  if ((await deploymentDelete).status() !== 204) throw new Error("confirmed deployment deletion did not finish");
+  await waitFor(async () => { try { await stat(sshPublishedPath); return false; } catch { return true; } }, "deleted publication files");
+  await page.getByRole("button", { name: "Delete project" }).click();
+  await page.getByText(/Projects with deployments cannot be deleted/).waitFor();
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id))) throw new Error("cancelling project deletion changed the project");
+  await page.getByRole("button", { name: "Delete project" }).click();
+  const projectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/delete`));
+  await page.getByRole("button", { name: "Confirm delete" }).click();
+  if ((await projectDelete).status() !== 204) throw new Error("confirmed project deletion did not finish");
+  if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
+  try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
-  console.log("combined-binary authenticated project workflow passed: smart HTTPS publication, SSH unknown-host blocking and approval, SSH create/fetch/publication from cached objects, cross-origin mutation rejection, and cached-ref retention");
+  console.log("combined-binary authenticated project workflow passed: publication and project deletion confirmation/cancel, SSH cached-object publication, host trust, cross-origin mutation rejection, and cached-ref retention");
 } finally {
   await browser?.close();
   for (const child of [app, fixture, sshFixture]) {

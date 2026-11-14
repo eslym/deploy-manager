@@ -32,6 +32,7 @@ import (
 type projectManager struct {
 	db                    *sql.DB
 	root                  string
+	rootIdentity          dirIdentity
 	timeout               time.Duration
 	maxTransferBytes      int64
 	maxCacheBytes         int64
@@ -92,8 +93,20 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheB
 	if timeout < time.Second || timeout > 10*time.Minute {
 		return nil, errors.New("Git timeout must be between 1 second and 10 minutes")
 	}
+	root, err := filepath.Abs(filepath.Clean(root))
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, err
+	}
+	info, err := os.Lstat(root)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, errors.New("project cache root must be a real directory")
+	}
+	resolved, err := filepath.EvalSymlinks(root)
+	if err != nil || resolved != root {
+		return nil, errors.New("project cache root must not traverse symbolic links")
 	}
 	if err := os.Chmod(root, 0700); err != nil {
 		return nil, err
@@ -103,6 +116,7 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheB
 		`CREATE TABLE IF NOT EXISTS project_refs(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,kind TEXT NOT NULL,name TEXT NOT NULL,commit_id TEXT NOT NULL,PRIMARY KEY(project_id,kind,name))`,
 		`CREATE TABLE IF NOT EXISTS project_refresh_journal(project_id TEXT PRIMARY KEY)`,
 		`CREATE TABLE IF NOT EXISTS project_ssh_keys(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,key_id TEXT NOT NULL REFERENCES repository_keys(id) ON DELETE RESTRICT)`,
+		`CREATE TABLE IF NOT EXISTS project_deletions(project_id TEXT PRIMARY KEY,cache_dev INTEGER NOT NULL,cache_ino INTEGER NOT NULL,lfs_dev INTEGER NOT NULL DEFAULT 0,lfs_ino INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,last_error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS ssh_host_trust(host TEXT NOT NULL,port INTEGER NOT NULL,trusted_key BLOB,observed_key BLOB,observed_fingerprint TEXT NOT NULL DEFAULT '',warning TEXT NOT NULL DEFAULT '',PRIMARY KEY(host,port))`,
 		`CREATE TABLE IF NOT EXISTS project_lfs_settings(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,endpoint TEXT NOT NULL,object_origins TEXT NOT NULL,allow_internal INTEGER NOT NULL DEFAULT 0,internal_addresses TEXT NOT NULL DEFAULT '[]',updated_at INTEGER NOT NULL)`,
 	} {
@@ -113,7 +127,23 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheB
 	if err := ensureColumn(db, "project_lfs_settings", "internal_addresses", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
 		return nil, err
 	}
-	manager := &projectManager{db: db, root: root, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
+	if err := ensureColumn(db, "project_deletions", "attempts", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return nil, err
+	}
+	if err := ensureColumn(db, "project_deletions", "retry_after", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return nil, err
+	}
+	if err := ensureColumn(db, "project_deletions", "lfs_dev", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return nil, err
+	}
+	if err := ensureColumn(db, "project_deletions", "lfs_ino", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return nil, err
+	}
+	rootIdentity, err := identity(root)
+	if err != nil {
+		return nil, err
+	}
+	manager := &projectManager{db: db, root: root, rootIdentity: rootIdentity, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
 	if err := manager.reconcileCacheFiles(); err != nil {
 		return nil, fmt.Errorf("project cache recovery failed; refusing to start: %w", err)
 	}

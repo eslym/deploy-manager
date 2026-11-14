@@ -19,6 +19,9 @@ func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
 	p := a.projects
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := p.ensureCacheReady(); err != nil {
 		return err
 	}
@@ -70,6 +73,9 @@ func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
 	if err = repo.FetchContext(withGitHTTPPolicy(ctx, p), &git.FetchOptions{RemoteName: "origin", Tags: git.AllTags, Force: true, Prune: true, Auth: auth}); err != nil && err != git.NoErrAlreadyUpToDate {
 		return errors.New(sanitizeGitError(err, remote))
 	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
 	refs, err := projectRefsFromRepository(stage, p.maxRefs)
 	if err != nil {
 		return errors.New(sanitizeGitError(err, remote))
@@ -89,6 +95,9 @@ func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
 	backup := p.refreshBackupPath(id)
 	p.cacheMu.Lock()
 	defer p.cacheMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if _, err := p.cacheFS.Lstat(backup); err == nil {
 		return errors.New("an unresolved previous project cache exists")
 	} else if !os.IsNotExist(err) {
@@ -96,6 +105,12 @@ func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
 	}
 	if err := p.markRefreshIntent(id); err != nil {
 		return errors.New("project refresh state could not be recorded")
+	}
+	if err := ctx.Err(); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, false); rollbackErr != nil {
+			return errors.New("cancelled project refresh could not be rolled back")
+		}
+		return err
 	}
 	if err := p.cacheFS.Rename(p.repoPath(id), backup); err != nil {
 		_ = p.rollbackRefresh(id, false)

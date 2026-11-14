@@ -124,7 +124,25 @@ func (a *App) projectLFSHydrator(projectID string) (*lfsHydrator, error) {
 		return nil, errors.New("administrator-approved LFS settings are invalid")
 	}
 	settings.AllowInternal = internal != 0
-	return newLFSHydratorWithBudget(projectID, settings, a.projects.root, a.cfg.DeployMaxBytes, a.projects.maxCacheBytes, a.cfg.DeployTimeout, &a.projects.lfsCacheMu)
+	hydrator, err := newLFSHydratorWithBudget(projectID, settings, a.projects.root, a.cfg.DeployMaxBytes, a.projects.maxCacheBytes, a.cfg.DeployTimeout, &a.projects.lfsCacheMu)
+	if err != nil {
+		return nil, err
+	}
+	hydrator.cacheAllowed = func() error {
+		var pending int
+		if err := a.db.QueryRow(`SELECT count(*) FROM project_deletions WHERE project_id=?`, projectID).Scan(&pending); err != nil {
+			return errors.New("project LFS cache lifecycle is unavailable")
+		}
+		if pending != 0 {
+			return errors.New("project deletion is in progress; LFS cache writes are blocked")
+		}
+		var exists int
+		if err := a.db.QueryRow(`SELECT count(*) FROM projects WHERE id=?`, projectID).Scan(&exists); err != nil || exists == 0 {
+			return errors.New("project no longer exists; LFS cache writes are blocked")
+		}
+		return nil
+	}
+	return hydrator, nil
 }
 
 func approvedInternalAddresses(allow bool, origins []string) (map[string][]string, error) {

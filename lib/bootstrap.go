@@ -78,6 +78,8 @@ type App struct {
 	publicationStateMu   sync.RWMutex
 	publicationBlocked   string
 	deployLocks          sync.Map
+	deploymentJobsMu     sync.Mutex
+	deploymentJobCancels map[string]activeDeploymentJob
 }
 
 func New(cfg Config) (*App, error) {
@@ -286,6 +288,7 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	app.retryProjectDeletions()
 	app.startDeploymentWorkers()
 	app.deployWG.Add(1)
 	go app.publicationCleanupLoop()
@@ -505,12 +508,14 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/projects", a.createProject)
 	m.HandleFunc("GET /api/projects/{id}/lfs", a.lfsSettings)
 	m.HandleFunc("POST /api/projects/{id}/lfs", a.lfsSettings)
+	m.HandleFunc("POST /api/projects/{id}/delete", a.deleteProject)
 	m.HandleFunc("GET /api/projects/{id}/refs", a.projectRefs)
 	m.HandleFunc("POST /api/projects/{id}/refresh", a.refreshProject)
 	m.HandleFunc("POST /api/projects/{id}/key", a.assignProjectKey)
 	m.HandleFunc("GET /api/deployments", a.listDeployments)
 	m.HandleFunc("POST /api/deployments", a.createDeployment)
 	m.HandleFunc("POST /api/deployments/{id}/deploy", a.deployNow)
+	m.HandleFunc("POST /api/deployments/{id}/delete", a.deleteDeployment)
 	m.HandleFunc("POST /api/deployments/{id}/target", a.updateDeploymentTarget)
 	m.HandleFunc("GET /api/deployments/{id}/jobs", a.deploymentJobs)
 	m.HandleFunc("GET /api/repository-keys", a.listRepositoryKeys)

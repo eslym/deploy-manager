@@ -26,6 +26,7 @@
 	let refSearch = $state('');
 	let error = $state('');
 	let busy = $state(false);
+	let deleteConfirmation = $state('');
 	let loadVersion = 0;
 	const key = (ref: Ref) => `${ref.kind}:${ref.name}`;
 	let branches = $derived(refs.filter((ref) => ref.kind === 'branch'));
@@ -39,6 +40,10 @@
 			credentials: 'same-origin',
 			headers: { 'Content-Type': 'application/json', ...init?.headers }
 		});
+		if (!response.ok && path.endsWith('/delete') && response.status === 503)
+			throw new Error(
+				'Deletion is pending. The published files are protected while cleanup retries; try again later.'
+			);
 		if (!response.ok)
 			throw new Error(
 				response.status >= 500
@@ -147,6 +152,23 @@
 			busy = false;
 		}
 	}
+	async function deleteDeployment(id: string) {
+		if (busy || deleteConfirmation !== id) return;
+		busy = true;
+		error = '';
+		try {
+			await request(`/api/deployments/${id}/delete`, {
+				method: 'POST',
+				body: JSON.stringify({ confirm: true })
+			});
+			deleteConfirmation = '';
+			await load();
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not delete the deployment.';
+		} finally {
+			busy = false;
+		}
+	}
 	$effect(() => {
 		const id = projectId;
 		const version = ++loadVersion;
@@ -239,7 +261,34 @@
 						onclick={() => deploy(item.id)}
 						disabled={busy}>Deploy</button
 					>
+					<button
+						class="min-h-9 rounded-lg border border-red-300 px-3 text-sm font-semibold text-red-800 disabled:opacity-60"
+						onclick={() => (deleteConfirmation = item.id)}
+						disabled={busy}>Delete</button
+					>
 				</div>
+				{#if deleteConfirmation === item.id}
+					<div
+						class="mt-3 rounded-lg border border-red-200 bg-red-50 p-3"
+						aria-label="Confirm deployment deletion"
+					>
+						<p class="m-0 text-sm text-red-900">
+							Delete “{item.name}” and remove its published files? This cannot be undone.
+						</p>
+						<div class="mt-3 flex gap-2">
+							<button
+								class="min-h-9 rounded-lg bg-red-800 px-3 text-sm font-semibold text-white disabled:opacity-60"
+								onclick={() => deleteDeployment(item.id)}
+								disabled={busy}>Confirm delete</button
+							>
+							<button
+								class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold disabled:opacity-60"
+								onclick={() => (deleteConfirmation = '')}
+								disabled={busy}>Cancel</button
+							>
+						</div>
+					</div>
+				{/if}
 				<p class="mt-2 text-sm text-[#58645b]">
 					{item.liveCommit ? `Live commit: ${item.liveCommit}` : ''}
 					{#if item.targetKind === 'branch'}

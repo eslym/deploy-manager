@@ -48,6 +48,7 @@
 	let lfsError = $state('');
 	let lfsNotice = $state('');
 	let selected = $state('');
+	let projectDeleteConfirmation = $state('');
 	let visibleRefs = $derived(
 		(refs[selected] ?? []).filter((ref) =>
 			`${ref.kind} ${ref.name}`.toLowerCase().includes(search.toLowerCase())
@@ -57,7 +58,7 @@
 	async function request(
 		path: string,
 		init?: RequestInit,
-		options?: { sshCreate?: boolean; sshRefresh?: boolean }
+		options?: { sshCreate?: boolean; sshRefresh?: boolean; deletion?: boolean }
 	) {
 		const response = await fetch(path, {
 			...init,
@@ -67,6 +68,12 @@
 		if (!response.ok) {
 			const status = Number.isInteger(response.status) ? ` (HTTP ${response.status})` : '';
 			const responseText = await response.text();
+			if (options?.deletion && response.status === 409)
+				throw new Error(`Remove the project's deployments before deleting it.${status}`);
+			if (options?.deletion && response.status === 503)
+				throw new Error(
+					`Project deletion is pending. Remaining cache files are protected while cleanup retries.${status}`
+				);
 			if (options?.sshCreate && response.status === 409) {
 				throw new Error(
 					'Host key not approved. Verify the fingerprint in SSH host warnings independently before approving it.'
@@ -312,6 +319,32 @@
 			busy = false;
 		}
 	}
+	async function deleteProject(project: Project) {
+		if (busy || projectDeleteConfirmation !== project.id) return;
+		busy = true;
+		error = '';
+		try {
+			await request(
+				`/api/projects/${project.id}/delete`,
+				{
+					method: 'POST',
+					body: JSON.stringify({ confirm: true })
+				},
+				{ deletion: true }
+			);
+			projects = projects.filter((item) => item.id !== project.id);
+			delete refs[project.id];
+			delete keyAssignments[project.id];
+			if (selected === project.id) selected = projects[0]?.id ?? '';
+			projectDeleteConfirmation = '';
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not delete the project.';
+			if (error.startsWith("Remove the project's deployments")) projectDeleteConfirmation = '';
+			await loadProjects();
+		} finally {
+			busy = false;
+		}
+	}
 	onMount(() => {
 		void loadProjects();
 		void loadRepositoryKeys();
@@ -520,6 +553,36 @@
 					>
 						{project.warning} Your current branches and tags are still shown.
 					</p>{/if}
+				<div class="mt-4 border-t border-[#e1e6df] pt-4">
+					{#if projectDeleteConfirmation === project?.id}
+						<div
+							class="rounded-lg border border-red-200 bg-red-50 p-3"
+							aria-label="Confirm project deletion"
+						>
+							<p class="m-0 text-sm text-red-900">
+								Delete “{project?.name}”? Projects with deployments cannot be deleted.
+							</p>
+							<div class="mt-3 flex gap-2">
+								<button
+									class="min-h-9 rounded-lg bg-red-800 px-3 text-sm font-semibold text-white disabled:opacity-60"
+									onclick={() => project && deleteProject(project)}
+									disabled={busy}>Confirm delete</button
+								>
+								<button
+									class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold disabled:opacity-60"
+									onclick={() => (projectDeleteConfirmation = '')}
+									disabled={busy}>Cancel</button
+								>
+							</div>
+						</div>
+					{:else}
+						<button
+							class="min-h-10 rounded-lg border border-red-300 px-4 font-semibold text-red-800 disabled:opacity-60"
+							onclick={() => (projectDeleteConfirmation = project?.id ?? '')}
+							disabled={busy || !project}>Delete project</button
+						>
+					{/if}
+				</div>
 				{#if project?.url.startsWith('ssh://')}
 					<label class="mt-4 grid gap-1 text-sm font-medium text-[#354238]"
 						>SSH key

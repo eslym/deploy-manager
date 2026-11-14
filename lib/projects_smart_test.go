@@ -57,6 +57,8 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	partialStore := missingObjectStorer{Storer: partialRepo.Storer, missing: partialFile.Hash}
 	var failRequests atomic.Bool
+	var pauseBranchFetch atomic.Bool
+	branchFetchStarted := make(chan struct{})
 	source, err := git.PlainOpen(remoteDir)
 	if err != nil {
 		t.Fatal(err)
@@ -73,6 +75,13 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	var measuredPackBytes atomic.Int64
 	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gitRequests.Add(1)
+		if pauseBranchFetch.Load() && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") {
+			if pauseBranchFetch.CompareAndSwap(true, false) {
+				close(branchFetchStarted)
+				<-r.Context().Done()
+				return
+			}
+		}
 		if failRequests.Load() {
 			http.Error(w, "fixture deliberately unavailable", http.StatusServiceUnavailable)
 			return
@@ -618,6 +627,77 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if got := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID); !equalProjectRefs(refreshedRefs, got) {
 		t.Fatalf("failed refresh altered cached refs: before %#v after %#v", refreshedRefs, got)
 	}
+
+	// Deleting a deployment while its branch fetch is in flight must cancel the
+	// fetch and prevent the worker from reaching publication.
+	failRequests.Store(false)
+	refreshedRefs = projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
+	mainRef := findProjectRef(refreshedRefs, "branch", "main")
+	cancelledCreate := projectPost(t, client, appServer.URL, cookie, "/api/deployments", `{"projectId":"`+created.ID+`","name":"cancelled branch fetch","targetKind":"branch","targetName":"main","commit":"`+mainRef.Commit+`"}`)
+	if cancelledCreate.StatusCode != http.StatusCreated {
+		t.Fatalf("cancellable branch deployment status %d: %s", cancelledCreate.StatusCode, responseText(cancelledCreate))
+	}
+	var cancelledDeployment struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(cancelledCreate.Body).Decode(&cancelledDeployment); err != nil {
+		t.Fatal(err)
+	}
+	cancelledCreate.Body.Close()
+	initialDeadline := time.Now().Add(5 * time.Second)
+	for {
+		var status string
+		_ = app.db.QueryRow(`SELECT status FROM deployments WHERE id=?`, cancelledDeployment.ID).Scan(&status)
+		if status == "live" {
+			break
+		}
+		if time.Now().After(initialDeadline) {
+			t.Fatalf("cancellable branch deployment did not become live, status=%q", status)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	refreshedRefs = projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
+	cacheBeforeCancellation, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pauseBranchFetch.Store(true)
+	var cancelledGeneration int64
+	if err := app.db.QueryRow(`SELECT generation FROM deployments WHERE id=?`, cancelledDeployment.ID).Scan(&cancelledGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.enqueueDeployment(cancelledDeployment.ID, mainRef.Commit, cancelledGeneration); err != nil {
+		t.Fatalf("queue branch fetch before deletion: %v", err)
+	}
+	select {
+	case <-branchFetchStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("branch fetch did not enter the cancellable remote request")
+	}
+	app.mu.Lock()
+	clear(app.rate)
+	app.mu.Unlock()
+	deleted := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+cancelledDeployment.ID+"/delete", `{"confirm":true}`)
+	if deleted.StatusCode != http.StatusNoContent {
+		t.Fatalf("delete during branch fetch status %d: %s", deleted.StatusCode, responseText(deleted))
+	}
+	deleted.Body.Close()
+	if _, err := os.Stat(app.deploymentPath(cancelledDeployment.ID)); !os.IsNotExist(err) {
+		t.Fatalf("cancelled branch fetch published or retained files: %v", err)
+	}
+	cacheAfterCancellation, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil || cacheAfterCancellation != cacheBeforeCancellation {
+		t.Fatalf("cancelled branch fetch promoted its staged cache: before=%q after=%q err=%v", cacheBeforeCancellation, cacheAfterCancellation, err)
+	}
+	failRequests.Store(true)
+	app.mu.Lock()
+	clear(app.rate)
+	app.mu.Unlock()
+	restoreWarning := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	if restoreWarning.StatusCode != http.StatusBadGateway {
+		t.Fatalf("restore failed-refresh status after cancellation test %d: %s", restoreWarning.StatusCode, responseText(restoreWarning))
+	}
+	restoreWarning.Body.Close()
 
 	if err := app.Close(); err != nil {
 		t.Fatal(err)

@@ -72,6 +72,39 @@ func fault(point string) error {
 	return nil
 }
 
+type activeDeploymentJob struct {
+	deploymentID string
+	cancel       context.CancelFunc
+}
+
+func (a *App) registerDeploymentJob(jobID, deploymentID string, cancel context.CancelFunc) func() {
+	a.deploymentJobsMu.Lock()
+	if a.deploymentJobCancels == nil {
+		a.deploymentJobCancels = make(map[string]activeDeploymentJob)
+	}
+	a.deploymentJobCancels[jobID] = activeDeploymentJob{deploymentID: deploymentID, cancel: cancel}
+	a.deploymentJobsMu.Unlock()
+	return func() {
+		a.deploymentJobsMu.Lock()
+		delete(a.deploymentJobCancels, jobID)
+		a.deploymentJobsMu.Unlock()
+	}
+}
+
+func (a *App) cancelDeploymentJobs(deploymentID string) {
+	a.deploymentJobsMu.Lock()
+	var cancel []context.CancelFunc
+	for _, job := range a.deploymentJobCancels {
+		if job.deploymentID == deploymentID {
+			cancel = append(cancel, job.cancel)
+		}
+	}
+	a.deploymentJobsMu.Unlock()
+	for _, stop := range cancel {
+		stop()
+	}
+}
+
 func (a *App) initDeployments() error {
 	d := a.cfg
 	if d.DeploymentRoot == "" {
@@ -119,6 +152,9 @@ func (a *App) initDeployments() error {
 		`CREATE TABLE IF NOT EXISTS deployment_jobs(id TEXT PRIMARY KEY,deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,commit_id TEXT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL,log TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS publication_intents(deployment_id TEXT PRIMARY KEY REFERENCES deployments(id) ON DELETE CASCADE,job_id TEXT NOT NULL,stage_name TEXT NOT NULL,had_old INTEGER NOT NULL,old_dev INTEGER NOT NULL,old_ino INTEGER NOT NULL,new_dev INTEGER NOT NULL,new_ino INTEGER NOT NULL,phase TEXT NOT NULL,created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS publication_cleanup(deployment_id TEXT NOT NULL,job_id TEXT NOT NULL,path_name TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,not_before INTEGER NOT NULL,last_error TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(deployment_id,job_id))`,
+		`CREATE TABLE IF NOT EXISTS deployment_removal_paths(deployment_id TEXT NOT NULL,path_name TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,last_error TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(deployment_id,path_name))`,
+		`CREATE TABLE IF NOT EXISTS deployment_deletions(deployment_id TEXT PRIMARY KEY,status TEXT NOT NULL,last_error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS archived_deployment_jobs(id TEXT PRIMARY KEY,deployment_id TEXT NOT NULL,commit_id TEXT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL,log TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
 	} {
 		if _, err := a.db.Exec(q); err != nil {
 			return err
@@ -128,6 +164,9 @@ func (a *App) initDeployments() error {
 		if err := ensureColumn(a.db, "deployments", column.name, column.definition); err != nil {
 			return err
 		}
+	}
+	if err := ensureColumn(a.db, "deployment_deletions", "retry_after", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
 	}
 	if err := ensureColumn(a.db, "publication_cleanup", "attempts", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
@@ -154,6 +193,9 @@ func (a *App) initDeployments() error {
 	}
 	if err := a.validateLivePublicationIdentities(); err != nil {
 		return err
+	}
+	if err := a.resumeDeploymentDeletions(); err != nil {
+		log.Printf("deployment deletion recovery: %v", err)
 	}
 	return nil
 }
@@ -201,18 +243,18 @@ func (a *App) lockDeployment(id string) (func(), error) {
 }
 
 func (a *App) validateLivePublicationIdentities() error {
-	rows, err := a.db.Query(`SELECT id,live_commit,live_dev,live_ino FROM deployments ORDER BY id`)
+	rows, err := a.db.Query(`SELECT id,live_commit,live_dev,live_ino,status FROM deployments ORDER BY id`)
 	if err != nil {
 		return err
 	}
 	type liveRecord struct {
-		id, commit string
-		identity   dirIdentity
+		id, commit, status string
+		identity           dirIdentity
 	}
 	var records []liveRecord
 	for rows.Next() {
 		var r liveRecord
-		if err = rows.Scan(&r.id, &r.commit, &r.identity.Dev, &r.identity.Ino); err != nil {
+		if err = rows.Scan(&r.id, &r.commit, &r.identity.Dev, &r.identity.Ino, &r.status); err != nil {
 			rows.Close()
 			return err
 		}
@@ -226,6 +268,9 @@ func (a *App) validateLivePublicationIdentities() error {
 	for _, r := range records {
 		if !validProjectID(r.id) {
 			return errors.New("deployment record contains an invalid identifier")
+		}
+		if r.status == "deleting" || r.status == "deletion_failed" {
+			continue
 		}
 		path := a.deploymentPath(r.id)
 		if r.commit == "" {
@@ -265,7 +310,7 @@ func (a *App) removeOrphanStages() error {
 			return errors.New("unrecognized publication staging path; refusing startup cleanup")
 		}
 		var present int
-		if err := a.db.QueryRow(`SELECT (SELECT count(*) FROM publication_intents WHERE stage_name=?)+(SELECT count(*) FROM publication_cleanup WHERE path_name=?)`, name, name).Scan(&present); err != nil {
+		if err := a.db.QueryRow(`SELECT (SELECT count(*) FROM publication_intents WHERE stage_name=?)+(SELECT count(*) FROM publication_cleanup WHERE path_name=?)+(SELECT count(*) FROM deployment_removal_paths WHERE path_name=?)`, name, name, name).Scan(&present); err != nil {
 			return err
 		}
 		if present > 0 {
@@ -459,11 +504,22 @@ func (a *App) enqueueDeployment(deploymentID, commit string, generation int64) (
 		return "", err
 	}
 	defer tx.Rollback()
+	var currentStatus string
+	if err = tx.QueryRow(`SELECT status FROM deployments WHERE id=? AND generation=?`, deploymentID, generation).Scan(&currentStatus); err != nil {
+		return "", err
+	}
+	if currentStatus == "deleting" || currentStatus == "deletion_failed" {
+		return "", errors.New("deployment is being deleted")
+	}
 	if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at) VALUES(?,?,?,?,'queued','Publication queued',?,?)`, jobID, deploymentID, commit, generation, now, now); err != nil {
 		return "", err
 	}
-	if _, err = tx.Exec(`UPDATE deployments SET status='queued',error='',updated_at=? WHERE id=? AND generation=?`, now, deploymentID, generation); err != nil {
+	res, err := tx.Exec(`UPDATE deployments SET status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, now, deploymentID, generation)
+	if err != nil {
 		return "", err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", errors.New("deployment is being deleted")
 	}
 	if err = tx.Commit(); err != nil {
 		return "", err
@@ -525,6 +581,8 @@ func (a *App) runDeploymentJob(jobID string) {
 	d.CreatedAt = time.Unix(0, createdAt).UTC()
 	d.UpdatedAt = time.Unix(0, updatedAt).UTC()
 	d.Publication = a.deploymentPath(d.ID)
+	unregister := a.registerDeploymentJob(jobID, d.ID, cancel)
+	defer unregister()
 	unlock, err := a.lockDeployment(d.ID)
 	if err != nil {
 		a.failJob(jobID, d.ID, generation, "publication locking is unavailable")
@@ -533,6 +591,11 @@ func (a *App) runDeploymentJob(jobID string) {
 	defer unlock()
 	var liveTarget string
 	var currentGeneration int64
+	var currentStatus string
+	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
+		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before work began',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
+		return
+	}
 	if d.TargetKind == "branch" {
 		if err := a.fetchProjectForBranch(ctx, d.ProjectID); err != nil {
 			a.failJob(jobID, d.ID, generation, "Could not fetch the configured branch; the current publication was kept")
@@ -547,7 +610,7 @@ func (a *App) runDeploymentJob(jobID string) {
 			return
 		}
 	}
-	if checkErr := a.db.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration); checkErr != nil || currentGeneration != generation || (d.TargetKind != "branch" && liveTarget != d.Commit) {
+	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
@@ -751,10 +814,11 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	defer tx.Rollback()
 	var currentCommit string
 	var currentGeneration int64
-	if err = tx.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, d.ID).Scan(&currentCommit, &currentGeneration); err != nil {
+	var currentStatus string
+	if err = tx.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&currentCommit, &currentGeneration, &currentStatus); err != nil {
 		return errors.New("deployment was deleted before publication")
 	}
-	if currentGeneration != generation || (d.TargetKind != "branch" && currentCommit != d.Commit) {
+	if currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && currentCommit != d.Commit) {
 		return errors.New("publication target changed; job superseded")
 	}
 	if err = fault("before-intent"); err != nil {
@@ -817,7 +881,8 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	tx = boundaryTx
 	var latest string
 	var latestGen int64
-	if err = tx.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, d.ID).Scan(&latest, &latestGen); err != nil || latestGen != generation || (d.TargetKind != "branch" && latest != d.Commit) {
+	var latestStatus string
+	if err = tx.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&latest, &latestGen, &latestStatus); err != nil || latestGen != generation || latestStatus == "deleting" || latestStatus == "deletion_failed" || (d.TargetKind != "branch" && latest != d.Commit) {
 		return errors.New("target changed after directory switch; publication requires reconciliation")
 	}
 	if _, err = tx.Exec(`UPDATE deployments SET live_commit=?,live_dev=?,live_ino=?,status='live',error='',updated_at=? WHERE id=? AND generation=?`, d.Commit, newID.Dev, newID.Ino, a.cfg.Now().UnixNano(), d.ID, generation); err != nil {
@@ -880,7 +945,17 @@ func sanitizePublicationError(err error) string {
 }
 
 func (a *App) reconcilePublications() error {
-	rows, err := a.db.Query(`SELECT deployment_id,job_id,stage_name,had_old,old_dev,old_ino,new_dev,new_ino FROM publication_intents`)
+	return a.reconcilePublicationsFor("")
+}
+
+func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
+	query := `SELECT deployment_id,job_id,stage_name,had_old,old_dev,old_ino,new_dev,new_ino FROM publication_intents`
+	args := []any{}
+	if onlyDeployment != "" {
+		query += ` WHERE deployment_id=?`
+		args = append(args, onlyDeployment)
+	}
+	rows, err := a.db.Query(query, args...)
 	if err != nil {
 		return err
 	}
@@ -947,7 +1022,7 @@ func (a *App) reconcilePublications() error {
 			if e != nil {
 				return e
 			}
-			if _, e = tx.Exec(`UPDATE deployments SET live_commit=?,live_dev=?,live_ino=?,status='live',error='',updated_at=? WHERE id=?`, commit, x.new.Dev, x.new.Ino, a.cfg.Now().UnixNano(), x.id); e != nil {
+			if _, e = tx.Exec(`UPDATE deployments SET live_commit=?,live_dev=?,live_ino=?,status=CASE WHEN status IN ('deleting','deletion_failed') THEN status ELSE 'live' END,error=CASE WHEN status IN ('deleting','deletion_failed') THEN error ELSE '' END,updated_at=? WHERE id=?`, commit, x.new.Dev, x.new.Ino, a.cfg.Now().UnixNano(), x.id); e != nil {
 				tx.Rollback()
 				return e
 			}
@@ -977,7 +1052,7 @@ func (a *App) reconcilePublications() error {
 			} else if _, e = os.Lstat(stage); !os.IsNotExist(e) {
 				return errors.New("ambiguous publication recovery: staged directory identity changed")
 			}
-			_, err = a.db.Exec(`UPDATE deployments SET status='failed',error='publication did not switch before restart',updated_at=? WHERE id=?`, a.cfg.Now().UnixNano(), x.id)
+			_, err = a.db.Exec(`UPDATE deployments SET status=CASE WHEN status IN ('deleting','deletion_failed') THEN status ELSE 'failed' END,error=CASE WHEN status IN ('deleting','deletion_failed') THEN error ELSE 'publication did not switch before restart' END,updated_at=? WHERE id=?`, a.cfg.Now().UnixNano(), x.id)
 			if err != nil {
 				return err
 			}
@@ -988,6 +1063,9 @@ func (a *App) reconcilePublications() error {
 		} else {
 			return errors.New("ambiguous publication recovery: live directory identity matches neither recorded state")
 		}
+	}
+	if onlyDeployment != "" {
+		return nil
 	}
 	return a.cleanupPublications(true)
 }
@@ -1085,6 +1163,9 @@ func (a *App) cleanupPublications(startup bool) error {
 	if _, err := a.db.Exec(`DELETE FROM deployment_jobs WHERE updated_at<? AND status IN ('succeeded','failed','superseded','noop') AND id NOT IN (SELECT job_id FROM publication_cleanup) AND id NOT IN (SELECT job_id FROM publication_intents)`, a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano()); err != nil {
 		return fmt.Errorf("prune expired deployment jobs: %w", err)
 	}
+	if _, err := a.db.Exec(`DELETE FROM archived_deployment_jobs WHERE updated_at<?`, a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano()); err != nil {
+		return fmt.Errorf("prune expired archived deployment jobs: %w", err)
+	}
 	return nil
 }
 
@@ -1100,6 +1181,10 @@ func (a *App) publicationCleanupLoop() {
 			if err := a.cleanupPublications(false); err != nil {
 				log.Printf("publication cleanup: %v", err)
 			}
+			if err := a.resumeDeploymentDeletions(); err != nil {
+				log.Printf("deployment deletion retry: %v", err)
+			}
+			a.retryProjectDeletions()
 		}
 	}
 }
@@ -1108,7 +1193,7 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),''),d.created_at,d.updated_at FROM deployments d ORDER BY d.created_at,d.id`)
+	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),(SELECT last_error FROM deployment_deletions x WHERE x.deployment_id=d.id),''),d.created_at,d.updated_at FROM deployments d ORDER BY d.created_at,d.id`)
 	if err != nil {
 		http.Error(w, "deployments are temporarily unavailable", 500)
 		return
@@ -1138,6 +1223,11 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, true) {
 		return
 	}
+	// Project removal holds this lock through cache deletion and the final
+	// database commit, so a deployment cannot be inserted into a disappearing
+	// project after its no-deployments check.
+	a.projects.mu.Lock()
+	defer a.projects.mu.Unlock()
 	r.Body = http.MaxBytesReader(w, r.Body, 8192)
 	var in struct {
 		ProjectID  string `json:"projectId"`
@@ -1264,10 +1354,14 @@ func (a *App) deployNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var commit string
+	var commit, status string
 	var gen int64
-	if err := a.db.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, id).Scan(&commit, &gen); err != nil {
+	if err := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, id).Scan(&commit, &gen, &status); err != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if status == "deleting" || status == "deletion_failed" {
+		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
 		return
 	}
 	job, err := a.enqueueDeployment(id, commit, gen)
@@ -1358,19 +1452,28 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	var currentCommit string
+	var currentCommit, currentStatus string
 	var generation int64
 	var currentKind, currentName string
-	if err = tx.QueryRow(`SELECT commit_id,target_kind,target_name,generation FROM deployments WHERE id=? AND project_id=?`, id, projectID).Scan(&currentCommit, &currentKind, &currentName, &generation); err != nil {
+	if err = tx.QueryRow(`SELECT commit_id,target_kind,target_name,generation,status FROM deployments WHERE id=? AND project_id=?`, id, projectID).Scan(&currentCommit, &currentKind, &currentName, &generation, &currentStatus); err != nil {
 		http.NotFound(w, r)
+		return
+	}
+	if currentStatus == "deleting" || currentStatus == "deletion_failed" {
+		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
 		return
 	}
 	if currentKind == input.TargetKind && currentName == input.TargetName && currentCommit == input.Commit {
 		http.Error(w, "this deployment already has that target", http.StatusConflict)
 		return
 	}
-	if _, err = tx.Exec(`UPDATE deployments SET commit_id=?,target_kind=?,target_name=?,generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=?`, input.Commit, input.TargetKind, input.TargetName, now, id, generation); err != nil {
+	res, err := tx.Exec(`UPDATE deployments SET commit_id=?,target_kind=?,target_name=?,generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, input.Commit, input.TargetKind, input.TargetName, now, id, generation)
+	if err != nil {
 		http.Error(w, "deployment target could not be saved", 500)
+		return
+	}
+	if affected, _ := res.RowsAffected(); affected != 1 {
+		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
 		return
 	}
 	if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at) VALUES(?,?,?,?, 'queued','Commit target changed; publication queued',?,?)`, jobID, id, input.Commit, generation+1, now, now); err != nil {

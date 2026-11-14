@@ -48,6 +48,9 @@ func validProjectID(id string) bool {
 }
 
 func (p *projectManager) ensureCacheReady() error {
+	if actual, err := identity(p.root); err != nil || actual != p.rootIdentity {
+		return errors.New("project cache root identity changed; project operations are blocked")
+	}
 	p.stateMu.RLock()
 	blocked := p.blocked
 	p.stateMu.RUnlock()

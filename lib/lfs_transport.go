@@ -38,14 +38,15 @@ type lfsProjectSettings struct {
 }
 
 type lfsHydrator struct {
-	projectID   string
-	settings    lfsProjectSettings
-	cacheRoot   string
-	cacheBase   string
-	cacheBudget int64
-	cacheLock   *sync.Mutex
-	maxObject   int64
-	client      *http.Client
+	projectID    string
+	settings     lfsProjectSettings
+	cacheRoot    string
+	cacheBase    string
+	cacheBudget  int64
+	cacheLock    *sync.Mutex
+	cacheAllowed func() error
+	maxObject    int64
+	client       *http.Client
 }
 
 type lfsBatchRequest struct {
@@ -227,6 +228,11 @@ func (h *lfsHydrator) hydrate(ctx context.Context, pointer lfsPointer) (string, 
 	}
 	h.cacheLock.Lock()
 	defer h.cacheLock.Unlock()
+	if h.cacheAllowed != nil {
+		if err := h.cacheAllowed(); err != nil {
+			return "", err
+		}
+	}
 	if err := ensureCacheDirectory(h.cacheRoot); err != nil {
 		return "", err
 	}
@@ -365,7 +371,7 @@ func (p *projectManager) verifiedLFSPayloadPath(projectID string, pointer lfsPoi
 // removeProjectLFSPayloads is called only after a project tombstone is durable
 // and its jobs are canceled/superseded. The lock prevents a concurrent cache
 // commit from recreating the project directory during cleanup.
-func (p *projectManager) removeProjectLFSPayloads(projectID string) error {
+func (p *projectManager) removeProjectLFSPayloads(projectID string, want dirIdentity) error {
 	if !validProjectID(projectID) {
 		return errors.New("invalid project identifier for LFS cache cleanup")
 	}
@@ -386,6 +392,10 @@ func (p *projectManager) removeProjectLFSPayloads(projectID string) error {
 	}
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return errors.New("project LFS cache path is not a real directory")
+	}
+	actual, err := identity(path)
+	if err != nil || actual != want || want == (dirIdentity{}) {
+		return errors.New("project LFS cache identity changed; cleanup blocked")
 	}
 	if err = os.RemoveAll(path); err != nil {
 		return errors.New("project LFS payload cache could not be removed")
