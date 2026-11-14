@@ -16,6 +16,7 @@ const fixtureURL = `${fixtureOrigin}/repo.git`;
 const password = "Project browser test password 2026!";
 let app;
 let fixture;
+let sshFixture;
 let browser;
 let appOutput = "";
 
@@ -52,7 +53,8 @@ async function startApplication(cert, key, gitCA) {
 try {
   const binary = process.env.DEPLOY_MANAGER_BINARY;
   const fixtureBinary = process.env.DEPLOY_MANAGER_FIXTURE_BINARY;
-  if (!binary || !fixtureBinary) throw new Error("combined app and smart-HTTPS fixture binaries are required");
+  const sshFixtureBinary = process.env.DEPLOY_MANAGER_SSH_FIXTURE_BINARY;
+  if (!binary || !fixtureBinary || !sshFixtureBinary) throw new Error("combined app, smart-HTTPS fixture, and SSH fixture binaries are required");
   await copyFile(resolve(binary), executable);
   await chmod(executable, 0o700);
 
@@ -96,6 +98,11 @@ try {
   fixture = spawn(resolve(fixtureBinary), ["--listen", fixtureListen, "--tls-cert", fixtureCert, "--tls-key", fixtureKey, "--data", join(dir, "fixture-data")], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   fixture.stderr.on("data", chunk => { appOutput += chunk.toString(); });
   await waitFor(async () => (await httpsRequestStatus("127.0.0.1", 18441, "/")) === 404, "smart-HTTPS Git fixture");
+  sshFixture = spawn(resolve(sshFixtureBinary), ["--listen", "127.0.0.1:18442"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  sshFixture.stderr.on("data", chunk => { appOutput += chunk.toString(); });
+  await waitFor(async () => {
+    try { const socket = await import("node:net").then(({ createConnection }) => new Promise(resolveSocket => { const client = createConnection({ host: "127.0.0.1", port: 18442 }); client.once("connect", () => { client.destroy(); resolveSocket(true); }); client.once("error", () => resolveSocket(false)); })); return socket; } catch { return false; }
+  }, "SSH Git fixture");
   await startApplication(cert, key, fixtureCert);
 
   await page.goto(`https://${appListen}/login`, { waitUntil: "domcontentloaded" });
@@ -104,8 +111,12 @@ try {
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.getByText(/You’re signed in/).waitFor({ timeout: 30000 });
+  const sessionCookie = (await context.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session")?.value;
+  if (!sessionCookie) throw new Error("authenticated browser session cookie is missing");
+  const crossOriginMutation = await httpsRequestStatus("127.0.0.1", 18440, "/api/ssh-hosts/approve", "POST", JSON.stringify({ host: "127.0.0.1", port: 18442, fingerprint: "SHA256:invalid", confirm: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" });
+  if (crossOriginMutation !== 403) throw new Error(`cross-origin SSH approval returned ${crossOriginMutation}`);
   await page.getByLabel("Project name").fill("Fixture site");
-  await page.getByLabel("HTTPS repository URL").fill(fixtureURL);
+  await page.getByLabel("Repository URL").fill(fixtureURL);
   const createResponse = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Add repository" }).click();
   const created = await createResponse;
@@ -167,11 +178,36 @@ try {
   if (JSON.stringify(retainedRefs) !== JSON.stringify(cachedRefs)) throw new Error("failed refresh changed the cached refs");
   const failedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
   if (failedTimestamp !== timestampAfterReloadFailure) throw new Error("failed refresh changed last successful fetch time");
+
+  await page.getByLabel("Key name").fill("SSH browser key");
+  await page.getByRole("button", { name: "Create Ed25519 key" }).click();
+  await page.getByText("SSH browser key", { exact: true }).waitFor();
+  const sshKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).find(key => key.name === "SSH browser key").id);
+  await page.getByLabel("Project name").fill("SSH fixture site");
+  await page.getByLabel("Repository URL").fill("ssh://git@127.0.0.1:18442/repo.git");
+  await page.getByLabel("SSH key").selectOption(sshKeyId);
+  const blockedCreateResponse = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "POST");
+  await page.getByRole("button", { name: "Add repository" }).click();
+  const blockedCreate = await blockedCreateResponse;
+  if (blockedCreate.status() !== 409) throw new Error(`unknown SSH host was not blocked (${blockedCreate.status()})`);
+  const hostTrust = page.locator("section").filter({ has: page.getByRole("heading", { name: "SSH host keys" }) });
+  await hostTrust.getByText(/SHA256:/).waitFor();
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "Approve verified host key" }).click();
+  await hostTrust.getByText("No SSH host warnings.").waitFor();
+  const sshCreateResponse = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "POST");
+  await page.getByRole("button", { name: "Add repository" }).click();
+  const sshCreated = await sshCreateResponse;
+  if (sshCreated.status() !== 201) throw new Error(`approved SSH project creation returned ${sshCreated.status()}: ${await sshCreated.text()}`);
+  await page.getByText("SSH fixture site", { exact: true }).waitFor();
+  const sshProject = await page.evaluate(async () => (await (await fetch("/api/projects")).json()).find(project => project.name === "SSH fixture site"));
+  const sshRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), sshProject.id);
+  if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
-  console.log("combined-binary authenticated project workflow passed: smart HTTPS create/fetch, searchable full-ID refs, refresh timestamp, and failed-refresh cache retention");
+  console.log("combined-binary authenticated project workflow passed: smart HTTPS browse/refresh, SSH unknown-host blocking and approval, SSH create/fetch, cross-origin mutation rejection, and cached-ref retention");
 } finally {
   await browser?.close();
-  for (const child of [app, fixture]) {
+  for (const child of [app, fixture, sshFixture]) {
     if (child && child.exitCode === null) {
       child.kill("SIGTERM");
       await Promise.race([once(child, "exit"), new Promise(resolveExit => setTimeout(resolveExit, 1000))]);

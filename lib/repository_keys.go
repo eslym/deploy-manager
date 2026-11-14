@@ -346,6 +346,44 @@ func (a *App) addRepositoryKey(w http.ResponseWriter, r *http.Request) {
 	writeJSONStatus(w, http.StatusCreated, key)
 }
 
+func (a *App) deleteRepositoryKey(w http.ResponseWriter, r *http.Request) {
+	if !a.projectAuthorized(w, r, true) {
+		return
+	}
+	a.projects.mu.Lock()
+	defer a.projects.mu.Unlock()
+	id := r.PathValue("id")
+	tx, err := a.db.Begin()
+	if err != nil {
+		http.Error(w, "repository key is temporarily unavailable", 500)
+		return
+	}
+	defer tx.Rollback()
+	var found int
+	if tx.QueryRow(`SELECT 1 FROM repository_keys WHERE id=?`, id).Scan(&found) != nil {
+		http.NotFound(w, r)
+		return
+	}
+	var assignments int
+	if tx.QueryRow(`SELECT count(*) FROM project_ssh_keys WHERE key_id=?`, id).Scan(&assignments) != nil {
+		http.Error(w, "repository key is temporarily unavailable", 500)
+		return
+	}
+	if assignments > 0 {
+		http.Error(w, "remove this key from every SSH project before deleting it", http.StatusConflict)
+		return
+	}
+	if _, err = tx.Exec(`DELETE FROM repository_keys WHERE id=?`, id); err != nil {
+		http.Error(w, "repository key is temporarily unavailable", 500)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		http.Error(w, "repository key is temporarily unavailable", 500)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (a *App) repositoryKeyCanSign(id string, challenge []byte) bool {
 	var ciphertext []byte
 	if a.db.QueryRow(`SELECT ciphertext FROM repository_keys WHERE id=?`, id).Scan(&ciphertext) != nil {

@@ -16,6 +16,7 @@ bun run lint
 cd "$workspace"
 GOFLAGS='-tags=integrationtest' ./scripts/build.sh
 go build -o "$workspace/smart-https-fixture" ./tests/fixtures/smart-https
+go build -o "$workspace/ssh-git-fixture" ./tests/fixtures/ssh-git
 go build -o "$workspace/repository-key-state" ./tests/fault/repository-key-state
 go test ./...
 go test -race ./...
@@ -24,4 +25,4 @@ go vet ./...
 cd tests/browser
 bun install --frozen-lockfile
 DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" REPOSITORY_KEY_STATE_BINARY="$workspace/repository-key-state" node registration.mjs
-DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" DEPLOY_MANAGER_FIXTURE_BINARY="$workspace/smart-https-fixture" node projects.mjs
+DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" DEPLOY_MANAGER_FIXTURE_BINARY="$workspace/smart-https-fixture" DEPLOY_MANAGER_SSH_FIXTURE_BINARY="$workspace/ssh-git-fixture" node projects.mjs
