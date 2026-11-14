@@ -1,30 +1,19 @@
 # Repository guidance
 
-## Requirements and domain
+## Requirements and layout
 
-- Before implementation, read `docs/design.md`; it is the confirmed requirements authority, not authorization to implement, and supersedes alternatives in research notes. RFC 9807 OPAQUE dependencies are approved; preserve the remaining security, upgrade, and distribution requirements there.
-- Use `GLOSSARY.md` for domain terms, especially deployment vs. release, frozen tag targets, and permanent rollback vs. commit targets.
-- For Git compatibility/tree export, LFS, publication recovery, or OPAQUE implementation details, read the corresponding `docs/research/` notes; where they differ, `docs/design.md` governs.
+- Read `docs/design.md` before feature or security work; it is the confirmed requirements source. Use `GLOSSARY.md` for deployment/release and rollback terminology. Read relevant `docs/research/` notes for Git/tree export, LFS, publication recovery, or OPAQUE details; the design doc takes precedence.
+- `main.go` wires CLI/server commands; application logic belongs in `lib/`. `web/` is the client-rendered SvelteKit SPA; Go owns persistence, auth, and HTTP endpoints. Do not add SvelteKit server routes for application behavior.
+- Frontend build output is embedded from `lib/web` (`lib/assets.go`). Build the frontend before compiling Go; `scripts/build.sh` performs the combined build. A missing frontend build intentionally fails Go compilation. The shipped binary must work without frontend source or runtime assets.
 
-## Implementation boundaries
+## Development and checks
 
-- This is a scaffold: `main.go` is empty, `lib/` has only a package declaration, and no tests or combined frontend/Go build exist yet. The registration implementation mentioned in `web/README.md` was removed; do not assume it exists.
-- The Go module is at the repository root; application logic belongs in `lib/`. `web/` owns all application UI; use a client-rendered static SPA, not Go templates or SvelteKit server endpoints.
-- Ticket #3 owns bootstrap and the combined embedded build; #4 adds login and the protected dashboard. Build frontend assets before Go compilation; validate the resulting binary from an unrelated working directory without source assets or a frontend runtime. A standalone frontend build does not verify embedding.
-- SvelteKit configuration lives in `web/vite.config.ts`, including the static adapter's `index.html` fallback and forced runes mode for application code. Read `web/AGENTS.md` before frontend work for required Svelte tooling.
-
-## Checks
-
-- Go (root): `go test ./...`; dependency vulnerabilities: `govulncheck ./...`.
-- Frontend (from `web/`): `bun install --frozen-lockfile`, then `bun run check`, `bun run lint`, `bun run build`. `lint` is Prettier checking, not ESLint; there is no frontend test script yet.
-- Container tests: `docker compose -f tests/compose.yaml run --build --rm test`. Read `tests/README.md` for custom runs and cleanup. Keep the `deploy-manager-tests` project name to share Bun and Go cache volumes across worktrees; ordinary cleanup preserves volumes. Use this environment when Playwright system dependencies are unavailable on the host.
+- Frontend instructions live in `web/AGENTS.md`. From `web/`, run `bun install --frozen-lockfile`, then `bun run check`, `bun run lint`, and `bun run build`; `lint` is Prettier.
+- For local full-stack debugging, run `go run . serve --listen 127.0.0.1:8080 --origin http://localhost:5173 --data ./data` at the root and `bun run dev` from `web/`. Vite proxies `/api`, `/opaque`, and `/webhooks`; `GO_BACKEND_URL` overrides its default `http://127.0.0.1:8080`. Use `http://localhost:5173` consistently for browser origin and setup links (`go run . setup --listen 127.0.0.1:8080 --url http://localhost:5173`).
+- Run Go tests from the root with `go test ./...` after frontend assets exist; run `govulncheck ./...` after the same build prerequisite. `scripts/build.sh` builds the frontend and executable together.
+- Compose provides the pinned Bun/Go/Playwright development shell and browser test runner. Use `docker compose -f tests/compose.yaml run --build --rm test bash` for the shell or omit `bash` to run the full suite. The checkout is mounted read-only at `/source`; copy it into `/workspace` before commands that generate files. See `tests/README.md` for cache sharing and cleanup.
 
 ## Shared workflow
 
-- Name branches `<category>/<ticket-number>-<name>` (for example, `fix/123-...`, `feat/123-...`, or `refactor/123-...`); omit the ticket number when none is available.
-- Use `gpt-6-luna` when delegating tasks to subagents.
-- Publish or push the working branch only when explicitly instructed by the user.
-- When working in a worktree, leave the main workspace's checked-out branch unchanged unless explicitly instructed by the user.
-- Follow `docs/agents/issue-tracker.md` and `docs/agents/triage-labels.md` for GitHub issue/spec tracking; follow `docs/agents/domain.md` when changing the shared `GLOSSARY.md` or ADRs.
-- Commit subjects use `<tag>: <message>` or `<category>/<tag>: <message>`.
-- When merging fixes, prefer a fast-forward merge.
+- Follow `docs/agents/issue-tracker.md` and `docs/agents/triage-labels.md` when managing GitHub issue/spec tracking; read `docs/agents/domain.md` when changing `GLOSSARY.md` or ADRs.
+- Name branches `<category>/<ticket-number>-<name>`; omit the ticket number when none applies. Commit subjects use `<tag>: <message>` or `<category>/<tag>: <message>`. Publish branches only when explicitly asked.
