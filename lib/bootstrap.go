@@ -45,6 +45,13 @@ type Config struct {
 	GitMaxCacheBytes         int64
 	GitMaxRefs               int
 	GitMaxAdvertisementBytes int64
+	DeploymentRoot           string
+	DeployMaxFiles           int
+	DeployMaxBytes           int64
+	DeployTimeout            time.Duration
+	DeployConcurrency        int
+	DeployGracePeriod        time.Duration
+	JobRetention             time.Duration
 }
 
 type App struct {
@@ -61,6 +68,16 @@ type App struct {
 	projects             *projectManager
 	repositoryMaster     []byte
 	registrationTxs      map[string]registrationTransaction
+	deployQueue          chan string
+	deployStop           chan struct{}
+	deploySem            chan struct{}
+	deploySlots          chan struct{}
+	deployWG             sync.WaitGroup
+	deployCloseOnce      sync.Once
+	publicationRootID    dirIdentity
+	publicationStateMu   sync.RWMutex
+	publicationBlocked   string
+	deployLocks          sync.Map
 }
 
 func New(cfg Config) (*App, error) {
@@ -264,7 +281,15 @@ func New(cfg Config) (*App, error) {
 			return nil, errors.New("repository key master file must not share the OPAQUE key file")
 		}
 	}
-	return &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}, nil
+	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	if err := app.initDeployments(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	app.startDeploymentWorkers()
+	app.deployWG.Add(1)
+	go app.publicationCleanupLoop()
+	return app, nil
 }
 
 func ensureColumn(db *sql.DB, table, column, definition string) error {
@@ -372,7 +397,16 @@ func writeExclusive(path string, b []byte) error {
 	}
 	return f.Close()
 }
-func (a *App) Close() error { clear(a.repositoryMaster); return a.db.Close() }
+func (a *App) Close() error {
+	a.deployCloseOnce.Do(func() {
+		if a.deployStop != nil {
+			close(a.deployStop)
+			a.deployWG.Wait()
+		}
+	})
+	clear(a.repositoryMaster)
+	return a.db.Close()
+}
 
 // IssueRegistrationGrant returns a random one-time token; only its SHA-256 digest is stored.
 func (a *App) IssueRegistrationGrant() (string, error) {
@@ -472,6 +506,11 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("GET /api/projects/{id}/refs", a.projectRefs)
 	m.HandleFunc("POST /api/projects/{id}/refresh", a.refreshProject)
 	m.HandleFunc("POST /api/projects/{id}/key", a.assignProjectKey)
+	m.HandleFunc("GET /api/deployments", a.listDeployments)
+	m.HandleFunc("POST /api/deployments", a.createDeployment)
+	m.HandleFunc("POST /api/deployments/{id}/deploy", a.deployNow)
+	m.HandleFunc("POST /api/deployments/{id}/target", a.updateDeploymentTarget)
+	m.HandleFunc("GET /api/deployments/{id}/jobs", a.deploymentJobs)
 	m.HandleFunc("GET /api/repository-keys", a.listRepositoryKeys)
 	m.HandleFunc("POST /api/repository-keys", a.addRepositoryKey)
 	m.HandleFunc("POST /api/repository-keys/{id}/delete", a.deleteRepositoryKey)

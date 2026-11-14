@@ -48,10 +48,19 @@ func validProjectID(id string) bool {
 }
 
 func (p *projectManager) ensureCacheReady() error {
-	if p.blocked != "" {
-		return errors.New(p.blocked)
+	p.stateMu.RLock()
+	blocked := p.blocked
+	p.stateMu.RUnlock()
+	if blocked != "" {
+		return errors.New(blocked)
 	}
 	return nil
+}
+
+func (p *projectManager) setBlocked(message string) {
+	p.stateMu.Lock()
+	p.blocked = message
+	p.stateMu.Unlock()
 }
 
 func (p *projectManager) checkPersistentCacheBudget() error {
@@ -67,13 +76,15 @@ func (p *projectManager) cleanupStage(path string) error {
 	}
 	if err := p.cacheFS.RemoveAll(path); err != nil {
 		if _, statErr := p.cacheFS.Lstat(path); !os.IsNotExist(statErr) {
-			p.blocked = "project cache staging cleanup failed; restart to reconcile cache files before retrying"
-			return errors.New(p.blocked)
+			message := "project cache staging cleanup failed; restart to reconcile cache files before retrying"
+			p.setBlocked(message)
+			return errors.New(message)
 		}
 	}
 	if _, err := p.cacheFS.Lstat(path); !os.IsNotExist(err) {
-		p.blocked = "project cache staging cleanup could not be confirmed; restart to reconcile cache files before retrying"
-		return errors.New(p.blocked)
+		message := "project cache staging cleanup could not be confirmed; restart to reconcile cache files before retrying"
+		p.setBlocked(message)
+		return errors.New(message)
 	}
 	return nil
 }

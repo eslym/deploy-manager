@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { chmod, copyFile, mkdtemp, rm } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -127,6 +127,38 @@ try {
   await page.getByText("v1.0", { exact: true }).waitFor();
 
   const id = await page.evaluate(async () => (await (await fetch("/api/projects")).json())[0].id);
+  const selectedCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
+  await page.getByLabel("Deployment name").fill("Production site");
+  await page.getByLabel("Commit").selectOption(selectedCommit);
+  const deploymentResponse = page.waitForResponse(response => response.url().endsWith("/api/deployments") && response.request().method() === "POST");
+  await page.getByRole("button", { name: "Create deployment" }).click();
+  const deploymentCreated = await deploymentResponse;
+  if (deploymentCreated.status() !== 201) throw new Error(`deployment creation returned ${deploymentCreated.status()}: ${await deploymentCreated.text()}`);
+  await page.getByText("Production site", { exact: true }).waitFor();
+  const deploymentID = await page.evaluate(async () => (await (await fetch("/api/deployments")).json())[0].id);
+  try {
+    await waitFor(async () => {
+      try { return (await readFile(join(dir, "state.sqlite.publications", deploymentID, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n"; } catch { return false; }
+    }, "published deployment files");
+  } catch (error) {
+    const state = await page.evaluate(async id => ({ deployment: await (await fetch("/api/deployments")).text(), jobs: await (await fetch(`/api/deployments/${id}/jobs`)).text() }), deploymentID);
+    throw new Error(`${error.message}; state: ${JSON.stringify(state)}`);
+  }
+  await page.getByText("Live", { exact: true }).waitFor();
+  const publishedPath = join(dir, "state.sqlite.publications", deploymentID);
+  const firstDirectoryIdentity = (await stat(publishedPath)).ino;
+  const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
+  await page.getByLabel("Target commit").selectOption(mainCommit);
+  const targetUpdate = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/target`));
+  await page.getByRole("button", { name: "Change commit" }).click();
+  if ((await targetUpdate).status() !== 202) throw new Error("changing the deployment commit did not queue publication");
+  await waitFor(async () => {
+    try { return (await readFile(join(publishedPath, "index.html"), "utf8")) === "<!doctype html><title>main</title>\n"; } catch { return false; }
+  }, "replacement publication files");
+  if ((await stat(publishedPath)).ino === firstDirectoryIdentity) throw new Error("replacement did not switch the live directory");
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  await page.getByText(/Latest publication: noop/).waitFor({ timeout: 10000 });
+
   const initialTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
   const search = page.getByLabel("Search branches and tags");
   await search.fill("feature/search");
@@ -203,8 +235,17 @@ try {
   const sshProject = await page.evaluate(async () => (await (await fetch("/api/projects")).json()).find(project => project.name === "SSH fixture site"));
   const sshRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
+  const sshCommit = sshRefs.find(ref => ref.kind === "branch" && ref.name === "main").commit;
+  const sshDeployment = await page.evaluate(async ({ projectID, commit }) => {
+    const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectID, name: "SSH published site", commit }) });
+    return { status: response.status, body: await response.json().catch(() => null) };
+  }, { projectID: sshProject.id, commit: sshCommit });
+  if (sshDeployment.status !== 201) throw new Error(`SSH publication was not accepted (${sshDeployment.status})`);
+  await waitFor(async () => {
+    try { return (await readFile(join(dir, "state.sqlite.publications", sshDeployment.body.id, "index.html"), "utf8")) === "SSH fixture site\n"; } catch { return false; }
+  }, "SSH cached-object publication");
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
-  console.log("combined-binary authenticated project workflow passed: smart HTTPS browse/refresh, SSH unknown-host blocking and approval, SSH create/fetch, cross-origin mutation rejection, and cached-ref retention");
+  console.log("combined-binary authenticated project workflow passed: smart HTTPS publication, SSH unknown-host blocking and approval, SSH create/fetch/publication from cached objects, cross-origin mutation rejection, and cached-ref retention");
 } finally {
   await browser?.close();
   for (const child of [app, fixture, sshFixture]) {

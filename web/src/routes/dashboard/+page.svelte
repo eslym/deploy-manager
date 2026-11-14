@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import Deployments from '#lib/components/Deployments.svelte';
 	type Project = {
 		id: string;
 		name: string;
@@ -488,6 +489,7 @@
 						</li>{:else}<li class="list-none py-4 text-[#58645b]">No matching refs.</li>{/each}
 				</ul>
 			</div>
+			<Deployments projectId={selected} refs={refs[selected] ?? []} />
 		{/if}
 	</section>
 </main>

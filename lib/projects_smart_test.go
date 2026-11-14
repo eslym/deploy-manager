@@ -204,6 +204,37 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	initialRefs := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
 	requireProjectRefs(t, initialRefs, featureAtCreate)
+	deploymentResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments", `{"projectId":"`+created.ID+`","name":"production","commit":"`+featureAtCreate+`"}`)
+	if deploymentResponse.StatusCode != http.StatusCreated {
+		t.Fatalf("deployment creation status %d: %s", deploymentResponse.StatusCode, responseText(deploymentResponse))
+	}
+	var deploymentCreated struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(deploymentResponse.Body).Decode(&deploymentCreated); err != nil {
+		t.Fatal(err)
+	}
+	deploymentResponse.Body.Close()
+	publicationPath := filepath.Join(app.cfg.DeploymentRoot, deploymentCreated.ID)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		info, statErr := os.Stat(publicationPath)
+		if statErr == nil && info.IsDir() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("deployment was not published: %v", statErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if content, readErr := os.ReadFile(filepath.Join(publicationPath, "README.md")); readErr != nil || string(content) != "searchable feature\n" {
+		t.Fatalf("published tracked file = %q, err=%v", content, readErr)
+	}
+	noOp := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+deploymentCreated.ID+"/deploy", `{}`)
+	if noOp.StatusCode != http.StatusAccepted {
+		t.Fatalf("ordinary deploy status %d: %s", noOp.StatusCode, responseText(noOp))
+	}
+	noOp.Body.Close()
 	for _, unsupported := range []struct {
 		name string
 		url  string

@@ -38,6 +38,8 @@ type projectManager struct {
 	maxRefs               int
 	maxAdvertisementBytes int64
 	mu                    sync.Mutex
+	cacheMu               sync.RWMutex
+	stateMu               sync.RWMutex
 	cacheFS               projectCacheFS
 	blocked               string
 }
@@ -497,9 +499,12 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	now := time.Now().UTC()
 	backup := p.refreshBackupPath(id)
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
 	if _, err = p.cacheFS.Lstat(backup); err == nil {
-		p.blocked = "an unresolved previous project cache exists; restart to reconcile before refreshing"
-		http.Error(w, p.blocked, http.StatusServiceUnavailable)
+		message := "an unresolved previous project cache exists; restart to reconcile before refreshing"
+		p.setBlocked(message)
+		http.Error(w, message, http.StatusServiceUnavailable)
 		return
 	} else if !os.IsNotExist(err) {
 		http.Error(w, "could not inspect previous project cache", 500)
@@ -511,8 +516,9 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if err = p.cacheFS.Rename(p.repoPath(id), backup); err != nil {
 		if rollbackErr := p.rollbackRefresh(id, false); rollbackErr != nil {
-			p.blocked = "project cache state is ambiguous after promotion failure; project operations are blocked until restart recovery succeeds"
-			http.Error(w, p.blocked, http.StatusServiceUnavailable)
+			message := "project cache state is ambiguous after promotion failure; project operations are blocked until restart recovery succeeds"
+			p.setBlocked(message)
+			http.Error(w, message, http.StatusServiceUnavailable)
 			return
 		}
 		http.Error(w, "refreshed repository could not be safely promoted; previous cache retained", 500)
@@ -520,8 +526,9 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if err = p.cacheFS.Rename(stage, p.repoPath(id)); err != nil {
 		if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
-			p.blocked = "project cache restoration failed; project operations are blocked until restart recovery succeeds"
-			http.Error(w, p.blocked, http.StatusServiceUnavailable)
+			message := "project cache restoration failed; project operations are blocked until restart recovery succeeds"
+			p.setBlocked(message)
+			http.Error(w, message, http.StatusServiceUnavailable)
 			return
 		}
 		http.Error(w, "refreshed repository could not be safely promoted; previous cache restored", 500)
@@ -531,8 +538,9 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		pending, journalErr := p.refreshIntentExists(id)
 		if journalErr != nil || pending {
 			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
-				p.blocked = "refresh commit and cache restoration failed; project operations are blocked until restart recovery succeeds"
-				http.Error(w, p.blocked, http.StatusServiceUnavailable)
+				message := "refresh commit and cache restoration failed; project operations are blocked until restart recovery succeeds"
+				p.setBlocked(message)
+				http.Error(w, message, http.StatusServiceUnavailable)
 				return
 			}
 			http.Error(w, "refresh could not be committed; previous cache and refs restored", 500)
@@ -541,8 +549,8 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	cleanupWarning := ""
 	if err := p.removeOwnedPath(backup); err != nil {
-		p.blocked = "refresh committed but previous cache cleanup failed; restart to reconcile before further project changes"
-		cleanupWarning = p.blocked
+		cleanupWarning = "refresh committed but previous cache cleanup failed; restart to reconcile before further project changes"
+		p.setBlocked(cleanupWarning)
 		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, cleanupWarning, id)
 	}
 	writeJSON(w, map[string]any{"lastFetched": now, "warning": cleanupWarning})

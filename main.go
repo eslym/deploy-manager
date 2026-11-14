@@ -33,12 +33,19 @@ func main() {
 	grantTTL := flags.Duration("grant-ttl", 15*time.Minute, "maximum lifetime of a setup or recovery link")
 	recentAuthTTL := flags.Duration("recent-auth-ttl", 5*time.Minute, "maximum age of OPAQUE authentication for credential changes")
 	authRate := flags.Int("auth-rate-per-minute", 20, "maximum authentication requests per client per minute")
+	publicationRoot := flags.String("publication-root", "", "manager-owned directory for published sites (defaults inside the data directory)")
+	deployMaxFiles := flags.Int("deploy-max-files", 10000, "maximum tracked files per publication")
+	deployMaxBytes := flags.Int64("deploy-max-bytes", 1<<30, "maximum expanded tracked bytes per publication")
+	deployTimeout := flags.Duration("deploy-timeout", 2*time.Minute, "maximum duration of one publication")
+	deployConcurrency := flags.Int("deploy-concurrency", 2, "maximum publications running across deployments")
+	deployGrace := flags.Duration("deploy-grace-period", 60*time.Second, "minimum time before replaced files are cleaned up")
+	jobRetention := flags.Duration("job-retention", 30*24*time.Hour, "how long publication job details and logs are retained")
 	_ = flags.Parse(os.Args[2:])
 	repositoryMasterPath := *repositoryMaster
 	if repositoryMasterPath == "" {
 		repositoryMasterPath = filepath.Join(*data, "repository-key-master.key")
 	}
-	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout})
+	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention})
 	if err != nil {
 		log.Fatal(err)
 	}
