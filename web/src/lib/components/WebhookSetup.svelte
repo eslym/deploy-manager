@@ -1,6 +1,8 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	let { projectId }: { projectId: string } = $props();
+	let { projectId, provider }: { projectId: string; provider: 'github' | 'gitea' } = $props();
+	const uid = $props.id();
+	let providerName = $derived(provider === 'github' ? 'GitHub' : 'Gitea');
 	type Settings = { configured: boolean; url: string };
 	let settings = $state<Settings | null>(null);
 	let secret = $state('');
@@ -21,7 +23,7 @@
 				throw new Error('Your session may have expired. Sign in again.');
 			throw new Error(
 				response.status >= 500
-					? 'GitHub webhook settings could not be saved. Try again shortly.'
+					? `${providerName} webhook settings could not be saved. Try again shortly.`
 					: 'The request was rejected. Refresh and try again.'
 			);
 		}
@@ -32,7 +34,7 @@
 		loading = true;
 		error = '';
 		try {
-			const result: Settings = await request(`/api/projects/${id}/github-webhook`);
+			const result: Settings = await request(`/api/projects/${id}/${provider}-webhook`);
 			if (version === loadVersion && id === projectId)
 				settings = { ...result, url: new URL(result.url, window.location.origin).toString() };
 		} catch (cause) {
@@ -48,24 +50,29 @@
 		if (
 			settings?.configured &&
 			!window.confirm(
-				'Create a new secret? GitHub deliveries signed with the current secret will stop working until you update the webhook.'
+				`Create a new secret? ${providerName} deliveries signed with the current secret will stop working until you update the webhook.`
 			)
 		)
 			return;
 		busy = true;
+		const id = projectId;
+		const version = loadVersion;
 		secret = '';
+		copied = '';
 		error = '';
 		try {
 			const result: { url: string; secret: string } = await request(
-				`/api/projects/${projectId}/github-webhook`,
+				`/api/projects/${id}/${provider}-webhook`,
 				{ method: 'POST', body: JSON.stringify({ rotate: true }) }
 			);
+			if (version !== loadVersion || id !== projectId) return;
 			secret = result.secret;
 			settings = { configured: true, url: new URL(result.url, window.location.origin).toString() };
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not create the webhook secret.';
+			if (version === loadVersion && id === projectId)
+				error = cause instanceof Error ? cause.message : 'Could not create the webhook secret.';
 		} finally {
-			busy = false;
+			if (version === loadVersion && id === projectId) busy = false;
 		}
 	}
 
@@ -80,18 +87,22 @@
 
 	onMount(() => {
 		void load(projectId, ++loadVersion);
+		return () => {
+			loadVersion++;
+			secret = '';
+		};
 	});
 </script>
 
 <section
 	class="mt-8 rounded-xl border border-[#e1e6df] bg-white p-5"
-	aria-labelledby="github-webhook-heading"
+	aria-labelledby={`${uid}-webhook-heading`}
 >
-	<h2 id="github-webhook-heading" class="m-0 text-xl font-semibold text-[#243528]">
-		GitHub webhook
+	<h2 id={`${uid}-webhook-heading`} class="m-0 text-xl font-semibold text-[#243528]">
+		{providerName} webhook
 	</h2>
 	<p class="mt-2 text-sm text-[#58645b]">
-		Deployments following a branch can update automatically when GitHub pushes to it.
+		Deployments following a branch can update automatically when {providerName} pushes to it.
 	</p>
 	{#if error}<p
 			role="alert"
@@ -127,13 +138,13 @@
 		{@const payloadURL = settings.url}
 		<div
 			class="mt-4 rounded-lg border border-amber-300 bg-amber-50 p-4"
-			aria-labelledby="webhook-setup-heading"
+			aria-labelledby={`${uid}-webhook-setup-heading`}
 		>
-			<h3 id="webhook-setup-heading" class="m-0 font-semibold text-amber-950">
-				Add this webhook in GitHub
+			<h3 id={`${uid}-webhook-setup-heading`} class="m-0 font-semibold text-amber-950">
+				Add this webhook in {providerName}
 			</h3>
 			<p class="mt-2 text-sm text-amber-950">
-				Use these settings in the repository’s webhook page. GitHub will send push events only.
+				Use these settings in the repository’s webhook page. {providerName} will send push events only.
 			</p>
 			<dl class="mt-3 grid gap-3 text-sm">
 				<div>
