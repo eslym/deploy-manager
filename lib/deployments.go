@@ -172,6 +172,13 @@ func (a *App) initDeployments() error {
 		return err
 	}
 	a.publicationRootID = rootID
+	if err := probeDirectoryExchange(root); err != nil {
+		return fmt.Errorf("publication filesystem does not support safe atomic directory exchange: %w", err)
+	}
+	return a.recoverDeployments()
+}
+
+func (a *App) initDeploymentSchema() error {
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS deployments(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,name TEXT NOT NULL,commit_id TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 1,live_commit TEXT NOT NULL DEFAULT '',live_dev INTEGER NOT NULL DEFAULT 0,live_ino INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'queued',error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(project_id,name))`,
 		`CREATE TABLE IF NOT EXISTS deployment_jobs(id TEXT PRIMARY KEY,deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,commit_id TEXT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL,log TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,force_redeploy INTEGER NOT NULL DEFAULT 0)`,
@@ -216,12 +223,13 @@ func (a *App) initDeployments() error {
 			return err
 		}
 	}
-	if err := probeDirectoryExchange(root); err != nil {
-		return fmt.Errorf("publication filesystem does not support safe atomic directory exchange: %w", err)
-	}
+	return nil
+}
+
+func (a *App) recoverDeployments() error {
 	// Jobs interrupted by process termination are terminalized separately from
 	// filesystem intent reconciliation, which uses observed inode identities.
-	_, err = a.db.Exec(`UPDATE deployment_jobs SET status='failed',log=CASE WHEN log='' THEN 'interrupted by service restart' ELSE substr(log || char(10) || 'interrupted by service restart',1,8192) END,updated_at=? WHERE status='running' OR (status='queued' AND durable=0)`, d.Now().UnixNano())
+	_, err := a.db.Exec(`UPDATE deployment_jobs SET status='failed',log=CASE WHEN log='' THEN 'interrupted by service restart' ELSE substr(log || char(10) || 'interrupted by service restart',1,8192) END,updated_at=? WHERE status='running' OR (status='queued' AND durable=0)`, a.cfg.Now().UnixNano())
 	if err != nil {
 		return err
 	}

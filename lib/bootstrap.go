@@ -85,7 +85,9 @@ type App struct {
 	webhookFault         func(string) error
 }
 
-func New(cfg Config) (*App, error) {
+// prepareStorage performs only schema/key preparation and validation. Runtime
+// recovery and all background work belong to readyStorage.start.
+func prepareStorage(cfg Config) (*readyStorage, error) {
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
 	}
@@ -265,12 +267,6 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
-	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout, cfg.GitMaxCacheBytes)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	projects.maxTransferBytes, projects.maxCacheBytes, projects.maxRefs, projects.maxAdvertisementBytes = cfg.GitMaxTransferBytes, cfg.GitMaxCacheBytes, cfg.GitMaxRefs, cfg.GitMaxAdvertisementBytes
 	var credentialGeneration int64
 	if err = db.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&credentialGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		db.Close()
@@ -286,7 +282,13 @@ func New(cfg Config) (*App, error) {
 			return nil, errors.New("repository key master file must not share the OPAQUE key file")
 		}
 	}
-	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	ready := false
+	defer func() {
+		if !ready {
+			_ = app.Close()
+		}
+	}()
 	if app.cfg.WebhookMaxBodyBytes == 0 {
 		app.cfg.WebhookMaxBodyBytes = 1 << 20
 	}
@@ -294,12 +296,33 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("webhook body limit must be between 1 KiB and 16 MiB")
 	}
+	if err := initProjectSchema(db); err != nil {
+		return nil, err
+	}
 	if err := app.initWebhooks(); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if err := app.initDeployments(); err != nil {
+	if err := app.initDeploymentSchema(); err != nil {
 		db.Close()
+		return nil, err
+	}
+	ready = true
+	return &readyStorage{app: app}, nil
+}
+
+func (s *readyStorage) start() (*App, error) {
+	app := s.app
+	cfg, db := app.cfg, app.db
+	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout, cfg.GitMaxCacheBytes)
+	if err != nil {
+		_ = app.Close()
+		return nil, err
+	}
+	projects.maxTransferBytes, projects.maxCacheBytes, projects.maxRefs, projects.maxAdvertisementBytes = cfg.GitMaxTransferBytes, cfg.GitMaxCacheBytes, cfg.GitMaxRefs, cfg.GitMaxAdvertisementBytes
+	app.projects = projects
+	if err := app.initDeployments(); err != nil {
+		_ = app.Close()
 		return nil, err
 	}
 	if app.cfg.beforeRestoreDeploymentJobs != nil {
