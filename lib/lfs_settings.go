@@ -142,6 +142,48 @@ func (a *App) projectLFSHydrator(projectID string) (*lfsHydrator, error) {
 		}
 		return nil
 	}
+	var remote string
+	if err := a.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, projectID).Scan(&remote); err != nil {
+		return nil, errors.New("project repository configuration is unavailable")
+	}
+	if strings.HasPrefix(remote, "ssh://") {
+		if _, _, _, _, parseErr := safeSSHRemote(remote); parseErr != nil {
+			return nil, errors.New("private SSH LFS requires an assigned repository key")
+		}
+		hydrator.now = a.cfg.Now
+		hydrator.sshLifecycleLock = func() func() {
+			a.projects.lfsAuthMu.RLock()
+			return a.projects.lfsAuthMu.RUnlock
+		}
+		hydrator.sshAuth = func(ctx context.Context) (lfsAuthCredentials, error) {
+			// hydrate holds the SSH-key lifecycle read lock across cache lookup,
+			// authentication, and transfer. No signer is retained across calls.
+			var currentRemote, keyID string
+			if a.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, projectID).Scan(&currentRemote) != nil || currentRemote != remote || a.db.QueryRow(`SELECT key_id FROM project_ssh_keys WHERE project_id=?`, projectID).Scan(&keyID) != nil {
+				return lfsAuthCredentials{}, errors.New("private SSH LFS project configuration changed")
+			}
+			parsed, host, port, _, parseErr := safeSSHRemote(currentRemote)
+			if parseErr != nil {
+				return lfsAuthCredentials{}, errors.New("private SSH LFS repository URL is invalid")
+			}
+			user := "git"
+			if parsed.User != nil {
+				user = parsed.User.Username()
+			}
+			signer, signerErr := a.projectSSHSigner(keyID)
+			if signerErr != nil {
+				return lfsAuthCredentials{}, errors.New("private SSH LFS repository key is unavailable")
+			}
+			timeoutCtx, cancel := context.WithTimeout(ctx, a.projects.timeout)
+			defer cancel()
+			raw, authErr := remoteLFSAuthenticate(timeoutCtx, host, port, user, parsed.Path, signer, a.projectSSHHostKeyCallback(host, port), a.projects.timeout)
+			if authErr != nil {
+				return lfsAuthCredentials{}, authErr
+			}
+			defer clear(raw)
+			return parseLFSAuthResponse(raw, settings.Endpoint, a.cfg.Now())
+		}
+	}
 	return hydrator, nil
 }
 

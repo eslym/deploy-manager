@@ -133,6 +133,41 @@ func serve(address, cert, key, data string) error {
 		}
 		_, _ = w.Write(lfsPayload)
 	})
+	// Separate authenticated LFS endpoint used by the SSH-backed private
+	// repository workflow. Its bearer token is issued only by the SSH fixture.
+	mux.HandleFunc("POST /private-lfs/objects/batch", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer ssh-fixture-private-lfs" {
+			http.Error(w, "private LFS authentication required", http.StatusUnauthorized)
+			return
+		}
+		var request struct {
+			Operation string `json:"operation"`
+			Objects   []struct {
+				OID  string `json:"oid"`
+				Size int64  `json:"size"`
+			} `json:"objects"`
+		}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&request); err != nil || request.Operation != "download" || len(request.Objects) != 1 {
+			http.Error(w, "invalid private LFS batch request", http.StatusBadRequest)
+			return
+		}
+		digest := sha256.Sum256(lfsPayload)
+		oid := hex.EncodeToString(digest[:])
+		if request.Objects[0].OID != oid || request.Objects[0].Size != int64(len(lfsPayload)) {
+			w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"error":{"code":404,"message":"not found"}}]}`, request.Objects[0].OID, request.Objects[0].Size)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+		_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q,"header":{"X-LFS-Private-Action":"approved"}}}}]}`, oid, len(lfsPayload), "https://"+address+"/private-lfs/object?signature=private-fixture-secret")
+	})
+	mux.HandleFunc("GET /private-lfs/object", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" || r.URL.Query().Get("signature") != "private-fixture-secret" || r.Header.Get("X-LFS-Private-Action") != "approved" {
+			http.Error(w, "invalid private fixture action", http.StatusForbidden)
+			return
+		}
+		_, _ = w.Write(lfsPayload)
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if fail.Load() {
 			http.Error(w, "controlled fixture failure", http.StatusServiceUnavailable)

@@ -960,6 +960,8 @@ func boolInt(v bool) int {
 func sanitizePublicationError(err error) string {
 	s := strings.ToLower(err.Error())
 	switch {
+	case strings.Contains(s, "private ssh lfs authentication"):
+		return "Private repository LFS authentication failed. Verify the repository key and approved SSH host key, and confirm the server provides git-lfs-authenticate. Pure-SSH LFS transfers are not supported. Existing published files were kept."
 	case strings.Contains(s, "lfs"):
 		return "Git LFS content could not be safely verified or hydrated; the current live files were kept"
 	case strings.Contains(s, "symbolic link") || strings.Contains(s, "symlink"):

@@ -98,7 +98,7 @@ try {
   fixture = spawn(resolve(fixtureBinary), ["--listen", fixtureListen, "--tls-cert", fixtureCert, "--tls-key", fixtureKey, "--data", join(dir, "fixture-data")], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   fixture.stderr.on("data", chunk => { appOutput += chunk.toString(); });
   await waitFor(async () => (await httpsRequestStatus("127.0.0.1", 18441, "/")) === 404, "smart-HTTPS Git fixture");
-  sshFixture = spawn(resolve(sshFixtureBinary), ["--listen", "127.0.0.1:18442"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  sshFixture = spawn(resolve(sshFixtureBinary), ["--listen", "127.0.0.1:18442", "--lfs-href", `${fixtureOrigin}/private-lfs`], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
   sshFixture.stderr.on("data", chunk => { appOutput += chunk.toString(); });
   await waitFor(async () => {
     try { const socket = await import("node:net").then(({ createConnection }) => new Promise(resolveSocket => { const client = createConnection({ host: "127.0.0.1", port: 18442 }); client.once("connect", () => { client.destroy(); resolveSocket(true); }); client.once("error", () => resolveSocket(false)); })); return socket; } catch { return false; }
@@ -267,6 +267,14 @@ try {
   const sshProject = await page.evaluate(async () => (await (await fetch("/api/projects")).json()).find(project => project.name === "SSH fixture site"));
   const sshRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
+  await page.getByText("SSH fixture site", { exact: true }).click();
+  await page.getByLabel("LFS server URL").fill(`${fixtureOrigin}/private-lfs`);
+  await page.getByLabel("Object download origins").fill(fixtureOrigin);
+  await page.getByLabel("Allow downloads from internal network addresses").check();
+  await page.getByLabel("I independently verified the internal destinations and intend to allow them.").check();
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "Save LFS settings" }).click();
+  await page.getByText("LFS settings saved.").waitFor();
   const sshCommit = sshRefs.find(ref => ref.kind === "branch" && ref.name === "main").commit;
   const sshDeployment = await page.evaluate(async ({ projectID, commit }) => {
     const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectID, name: "SSH published site", commit }) });
@@ -274,8 +282,15 @@ try {
   }, { projectID: sshProject.id, commit: sshCommit });
   if (sshDeployment.status !== 201) throw new Error(`SSH publication was not accepted (${sshDeployment.status})`);
   await waitFor(async () => {
-    try { return (await readFile(join(dir, "state.sqlite.publications", sshDeployment.body.id, "index.html"), "utf8")) === "SSH fixture site\n"; } catch { return false; }
+    try {
+      const published = join(dir, "state.sqlite.publications", sshDeployment.body.id);
+      return (await readFile(join(published, "index.html"), "utf8")) === "SSH fixture site\n" && (await readFile(join(published, "asset.dat"), "utf8")) === "fixture hydrated LFS asset\n";
+    } catch { return false; }
   }, "SSH cached-object publication");
+  const privateJobLog = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).text(), sshDeployment.body.id);
+  for (const secret of ["ssh-fixture-private-lfs", "private-fixture-secret", "Bearer"]) {
+    if (privateJobLog.includes(secret) || appOutput.includes(secret)) throw new Error(`private LFS secret reached an application or job log (${secret})`);
+  }
   const sshPublishedPath = join(dir, "state.sqlite.publications", sshDeployment.body.id);
   await page.getByRole("button", { name: "Delete", exact: true }).click();
   await page.getByText(/Delete “SSH published site” and remove its published files/).waitFor();
@@ -303,7 +318,7 @@ try {
   if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
   try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
-  console.log("combined-binary authenticated project workflow passed: publication and project deletion confirmation/cancel, SSH cached-object publication, host trust, cross-origin mutation rejection, and cached-ref retention");
+  console.log("combined-binary authenticated project workflow passed: publication and deletion confirmation/cancel, private SSH/LFS publication, host trust, cross-origin mutation rejection, and cached-ref retention");
 } finally {
   await browser?.close();
   for (const child of [app, fixture, sshFixture]) {

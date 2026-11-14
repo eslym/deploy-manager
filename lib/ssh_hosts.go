@@ -35,6 +35,16 @@ func init() {
 }
 
 func (a *App) projectSSHAuth(keyID, host string, port int, user string) (transport.AuthMethod, error) {
+	signer, err := a.projectSSHSigner(keyID)
+	if err != nil {
+		return nil, err
+	}
+	auth := &gitssh.PublicKeys{User: user, Signer: signer}
+	auth.HostKeyCallback = a.projectSSHHostKeyCallback(host, port)
+	return timedPublicKeys{PublicKeys: auth, timeout: a.projects.timeout}, nil
+}
+
+func (a *App) projectSSHSigner(keyID string) (ssh.Signer, error) {
 	var ciphertext []byte
 	if a.db.QueryRow(`SELECT ciphertext FROM repository_keys WHERE id=?`, keyID).Scan(&ciphertext) != nil {
 		return nil, errors.New("managed repository key is unavailable")
@@ -55,8 +65,11 @@ func (a *App) projectSSHAuth(keyID, host string, port int, user string) (transpo
 	if err != nil {
 		return nil, errors.New("managed repository key is invalid")
 	}
-	auth := &gitssh.PublicKeys{User: user, Signer: signer}
-	auth.HostKeyCallback = func(gotHost string, _ net.Addr, observed ssh.PublicKey) error {
+	return signer, nil
+}
+
+func (a *App) projectSSHHostKeyCallback(host string, port int) ssh.HostKeyCallback {
+	return func(gotHost string, _ net.Addr, observed ssh.PublicKey) error {
 		if canonicalSSHHost(gotHost) != host {
 			return errors.New("SSH host does not match the configured repository host")
 		}
@@ -76,7 +89,6 @@ func (a *App) projectSSHAuth(keyID, host string, port int, user string) (transpo
 		}
 		return errors.New("SSH host key is not approved")
 	}
-	return timedPublicKeys{PublicKeys: auth, timeout: a.projects.timeout}, nil
 }
 
 type timedPublicKeys struct {
