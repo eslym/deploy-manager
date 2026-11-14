@@ -141,7 +141,9 @@ func serve(cfg lib.Config, address, cert, key string) error {
 	if daemon.Locked() {
 		log.Print(lib.ErrMaintenance)
 	}
-	server := &http.Server{Handler: daemon.Handler(), TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
+	// OPTIONS * must reach the daemon handler, including during maintenance,
+	// rather than net/http's default server-wide success response.
+	server := &http.Server{Handler: daemon.Handler(), DisableGeneralOptionsHandler: true, TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
 	if tlsConfig != nil {
 		err = server.ServeTLS(listener, "", "")
 	} else {

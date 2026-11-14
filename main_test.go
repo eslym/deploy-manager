@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -135,6 +136,78 @@ func TestLockedCommandServesMaintenanceOverTLS(t *testing.T) {
 	entries, err := os.ReadDir(data)
 	if err != nil || len(entries) != 2 || entries[0].Name() != "state.sqlite.daemon.lock" || entries[1].Name() != "state.sqlite.maintenance.json" {
 		t.Fatalf("TLS locked start initialized state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestLockedCommandServesMaintenanceForRawOptionsStar(t *testing.T) {
+	binary := buildCommand(t)
+	fixture := httptest.NewTLSServer(http.NotFoundHandler())
+	pair := fixture.TLS.Certificates[0]
+	fixture.Close()
+	key, err := x509.MarshalPKCS8PrivateKey(pair.PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPath, keyPath := filepath.Join(t.TempDir(), "cert.pem"), filepath.Join(t.TempDir(), "key.pem")
+	for path, content := range map[string][]byte{
+		certPath: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: pair.Certificate[0]}),
+		keyPath:  pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: key}),
+	} {
+		if err := os.WriteFile(path, content, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, secure := range []bool{false, true} {
+		t.Run(fmt.Sprintf("TLS=%t", secure), func(t *testing.T) {
+			data := t.TempDir()
+			for _, name := range []string{"state.sqlite", "opaque-server.key", "repository-key-master.key", "state.sqlite.maintenance.json"} {
+				if err := os.WriteFile(filepath.Join(data, name), []byte("sensitive invalid state: secret-backup-path"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			address := freeAddress(t)
+			var flags []string
+			if secure {
+				flags = []string{"--tls-cert", certPath, "--tls-key", keyPath}
+			}
+			client := startCommand(t, binary, data, address, flags...)
+			var conn net.Conn
+			dialer := &net.Dialer{Timeout: 5 * time.Second}
+			if secure {
+				conn, err = tls.DialWithDialer(dialer, "tcp", address, client.Transport.(*http.Transport).TLSClientConfig)
+			} else {
+				conn, err = dialer.Dial("tcp", address)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if err := conn.SetDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			// Send the actual asterisk-form request target, not a URL path that
+			// an HTTP client or router might normalize before it reaches net/http.
+			if _, err := fmt.Fprintf(conn, "OPTIONS * HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", address); err != nil {
+				t.Fatal(err)
+			}
+			res, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.StatusCode != http.StatusServiceUnavailable || res.Header.Get("Cache-Control") != "no-store" || res.Header.Get("Content-Type") != "text/plain; charset=utf-8" || string(body) != "Service unavailable: maintenance required.\n" {
+				t.Fatalf("raw OPTIONS * response: status=%d headers=%v body=%q", res.StatusCode, res.Header, body)
+			}
+			for _, secret := range []string{data, "sensitive invalid state", "secret-backup-path", "SELECT", "PRIVATE KEY"} {
+				if strings.Contains(fmt.Sprint(res.Header)+string(body), secret) {
+					t.Errorf("raw OPTIONS * leaked %q", secret)
+				}
+			}
+		})
 	}
 }
 

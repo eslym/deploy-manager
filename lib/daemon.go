@@ -20,26 +20,11 @@ type Daemon struct {
 // application or retains ownership with only a minimal maintenance handler.
 // Compatible grant issuers do not acquire this daemon ownership.
 func OpenDaemon(cfg Config) (*Daemon, error) {
-	if err := validateStoragePaths(cfg); err != nil {
+	app, ownership, err := startDaemon(cfg)
+	if err != nil && !errors.Is(err, ErrMaintenance) {
 		return nil, err
 	}
-	ownership, err := acquireDaemonOwnership(cfg)
-	if err != nil {
-		return nil, err
-	}
-	d := &Daemon{ownership: ownership}
-	storage, err := prepareStorage(cfg)
-	if errors.Is(err, ErrMaintenance) {
-		return d, nil
-	}
-	if err == nil {
-		d.app, err = storage.start()
-	}
-	if err != nil {
-		_ = d.Close()
-		return nil, err
-	}
-	return d, nil
+	return &Daemon{app: app, ownership: ownership}, nil
 }
 
 func (d *Daemon) Locked() bool { return d.app == nil }
