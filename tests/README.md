@@ -1,4 +1,28 @@
-# Container test environment
+# Container development and test environment
+
+The Compose image is a reusable development tools environment as well as the
+full browser-test runner. Use the interactive form to prepare or inspect the
+project in a pinned Bun/Go/Playwright environment without launching the suite:
+
+```sh
+docker compose -f tests/compose.yaml run --build --rm test bash
+```
+
+The interactive shell starts in `/workspace`; `/source` is the read-only
+checkout. Copy files to `/workspace` before running commands that generate or
+modify project output. For example:
+
+```sh
+cp -a /source/. /workspace/
+cd /workspace
+cd web
+bun install --frozen-lockfile
+bun run check
+```
+
+The shell has shared Bun and Go caches mounted at `/cache`. Run any needed
+development commands there; stop any servers before exiting. To run the complete
+browser/Go test suite instead, use:
 
 From any checkout or worktree root:
 
@@ -29,15 +53,6 @@ one-off container for each invocation, including concurrent invocations.
 Keep the project name unchanged (including `COMPOSE_PROJECT_NAME` and `-p`) to
 reuse these caches. The environment image layers and Dockerfile's BuildKit cache
 mounts also persist independently of a checkout.
-
-To open the tools environment without running the suite:
-
-```sh
-docker compose -f tests/compose.yaml run --build --rm test bash
-```
-
-The source is at `/source`; use a disposable copy when running commands that
-write generated files. Stop any development servers you start before exiting.
 
 Remove leftover Compose containers/networks without deleting caches:
 
