@@ -227,56 +227,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	initialRefs := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
 	requireProjectRefs(t, initialRefs, featureAtCreate)
-	tagRef := findProjectRef(initialRefs, "tag", "v1.0")
-	tagDeploymentResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments", `{"projectId":"`+created.ID+`","name":"tag-production","targetKind":"tag","targetName":"v1.0"}`)
-	if tagDeploymentResponse.StatusCode != http.StatusCreated {
-		t.Fatalf("tag deployment creation status %d: %s", tagDeploymentResponse.StatusCode, responseText(tagDeploymentResponse))
-	}
-	var tagDeployment struct{ ID, JobID string }
-	if err := json.NewDecoder(tagDeploymentResponse.Body).Decode(&tagDeployment); err != nil {
-		t.Fatal(err)
-	}
-	tagDeploymentResponse.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, tagDeployment.ID, tagDeployment.JobID, "succeeded")
-	var frozenTagCommit string
-	if err := app.db.QueryRow(`SELECT commit_id FROM deployments WHERE id=?`, tagDeployment.ID).Scan(&frozenTagCommit); err != nil || frozenTagCommit != tagRef.Commit {
-		t.Fatalf("created tag target resolution=%q, cached tag=%q, err=%v", frozenTagCommit, tagRef.Commit, err)
-	}
-	tagPath := filepath.Join(app.cfg.DeploymentRoot, tagDeployment.ID)
-	tagLiveIdentity, err := identity(tagPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ordinaryTagDeploy := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+tagDeployment.ID+"/deploy", `{}`)
-	if ordinaryTagDeploy.StatusCode != http.StatusAccepted {
-		t.Fatalf("ordinary tag Deploy status %d: %s", ordinaryTagDeploy.StatusCode, responseText(ordinaryTagDeploy))
-	}
-	var ordinaryTagJob struct {
-		JobID string `json:"jobId"`
-	}
-	if err := json.NewDecoder(ordinaryTagDeploy.Body).Decode(&ordinaryTagJob); err != nil {
-		t.Fatal(err)
-	}
-	ordinaryTagDeploy.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, tagDeployment.ID, ordinaryTagJob.JobID, "noop")
-	if after, identityErr := identity(tagPath); identityErr != nil || after != tagLiveIdentity {
-		t.Fatalf("ordinary tag Deploy recreated unchanged live content: before=%+v after=%+v err=%v", tagLiveIdentity, after, identityErr)
-	}
-	hardTagDeploy := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+tagDeployment.ID+"/hard-redeploy", `{}`)
-	if hardTagDeploy.StatusCode != http.StatusAccepted {
-		t.Fatalf("tag Hard re-deploy status %d: %s", hardTagDeploy.StatusCode, responseText(hardTagDeploy))
-	}
-	var hardTagJob struct {
-		JobID string `json:"jobId"`
-	}
-	if err := json.NewDecoder(hardTagDeploy.Body).Decode(&hardTagJob); err != nil {
-		t.Fatal(err)
-	}
-	hardTagDeploy.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, tagDeployment.ID, hardTagJob.JobID, "succeeded")
-	if after, identityErr := identity(tagPath); identityErr != nil || after == tagLiveIdentity {
-		t.Fatalf("hard tag re-deploy did not recreate unchanged commit: before=%+v after=%+v err=%v", tagLiveIdentity, after, identityErr)
-	}
+	tagDeployment := createAndTestTagDeployment(t, client, appServer.URL, cookie, app, created.ID, initialRefs)
 	deploymentResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments", `{"projectId":"`+created.ID+`","name":"production","commit":"`+featureAtCreate+`"}`)
 	if deploymentResponse.StatusCode != http.StatusCreated {
 		t.Fatalf("deployment creation status %d: %s", deploymentResponse.StatusCode, responseText(deploymentResponse))
@@ -380,21 +331,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if after, identityErr := identity(branchPath); identityErr != nil || after != branchIdentity {
 		t.Fatalf("no-op recreated the live directory: before=%+v after=%+v err=%v", branchIdentity, after, identityErr)
 	}
-	hardBranch := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/hard-redeploy", `{}`)
-	if hardBranch.StatusCode != http.StatusAccepted {
-		t.Fatalf("branch Hard re-deploy status %d: %s", hardBranch.StatusCode, responseText(hardBranch))
-	}
-	var hardBranchJob struct {
-		JobID string `json:"jobId"`
-	}
-	if err := json.NewDecoder(hardBranch.Body).Decode(&hardBranchJob); err != nil {
-		t.Fatal(err)
-	}
-	hardBranch.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, branchDeployment.ID, hardBranchJob.JobID, "succeeded")
-	if after, identityErr := identity(branchPath); identityErr != nil || after == branchIdentity {
-		t.Fatalf("branch Hard re-deploy did not recreate unchanged content: before=%+v after=%+v err=%v", branchIdentity, after, identityErr)
-	}
+	hardRedeployAndWait(t, client, appServer.URL, cookie, branchDeployment.ID, branchPath, nil)
 	if transientFailures.Load() != 0 {
 		t.Fatal("creation fetch did not reach the controlled transient failure")
 	}
@@ -520,29 +457,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("ordinary deploy status %d: %s", noOp.StatusCode, responseText(noOp))
 	}
 	noOp.Body.Close()
-	commitLiveIdentity, err := identity(publicationPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	commitHardFetchBaseline := gitRequests.Load()
-	hardCommit := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+deploymentCreated.ID+"/hard-redeploy", `{}`)
-	if hardCommit.StatusCode != http.StatusAccepted {
-		t.Fatalf("commit Hard re-deploy status %d: %s", hardCommit.StatusCode, responseText(hardCommit))
-	}
-	var hardCommitJob struct {
-		JobID string `json:"jobId"`
-	}
-	if err := json.NewDecoder(hardCommit.Body).Decode(&hardCommitJob); err != nil {
-		t.Fatal(err)
-	}
-	hardCommit.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, deploymentCreated.ID, hardCommitJob.JobID, "succeeded")
-	if gitRequests.Load() <= commitHardFetchBaseline {
-		t.Fatal("commit Hard re-deploy did not fetch the repository")
-	}
-	if after, identityErr := identity(publicationPath); identityErr != nil || after == commitLiveIdentity {
-		t.Fatalf("commit Hard re-deploy did not recreate fixed target: before=%+v after=%+v err=%v", commitLiveIdentity, after, identityErr)
-	}
+	hardRedeployAndWait(t, client, appServer.URL, cookie, deploymentCreated.ID, publicationPath, &gitRequests)
 	for _, unsupported := range []struct {
 		name string
 		url  string
@@ -584,12 +499,6 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 	featureAfter := commitFixtureFile(t, remoteDir, fixtureWorktree, "feature", string(largePayload)).String()
-	if err := fixtureRepo.Storer.RemoveReference(plumbing.NewTagReferenceName("v1.0")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := fixtureRepo.CreateTag("v1.0", plumbing.NewHash(featureAfter), &git.CreateTagOptions{Tagger: &object.Signature{Name: "fixture", Email: "fixture@example.test", When: time.Now().UTC()}, Message: "moved annotated release"}); err != nil {
-		t.Fatal(err)
-	}
 	lastSuccessfulBeforeOversizedRefresh := listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched
 	failStatus.Store(http.StatusUnauthorized)
 	failRequests.Store(true)
@@ -638,65 +547,6 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	featureRef := findProjectRef(refreshedRefs, "branch", "feature/search")
 	if featureRef.Commit != featureAfter || featureRef.Commit == featureAtCreate {
 		t.Fatalf("refresh returned branch %q, initial %q, want %q", featureRef.Commit, featureAtCreate, featureAfter)
-	}
-	ordinaryFrozenTag := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+tagDeployment.ID+"/deploy", `{}`)
-	if ordinaryFrozenTag.StatusCode != http.StatusAccepted {
-		t.Fatalf("ordinary Deploy for moved upstream tag status %d: %s", ordinaryFrozenTag.StatusCode, responseText(ordinaryFrozenTag))
-	}
-	var ordinaryFrozenTagJob struct {
-		JobID string `json:"jobId"`
-	}
-	if err := json.NewDecoder(ordinaryFrozenTag.Body).Decode(&ordinaryFrozenTagJob); err != nil {
-		t.Fatal(err)
-	}
-	ordinaryFrozenTag.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, tagDeployment.ID, ordinaryFrozenTagJob.JobID, "noop")
-	var stillFrozen string
-	if err := app.db.QueryRow(`SELECT commit_id FROM deployments WHERE id=?`, tagDeployment.ID).Scan(&stillFrozen); err != nil || stillFrozen != frozenTagCommit {
-		t.Fatalf("ordinary Deploy changed frozen tag resolution to %q (want %q): %v", stillFrozen, frozenTagCommit, err)
-	}
-	tagIdentityBeforeFailedRefresh, err := identity(tagPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	failRequests.Store(true)
-	failedTagRefresh := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+tagDeployment.ID+"/hard-redeploy", `{}`)
-	if failedTagRefresh.StatusCode != http.StatusAccepted {
-		t.Fatalf("failed-refresh Hard re-deploy queue status %d: %s", failedTagRefresh.StatusCode, responseText(failedTagRefresh))
-	}
-	var failedTagJob struct {
-		JobID string `json:"jobId"`
-	}
-	if err := json.NewDecoder(failedTagRefresh.Body).Decode(&failedTagJob); err != nil {
-		t.Fatal(err)
-	}
-	failedTagRefresh.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, tagDeployment.ID, failedTagJob.JobID, "failed")
-	failRequests.Store(false)
-	if after, identityErr := identity(tagPath); identityErr != nil || after != tagIdentityBeforeFailedRefresh {
-		t.Fatalf("failed tag refresh changed live directory identity: before=%+v after=%+v err=%v", tagIdentityBeforeFailedRefresh, after, identityErr)
-	}
-	if err := app.db.QueryRow(`SELECT commit_id FROM deployments WHERE id=?`, tagDeployment.ID).Scan(&stillFrozen); err != nil || stillFrozen != frozenTagCommit {
-		t.Fatalf("failed refresh changed frozen tag resolution to %q (want %q): %v", stillFrozen, frozenTagCommit, err)
-	}
-	hardMovedTag := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+tagDeployment.ID+"/hard-redeploy", `{}`)
-	if hardMovedTag.StatusCode != http.StatusAccepted {
-		t.Fatalf("Hard re-deploy after moving annotated tag status %d: %s", hardMovedTag.StatusCode, responseText(hardMovedTag))
-	}
-	var hardMovedTagJob struct {
-		JobID string `json:"jobId"`
-	}
-	if err := json.NewDecoder(hardMovedTag.Body).Decode(&hardMovedTagJob); err != nil {
-		t.Fatal(err)
-	}
-	hardMovedTag.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, tagDeployment.ID, hardMovedTagJob.JobID, "succeeded")
-	var refreshedTagCommit string
-	if err := app.db.QueryRow(`SELECT commit_id FROM deployments WHERE id=?`, tagDeployment.ID).Scan(&refreshedTagCommit); err != nil || refreshedTagCommit != featureAfter {
-		t.Fatalf("Hard re-deploy saved tag resolution %q, want %q: %v", refreshedTagCommit, featureAfter, err)
-	}
-	if content, readErr := os.ReadFile(filepath.Join(tagPath, "README.md")); readErr != nil || string(content) != string(largePayload)+"\n" {
-		t.Fatalf("Hard re-deploy did not publish moved annotated tag: %v", readErr)
 	}
 	branchDeployResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/deploy", `{}`)
 	if branchDeployResponse.StatusCode != http.StatusAccepted {
@@ -821,6 +671,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		}
 	}
 
+	hardMovedTagJobID := moveAnnotatedTagAndTestHardRefresh(t, client, appServer.URL, cookie, app, fixtureRepo, &failRequests, tagDeployment, featureAfter, largePayload)
+	refreshedRefs = projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
+	lastSuccessful = listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched
+
 	// A genuinely failed refresh must keep refs and the timestamp from the last
 	// successful smart-HTTPS exchange, while making the error visible.
 	failRequests.Store(true)
@@ -912,10 +766,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	restoreWarning.Body.Close()
 	// Model an abrupt shutdown with a durable hard re-deploy in progress. Startup
 	// must terminalize the job without losing its persisted force intent.
-	if _, err := app.db.Exec(`UPDATE deployment_jobs SET status='running' WHERE id=?`, hardMovedTagJob.JobID); err != nil {
+	if _, err := app.db.Exec(`UPDATE deployment_jobs SET status='running' WHERE id=?`, hardMovedTagJobID); err != nil {
 		t.Fatal(err)
 	}
-	tagIdentityBeforeRestart, err := identity(tagPath)
+	tagIdentityBeforeRestart, err := identity(tagDeployment.Path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -949,45 +803,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	deploymentsResponse.Body.Close()
 	persistedBranchTarget := false
-	persistedTagTarget := false
 	for _, item := range persistedDeployments {
 		if item.ID == branchDeployment.ID && item.TargetKind == "branch" && item.TargetName == "feature/search" {
 			persistedBranchTarget = true
-		}
-		if item.ID == tagDeployment.ID && item.TargetKind == "tag" && item.TargetName == "v1.0" && item.Commit == featureAfter {
-			persistedTagTarget = true
 		}
 	}
 	if !persistedBranchTarget {
 		t.Fatal("configured branch target did not survive application restart")
 	}
-	if !persistedTagTarget {
-		t.Fatal("explicitly refreshed tag resolution did not survive application restart")
-	}
-	jobsRequest, _ := http.NewRequest(http.MethodGet, restarted.URL+"/api/deployments/"+tagDeployment.ID+"/jobs", nil)
-	jobsRequest.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
-	jobsResponse, err := restarted.Client().Do(jobsRequest)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var persistedJobs []deploymentJob
-	if err = json.NewDecoder(jobsResponse.Body).Decode(&persistedJobs); err != nil {
-		jobsResponse.Body.Close()
-		t.Fatal(err)
-	}
-	jobsResponse.Body.Close()
-	forceIntentPersisted := false
-	for _, item := range persistedJobs {
-		if item.ID == hardMovedTagJob.JobID && item.Force && item.Status == "failed" {
-			forceIntentPersisted = true
-		}
-	}
-	if !forceIntentPersisted {
-		t.Fatal("hard re-deploy force intent did not survive application restart")
-	}
-	if after, identityErr := identity(filepath.Join(app.cfg.DeploymentRoot, tagDeployment.ID)); identityErr != nil || after != tagIdentityBeforeRestart {
-		t.Fatalf("restart after interrupted hard re-deploy changed live publication: before=%+v after=%+v err=%v", tagIdentityBeforeRestart, after, identityErr)
-	}
+	assertTagDeploymentRestarted(t, restarted.Client(), restarted.URL, cookie, persistedDeployments, tagDeployment, hardMovedTagJobID, featureAfter, tagIdentityBeforeRestart)
 	if got := projectRefsFromAPI(t, restarted.Client(), restarted.URL, cookie, created.ID); !equalProjectRefs(refreshedRefs, got) {
 		t.Fatalf("cached refs did not survive restart: %#v", got)
 	}

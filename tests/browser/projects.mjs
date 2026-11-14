@@ -314,7 +314,8 @@ try {
   await page.getByRole("button", { name: "Delete project" }).click();
   const projectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/delete`));
   await page.getByRole("button", { name: "Confirm delete" }).click();
-  if ((await projectDelete).status() !== 204) throw new Error("confirmed project deletion did not finish");
+  const confirmedProjectDelete = await projectDelete;
+  if (confirmedProjectDelete.status() !== 204) throw new Error(`confirmed project deletion returned ${confirmedProjectDelete.status()}: ${await confirmedProjectDelete.text()}`);
   if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
   try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
