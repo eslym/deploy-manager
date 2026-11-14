@@ -4,6 +4,7 @@
 		id: string;
 		name: string;
 		url: string;
+		keyId?: string;
 		lastFetched: string | null;
 		warning?: string;
 	};
@@ -26,6 +27,12 @@
 	let refs = $state<Record<string, Ref[]>>({});
 	let name = $state('');
 	let url = $state('');
+	let keyId = $state('');
+	let sshHosts = $state<
+		{ host: string; port: number; fingerprint: string; warning?: string; trusted: boolean }[]
+	>([]);
+	let hostError = $state('');
+	let keyAssignments = $state<Record<string, string>>({});
 	let search = $state('');
 	let error = $state('');
 	let busy = $state(false);
@@ -36,7 +43,11 @@
 		)
 	);
 
-	async function request(path: string, init?: RequestInit) {
+	async function request(
+		path: string,
+		init?: RequestInit,
+		options?: { sshCreate?: boolean; sshRefresh?: boolean }
+	) {
 		const response = await fetch(path, {
 			...init,
 			credentials: 'same-origin',
@@ -44,6 +55,20 @@
 		});
 		if (!response.ok) {
 			const status = Number.isInteger(response.status) ? ` (HTTP ${response.status})` : '';
+			const responseText = await response.text();
+			if (options?.sshCreate && response.status === 409) {
+				throw new Error(
+					'Host key not approved. Verify the fingerprint in SSH host warnings independently before approving it.'
+				);
+			}
+			if (options?.sshRefresh && response.status === 502) {
+				throw new Error('SSH connection failed. Check the repository key and SSH host warnings.');
+			}
+			if (response.status === 409)
+				throw new Error(
+					'This change is out of date or the key is assigned. Refresh the page, then choose a key that is not assigned to another project.' +
+						status
+				);
 			const message =
 				response.status === 401 || response.status === 403
 					? 'Your session may have expired. Sign in again.'
@@ -58,13 +83,17 @@
 									: response.status >= 500
 										? 'The server could not complete the request. Try again shortly.'
 										: 'The request could not be completed. Check your input and try again.';
-			throw new Error(`${message}${status}`);
+			const safeBackendText = responseText.trim().slice(0, 400);
+			throw new Error(
+				`${(options?.sshCreate || options?.sshRefresh) && safeBackendText ? safeBackendText : message}${status}`
+			);
 		}
 		return response.status === 204 ? null : response.json();
 	}
 	async function loadProjects() {
 		try {
 			projects = await request('/api/projects');
+			for (const project of projects) keyAssignments[project.id] = project.keyId ?? '';
 			for (const project of projects) await loadRefs(project.id);
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not load projects.';
@@ -75,6 +104,61 @@
 			repositoryKeys = await request('/api/repository-keys');
 		} catch (cause) {
 			keyError = cause instanceof Error ? cause.message : 'Could not load repository keys.';
+		}
+	}
+	async function loadSshHosts() {
+		try {
+			sshHosts = await request('/api/ssh-hosts');
+		} catch (cause) {
+			hostError = cause instanceof Error ? cause.message : 'Could not load SSH hosts.';
+		}
+	}
+	async function approveHost(host: (typeof sshHosts)[number]) {
+		if (
+			!window.confirm(
+				`Only continue after independently verifying this SSH host key.\n\n${host.host}:${host.port}\n${host.fingerprint}\n\nApprove this host key?`
+			)
+		)
+			return;
+		hostError = '';
+		try {
+			await request('/api/ssh-hosts/approve', {
+				method: 'POST',
+				body: JSON.stringify({
+					host: host.host,
+					port: host.port,
+					fingerprint: host.fingerprint,
+					confirm: true
+				})
+			});
+			await loadSshHosts();
+		} catch (cause) {
+			hostError = cause instanceof Error ? cause.message : 'Could not approve the host key.';
+		}
+	}
+	async function deleteKey(key: RepositoryKey) {
+		keyError = '';
+		try {
+			await request(`/api/repository-keys/${key.id}/delete`, { method: 'POST', body: '{}' });
+			await loadRepositoryKeys();
+		} catch (cause) {
+			keyError =
+				cause instanceof Error && cause.message.includes('409')
+					? 'This key is assigned to a project. Assign another key before removing it.'
+					: cause instanceof Error
+						? cause.message
+						: 'Could not remove the key.';
+		}
+	}
+	async function assignKey(project: Project) {
+		error = '';
+		try {
+			await request(`/api/projects/${project.id}/key`, {
+				method: 'POST',
+				body: JSON.stringify({ keyId: keyAssignments[project.id] })
+			});
+		} catch (cause) {
+			error = cause instanceof Error ? cause.message : 'Could not assign the key.';
 		}
 	}
 	async function saveRepositoryKey(generate: boolean) {
@@ -108,17 +192,24 @@
 		busy = true;
 		error = '';
 		try {
-			const created: Project = await request('/api/projects', {
-				method: 'POST',
-				body: JSON.stringify({ name, url })
-			});
+			const created: Project = await request(
+				'/api/projects',
+				{
+					method: 'POST',
+					body: JSON.stringify({ name, url, keyId: url.startsWith('ssh://') ? keyId : '' })
+				},
+				{ sshCreate: url.startsWith('ssh://') }
+			);
 			projects = [...projects, created];
+			keyAssignments[created.id] = created.keyId ?? '';
 			refs[created.id] = await request(`/api/projects/${created.id}/refs`);
 			selected = created.id;
 			name = '';
 			url = '';
+			keyId = '';
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not add repository.';
+			if (url.startsWith('ssh://')) await loadSshHosts();
 		} finally {
 			busy = false;
 		}
@@ -127,7 +218,11 @@
 		if (busy) return;
 		busy = true;
 		try {
-			await request(`/api/projects/${project.id}/refresh`, { method: 'POST', body: '{}' });
+			await request(
+				`/api/projects/${project.id}/refresh`,
+				{ method: 'POST', body: '{}' },
+				{ sshRefresh: project.url.startsWith('ssh://') }
+			);
 			const refreshedRefs: Ref[] = await request(`/api/projects/${project.id}/refs`);
 			const refreshedProjects: Project[] = await request('/api/projects');
 			refs[project.id] = refreshedRefs;
@@ -144,6 +239,7 @@
 						}
 					: item
 			);
+			if (project.url.startsWith('ssh://')) await loadSshHosts();
 		} finally {
 			busy = false;
 		}
@@ -151,6 +247,7 @@
 	onMount(() => {
 		void loadProjects();
 		void loadRepositoryKeys();
+		void loadSshHosts();
 	});
 </script>
 
@@ -158,7 +255,7 @@
 <main class="mx-auto w-[min(100%-2rem,64rem)] py-10">
 	<h1 class="m-0 text-3xl font-semibold tracking-[-0.03em] text-[#243528]">Projects</h1>
 	<p class="mt-2 text-[#58645b]">
-		You’re signed in. Connect a public repository to browse its branches and tags.
+		You’re signed in. Connect HTTPS or SSH repositories to browse branches and tags.
 	</p>
 	{#if error}<p
 			role="alert"
@@ -178,14 +275,28 @@
 				/></label
 			>
 			<label class="grid gap-1 text-sm font-medium text-[#354238]"
-				>HTTPS repository URL<input
+				>Repository URL<input
 					class="min-h-11 rounded-lg border border-[#aeb9ae] px-3"
 					bind:value={url}
-					type="url"
-					placeholder="https://example.com/owner/site.git"
+					placeholder="https://example.com/owner/site.git or ssh://user@example.com:22/owner/site.git"
 					required
 				/></label
 			>
+			{#if url.startsWith('ssh://')}
+				<label class="grid gap-1 text-sm font-medium text-[#354238]"
+					>SSH key
+					<select
+						class="min-h-11 rounded-lg border border-[#aeb9ae] px-3"
+						bind:value={keyId}
+						required
+					>
+						<option value="">Choose a key</option>
+						{#each repositoryKeys as key (key.id)}<option value={key.id}
+								>{key.name} · {key.fingerprint}</option
+							>{/each}
+					</select>
+				</label>
+			{/if}
 			<button
 				class="min-h-11 w-fit rounded-lg bg-[#214c30] px-5 font-semibold text-white disabled:opacity-60"
 				disabled={busy}>Add repository</button
@@ -272,8 +383,32 @@
 						<p class="mt-2 text-xs text-[#58645b]">
 							Added {new Date(key.createdAt).toLocaleString()}
 						</p>
+						<button
+							class="mt-3 rounded-lg border border-[#aeb9ae] px-3 py-2 text-sm"
+							onclick={() => deleteKey(key)}>Remove key</button
+						>
 					</li>{/each}
 			</ul>{/if}
+	</section>
+	<section class="mt-8 rounded-xl border border-[#e1e6df] bg-white p-5">
+		<h2 class="m-0 text-xl font-semibold text-[#243528]">SSH host keys</h2>
+		{#if hostError}<p role="alert" class="mt-3 text-red-800">{hostError}</p>{/if}
+		{#if sshHosts.filter((host) => host.warning).length === 0}
+			<p class="mt-2 text-sm text-[#58645b]">No SSH host warnings.</p>
+		{:else}
+			{#each sshHosts.filter((host) => host.warning) as host (`${host.host}:${host.port}`)}
+				<div class="mt-4 rounded-lg border border-amber-300 bg-amber-50 p-4">
+					<p class="font-semibold">{host.host}:{host.port}</p>
+					<p class="mt-1 text-sm">{host.warning}</p>
+					<p class="mt-1 font-mono text-xs break-all">{host.fingerprint}</p>
+					<p class="mt-2 text-sm">Verify this fingerprint independently before approving it.</p>
+					<button
+						class="mt-3 rounded-lg border border-[#aeb9ae] px-3 py-2 text-sm"
+						onclick={() => approveHost(host)}>Approve verified host key</button
+					>
+				</div>
+			{/each}
+		{/if}
 	</section>
 	<section class="mt-8 grid gap-6 md:grid-cols-[16rem_1fr]">
 		<div>
@@ -316,6 +451,24 @@
 					>
 						{project.warning} Your current branches and tags are still shown.
 					</p>{/if}
+				{#if project?.url.startsWith('ssh://')}
+					<label class="mt-4 grid gap-1 text-sm font-medium text-[#354238]"
+						>SSH key
+						<select
+							class="min-h-11 rounded-lg border border-[#aeb9ae] px-3"
+							bind:value={keyAssignments[project.id]}
+						>
+							<option value="">Choose a key</option>
+							{#each repositoryKeys as key (key.id)}<option value={key.id}>{key.name}</option
+								>{/each}
+						</select>
+					</label>
+					<button
+						class="mt-2 rounded-lg border border-[#aeb9ae] px-4 py-2 text-sm"
+						onclick={() => assignKey(project)}
+						disabled={!keyAssignments[project.id]}>Change SSH key</button
+					>
+				{/if}
 				<label class="mt-4 grid gap-1 text-sm font-medium text-[#354238]"
 					>Search branches and tags<input
 						class="min-h-11 rounded-lg border border-[#aeb9ae] px-3"

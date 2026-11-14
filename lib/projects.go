@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/transport"
 	gitclient "github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 )
@@ -68,6 +70,7 @@ type project struct {
 	URL         string     `json:"url"`
 	LastFetched *time.Time `json:"lastFetched"`
 	Warning     string     `json:"warning,omitempty"`
+	KeyID       string     `json:"keyId,omitempty"`
 }
 
 type projectRef struct {
@@ -96,6 +99,8 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheB
 		`CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,remote_url TEXT NOT NULL,created_at INTEGER NOT NULL,last_fetched INTEGER,warning TEXT NOT NULL DEFAULT '')`,
 		`CREATE TABLE IF NOT EXISTS project_refs(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,kind TEXT NOT NULL,name TEXT NOT NULL,commit_id TEXT NOT NULL,PRIMARY KEY(project_id,kind,name))`,
 		`CREATE TABLE IF NOT EXISTS project_refresh_journal(project_id TEXT PRIMARY KEY)`,
+		`CREATE TABLE IF NOT EXISTS project_ssh_keys(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,key_id TEXT NOT NULL REFERENCES repository_keys(id) ON DELETE RESTRICT)`,
+		`CREATE TABLE IF NOT EXISTS ssh_host_trust(host TEXT NOT NULL,port INTEGER NOT NULL,trusted_key BLOB,observed_key BLOB,observed_fingerprint TEXT NOT NULL DEFAULT '',warning TEXT NOT NULL DEFAULT '',PRIMARY KEY(host,port))`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			return nil, err
@@ -119,6 +124,43 @@ func safeRemote(raw string) (*url.URL, error) {
 		}
 	}
 	return u, nil
+}
+
+func safeSSHRemote(raw string) (*url.URL, string, int, string, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme != "ssh" || u.Hostname() == "" || u.Fragment != "" || u.RawQuery != "" || u.Opaque != "" {
+		return nil, "", 0, "", errors.New("use an SSH repository URL with a host and path, without query or fragment")
+	}
+	if u.User != nil {
+		if _, hasPassword := u.User.Password(); hasPassword {
+			return nil, "", 0, "", errors.New("SSH repository URLs cannot contain passwords")
+		}
+	}
+	host, hostErr := normalizeSSHHostname(u.Hostname())
+	if hostErr != nil {
+		return nil, "", 0, "", errors.New("SSH repository URL has an invalid host")
+	}
+	port := 22
+	if u.Port() != "" {
+		port, err = strconv.Atoi(u.Port())
+		if err != nil || port < 1 || port > 65535 {
+			return nil, "", 0, "", errors.New("SSH repository URL has an invalid port")
+		}
+	}
+	path := strings.TrimPrefix(u.EscapedPath(), "/")
+	decoded, decodeErr := url.PathUnescape(path)
+	if decodeErr != nil || decoded == "" || strings.ContainsAny(decoded, "\r\n\x00") || strings.Contains(decoded, "..") || strings.HasPrefix(decoded, "-") {
+		return nil, "", 0, "", errors.New("SSH repository URL has an invalid repository path")
+	}
+	user := "git"
+	if u.User != nil {
+		user = u.User.Username()
+	}
+	if user == "" || strings.ContainsAny(user, "\r\n\x00 /\\") {
+		return nil, "", 0, "", errors.New("SSH repository URL has an invalid username")
+	}
+	canonical := (&url.URL{Scheme: "ssh", User: url.User(user), Host: net.JoinHostPort(host, strconv.Itoa(port)), Path: "/" + decoded}).String()
+	return u, host, port, canonical, nil
 }
 
 func (p *projectManager) repoPath(id string) string { return filepath.Join(p.root, id) }
@@ -147,7 +189,7 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT id,name,remote_url,last_fetched,warning FROM projects ORDER BY created_at,id`)
+	rows, err := a.db.Query(`SELECT p.id,p.name,p.remote_url,p.last_fetched,p.warning,COALESCE(k.key_id,'') FROM projects p LEFT JOIN project_ssh_keys k ON p.id=k.project_id ORDER BY p.created_at,p.id`)
 	if err != nil {
 		http.Error(w, "projects are temporarily unavailable", 500)
 		return
@@ -157,7 +199,7 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var x project
 		var fetched sql.NullInt64
-		if err := rows.Scan(&x.ID, &x.Name, &x.URL, &fetched, &x.Warning); err != nil {
+		if err := rows.Scan(&x.ID, &x.Name, &x.URL, &fetched, &x.Warning, &x.KeyID); err != nil {
 			http.Error(w, "projects are temporarily unavailable", 500)
 			return
 		}
@@ -183,19 +225,40 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8192)
 	var input struct {
-		Name string `json:"name"`
-		URL  string `json:"url"`
+		Name  string `json:"name"`
+		URL   string `json:"url"`
+		KeyID string `json:"keyId"`
 	}
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if dec.Decode(&input) != nil || strings.TrimSpace(input.Name) == "" || len(input.Name) > 100 {
-		http.Error(w, "enter a project name and HTTPS repository URL", 400)
+		http.Error(w, "enter a project name and repository URL", 400)
 		return
 	}
-	u, err := safeRemote(input.URL)
-	if err != nil {
-		http.Error(w, err.Error(), 400)
-		return
+	remote, sshHost, sshPort, keyID := "", "", 0, input.KeyID
+	var sshURL *url.URL
+	if strings.HasPrefix(strings.TrimSpace(input.URL), "ssh://") {
+		var err error
+		sshURL, sshHost, sshPort, remote, err = safeSSHRemote(input.URL)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		if keyID == "" {
+			http.Error(w, "select a repository key for this SSH project", 400)
+			return
+		}
+	} else {
+		if keyID != "" {
+			http.Error(w, "repository keys are only used with SSH repositories", 400)
+			return
+		}
+		u, err := safeRemote(input.URL)
+		if err != nil {
+			http.Error(w, err.Error(), 400)
+			return
+		}
+		remote = u.String()
 	}
 	p := a.projects
 	p.mu.Lock()
@@ -204,8 +267,15 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	if keyID != "" {
+		var exists int
+		if err := p.db.QueryRow(`SELECT 1 FROM repository_keys WHERE id=?`, keyID).Scan(&exists); err != nil {
+			http.Error(w, "select an available repository key", 400)
+			return
+		}
+	}
 	idBytes := make([]byte, 16)
-	if _, err = rand.Read(idBytes); err != nil {
+	if _, err := rand.Read(idBytes); err != nil {
 		http.Error(w, "project creation is temporarily unavailable", 500)
 		return
 	}
@@ -213,7 +283,6 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
 	defer cancel()
 	ctx = withGitHTTPPolicy(ctx, p)
-	remote := u.String()
 	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size >= p.maxCacheBytes {
 		http.Error(w, "project caches have no remaining space under the configured storage limit", http.StatusRequestEntityTooLarge)
 		return
@@ -228,13 +297,34 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 			buffered.replace(http.StatusServiceUnavailable, cleanupErr.Error())
 		}
 	}()
-	_, err = git.CloneContext(ctx, boundedStorage(stage, p.maxCacheBytes), nil, &git.CloneOptions{URL: remote, NoCheckout: true, Tags: git.AllTags})
+	var auth transport.AuthMethod
+	if sshURL != nil {
+		user := "git"
+		if sshURL.User != nil {
+			user = sshURL.User.Username()
+		}
+		var authErr error
+		auth, authErr = a.projectSSHAuth(keyID, sshHost, sshPort, user)
+		if authErr != nil {
+			http.Error(w, "managed repository key is unavailable", http.StatusBadRequest)
+			return
+		}
+	}
+	_, err = git.CloneContext(ctx, boundedStorage(stage, p.maxCacheBytes), nil, &git.CloneOptions{URL: remote, NoCheckout: true, Tags: git.AllTags, Auth: auth})
 	if err != nil {
 		if errors.Is(err, errGitCacheLimit) {
 			http.Error(w, "repository object storage exceeded the configured cache limit", http.StatusRequestEntityTooLarge)
 			return
 		}
-		http.Error(w, sanitizeGitError(err, remote), 400)
+		message := sanitizeGitError(err, remote)
+		status := http.StatusBadRequest
+		if strings.Contains(strings.ToLower(err.Error()), "ssh host key is not approved") {
+			status = http.StatusConflict
+		}
+		if strings.Contains(strings.ToLower(err.Error()), "unable to authenticate") || strings.Contains(strings.ToLower(err.Error()), "authentication failed") {
+			status = http.StatusBadGateway
+		}
+		http.Error(w, message, status)
 		return
 	}
 	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes {
@@ -247,7 +337,19 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	}
 	stage = ""
 	now := time.Now().UTC()
-	_, err = p.db.Exec(`INSERT INTO projects(id,name,remote_url,created_at,last_fetched,warning) VALUES(?,?,?,?,?,'')`, id, strings.TrimSpace(input.Name), remote, now.UnixNano(), now.UnixNano())
+	tx, txErr := p.db.Begin()
+	if txErr == nil {
+		_, txErr = tx.Exec(`INSERT INTO projects(id,name,remote_url,created_at,last_fetched,warning) VALUES(?,?,?,?,?,'')`, id, strings.TrimSpace(input.Name), remote, now.UnixNano(), now.UnixNano())
+		if txErr == nil && keyID != "" {
+			_, txErr = tx.Exec(`INSERT INTO project_ssh_keys(project_id,key_id) VALUES(?,?)`, id, keyID)
+		}
+		if txErr == nil {
+			txErr = tx.Commit()
+		} else {
+			_ = tx.Rollback()
+		}
+	}
+	err = txErr
 	if err != nil {
 		_ = os.RemoveAll(p.repoPath(id))
 		http.Error(w, "could not save project", 500)
@@ -263,7 +365,7 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	writeJSONStatus(w, http.StatusCreated, project{ID: id, Name: strings.TrimSpace(input.Name), URL: remote, LastFetched: &now})
+	writeJSONStatus(w, http.StatusCreated, project{ID: id, Name: strings.TrimSpace(input.Name), URL: remote, LastFetched: &now, KeyID: keyID})
 }
 
 func (a *App) projectRefs(w http.ResponseWriter, r *http.Request) {
@@ -318,6 +420,25 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	var keyID, sshUser string
+	var sshAuth transport.AuthMethod
+	if strings.HasPrefix(remote, "ssh://") {
+		parsed, host, port, _, parseErr := safeSSHRemote(remote)
+		if parseErr != nil || p.db.QueryRow(`SELECT key_id FROM project_ssh_keys WHERE project_id=?`, id).Scan(&keyID) != nil {
+			http.Error(w, "SSH repository key is unavailable", 400)
+			return
+		}
+		sshUser = "git"
+		if parsed.User != nil {
+			sshUser = parsed.User.Username()
+		}
+		var authErr error
+		sshAuth, authErr = a.projectSSHAuth(keyID, host, port, sshUser)
+		if authErr != nil {
+			http.Error(w, "managed repository key is unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	if err := p.checkPersistentCacheBudget(); err != nil {
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
 		return
@@ -343,7 +464,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	repo, err := git.Open(boundedStorage(stage, p.maxCacheBytes), nil)
 	if err == nil {
-		err = repo.FetchContext(ctx, &git.FetchOptions{RemoteName: "origin", Tags: git.AllTags, Force: true, Prune: true})
+		err = repo.FetchContext(ctx, &git.FetchOptions{RemoteName: "origin", Tags: git.AllTags, Force: true, Prune: true, Auth: sshAuth})
 	}
 	if err == git.NoErrAlreadyUpToDate {
 		err = nil
@@ -425,6 +546,52 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, cleanupWarning, id)
 	}
 	writeJSON(w, map[string]any{"lastFetched": now, "warning": cleanupWarning})
+}
+
+func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
+	if !a.projectAuthorized(w, r, true) {
+		return
+	}
+	var input struct {
+		KeyID string `json:"keyId"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&input); err != nil || input.KeyID == "" {
+		http.Error(w, "select a repository key", 400)
+		return
+	}
+	p := a.projects
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	id := r.PathValue("id")
+	var remote string
+	if p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote) != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !strings.HasPrefix(remote, "ssh://") {
+		http.Error(w, "repository keys can only be assigned to SSH projects", 400)
+		return
+	}
+	tx, err := p.db.Begin()
+	if err != nil {
+		http.Error(w, "project key assignment is temporarily unavailable", 500)
+		return
+	}
+	defer tx.Rollback()
+	var found int
+	if tx.QueryRow(`SELECT 1 FROM repository_keys WHERE id=?`, input.KeyID).Scan(&found) != nil {
+		http.Error(w, "repository key was not found", 404)
+		return
+	}
+	if _, err = tx.Exec(`INSERT INTO project_ssh_keys(project_id,key_id) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET key_id=excluded.key_id`, id, input.KeyID); err != nil {
+		http.Error(w, "project key assignment is temporarily unavailable", 500)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		http.Error(w, "project key assignment is temporarily unavailable", 500)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func saveProjectRefs(db *sql.DB, id, dir string, maxRefs int) error {
@@ -597,6 +764,15 @@ func verifyCompleteCommit(repo *git.Repository, commit *object.Commit, checked m
 func sanitizeGitError(err error, remote string) string {
 	s := strings.ReplaceAll(err.Error(), remote, "repository URL")
 	lower := strings.ToLower(s)
+	if strings.HasPrefix(remote, "ssh://") {
+		if strings.Contains(lower, "ssh host key is not approved") || strings.Contains(lower, "host key could not be verified") {
+			return "SSH host key is not approved; independently verify the observed fingerprint in SSH host warnings before approval"
+		}
+		if strings.Contains(lower, "authentication") || strings.Contains(lower, "authenticate") {
+			return "SSH authentication failed; verify the selected repository key is authorized by the repository host"
+		}
+		return "SSH repository fetch failed; check the repository URL and SSH service availability"
+	}
 	if errors.Is(err, errGitUnsupportedSmartHTTP) {
 		return "server does not provide a supported smart HTTPS Git repository"
 	}

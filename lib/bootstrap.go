@@ -471,8 +471,12 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/projects", a.createProject)
 	m.HandleFunc("GET /api/projects/{id}/refs", a.projectRefs)
 	m.HandleFunc("POST /api/projects/{id}/refresh", a.refreshProject)
+	m.HandleFunc("POST /api/projects/{id}/key", a.assignProjectKey)
 	m.HandleFunc("GET /api/repository-keys", a.listRepositoryKeys)
 	m.HandleFunc("POST /api/repository-keys", a.addRepositoryKey)
+	m.HandleFunc("POST /api/repository-keys/{id}/delete", a.deleteRepositoryKey)
+	m.HandleFunc("GET /api/ssh-hosts", a.listSSHHostWarnings)
+	m.HandleFunc("POST /api/ssh-hosts/approve", a.approveSSHHost)
 	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if a.cfg.CanonicalOrigin != "" {
 			origin, _ := url.Parse(a.cfg.CanonicalOrigin)
