@@ -234,6 +234,11 @@ try {
     await history.getByRole("button", { name: "Confirm temporary rollback", exact: true }).click();
     const accepted = await rollbackResponse;
     if (accepted.status() !== 202 || accepted.request().postDataJSON().commit !== commit) throw new Error("rollback did not use the full selected commit ID");
+    const rollbackJob = await accepted.json();
+    await waitFor(async () => {
+      const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+      return jobs.find(job => job.id === rollbackJob.jobId)?.status === "succeeded";
+    }, "recorded rollback completion");
     await waitFor(async () => (await readFile(join(publishedPath, "index.html"), "utf8")) === `<!doctype html><title>${title}</title>\n`, "dashboard rollback publication");
     if (title === "feature search" && (await readFile(join(publishedPath, "asset.dat"), "utf8")) !== "fixture hydrated LFS asset\n") throw new Error("rollback did not recreate LFS content");
     const state = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
