@@ -122,14 +122,12 @@ try {
   const created = await createResponse;
   if (created.status() !== 201) throw new Error(`project creation returned ${created.status()}: ${await created.text()}\n${appOutput}`);
   await page.getByRole("heading", { name: "Branches and tags" }).waitFor({ timeout: 30000 });
-  await page.getByText("main", { exact: true }).waitFor();
-  await page.getByText("feature/search", { exact: true }).waitFor();
+  await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   await page.getByText("v1.0", { exact: true }).waitFor();
 
   const id = await page.evaluate(async () => (await (await fetch("/api/projects")).json())[0].id);
-  const selectedCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
   await page.getByLabel("Deployment name").fill("Production site");
-  await page.getByLabel("Commit").selectOption(selectedCommit);
+  await page.locator("form").locator("select").selectOption("feature/search");
   const deploymentResponse = page.waitForResponse(response => response.url().endsWith("/api/deployments") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Create deployment" }).click();
   const deploymentCreated = await deploymentResponse;
@@ -148,32 +146,32 @@ try {
   const publishedPath = join(dir, "state.sqlite.publications", deploymentID);
   const firstDirectoryIdentity = (await stat(publishedPath)).ino;
   const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
-  await page.getByLabel("Target commit").selectOption(mainCommit);
+  await page.getByLabel("Branch for Production site").selectOption("main");
   const targetUpdate = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/target`));
-  await page.getByRole("button", { name: "Change commit" }).click();
-  if ((await targetUpdate).status() !== 202) throw new Error("changing the deployment commit did not queue publication");
+  await page.getByRole("button", { name: "Change branch" }).click();
+  if ((await targetUpdate).status() !== 202) throw new Error("changing the deployment branch did not queue publication");
   await waitFor(async () => {
     try { return (await readFile(join(publishedPath, "index.html"), "utf8")) === "<!doctype html><title>main</title>\n"; } catch { return false; }
   }, "replacement publication files");
   if ((await stat(publishedPath)).ino === firstDirectoryIdentity) throw new Error("replacement did not switch the live directory");
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
-  await page.getByText(/Latest publication: noop/).waitFor({ timeout: 10000 });
+  await page.getByText(/Latest deployment: noop/).waitFor({ timeout: 10000 });
 
   const initialTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
   const search = page.getByLabel("Search branches and tags");
   await search.fill("feature/search");
-  await page.getByText("feature/search", { exact: true }).waitFor();
+  await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   if (await page.getByText("v1.0", { exact: true }).count()) throw new Error("branch search left a non-matching tag visible");
   await search.fill("v1.0");
   await page.getByText("v1.0", { exact: true }).waitFor();
-  if (await page.getByText("feature/search", { exact: true }).count()) throw new Error("tag search left a non-matching branch visible");
+  if (await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).count()) throw new Error("tag search left a non-matching branch visible");
   await search.fill("");
 
   const refreshResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
-  await page.getByRole("button", { name: "Refresh" }).click();
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
   const refreshed = await refreshResponse;
   if (refreshed.status() !== 200) throw new Error(`successful refresh returned ${refreshed.status()}`);
-  await page.getByText("feature/search", { exact: true }).waitFor();
+  await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   const refreshedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
   if (!refreshedTimestamp || refreshedTimestamp === initialTimestamp) throw new Error("successful refresh did not update the last-fetch timestamp");
 
@@ -186,13 +184,13 @@ try {
   });
   const failedReload = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "GET" && response.status() === 500);
   const refreshWithFailedListReload = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
-  await page.getByRole("button", { name: "Refresh" }).click();
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
   const refreshedBeforeReloadFailure = await refreshWithFailedListReload;
   if (refreshedBeforeReloadFailure.status() !== 200) throw new Error(`refresh before failed list reload returned ${refreshedBeforeReloadFailure.status()}`);
   await failedReload;
   await page.getByText(/Your current branches and tags are still shown/).waitFor();
   await page.getByText("Fixture site", { exact: true }).waitFor();
-  await page.getByText("feature/search", { exact: true }).waitFor();
+  await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   if ((await page.locator("body").innerText()).includes("SENSITIVE INTERNAL RESPONSE DETAIL")) throw new Error("dashboard exposed an HTTP response body");
   await page.unroute("**/api/projects");
   const timestampAfterReloadFailure = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
@@ -202,7 +200,7 @@ try {
   if (failFixture !== 204) throw new Error(`fixture fail control returned ${failFixture}`);
   const cachedRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), id);
   const failedRefreshResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
-  await page.getByRole("button", { name: "Refresh" }).click();
+  await page.getByRole("button", { name: "Refresh", exact: true }).click();
   const failedRefresh = await failedRefreshResponse;
   if (failedRefresh.status() !== 502) throw new Error(`failed refresh returned ${failedRefresh.status()}`);
   await page.getByText(/Your current branches and tags are still shown/).waitFor();

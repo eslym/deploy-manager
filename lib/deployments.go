@@ -32,6 +32,8 @@ type deployment struct {
 	ProjectID   string    `json:"projectId"`
 	Name        string    `json:"name"`
 	Commit      string    `json:"commit"`
+	TargetKind  string    `json:"targetKind"`
+	TargetName  string    `json:"targetName,omitempty"`
 	LiveCommit  string    `json:"liveCommit,omitempty"`
 	LiveDev     uint64    `json:"-"`
 	LiveIno     uint64    `json:"-"`
@@ -119,6 +121,11 @@ func (a *App) initDeployments() error {
 		`CREATE TABLE IF NOT EXISTS publication_cleanup(deployment_id TEXT NOT NULL,job_id TEXT NOT NULL,path_name TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,not_before INTEGER NOT NULL,last_error TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(deployment_id,job_id))`,
 	} {
 		if _, err := a.db.Exec(q); err != nil {
+			return err
+		}
+	}
+	for _, column := range []struct{ name, definition string }{{"target_kind", `TEXT NOT NULL DEFAULT 'commit'`}, {"target_name", `TEXT NOT NULL DEFAULT ''`}} {
+		if err := ensureColumn(a.db, "deployments", column.name, column.definition); err != nil {
 			return err
 		}
 	}
@@ -509,7 +516,7 @@ func (a *App) runDeploymentJob(jobID string) {
 	var generation int64
 	var projectID string
 	var createdAt, updatedAt int64
-	err := a.db.QueryRow(`SELECT d.id,d.project_id,d.name,d.commit_id,d.generation,d.live_commit,d.live_dev,d.live_ino,d.status,d.error,d.created_at,d.updated_at FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=? AND j.status='queued' AND j.generation=d.generation`, jobID).Scan(&d.ID, &projectID, &d.Name, &d.Commit, &generation, &d.LiveCommit, &d.LiveDev, &d.LiveIno, &d.Status, &d.Error, &createdAt, &updatedAt)
+	err := a.db.QueryRow(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.generation,d.live_commit,d.live_dev,d.live_ino,d.status,d.error,d.created_at,d.updated_at FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=? AND j.status='queued' AND j.generation=d.generation`, jobID).Scan(&d.ID, &projectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &generation, &d.LiveCommit, &d.LiveDev, &d.LiveIno, &d.Status, &d.Error, &createdAt, &updatedAt)
 	if err != nil {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log='deployment was removed or its target changed',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 		return
@@ -526,7 +533,21 @@ func (a *App) runDeploymentJob(jobID string) {
 	defer unlock()
 	var liveTarget string
 	var currentGeneration int64
-	if checkErr := a.db.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration); checkErr != nil || liveTarget != d.Commit || currentGeneration != generation {
+	if d.TargetKind == "branch" {
+		if err := a.fetchProjectForBranch(ctx, d.ProjectID); err != nil {
+			a.failJob(jobID, d.ID, generation, "Could not fetch the configured branch; the current publication was kept")
+			return
+		}
+		if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name=?`, d.ProjectID, d.TargetName).Scan(&d.Commit); err != nil {
+			a.failJob(jobID, d.ID, generation, "The configured branch is missing from the cached repository; the current publication was kept")
+			return
+		}
+		if _, err := a.db.Exec(`UPDATE deployment_jobs SET commit_id=?,updated_at=? WHERE id=? AND status='queued'`, d.Commit, a.cfg.Now().UnixNano(), jobID); err != nil {
+			a.failJob(jobID, d.ID, generation, "The resolved branch commit could not be recorded; the current publication was kept")
+			return
+		}
+	}
+	if checkErr := a.db.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration); checkErr != nil || currentGeneration != generation || (d.TargetKind != "branch" && liveTarget != d.Commit) {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
@@ -558,6 +579,9 @@ func (a *App) runDeploymentJob(jobID string) {
 	err = a.publish(ctx, jobID, d, generation)
 	if err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "target changed") {
+			if cleanupErr := a.cleanupUnpublishedStage(d.ID, jobID); cleanupErr != nil {
+				log.Printf("cannot clean superseded publication stage for deployment %s: %v", d.ID, cleanupErr)
+			}
 			_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
 			return
 		}
@@ -726,7 +750,7 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if err = tx.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, d.ID).Scan(&currentCommit, &currentGeneration); err != nil {
 		return errors.New("deployment was deleted before publication")
 	}
-	if currentCommit != d.Commit || currentGeneration != generation {
+	if currentGeneration != generation || (d.TargetKind != "branch" && currentCommit != d.Commit) {
 		return errors.New("publication target changed; job superseded")
 	}
 	if err = fault("before-intent"); err != nil {
@@ -740,6 +764,21 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	}
 	if err = fault("after-intent"); err != nil {
 		return err
+	}
+	// Hold a SQLite write transaction from the final generation check through
+	// the namespace switch and durable state update. Target edits may supersede
+	// work during preparation, but cannot slip between this check and exchange.
+	boundaryTx, err := a.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer boundaryTx.Rollback()
+	guard, err := boundaryTx.Exec(`UPDATE deployments SET updated_at=updated_at WHERE id=? AND generation=?`, d.ID, generation)
+	if err != nil {
+		return err
+	}
+	if changed, _ := guard.RowsAffected(); changed != 1 {
+		return errors.New("publication target changed; job superseded")
 	}
 	if hadOld {
 		err = unix.Renameat2(unix.AT_FDCWD, stage, unix.AT_FDCWD, live, unix.RENAME_EXCHANGE)
@@ -771,14 +810,10 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if err = fault("before-state"); err != nil {
 		return err
 	}
-	tx, err = a.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
+	tx = boundaryTx
 	var latest string
 	var latestGen int64
-	if err = tx.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, d.ID).Scan(&latest, &latestGen); err != nil || latest != d.Commit || latestGen != generation {
+	if err = tx.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=?`, d.ID).Scan(&latest, &latestGen); err != nil || latestGen != generation || (d.TargetKind != "branch" && latest != d.Commit) {
 		return errors.New("target changed after directory switch; publication requires reconciliation")
 	}
 	if _, err = tx.Exec(`UPDATE deployments SET live_commit=?,live_dev=?,live_ino=?,status='live',error='',updated_at=? WHERE id=? AND generation=?`, d.Commit, newID.Dev, newID.Ino, a.cfg.Now().UnixNano(), d.ID, generation); err != nil {
@@ -1069,7 +1104,7 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),''),d.created_at,d.updated_at FROM deployments d ORDER BY d.created_at,d.id`)
+	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),''),d.created_at,d.updated_at FROM deployments d ORDER BY d.created_at,d.id`)
 	if err != nil {
 		http.Error(w, "deployments are temporarily unavailable", 500)
 		return
@@ -1079,7 +1114,7 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var d deployment
 		var c, u int64
-		if err = rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.Commit, &d.LiveCommit, &d.Status, &d.Error, &c, &u); err != nil {
+		if err = rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &d.LiveCommit, &d.Status, &d.Error, &c, &u); err != nil {
 			http.Error(w, "deployments are temporarily unavailable", 500)
 			return
 		}
@@ -1100,11 +1135,37 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 8192)
-	var in struct{ ProjectID, Name, Commit string }
+	var in struct {
+		ProjectID  string `json:"projectId"`
+		Name       string `json:"name"`
+		Commit     string `json:"commit"`
+		TargetKind string `json:"targetKind"`
+		TargetName string `json:"targetName"`
+	}
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
-	if dec.Decode(&in) != nil || !validProjectID(in.ProjectID) || strings.TrimSpace(in.Name) == "" || len(in.Name) > 100 || !validCommitTarget(in.Commit) {
-		http.Error(w, "enter a deployment name, project, and full 40-character commit ID", 400)
+	if dec.Decode(&in) != nil || !validProjectID(in.ProjectID) || strings.TrimSpace(in.Name) == "" || len(in.Name) > 100 {
+		http.Error(w, "enter a deployment name and project", 400)
+		return
+	}
+	if in.TargetKind == "" {
+		in.TargetKind = "commit"
+	}
+	if in.TargetKind != "branch" && in.TargetKind != "commit" {
+		http.Error(w, "choose a branch or commit target", 400)
+		return
+	}
+	if in.TargetKind == "branch" {
+		if in.TargetName == "" || len(in.TargetName) > 255 {
+			http.Error(w, "choose a cached branch", 400)
+			return
+		}
+		if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name=?`, in.ProjectID, in.TargetName).Scan(&in.Commit); err != nil {
+			http.Error(w, "the selected branch is not in the cached branch list", 400)
+			return
+		}
+	} else if !validCommitTarget(in.Commit) {
+		http.Error(w, "enter a full 40-character commit ID", 400)
 		return
 	}
 	pm := a.projects
@@ -1151,7 +1212,7 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,created_at,updated_at) VALUES(?,?,?,?,?,?)`, id, in.ProjectID, strings.TrimSpace(in.Name), in.Commit, now.UnixNano(), now.UnixNano()); err != nil {
+	if _, err = tx.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,target_kind,target_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, id, in.ProjectID, strings.TrimSpace(in.Name), in.Commit, in.TargetKind, in.TargetName, now.UnixNano(), now.UnixNano()); err != nil {
 		http.Error(w, "a deployment with this name already exists or could not be saved", 409)
 		return
 	}
@@ -1223,12 +1284,14 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var input struct {
-		Commit string `json:"commit"`
+		Commit     string `json:"commit"`
+		TargetKind string `json:"targetKind"`
+		TargetName string `json:"targetName"`
 	}
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&input) != nil || !validCommitTarget(input.Commit) {
-		http.Error(w, "choose a full 40-character commit ID", http.StatusBadRequest)
+	if decoder.Decode(&input) != nil {
+		http.Error(w, "choose a branch or full commit ID", http.StatusBadRequest)
 		return
 	}
 	id := r.PathValue("id")
@@ -1237,10 +1300,18 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	lockValue, _ := a.deployLocks.LoadOrStore(id, &sync.Mutex{})
-	deploymentLock := lockValue.(*sync.Mutex)
-	deploymentLock.Lock()
-	defer deploymentLock.Unlock()
+	if input.TargetKind == "" {
+		input.TargetKind = "commit"
+	}
+	if input.TargetKind == "branch" {
+		if input.TargetName == "" || len(input.TargetName) > 255 || a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name=?`, projectID, input.TargetName).Scan(&input.Commit) != nil {
+			http.Error(w, "choose a branch from the cached branch list", http.StatusBadRequest)
+			return
+		}
+	} else if input.TargetKind != "commit" || !validCommitTarget(input.Commit) {
+		http.Error(w, "choose a branch or full commit ID", http.StatusBadRequest)
+		return
+	}
 	if err := a.assertPublicationRoot(); err != nil {
 		http.Error(w, "publication is temporarily blocked pending recovery", http.StatusServiceUnavailable)
 		return
@@ -1285,15 +1356,16 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback()
 	var currentCommit string
 	var generation int64
-	if err = tx.QueryRow(`SELECT commit_id,generation FROM deployments WHERE id=? AND project_id=?`, id, projectID).Scan(&currentCommit, &generation); err != nil {
+	var currentKind, currentName string
+	if err = tx.QueryRow(`SELECT commit_id,target_kind,target_name,generation FROM deployments WHERE id=? AND project_id=?`, id, projectID).Scan(&currentCommit, &currentKind, &currentName, &generation); err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if currentCommit == input.Commit {
-		http.Error(w, "this deployment already targets that commit", http.StatusConflict)
+	if currentKind == input.TargetKind && currentName == input.TargetName && currentCommit == input.Commit {
+		http.Error(w, "this deployment already has that target", http.StatusConflict)
 		return
 	}
-	if _, err = tx.Exec(`UPDATE deployments SET commit_id=?,generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=?`, input.Commit, now, id, generation); err != nil {
+	if _, err = tx.Exec(`UPDATE deployments SET commit_id=?,target_kind=?,target_name=?,generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=?`, input.Commit, input.TargetKind, input.TargetName, now, id, generation); err != nil {
 		http.Error(w, "deployment target could not be saved", 500)
 		return
 	}

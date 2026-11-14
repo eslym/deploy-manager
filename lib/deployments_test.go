@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -250,7 +251,8 @@ func TestCommitTargetRequiresFullSHA1ObjectID(t *testing.T) {
 func TestPublicationCleanupResumesAfterRestartAfterManyFailures(t *testing.T) {
 	base := t.TempDir()
 	now := time.Now()
-	cfg := Config{DatabasePath: filepath.Join(base, "state.sqlite"), OPAQUEKeyPath: filepath.Join(base, "opaque.key"), Now: func() time.Time { return now }}
+	var nowMu sync.RWMutex
+	cfg := Config{DatabasePath: filepath.Join(base, "state.sqlite"), OPAQUEKeyPath: filepath.Join(base, "opaque.key"), Now: func() time.Time { nowMu.RLock(); defer nowMu.RUnlock(); return now }}
 	app, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -285,7 +287,9 @@ func TestPublicationCleanupResumesAfterRestartAfterManyFailures(t *testing.T) {
 		if err := app.cleanupPublications(false); err != nil {
 			t.Fatal(err)
 		}
+		nowMu.Lock()
 		now = now.Add(time.Hour)
+		nowMu.Unlock()
 	}
 	var attempts int
 	if err := app.db.QueryRow(`SELECT attempts FROM publication_cleanup WHERE deployment_id=? AND job_id=?`, id, job).Scan(&attempts); err != nil || attempts != 9 {
@@ -303,7 +307,9 @@ func TestPublicationCleanupResumesAfterRestartAfterManyFailures(t *testing.T) {
 	}
 	defer app.Close()
 	publicationFaultPoint = nil
+	nowMu.Lock()
 	now = now.Add(time.Hour)
+	nowMu.Unlock()
 	if err := app.cleanupPublications(true); err != nil {
 		t.Fatal(err)
 	}

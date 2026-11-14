@@ -490,7 +490,7 @@
 				</ul>
 			</div>
 			<div class="md:col-span-2">
-				<Deployments projectId={selected} refs={refs[selected] ?? []} />
+				<Deployments projectId={selected} />
 			</div>
 		{/if}
 	</section>

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -165,7 +166,8 @@ func TestProjectCacheLimitCanBeSmallerThanTransferLimit(t *testing.T) {
 func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Date(2026, 11, 13, 12, 0, 0, 0, time.UTC)
-	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), GrantTTL: time.Minute, InsecureLocalHTTP: true, Now: func() time.Time { return now }}
+	var nowMu sync.RWMutex
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), GrantTTL: time.Minute, InsecureLocalHTTP: true, Now: func() time.Time { nowMu.RLock(); defer nowMu.RUnlock(); return now }}
 	app, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +193,9 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	if plainLoginResponse.Code != http.StatusUpgradeRequired {
 		t.Fatalf("plain HTTP login page status = %d, want 426", plainLoginResponse.Code)
 	}
+	nowMu.Lock()
 	now = now.Add(2 * time.Minute)
+	nowMu.Unlock()
 	expired := httptest.NewRequest(http.MethodPost, "/opaque/register/start", strings.NewReader(`{"grant":"`+token+`","value":"AA"}`))
 	expired.RemoteAddr, expired.Host = "127.0.0.1:4321", "127.0.0.1:8080"
 	expired.Header.Set("Origin", "http://127.0.0.1:8080")
@@ -207,7 +211,9 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	if res.Code != http.StatusUpgradeRequired {
 		t.Fatalf("non-loopback HTTP status = %d, want 426", res.Code)
 	}
+	nowMu.Lock()
 	now = now.Add(-2 * time.Minute)
+	nowMu.Unlock()
 	proxyGrant, err := app.IssueRegistrationGrant()
 	if err != nil {
 		t.Fatal(err)

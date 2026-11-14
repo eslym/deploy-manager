@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,10 +17,11 @@ import (
 
 func TestRegistrationAndRecoveryRequireOriginBoundOneUseTransaction(t *testing.T) {
 	now := time.Now().UTC()
+	var nowMu sync.RWMutex
 	dir := t.TempDir()
 	app, err := New(Config{
 		DatabasePath: filepath.Join(dir, "state.sqlite"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"),
-		InsecureLocalHTTP: true, Now: func() time.Time { return now },
+		InsecureLocalHTTP: true, Now: func() time.Time { nowMu.RLock(); defer nowMu.RUnlock(); return now },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -41,7 +43,9 @@ func TestRegistrationAndRecoveryRequireOriginBoundOneUseTransaction(t *testing.T
 		t.Fatal(err)
 	}
 	expiredHandle, expiredRecord := newRegistrationFlow(t, app, expiredGrant, origin, "expired secret")
+	nowMu.Lock()
 	now = now.Add(6 * time.Minute)
+	nowMu.Unlock()
 	if got := finishTestRegistration(app, "", expiredHandle, expiredRecord, origin); got != http.StatusGone {
 		t.Fatalf("expired transaction finish status %d, want 410", got)
 	}
