@@ -656,6 +656,10 @@ func (a *App) runDeploymentJob(jobID string) {
 	d.Publication = a.deploymentPath(d.ID)
 	unregister := a.registerDeploymentJob(jobID, d.ID, generation, cancel)
 	defer unregister()
+	if err := fault("before-job-lock"); err != nil {
+		a.failJob(jobID, d.ID, generation, "publication locking was interrupted")
+		return
+	}
 	unlock, err := a.lockDeployment(d.ID)
 	if err != nil {
 		a.failJob(jobID, d.ID, generation, "publication locking is unavailable")
@@ -672,7 +676,9 @@ func (a *App) runDeploymentJob(jobID string) {
 	var liveTarget string
 	var currentGeneration int64
 	var currentStatus string
-	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
+	// Another job in this generation may have published while this worker was
+	// waiting for the deployment lock (notably a preceding rollback).
+	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status,live_commit,live_dev,live_ino FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus, &d.LiveCommit, &d.LiveDev, &d.LiveIno); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before work began',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}

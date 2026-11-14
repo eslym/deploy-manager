@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -247,6 +248,45 @@ func testRollbackGraphAndRaces(t *testing.T, client *http.Client, origin, cookie
 	}
 	// Put the common fixture back for the rest of its lifecycle scenarios.
 	// A Git-readable ancestor with unavailable LFS material cannot replace live.
+	// Later manual tip work accepted while rollback is still preparing must use
+	// the live state after taking the per-deployment lock, not its old snapshot.
+	setTip(merge)
+	job = queue("deploy", "")
+	waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
+	rollbackStaged := make(chan struct{})
+	releaseRollback := make(chan struct{})
+	laterReady := make(chan struct{})
+	var staging, ready sync.Once
+	var later atomic.Bool
+	previous = setPublicationFaultPoint(func(point string) error {
+		if point == "after-stage-fsync" {
+			staging.Do(func() { close(rollbackStaged); <-releaseRollback })
+		}
+		if point == "before-job-lock" && later.Load() {
+			ready.Do(func() { close(laterReady) })
+		}
+		return nil
+	})
+	rollbackJob := queue("rollback", side.String())
+	select {
+	case <-rollbackStaged:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback did not stage")
+	}
+	later.Store(true)
+	laterJob := queue("deploy", "")
+	select {
+	case <-laterReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("later Deploy did not reach deployment lock")
+	}
+	close(releaseRollback)
+	waitForDeploymentJob(t, client, origin, cookie, id, rollbackJob, "succeeded")
+	waitForDeploymentJob(t, client, origin, cookie, id, laterJob, "succeeded")
+	setPublicationFaultPoint(previous)
+	assertContent("race branch tip\n")
+	job = queue("rollback", side.String())
+	waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
 	storeBlob := func(contents string) plumbing.Hash {
 		encoded := repo.Storer.NewEncodedObject()
 		encoded.SetType(plumbing.BlobObject)
@@ -291,6 +331,18 @@ func testRollbackGraphAndRaces(t *testing.T, client *http.Client, origin, cookie
 	job = queue("deploy", "")
 	waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
 	assertContent("race branch tip\n")
+	// A valid publication may outlast a tiny HTTP polling window, especially
+	// with the race detector and concurrent Compose worktrees. Keep observing
+	// the actual job instead of treating five seconds as a publication limit.
+	var slow sync.Once
+	previous = setPublicationFaultPoint(func(point string) error {
+		if point == "after-stage-fsync" {
+			slow.Do(func() { time.Sleep(6 * time.Second) })
+		}
+		return nil
+	})
+	defer setPublicationFaultPoint(previous)
+	hardRedeployAndWait(t, client, origin, cookie, id, path, nil)
 }
 
 func testRejectedRollbackKeepsLive(t *testing.T, client *http.Client, origin, cookie, id, commit, path string) {

@@ -1143,6 +1143,16 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	// delivery identity. Observe publication and protected job listings only.
 	giteaSecret := setupProviderWebhook(t, branchServer, cookie, created.ID, "gitea")
 	giteaURL := branchServer.URL + "/webhooks/gitea/" + created.ID
+	rollbackBeforeGitea := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/rollback", `{"commit":"`+featureAtCreate+`"}`)
+	var rollbackBeforeGiteaJob struct{ JobID string }
+	if rollbackBeforeGitea.StatusCode != http.StatusAccepted || json.NewDecoder(rollbackBeforeGitea.Body).Decode(&rollbackBeforeGiteaJob) != nil {
+		t.Fatalf("rollback before Gitea webhook status %d", rollbackBeforeGitea.StatusCode)
+	}
+	rollbackBeforeGitea.Body.Close()
+	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, rollbackBeforeGiteaJob.JobID, "succeeded")
+	if content, err := os.ReadFile(filepath.Join(branchPath, "README.md")); err != nil || string(content) != "searchable feature\n" {
+		t.Fatalf("rollback before Gitea webhook content=%q err=%v", content, err)
+	}
 	giteaTip := commitFixtureFile(t, remoteDir, webhookWorktree, "feature", "Gitea latest tip").String()
 	if err := source.Storer.SetReference(plumbing.NewHashReference(featureBranch, plumbing.NewHash(giteaTip))); err != nil {
 		t.Fatal(err)
@@ -1265,7 +1275,10 @@ func waitForDeploymentWorkersIdle(t *testing.T, app *App) {
 
 func waitForDeploymentJob(t *testing.T, client *http.Client, origin, cookie, deploymentID, jobID, want string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// Fetch, export, hydration and fsync are asynchronous work, not an HTTP
+	// response-time assertion. Allow controlled slow publications to finish;
+	// fail immediately on an unexpected terminal outcome rather than retrying it.
+	deadline := time.Now().Add(30 * time.Second)
 	last := "not listed"
 	for time.Now().Before(deadline) {
 		req, _ := http.NewRequest(http.MethodGet, origin+"/api/deployments/"+deploymentID+"/jobs", nil)
@@ -1286,6 +1299,9 @@ func waitForDeploymentJob(t *testing.T, client *http.Client, origin, cookie, dep
 			}
 			if job.ID == jobID && job.Status == want {
 				return
+			}
+			if job.ID == jobID && (job.Status == "succeeded" || job.Status == "failed" || job.Status == "superseded" || job.Status == "noop") {
+				t.Fatalf("deployment job %s reached unexpected terminal outcome: %s; want %s", jobID, last, want)
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
