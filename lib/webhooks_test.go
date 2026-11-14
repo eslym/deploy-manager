@@ -256,7 +256,11 @@ func TestGitHubWebhookCrashChild(t *testing.T) {
 		t.Fatal("after-ack child is started in serve mode")
 	}
 	body := []byte(`{"ref":"refs/heads/main","after":"` + strings.Repeat("a", 40) + `"}`)
-	_ = sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+projectID, "crash-window", "push", body, secret)
+	if os.Getenv("WEBHOOK_CRASH_PROVIDER") == "gitea" {
+		_ = sendGiteaWebhook(server.Client(), server.URL+"/webhooks/gitea/"+projectID, "crash-window", "push", body, secret)
+	} else {
+		_ = sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+projectID, "crash-window", "push", body, secret)
+	}
 	t.Fatalf("expected abrupt exit at %s", point)
 }
 
@@ -303,6 +307,15 @@ func seedWebhookCrashProject(t *testing.T, app *App) (string, []byte) {
 	}
 	if _, err = app.db.Exec(`INSERT INTO project_webhooks(project_id,secret,created_at) VALUES(?,?,?)`, projectID, sealed, time.Now().UnixNano()); err != nil {
 		t.Fatal(err)
+	}
+	if os.Getenv("WEBHOOK_CRASH_PROVIDER") == "gitea" {
+		sealed, err = app.sealProviderWebhookSecret("gitea", projectID, secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err = app.db.Exec(`INSERT INTO project_gitea_webhooks(project_id,secret,created_at) VALUES(?,?,?)`, projectID, sealed, time.Now().UnixNano()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return projectID, secret
 }

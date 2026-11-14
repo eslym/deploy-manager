@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1053,10 +1052,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("GitHub webhook setup status %d: %s", setupResponse.StatusCode, responseText(setupResponse))
 	}
 	setupResponse.Body.Close()
-	webhookSecret, err := hex.DecodeString(webhookSetup.Secret)
-	if err != nil {
-		t.Fatal(err)
-	}
+	webhookSecret := []byte(webhookSetup.Secret)
 	webhookRepo, err := git.PlainOpen(remoteDir)
 	if err != nil {
 		t.Fatal(err)
@@ -1124,6 +1120,113 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr != nil || string(content) != "webhook latest tip\n" {
 		t.Fatalf("branch deletion changed the live publication: %q err=%v", content, readErr)
 	}
+
+	// Gitea shares the durable latest-tip pipeline, but never GitHub's secret or
+	// delivery identity. Observe publication and protected job listings only.
+	giteaSecret := setupProviderWebhook(t, branchServer, cookie, created.ID, "gitea")
+	giteaURL := branchServer.URL + "/webhooks/gitea/" + created.ID
+	giteaTip := commitFixtureFile(t, remoteDir, webhookWorktree, "feature", "Gitea latest tip").String()
+	if err := source.Storer.SetReference(plumbing.NewHashReference(featureBranch, plumbing.NewHash(giteaTip))); err != nil {
+		t.Fatal(err)
+	}
+	// This delivery ID already exists for GitHub in this project.
+	if status := sendGiteaWebhook(branchServer.Client(), giteaURL, "github-delivery-1", "push", stalePush, giteaSecret); status != 204 {
+		t.Fatalf("cross-provider push = %d", status)
+	}
+	for _, deploymentID := range []string{branchDeployment.ID, mirrorID} {
+		waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, deploymentID, "README.md"), "Gitea latest tip\n")
+		waitForPublicJobsSettled(t, branchServer, cookie, deploymentID)
+	}
+	beforeIgnored := publicDeploymentJobs(t, branchServer, cookie, branchDeployment.ID)
+	for _, event := range []struct{ id, event, body string }{
+		{"github-delivery-1", "push", string(stalePush)},
+		{"gitea-delete", "push", `{"ref":"refs/heads/feature/search","after":"` + strings.Repeat("0", 40) + `"}`},
+		{"gitea-delete-event", "delete", `{"ref":"feature/search","ref_type":"branch"}`},
+		{"gitea-tag", "push", `{"ref":"refs/tags/v2","after":"` + giteaTip + `"}`},
+		{"gitea-unsupported", "issues", `{"action":"opened"}`},
+	} {
+		if status := sendGiteaWebhook(branchServer.Client(), giteaURL, event.id, event.event, []byte(event.body), giteaSecret); status != 204 {
+			t.Fatalf("%s status = %d", event.id, status)
+		}
+	}
+	if afterIgnored := publicDeploymentJobs(t, branchServer, cookie, branchDeployment.ID); len(afterIgnored) != len(beforeIgnored) {
+		t.Fatalf("duplicate/deletion/non-branch activity queued jobs: before=%d after=%d", len(beforeIgnored), len(afterIgnored))
+	}
+	// The same ID in another project must also cause publication.
+	// Earlier limit scenarios added large reachable fixture objects; this slice
+	// tests identity isolation rather than the deliberately tiny transfer cap.
+	app.projects.maxTransferBytes = 32 << 20
+	second := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/projects", `{"name":"second Gitea project","url":"`+remote.URL+`/repo.git"}`)
+	var secondProject project
+	if second.StatusCode != 201 || json.NewDecoder(second.Body).Decode(&secondProject) != nil {
+		t.Fatalf("second project = %d: %s", second.StatusCode, responseText(second))
+	}
+	second.Body.Close()
+	secondSecret := setupProviderWebhook(t, branchServer, cookie, secondProject.ID, "gitea")
+	deployment := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments", `{"projectId":"`+secondProject.ID+`","name":"second Gitea site","targetKind":"branch","targetName":"feature/search"}`)
+	var secondDeployment struct{ ID string }
+	if deployment.StatusCode != 201 || json.NewDecoder(deployment.Body).Decode(&secondDeployment) != nil {
+		t.Fatalf("second deployment = %d: %s", deployment.StatusCode, responseText(deployment))
+	}
+	deployment.Body.Close()
+	waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, secondDeployment.ID, "README.md"), "Gitea latest tip\n")
+	waitForPublicJobsSettled(t, branchServer, cookie, secondDeployment.ID)
+	secondTip := commitFixtureFile(t, remoteDir, webhookWorktree, "feature", "second Gitea project tip").String()
+	if err := source.Storer.SetReference(plumbing.NewHashReference(featureBranch, plumbing.NewHash(secondTip))); err != nil {
+		t.Fatal(err)
+	}
+	if status := sendGiteaWebhook(branchServer.Client(), branchServer.URL+"/webhooks/gitea/"+secondProject.ID, "github-delivery-1", "push", stalePush, secondSecret); status != 204 {
+		t.Fatalf("cross-project push = %d", status)
+	}
+	waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, secondDeployment.ID, "README.md"), "second Gitea project tip\n")
+	if content, err := os.ReadFile(filepath.Join(branchPath, "README.md")); err != nil || string(content) != "Gitea latest tip\n" {
+		t.Fatalf("other project affected first publication: %q %v", content, err)
+	}
+}
+
+func publicDeploymentJobs(t *testing.T, server *httptest.Server, cookie, id string) []deploymentJob {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/deployments/"+id+"/jobs", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+	res, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	var jobs []deploymentJob
+	if res.StatusCode != 200 || json.NewDecoder(res.Body).Decode(&jobs) != nil {
+		t.Fatalf("job list = %d", res.StatusCode)
+	}
+	return jobs
+}
+
+func waitForPublicJobsSettled(t *testing.T, server *httptest.Server, cookie, id string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		active := false
+		for _, job := range publicDeploymentJobs(t, server, cookie, id) {
+			active = active || job.Status == "queued" || job.Status == "running"
+		}
+		if !active {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("jobs did not settle")
+}
+
+func waitForPublishedFile(t *testing.T, path, want string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if content, err := os.ReadFile(path); err == nil && string(content) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	content, err := os.ReadFile(path)
+	t.Fatalf("publication = %q (%v), want %q", content, err, want)
 }
 
 func waitForDeploymentWorkersIdle(t *testing.T, app *App) {

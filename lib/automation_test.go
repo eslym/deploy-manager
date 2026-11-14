@@ -1,7 +1,6 @@
 package lib
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -26,12 +25,17 @@ type automationFixture struct {
 	server                                      *httptest.Server
 	cookie, projectID, remoteDir, initialCommit string
 	secret                                      []byte
+	provider                                    string
 	gitFetches                                  atomic.Int32
 }
 
-func newAutomationFixture(t *testing.T) *automationFixture {
+func newAutomationFixture(t *testing.T, providers ...string) *automationFixture {
 	t.Helper()
 	f := &automationFixture{remoteDir: filepath.Join(t.TempDir(), "repo")}
+	f.provider = "github"
+	if len(providers) > 0 {
+		f.provider = providers[0]
+	}
 	f.initialCommit = createSmartFixture(t, f.remoteDir)
 	repo, err := git.PlainOpen(f.remoteDir)
 	if err != nil {
@@ -108,16 +112,13 @@ func newAutomationFixture(t *testing.T) *automationFixture {
 	}
 	response.Body.Close()
 	f.projectID = project.ID
-	response = projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/github-webhook", `{"rotate":true}`)
+	response = projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/"+f.provider+"-webhook", `{"rotate":true}`)
 	var setup struct{ Secret string }
 	if err = json.NewDecoder(response.Body).Decode(&setup); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	f.secret, err = hex.DecodeString(setup.Secret)
-	if err != nil {
-		t.Fatal(err)
-	}
+	f.secret = []byte(setup.Secret)
 	return f
 }
 
@@ -153,7 +154,13 @@ func (f *automationFixture) action(t *testing.T, id, action, body string) string
 func (f *automationFixture) push(t *testing.T, delivery, commit string) {
 	t.Helper()
 	body := []byte(`{"ref":"refs/heads/feature/search","after":"` + commit + `"}`)
-	if status := sendGitHubWebhook(f.server.Client(), f.server.URL+"/webhooks/github/"+f.projectID, delivery, "push", body, f.secret); status != http.StatusNoContent {
+	status := http.StatusNoContent
+	if f.provider == "gitea" {
+		status = sendGiteaWebhook(f.server.Client(), f.server.URL+"/webhooks/gitea/"+f.projectID, delivery, "push", body, f.secret)
+	} else {
+		status = sendGitHubWebhook(f.server.Client(), f.server.URL+"/webhooks/github/"+f.projectID, delivery, "push", body, f.secret)
+	}
+	if status != http.StatusNoContent {
 		t.Fatalf("push status=%d", status)
 	}
 }
@@ -190,7 +197,18 @@ func (f *automationFixture) waitJobs(t *testing.T, id string) []deploymentJob {
 }
 
 func TestPausedWebhookFetchesOnlyWhileOtherDeploymentPublishes(t *testing.T) {
-	f := newAutomationFixture(t)
+	forAutomationProviders(t, testPausedWebhookFetchesOnlyWhileOtherDeploymentPublishes)
+}
+
+func forAutomationProviders(t *testing.T, run func(*testing.T, string)) {
+	t.Helper()
+	for _, provider := range []string{"github", "gitea"} {
+		t.Run(provider, func(t *testing.T) { run(t, provider) })
+	}
+}
+
+func testPausedWebhookFetchesOnlyWhileOtherDeploymentPublishes(t *testing.T, provider string) {
+	f := newAutomationFixture(t, provider)
 	paused := f.createBranch(t, "paused")
 	other := f.createBranch(t, "other")
 	f.action(t, paused, "pause", `{}`)
@@ -218,7 +236,11 @@ func TestPausedWebhookFetchesOnlyWhileOtherDeploymentPublishes(t *testing.T) {
 }
 
 func TestPausedWebhookDoesNotExportOrHydrateUnpublishableTree(t *testing.T) {
-	f := newAutomationFixture(t)
+	forAutomationProviders(t, testPausedWebhookDoesNotExportOrHydrateUnpublishableTree)
+}
+
+func testPausedWebhookDoesNotExportOrHydrateUnpublishableTree(t *testing.T, provider string) {
+	f := newAutomationFixture(t, provider)
 	id := f.createBranch(t, "paused")
 	f.action(t, id, "pause", `{}`)
 	before, err := identity(f.app.deploymentPath(id))
@@ -324,9 +346,13 @@ func TestManualDeployWhilePausedAndResumeCatchUp(t *testing.T) {
 }
 
 func TestPauseInvalidatesAutomaticWorkAtPublicationBoundary(t *testing.T) {
+	forAutomationProviders(t, testPauseInvalidatesAutomaticWorkAtPublicationBoundary)
+}
+
+func testPauseInvalidatesAutomaticWorkAtPublicationBoundary(t *testing.T, provider string) {
 	for _, point := range []string{"after-stage-fsync", "after-intent"} {
 		t.Run(point, func(t *testing.T) {
-			f := newAutomationFixture(t)
+			f := newAutomationFixture(t, provider)
 			id := f.createBranch(t, "production")
 			before, err := identity(f.app.deploymentPath(id))
 			if err != nil {
@@ -396,7 +422,11 @@ func TestPausedTargetChangesPublishOnceAndClearBranchOnlyState(t *testing.T) {
 }
 
 func TestPauseAndResumeDoNotReviveAcceptedAutomaticWork(t *testing.T) {
-	f := newAutomationFixture(t)
+	forAutomationProviders(t, testPauseAndResumeDoNotReviveAcceptedAutomaticWork)
+}
+
+func testPauseAndResumeDoNotReviveAcceptedAutomaticWork(t *testing.T, provider string) {
+	f := newAutomationFixture(t, provider)
 	id := f.createBranch(t, "production")
 	initial := f.waitJobs(t, id)[0].ID
 	latest := addSmartFixtureCommit(t, f.remoteDir, "latest after controls")
