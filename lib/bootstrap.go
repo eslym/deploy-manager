@@ -54,6 +54,8 @@ type Config struct {
 	JobRetention                time.Duration
 	WebhookMaxBodyBytes         int64
 	beforeRestoreDeploymentJobs func(*sql.DB) error
+	// storageFault is a per-startup test seam, never configured by the CLI or HTTP.
+	storageFault func(string, *sql.DB) error
 }
 
 type App struct {
@@ -224,7 +226,7 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 		db.Close()
 		return nil, err
 	}
-	if err = initializeRepositoryKeyStore(db, cfg.RepositoryKeyPath, priorRepositoryKeyStore != 0); err != nil {
+	if err = prepareRepositoryKeyStore(db, cfg.RepositoryKeyPath, priorRepositoryKeyStore != 0); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -233,6 +235,12 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 		db.Close()
 		return nil, err
 	}
+	masterTransferred := false
+	defer func() {
+		if !masterTransferred {
+			clear(repositoryMaster)
+		}
+	}()
 	for _, suffix := range []string{"-wal", "-shm"} {
 		if path := cfg.DatabasePath + suffix; fileInfo(path) {
 			if err = os.Chmod(path, 0600); err != nil {
@@ -283,6 +291,7 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 		}
 	}
 	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	masterTransferred = true
 	ready := false
 	defer func() {
 		if !ready {
@@ -296,6 +305,9 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 		db.Close()
 		return nil, errors.New("webhook body limit must be between 1 KiB and 16 MiB")
 	}
+	if err := app.configureDeployments(); err != nil {
+		return nil, err
+	}
 	if err := initProjectSchema(db); err != nil {
 		return nil, err
 	}
@@ -307,40 +319,13 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 		db.Close()
 		return nil, err
 	}
-	ready = true
-	return &readyStorage{app: app}, nil
-}
-
-func (s *readyStorage) start() (*App, error) {
-	app := s.app
-	cfg, db := app.cfg, app.db
-	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout, cfg.GitMaxCacheBytes)
-	if err != nil {
-		_ = app.Close()
-		return nil, err
-	}
-	projects.maxTransferBytes, projects.maxCacheBytes, projects.maxRefs, projects.maxAdvertisementBytes = cfg.GitMaxTransferBytes, cfg.GitMaxCacheBytes, cfg.GitMaxRefs, cfg.GitMaxAdvertisementBytes
-	app.projects = projects
-	if err := app.initDeployments(); err != nil {
-		_ = app.Close()
-		return nil, err
-	}
-	if app.cfg.beforeRestoreDeploymentJobs != nil {
-		if err := app.cfg.beforeRestoreDeploymentJobs(db); err != nil {
-			_ = app.Close()
-			return nil, fmt.Errorf("prepare deployment queue recovery: %w", err)
+	if cfg.storageFault != nil {
+		if err := cfg.storageFault("verify", db); err != nil {
+			return nil, fmt.Errorf("storage verification: %w", err)
 		}
 	}
-	restoredJobs, err := restoreQueuedDeploymentJobs(db, deploymentQueueCapacity)
-	if err != nil {
-		_ = app.Close()
-		return nil, fmt.Errorf("restore accepted deployment work: %w", err)
-	}
-	app.retryProjectDeletions()
-	app.startDeploymentWorkers(restoredJobs)
-	app.deployWG.Add(1)
-	go app.publicationCleanupLoop()
-	return app, nil
+	ready = true
+	return &readyStorage{app: app}, nil
 }
 
 func ensureColumn(db *sql.DB, table, column, definition string) error {

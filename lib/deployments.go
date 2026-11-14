@@ -130,7 +130,7 @@ func (a *App) cancelDeploymentJobsBefore(deploymentID string, generation int64) 
 	}
 }
 
-func (a *App) initDeployments() error {
+func (a *App) configureDeployments() error {
 	d := a.cfg
 	if d.DeploymentRoot == "" {
 		d.DeploymentRoot = d.DatabasePath + ".publications"
@@ -157,6 +157,11 @@ func (a *App) initDeployments() error {
 		return errors.New("deployment limits, timeout, concurrency, or retention are outside supported bounds")
 	}
 	a.cfg = d
+	return nil
+}
+
+func (a *App) initDeployments() error {
+	d := a.cfg
 	root := filepath.Clean(d.DeploymentRoot)
 	absoluteRoot, err := filepath.Abs(root)
 	if err != nil {
