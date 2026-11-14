@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func TestTemporaryRollbackSurvivesRestartWithoutUnsolicitedCatchUp(t *testing.T) {
@@ -22,6 +21,7 @@ func TestTemporaryRollbackSurvivesRestartWithoutUnsolicitedCatchUp(t *testing.T)
 			beforeFetches := f.gitFetches.Load()
 			path := filepath.Join(f.app.deploymentPath(id), "README.md")
 			cfg := f.app.cfg
+			cfg.DeployConcurrency = 1
 			f.server.Close()
 			if err := f.app.Close(); err != nil {
 				t.Fatal(err)
@@ -34,8 +34,11 @@ func TestTemporaryRollbackSurvivesRestartWithoutUnsolicitedCatchUp(t *testing.T)
 			f.cookie = installAPITestSession(t, f.app)
 			f.server = httptest.NewTLSServer(f.app.Handler())
 			assertAutomationPaused(t, f.server, f.cookie, id, false)
-			time.Sleep(150 * time.Millisecond)
-			if jobs := f.waitJobs(t, id); len(jobs) != len(beforeJobs) || f.gitFetches.Load() != beforeFetches {
+			// With one worker, completing a new deployment fences startup's
+			// restored queue: any unsolicited catch-up queued at restart must
+			// already have run. This replaces the scheduler-dependent quiet sleep.
+			f.createBranch(t, "restart-queue-fence")
+			if jobs := f.waitJobs(t, id); len(jobs) != len(beforeJobs) || f.gitFetches.Load() != beforeFetches+1 {
 				t.Fatalf("restart scheduled unsolicited tip work: jobs %d -> %d, fetches %d -> %d", len(beforeJobs), len(jobs), beforeFetches, f.gitFetches.Load())
 			}
 			if content, err := os.ReadFile(path); err != nil || string(content) != "searchable feature\n" {

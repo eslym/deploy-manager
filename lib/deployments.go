@@ -525,18 +525,40 @@ func (a *App) stagePath(id, job string) string {
 	return filepath.Join(a.cfg.DeploymentRoot, "."+id+".stage-"+job)
 }
 
-func (a *App) enqueueDeployment(deploymentID, commit string, generation int64) (string, error) {
+// A reservation keeps queue admission separate from each operation's durable
+// transaction. Defer release on every path; enqueue transfers it to the worker.
+type deploymentSlot struct {
+	app      *App
+	reserved bool
+}
+
+func (a *App) reserveDeploymentSlot() (*deploymentSlot, bool) {
 	select {
 	case a.deploySlots <- struct{}{}:
+		return &deploymentSlot{app: a, reserved: true}, true
 	default:
+		return nil, false
+	}
+}
+
+func (s *deploymentSlot) release() {
+	if s.reserved {
+		<-s.app.deploySlots
+		s.reserved = false
+	}
+}
+
+func (s *deploymentSlot) enqueue(jobID string) {
+	s.app.deployQueue <- jobID
+	s.reserved = false
+}
+
+func (a *App) enqueueDeployment(deploymentID, commit string, generation int64) (string, error) {
+	slot, ok := a.reserveDeploymentSlot()
+	if !ok {
 		return "", errors.New("publication queue is full")
 	}
-	reserved := true
-	defer func() {
-		if reserved {
-			<-a.deploySlots
-		}
-	}()
+	defer slot.release()
 	jobID, err := randomID()
 	if err != nil {
 		return "", err
@@ -567,8 +589,7 @@ func (a *App) enqueueDeployment(deploymentID, commit string, generation int64) (
 	if err = tx.Commit(); err != nil {
 		return "", err
 	}
-	a.deployQueue <- jobID
-	reserved = false
+	slot.enqueue(jobID)
 	return jobID, nil
 }
 
@@ -639,6 +660,56 @@ func (a *App) runDeploymentJob(jobID string) {
 		return
 	}
 	defer func() { <-a.deploySem }()
+	var deploymentID string
+	var generation int64
+	if err := a.db.QueryRow(`SELECT deployment_id,generation FROM deployment_jobs WHERE id=? AND status='queued'`, jobID).Scan(&deploymentID, &generation); err != nil {
+		return
+	}
+	if err := fault("before-job-lock"); err != nil {
+		a.failJob(jobID, deploymentID, generation, "publication locking was interrupted")
+		return
+	}
+	unlock, err := a.lockDeployment(deploymentID)
+	if err != nil {
+		a.failJob(jobID, deploymentID, generation, "publication locking is unavailable")
+		return
+	}
+	defer unlock()
+	// Workers may acquire this lock in a different order than jobs were
+	// accepted. Execute any queued predecessors first, under the same lock,
+	// rather than allowing a later tip publication/no-op to precede rollback.
+	// SQLite's insertion order is the acceptance order, independent of clocks
+	// and of the order producers manage to send their committed job IDs.
+	rows, err := a.db.Query(`SELECT id FROM deployment_jobs WHERE deployment_id=? AND status='queued' AND rowid<=(SELECT rowid FROM deployment_jobs WHERE id=?) ORDER BY rowid`, deploymentID, jobID)
+	if err != nil {
+		return
+	}
+	var jobs []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return
+		}
+		jobs = append(jobs, id)
+	}
+	err = rows.Err()
+	if closeErr := rows.Close(); err != nil || closeErr != nil {
+		return
+	}
+	for _, id := range jobs {
+		select {
+		case <-a.deployStop:
+			return
+		default:
+		}
+		a.runLockedDeploymentJob(id)
+	}
+}
+
+// The caller owns the deployment lock; each job gets its own timeout and
+// cancellation registration, including predecessors picked up by a later worker.
+func (a *App) runLockedDeploymentJob(jobID string) {
 	ctx, cancel := context.WithTimeout(context.Background(), a.cfg.DeployTimeout)
 	defer cancel()
 	var d deployment
@@ -662,16 +733,6 @@ func (a *App) runDeploymentJob(jobID string) {
 	d.Publication = a.deploymentPath(d.ID)
 	unregister := a.registerDeploymentJob(jobID, d.ID, generation, cancel)
 	defer unregister()
-	if err := fault("before-job-lock"); err != nil {
-		a.failJob(jobID, d.ID, generation, "publication locking was interrupted")
-		return
-	}
-	unlock, err := a.lockDeployment(d.ID)
-	if err != nil {
-		a.failJob(jobID, d.ID, generation, "publication locking is unavailable")
-		return
-	}
-	defer unlock()
 	claimed, claimErr := a.db.Exec(`UPDATE deployment_jobs SET status='running',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
 	if claimErr != nil {
 		return
@@ -1461,18 +1522,12 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "deployment could not be saved", 500)
 		return
 	}
-	select {
-	case a.deploySlots <- struct{}{}:
-	default:
+	slot, ok := a.reserveDeploymentSlot()
+	if !ok {
 		http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
 		return
 	}
-	reserved := true
-	defer func() {
-		if reserved {
-			<-a.deploySlots
-		}
-	}()
+	defer slot.release()
 	job, err := randomID()
 	if err != nil {
 		http.Error(w, "deployment could not be queued", 500)
@@ -1497,8 +1552,7 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "deployment could not be queued", 500)
 		return
 	}
-	a.deployQueue <- job
-	reserved = false
+	slot.enqueue(job)
 	writeJSONStatus(w, 201, map[string]any{"id": id, "jobId": job, "status": "queued"})
 }
 
@@ -1560,18 +1614,12 @@ func (a *App) hardRedeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	select {
-	case a.deploySlots <- struct{}{}:
-	default:
+	slot, ok := a.reserveDeploymentSlot()
+	if !ok {
 		http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
 		return
 	}
-	reserved := true
-	defer func() {
-		if reserved {
-			<-a.deploySlots
-		}
-	}()
+	defer slot.release()
 	jobID, err := randomID()
 	if err != nil {
 		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
@@ -1611,8 +1659,7 @@ func (a *App) hardRedeploy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
 		return
 	}
-	a.deployQueue <- jobID
-	reserved = false
+	slot.enqueue(jobID)
 	writeJSONStatus(w, http.StatusAccepted, map[string]string{"jobId": jobID, "status": "queued"})
 }
 
@@ -1669,18 +1716,12 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the selected commit is not available in this project", http.StatusBadRequest)
 		return
 	}
-	select {
-	case a.deploySlots <- struct{}{}:
-	default:
+	slot, ok := a.reserveDeploymentSlot()
+	if !ok {
 		http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
 		return
 	}
-	reserved := true
-	defer func() {
-		if reserved {
-			<-a.deploySlots
-		}
-	}()
+	defer slot.release()
 	jobID, err := randomID()
 	if err != nil {
 		http.Error(w, "publication could not be queued", 500)
@@ -1725,7 +1766,6 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "publication could not be queued", 500)
 		return
 	}
-	a.deployQueue <- jobID
-	reserved = false
+	slot.enqueue(jobID)
 	writeJSONStatus(w, http.StatusAccepted, map[string]string{"jobId": jobID, "status": "queued"})
 }

@@ -289,6 +289,35 @@ func testRollbackGraphAndRaces(t *testing.T, client *http.Client, origin, cookie
 	waitForDeploymentJob(t, client, origin, cookie, id, laterJob, "succeeded")
 	setPublicationFaultPoint(previous)
 	assertContent("race branch tip\n")
+	// Dequeue order is not lock-acquisition order. Hold the accepted rollback
+	// before its lock, then let a later Deploy acquire the lock first. Both jobs
+	// must finish in acceptance order, even though the tip is already live.
+	rollbackReady := make(chan struct{})
+	releaseBeforeLock := make(chan struct{})
+	var releaseLock sync.Once
+	defer releaseLock.Do(func() { close(releaseBeforeLock) })
+	var firstLock atomic.Bool
+	previous = setPublicationFaultPoint(func(point string) error {
+		if point == "before-job-lock" && firstLock.CompareAndSwap(false, true) {
+			close(rollbackReady)
+			<-releaseBeforeLock
+		}
+		return nil
+	})
+	rollbackJob = queue("rollback", side.String())
+	select {
+	case <-rollbackReady:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback did not reach deployment lock")
+	}
+	laterJob = queue("deploy", "")
+	// Do not release the rollback worker until the later worker has completed:
+	// this deterministically schedules the later job's lock ahead of rollback.
+	waitForDeploymentJob(t, client, origin, cookie, id, laterJob, "succeeded")
+	releaseLock.Do(func() { close(releaseBeforeLock) })
+	waitForDeploymentJob(t, client, origin, cookie, id, rollbackJob, "succeeded")
+	setPublicationFaultPoint(previous)
+	assertContent("race branch tip\n")
 	job = queue("rollback", side.String())
 	waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
 	storeBlob := func(contents string) plumbing.Hash {

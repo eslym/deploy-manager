@@ -83,20 +83,15 @@ func (a *App) controlDeploymentAutomation(w http.ResponseWriter, r *http.Request
 	}
 	id := r.PathValue("id")
 	jobID := ""
-	reserved := false
+	var slot *deploymentSlot
 	if !pause {
-		select {
-		case a.deploySlots <- struct{}{}:
-			reserved = true
-		default:
+		var ok bool
+		slot, ok = a.reserveDeploymentSlot()
+		if !ok {
 			http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
 			return
 		}
-		defer func() {
-			if reserved {
-				<-a.deploySlots
-			}
-		}()
+		defer slot.release()
 		var err error
 		jobID, err = randomID()
 		if err != nil {
@@ -146,7 +141,6 @@ func (a *App) controlDeploymentAutomation(w http.ResponseWriter, r *http.Request
 		writeJSON(w, map[string]any{"automationPaused": true})
 		return
 	}
-	a.deployQueue <- jobID
-	reserved = false
+	slot.enqueue(jobID)
 	writeJSONStatus(w, http.StatusAccepted, map[string]any{"automationPaused": false, "jobId": jobID, "status": "queued"})
 }

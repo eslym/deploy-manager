@@ -131,47 +131,34 @@
 			busy = false;
 		}
 	}
-	async function deploy(id: string) {
+	async function runDeploymentAction(path: string, fallbackError: string) {
 		if (busy) return;
 		busy = true;
 		error = '';
 		try {
-			await request(`/api/deployments/${id}/deploy`, { method: 'POST', body: '{}' });
+			await request(path, { method: 'POST', body: '{}' });
 			await load();
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not start deployment.';
+			error = cause instanceof Error ? cause.message : fallbackError;
 		} finally {
 			busy = false;
 		}
+	}
+	async function deploy(id: string) {
+		return runDeploymentAction(`/api/deployments/${id}/deploy`, 'Could not start deployment.');
 	}
 	async function hardRedeploy(id: string) {
-		if (busy) return;
-		busy = true;
-		error = '';
-		try {
-			await request(`/api/deployments/${id}/hard-redeploy`, { method: 'POST', body: '{}' });
-			await load();
-		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not start hard re-deploy.';
-		} finally {
-			busy = false;
-		}
+		return runDeploymentAction(
+			`/api/deployments/${id}/hard-redeploy`,
+			'Could not start hard re-deploy.'
+		);
 	}
 	async function setAutomationPaused(id: string, paused: boolean) {
-		if (busy || deployments.find((item) => item.id === id)?.targetKind !== 'branch') return;
-		busy = true;
-		error = '';
-		try {
-			await request(`/api/deployments/${id}/${paused ? 'pause' : 'resume'}`, {
-				method: 'POST',
-				body: '{}'
-			});
-			await load();
-		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not update automatic deployment.';
-		} finally {
-			busy = false;
-		}
+		if (deployments.find((item) => item.id === id)?.targetKind !== 'branch') return;
+		return runDeploymentAction(
+			`/api/deployments/${id}/${paused ? 'pause' : 'resume'}`,
+			'Could not update automatic deployment.'
+		);
 	}
 	async function changeTarget(id: string) {
 		const target = refs.find((ref) => key(ref) === targetSelections[id]);
