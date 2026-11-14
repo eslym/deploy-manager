@@ -391,7 +391,14 @@ func TestExportHydratesCommittedLFSPointerIntoActualFile(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(repoDir, "nested"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	for name, contents := range map[string]string{".gitattributes": "[attr]one two\n[attr]two filter=lfs\n", "nested/.gitattributes": "*.dat one\n", "nested/asset.dat": pointer, "unselected.dat": pointer} {
+	files := map[string]string{
+		".gitattributes":        "[attr]one two\n[attr]two filter=lfs\n\"nested/asset\\x20file.dat\" one\nnested/reset.dat one\n",
+		"nested/.gitattributes": "reset.dat !filter\n",
+		"nested/asset file.dat": pointer,
+		"nested/reset.dat":      pointer,
+		"nested/unselected.dat": pointer,
+	}
+	for name, contents := range files {
 		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(contents), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -402,9 +409,21 @@ func TestExportHydratesCommittedLFSPointerIntoActualFile(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(repoDir, ".git", "info"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(repoDir, ".git", "info", "attributes"), []byte("unselected.dat filter=lfs\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(repoDir, ".git", "info", "attributes"), []byte("nested/unselected.dat filter=lfs\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
+	// Point isolated host-global Git configuration at a rule that would select
+	// the uncontrolled pointer if the exporter consulted ambient attributes.
+	home := t.TempDir()
+	globalAttributes := filepath.Join(home, "attributes")
+	if err := os.WriteFile(globalAttributes, []byte("nested/unselected.dat filter=lfs\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[core]\n\tattributesFile = "+globalAttributes+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	commitID, err := worktree.Commit("LFS tracked object", &git.CommitOptions{Author: &object.Signature{Name: "fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
 	if err != nil {
 		t.Fatal(err)
@@ -443,12 +462,95 @@ func TestExportHydratesCommittedLFSPointerIntoActualFile(t *testing.T) {
 	if err = exportTrackedTree(context.Background(), repo, commit, out, exportLimits{files: 20, bytes: 1024, timeout: time.Second}, hydrator); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.ReadFile(filepath.Join(out, "nested", "asset.dat"))
+	got, err := os.ReadFile(filepath.Join(out, "nested", "asset file.dat"))
 	if err != nil || string(got) != string(payload) {
 		t.Fatalf("published asset = %q, %v; want hydrated bytes", got, err)
 	}
-	if got, err := os.ReadFile(filepath.Join(out, "unselected.dat")); err != nil || string(got) != pointer {
-		t.Fatalf("repository-local attributes changed an unselected file: %q, %v", got, err)
+	for _, name := range []string{"reset.dat", "unselected.dat"} {
+		got, err := os.ReadFile(filepath.Join(out, "nested", name))
+		if err != nil || string(got) != pointer {
+			t.Fatalf("non-selected pointer %s changed: %q, %v", name, got, err)
+		}
+	}
+}
+
+func TestNegativeTrackedAttributeFailsPublicationAndKeepsLiveFiles(t *testing.T) {
+	base := t.TempDir()
+	repoDir := filepath.Join(base, "fixture")
+	previousCommit := createSmartFixture(t, repoDir)
+	repo, err := git.PlainOpen(repoDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := worktree.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("feature/search")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, ".gitattributes"), []byte("!private.dat filter=lfs\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repoDir, "private.dat"), []byte("must never become live"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worktree.Add(".gitattributes"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := worktree.Add("private.dat"); err != nil {
+		t.Fatal(err)
+	}
+	badCommit, err := worktree.Commit("forbidden negative attribute", &git.CommitOptions{Author: &object.Signature{Name: "fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Config{DatabasePath: filepath.Join(base, "state.sqlite"), OPAQUEKeyPath: filepath.Join(base, "opaque.key"), DeployTimeout: 5 * time.Second}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	deploymentID := strings.Repeat("d", 32)
+	projectID := strings.Repeat("e", 32)
+	now := time.Now().UnixNano()
+	if _, err := app.db.Exec(`INSERT INTO projects(id,name,remote_url,created_at,last_fetched,warning) VALUES(?,?,?,?,?,'')`, projectID, "fixture", "https://example.test/repo.git", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(app.projects.repoPath(projectID), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := copyGitCache(repoDir, app.projects.repoPath(projectID), 64<<20); err != nil {
+		t.Fatal(err)
+	}
+	livePath := app.deploymentPath(deploymentID)
+	if err := os.MkdirAll(livePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(livePath, "index.html"), []byte("previous live version"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	liveID, err := identity(livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,target_kind,generation,live_commit,live_dev,live_ino,status,created_at,updated_at) VALUES(?,?,?,?,'commit',1,?,?,?,'live',?,?)`, deploymentID, projectID, "negative-pattern", badCommit.String(), previousCommit, liveID.Dev, liveID.Ino, now, now); err != nil {
+		t.Fatal(err)
+	}
+	cookie := installAPITestSession(t, app)
+	server := httptest.NewTLSServer(app.Handler())
+	defer server.Close()
+	jobID, err := app.enqueueDeployment(deploymentID, badCommit.String(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForDeploymentJob(t, server.Client(), server.URL, cookie, deploymentID, jobID, "failed")
+	if got, err := os.ReadFile(filepath.Join(livePath, "index.html")); err != nil || string(got) != "previous live version" {
+		t.Fatalf("negative attribute changed existing live content: %q, %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(livePath, "private.dat")); !os.IsNotExist(err) {
+		t.Fatalf("forbidden commit content became live: %v", err)
 	}
 }
 
