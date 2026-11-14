@@ -45,13 +45,14 @@ func main() {
 	if repositoryMasterPath == "" {
 		repositoryMasterPath = filepath.Join(*data, "repository-key-master.key")
 	}
-	app, err := lib.New(lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention})
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer app.Close()
+	cfg := lib.Config{DatabasePath: filepath.Join(*data, "state.sqlite"), OPAQUEKeyPath: filepath.Join(*data, "opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention}
 	switch command {
 	case "setup", "recover":
+		app, err := lib.NewGrantIssuer(cfg)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer app.Close()
 		var token string
 		if command == "recover" {
 			token, err = app.IssueRecoveryGrant()
@@ -87,6 +88,11 @@ func main() {
 		}
 		fmt.Println(link)
 	case "serve":
+		app, err := lib.New(cfg)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer app.Close()
 		server := &http.Server{Addr: *listen, Handler: app.Handler(), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
 		if *cert != "" || *key != "" {
 			if *cert == "" || *key == "" {

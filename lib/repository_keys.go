@@ -40,47 +40,69 @@ type repositoryKey struct {
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
-func initializeRepositoryKeyStore(db *sql.DB, path string, priorStore bool) error {
+// prepareRepositoryKeyStore consumes the pre-schema classification. The mere
+// existence of freshly created tables must never authorize key regeneration.
+func prepareRepositoryKeyStore(db *sql.DB, path string, priorStore bool) error {
 	key, err := loadRepositoryMasterKey(path, priorStore)
 	if err != nil {
 		return err
 	}
 	defer clear(key)
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(repositoryKeyVerifierContext))
-	verifier := mac.Sum(nil)
 	if !priorStore {
 		tx, txErr := db.Begin()
 		if txErr != nil {
 			return errors.New("could not initialize repository key store")
 		}
 		defer tx.Rollback()
-		for _, statement := range []string{
-			`CREATE TABLE repository_key_store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),verifier BLOB NOT NULL)`,
-			`CREATE TABLE repository_keys(id TEXT PRIMARY KEY,name TEXT NOT NULL,algorithm TEXT NOT NULL,bits INTEGER NOT NULL,fingerprint TEXT NOT NULL,public_key TEXT NOT NULL,ciphertext BLOB NOT NULL,created_at INTEGER NOT NULL)`,
-		} {
-			if _, txErr = tx.Exec(statement); txErr != nil {
-				return errors.New("could not initialize repository key store")
-			}
+		if txErr = createRepositoryKeySchema(tx); txErr != nil {
+			return errors.New("could not initialize repository key store")
 		}
-		if _, txErr = tx.Exec(`INSERT INTO repository_key_store(singleton,verifier) VALUES(1,?)`, verifier); txErr != nil {
+		if txErr = initializeRepositoryKeyBinding(tx, key); txErr != nil {
 			return errors.New("could not initialize repository key store")
 		}
 		if txErr = tx.Commit(); txErr != nil {
 			return errors.New("could not initialize repository key store")
 		}
-	} else {
-		var tables int
-		if err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('repository_key_store','repository_keys')`).Scan(&tables); err != nil || tables != 2 {
-			return errors.New("repository key store schema is incomplete; refusing startup")
+	}
+	return validateRepositoryKeyStore(db, key)
+}
+
+// Structural DDL is deliberately independent from the external key/binding.
+// Fresh preparation keeps DDL and binding insertion in one transaction.
+func createRepositoryKeySchema(tx *sql.Tx) error {
+	for _, statement := range []string{
+		`CREATE TABLE repository_key_store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),verifier BLOB NOT NULL)`,
+		`CREATE TABLE repository_keys(id TEXT PRIMARY KEY,name TEXT NOT NULL,algorithm TEXT NOT NULL,bits INTEGER NOT NULL,fingerprint TEXT NOT NULL,public_key TEXT NOT NULL,ciphertext BLOB NOT NULL,created_at INTEGER NOT NULL)`,
+	} {
+		if _, err := tx.Exec(statement); err != nil {
+			return err
 		}
-		var stored []byte
-		if err = db.QueryRow(`SELECT verifier FROM repository_key_store WHERE singleton=1`).Scan(&stored); err != nil {
-			return errors.New("repository key master-key verifier is missing or unavailable; refusing startup")
-		}
-		if !hmac.Equal(stored, verifier) {
-			return errors.New("repository key master key does not match this database; refusing startup")
-		}
+	}
+	return nil
+}
+
+func repositoryKeyVerifier(key []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(repositoryKeyVerifierContext))
+	return mac.Sum(nil)
+}
+
+func initializeRepositoryKeyBinding(tx *sql.Tx, key []byte) error {
+	_, err := tx.Exec(`INSERT INTO repository_key_store(singleton,verifier) VALUES(1,?)`, repositoryKeyVerifier(key))
+	return err
+}
+
+func validateRepositoryKeyStore(db *sql.DB, key []byte) error {
+	var tables int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('repository_key_store','repository_keys')`).Scan(&tables); err != nil || tables != 2 {
+		return errors.New("repository key store schema is incomplete; refusing startup")
+	}
+	var stored []byte
+	if err := db.QueryRow(`SELECT verifier FROM repository_key_store WHERE singleton=1`).Scan(&stored); err != nil {
+		return errors.New("repository key master-key verifier is missing or unavailable; refusing startup")
+	}
+	if !hmac.Equal(stored, repositoryKeyVerifier(key)) {
+		return errors.New("repository key master key does not match this database; refusing startup")
 	}
 	rows, err := db.Query(`SELECT id,ciphertext FROM repository_keys`)
 	if err != nil {

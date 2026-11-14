@@ -54,6 +54,8 @@ type Config struct {
 	JobRetention                time.Duration
 	WebhookMaxBodyBytes         int64
 	beforeRestoreDeploymentJobs func(*sql.DB) error
+	// storageFault is a per-startup test seam, never configured by the CLI or HTTP.
+	storageFault func(string, *sql.DB) error
 }
 
 type App struct {
@@ -85,7 +87,9 @@ type App struct {
 	webhookFault         func(string) error
 }
 
-func New(cfg Config) (*App, error) {
+// prepareStorage performs only schema/key preparation and validation. Runtime
+// recovery and all background work belong to readyStorage.start.
+func prepareStorage(cfg Config) (*readyStorage, error) {
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
 	}
@@ -222,7 +226,7 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
-	if err = initializeRepositoryKeyStore(db, cfg.RepositoryKeyPath, priorRepositoryKeyStore != 0); err != nil {
+	if err = prepareRepositoryKeyStore(db, cfg.RepositoryKeyPath, priorRepositoryKeyStore != 0); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -231,6 +235,12 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	masterTransferred := false
+	defer func() {
+		if !masterTransferred {
+			clear(repositoryMaster)
+		}
+	}()
 	for _, suffix := range []string{"-wal", "-shm"} {
 		if path := cfg.DatabasePath + suffix; fileInfo(path) {
 			if err = os.Chmod(path, 0600); err != nil {
@@ -265,12 +275,6 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
-	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout, cfg.GitMaxCacheBytes)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	projects.maxTransferBytes, projects.maxCacheBytes, projects.maxRefs, projects.maxAdvertisementBytes = cfg.GitMaxTransferBytes, cfg.GitMaxCacheBytes, cfg.GitMaxRefs, cfg.GitMaxAdvertisementBytes
 	var credentialGeneration int64
 	if err = db.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&credentialGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		db.Close()
@@ -286,7 +290,14 @@ func New(cfg Config) (*App, error) {
 			return nil, errors.New("repository key master file must not share the OPAQUE key file")
 		}
 	}
-	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	masterTransferred = true
+	ready := false
+	defer func() {
+		if !ready {
+			_ = app.Close()
+		}
+	}()
 	if app.cfg.WebhookMaxBodyBytes == 0 {
 		app.cfg.WebhookMaxBodyBytes = 1 << 20
 	}
@@ -294,30 +305,27 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("webhook body limit must be between 1 KiB and 16 MiB")
 	}
+	if err := app.configureDeployments(); err != nil {
+		return nil, err
+	}
+	if err := initProjectSchema(db); err != nil {
+		return nil, err
+	}
 	if err := app.initWebhooks(); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if err := app.initDeployments(); err != nil {
+	if err := app.initDeploymentSchema(); err != nil {
 		db.Close()
 		return nil, err
 	}
-	if app.cfg.beforeRestoreDeploymentJobs != nil {
-		if err := app.cfg.beforeRestoreDeploymentJobs(db); err != nil {
-			_ = app.Close()
-			return nil, fmt.Errorf("prepare deployment queue recovery: %w", err)
+	if cfg.storageFault != nil {
+		if err := cfg.storageFault("verify", db); err != nil {
+			return nil, fmt.Errorf("storage verification: %w", err)
 		}
 	}
-	restoredJobs, err := restoreQueuedDeploymentJobs(db, deploymentQueueCapacity)
-	if err != nil {
-		_ = app.Close()
-		return nil, fmt.Errorf("restore accepted deployment work: %w", err)
-	}
-	app.retryProjectDeletions()
-	app.startDeploymentWorkers(restoredJobs)
-	app.deployWG.Add(1)
-	go app.publicationCleanupLoop()
-	return app, nil
+	ready = true
+	return &readyStorage{app: app}, nil
 }
 
 func ensureColumn(db *sql.DB, table, column, definition string) error {
