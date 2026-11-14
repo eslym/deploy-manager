@@ -57,3 +57,42 @@ fix in the actual asset, refresh integrity/provenance and license/advisory
 evidence, and rerun the browser interoperability and malformed-argument tests.
 No claim is made here that either follow-up is complete or that the browser
 artifact has a complete dependency SBOM.
+
+Git LFS utility reuse is pinned to `github.com/git-lfs/git-lfs/v3 v3.8.1` and
+is limited to the pointer parser and committed-attribute parser/pattern
+primitives behind application-owned adapters. The LFS client, config discovery,
+credentials, subprocesses, and transfer orchestration are not imported. The
+upstream MIT notice (and its separately stated Go Authors BSD notice) is
+retained verbatim at
+`third_party/licenses/git-lfs/github.com/git-lfs/git-lfs/v3@v3.8.1/LICENSE.md`.
+License files for the newly selected transitive module graph are retained under
+the corresponding module/version directories there:
+
+| Module | Retained upstream license file |
+| --- | --- |
+| `github.com/alexbrainman/sspi v0.0.0-20210105120005-909beea2cc74` | `LICENSE` |
+| `github.com/avast/retry-go v3.0.0+incompatible` | `LICENSE` |
+| `github.com/dpotapov/go-spnego v0.0.0-20210315154721-298b63a54430` | `LICENSE` |
+| `github.com/git-lfs/gitobj/v2 v2.1.1` | `LICENSE.md` |
+| `github.com/git-lfs/go-netrc v0.0.0-20250218165306-ba0029b43d11` | `LICENSE` |
+| `github.com/git-lfs/pktline v0.0.0-20210330133718-06e9096e2825` | `LICENSE.md` |
+| `github.com/git-lfs/wildmatch/v2 v2.0.1` | `LICENSE.md` |
+| `github.com/hashicorp/go-uuid v1.0.2` | `LICENSE` |
+| `github.com/jcmturner/aescts/v2 v2.0.0` | `LICENSE` |
+| `github.com/jcmturner/dnsutils/v2 v2.0.0` | `LICENSE` |
+| `github.com/jcmturner/gofork v1.0.0` | `LICENSE` |
+| `github.com/jcmturner/goidentity/v6 v6.0.1` | `LICENSE` |
+| `github.com/jcmturner/gokrb5/v8 v8.4.2` | `LICENSE` |
+| `github.com/jcmturner/rpc/v2 v2.0.3` | `LICENSE` |
+| `github.com/jmhodges/clock v1.2.0` | `LICENSE` |
+| `github.com/klauspost/compress v1.20.2` | `LICENSE` |
+| `github.com/leonelquinteros/gotext v1.7.2` | `LICENSE` |
+| `github.com/mattn/go-isatty v0.0.24` | `LICENSE` |
+| `github.com/olekukonko/ts v0.0.0-20171002115256-78ecb04241c0` | `LICENCE` |
+| `github.com/pkg/errors v0.9.1` | `LICENSE` |
+| `github.com/rubyist/tracerx v0.0.0-20170927163412-787959303086` | `LICENSE` |
+| `github.com/ssgelm/cookiejarparser v1.0.1` | `LICENSE.md` |
+
+This records upstream files for the selected graph, not a legal review or a
+complete distribution inventory. Continue the dependency and advisory review
+tracked by #26 before distribution.

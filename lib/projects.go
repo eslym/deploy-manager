@@ -39,6 +39,7 @@ type projectManager struct {
 	maxAdvertisementBytes int64
 	mu                    sync.Mutex
 	cacheMu               sync.RWMutex
+	lfsCacheMu            sync.Mutex
 	stateMu               sync.RWMutex
 	cacheFS               projectCacheFS
 	blocked               string
@@ -103,14 +104,21 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheB
 		`CREATE TABLE IF NOT EXISTS project_refresh_journal(project_id TEXT PRIMARY KEY)`,
 		`CREATE TABLE IF NOT EXISTS project_ssh_keys(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,key_id TEXT NOT NULL REFERENCES repository_keys(id) ON DELETE RESTRICT)`,
 		`CREATE TABLE IF NOT EXISTS ssh_host_trust(host TEXT NOT NULL,port INTEGER NOT NULL,trusted_key BLOB,observed_key BLOB,observed_fingerprint TEXT NOT NULL DEFAULT '',warning TEXT NOT NULL DEFAULT '',PRIMARY KEY(host,port))`,
+		`CREATE TABLE IF NOT EXISTS project_lfs_settings(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,endpoint TEXT NOT NULL,object_origins TEXT NOT NULL,allow_internal INTEGER NOT NULL DEFAULT 0,internal_addresses TEXT NOT NULL DEFAULT '[]',updated_at INTEGER NOT NULL)`,
 	} {
 		if _, err := db.Exec(q); err != nil {
 			return nil, err
 		}
 	}
+	if err := ensureColumn(db, "project_lfs_settings", "internal_addresses", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
+		return nil, err
+	}
 	manager := &projectManager{db: db, root: root, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
 	if err := manager.reconcileCacheFiles(); err != nil {
 		return nil, fmt.Errorf("project cache recovery failed; refusing to start: %w", err)
+	}
+	if err := manager.reconcileLFSCacheTemps(); err != nil {
+		return nil, fmt.Errorf("LFS cache recovery failed; refusing to start: %w", err)
 	}
 	return manager, nil
 }
