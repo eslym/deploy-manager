@@ -18,6 +18,9 @@ type GrantIssuer struct {
 }
 
 func NewGrantIssuer(cfg Config) (*GrantIssuer, error) {
+	if err := validateStoragePaths(cfg); err != nil {
+		return nil, err
+	}
 	storage, err := prepareStorage(cfg)
 	if err != nil {
 		return nil, err
@@ -40,6 +43,9 @@ func (g *GrantIssuer) RecoveryURL(base, token string) (string, error) {
 // New prepares storage before performing normal application recovery/startup.
 // Failure returns no usable application and releases opened resources.
 func New(cfg Config) (*App, error) {
+	if err := validateStoragePaths(cfg); err != nil {
+		return nil, err
+	}
 	ownership, err := acquireDaemonOwnership(cfg)
 	if err != nil {
 		return nil, err

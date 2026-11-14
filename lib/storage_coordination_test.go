@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -17,6 +18,105 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+func TestParentTraversalRejectedWithoutStorageSideEffects(t *testing.T) {
+	for _, entrypoint := range []string{"daemon", "command"} {
+		for _, relative := range []bool{false, true} {
+			for _, field := range []string{"database", "opaque", "repository"} {
+				t.Run(fmt.Sprintf("%s/%s/relative=%t", entrypoint, field, relative), func(t *testing.T) {
+					root := t.TempDir()
+					trusted, other := filepath.Join(root, "trusted"), filepath.Join(root, "other")
+					for _, dir := range []string{trusted, filepath.Join(other, "child")} {
+						if err := os.MkdirAll(dir, 0700); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := os.Symlink(filepath.Join(other, "child"), filepath.Join(trusted, "link")); err != nil {
+						t.Fatal(err)
+					}
+					cfg := Config{DatabasePath: filepath.Join(trusted, "state.db"), OPAQUEKeyPath: filepath.Join(trusted, "opaque.key"), RepositoryKeyPath: filepath.Join(trusted, "repository.key"), DeploymentRoot: filepath.Join(trusted, "publications")}
+					prefix := trusted + "/link/../"
+					if relative {
+						t.Chdir(root)
+						prefix = "trusted/link/../"
+					}
+					switch field {
+					case "database":
+						cfg.DatabasePath = prefix + "state.db"
+					case "opaque":
+						cfg.OPAQUEKeyPath = prefix + "opaque.key"
+					case "repository":
+						cfg.RepositoryKeyPath = prefix + "repository.key"
+					}
+					if entrypoint == "daemon" {
+						app, err := New(cfg)
+						if app != nil {
+							_ = app.Close()
+						}
+						if err == nil {
+							t.Error("daemon accepted ambiguous storage path")
+						}
+					} else {
+						g, err := NewGrantIssuer(cfg)
+						if g != nil {
+							_ = g.Close()
+						}
+						if err == nil {
+							t.Error("command accepted ambiguous storage path")
+						}
+					}
+					for _, want := range []struct {
+						dir   string
+						names []string
+					}{{trusted, []string{"link"}}, {other, []string{"child"}}, {filepath.Join(other, "child"), []string{}}} {
+						entries, err := os.ReadDir(want.dir)
+						if err != nil {
+							t.Fatal(err)
+						}
+						var names []string
+						for _, entry := range entries {
+							names = append(names, entry.Name())
+						}
+						if !slices.Equal(names, want.names) {
+							t.Errorf("unsafe path caused filesystem side effects in %s: got %v, want %v", want.dir, names, want.names)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCanonicalRelativeStoragePathsShareDaemonCoordination(t *testing.T) {
+	for _, prefix := range []string{"", "./"} {
+		t.Run("prefix="+prefix, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			cfg := Config{DatabasePath: prefix + "data/state.db", OPAQUEKeyPath: prefix + "data/opaque.key", RepositoryKeyPath: prefix + "data/repository.key"}
+			daemon, err := New(cfg)
+			if err != nil {
+				t.Fatalf("ordinary relative paths rejected: %v", err)
+			}
+			defer daemon.Close()
+			command, err := NewGrantIssuer(cfg)
+			if err != nil {
+				t.Fatalf("relative command alongside daemon: %v", err)
+			}
+			defer command.Close()
+			if _, err := command.IssueRegistrationGrant(); err != nil {
+				t.Fatal(err)
+			}
+			absolute := cfg
+			absolute.DatabasePath, err = filepath.Abs(cfg.DatabasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second, err := New(absolute); err == nil {
+				_ = second.Close()
+				t.Fatal("absolute path bypassed relative daemon ownership")
+			}
+		})
+	}
+}
 
 // Real processes exercise the OS lock lifetime; no in-process mutex can pass.
 func TestStorageCoordinationChild(t *testing.T) {

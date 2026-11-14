@@ -14,6 +14,26 @@ import (
 // Closing the descriptor (including on process death) releases OS ownership.
 type storageLock struct{ file *os.File }
 
+// validateStoragePaths must precede any path cleaning or filesystem operation,
+// including marker preflight. Cleaning "link/../file" can erase a symlink that
+// the kernel would traverse, giving coordination and SQLite different files.
+// Reject parent traversal rather than silently retargeting the installation.
+// Ordinary absolute and relative paths (including "./data") remain supported.
+func validateStoragePaths(cfg Config) error {
+	for _, path := range []struct{ name, value string }{
+		{"database path", cfg.DatabasePath},
+		{"OPAQUE key path", cfg.OPAQUEKeyPath},
+		{"repository key path", cfg.RepositoryKeyPath},
+	} {
+		for _, component := range strings.Split(path.value, string(filepath.Separator)) {
+			if component == ".." {
+				return fmt.Errorf("%s must not contain '..' path components; use an explicit path without parent traversal", path.name)
+			}
+		}
+	}
+	return nil
+}
+
 func acquireDaemonOwnership(cfg Config) (*storageLock, error) {
 	f, err := openCoordinationFile(cfg, ".daemon.lock")
 	if err != nil {
@@ -81,6 +101,9 @@ func (l *storageLock) acquire(mode int) error {
 func (l *storageLock) share() error { return l.acquire(unix.LOCK_SH) }
 
 func openCoordinationFile(cfg Config, suffix string) (*os.File, error) {
+	if err := validateStoragePaths(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.DatabasePath == "" {
 		return nil, fmt.Errorf("database path is required")
 	}

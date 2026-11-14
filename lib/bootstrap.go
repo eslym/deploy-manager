@@ -96,6 +96,9 @@ type App struct {
 // prepareStorage performs only schema/key preparation and validation. Runtime
 // recovery and all background work belong to readyStorage.start.
 func prepareStorage(cfg Config) (*readyStorage, error) {
+	if err := validateStoragePaths(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
 	}
@@ -206,7 +209,15 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	if err != nil {
 		return nil, err
 	}
-	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String()
+	// Parent traversal was rejected before any filesystem work, and access
+	// coordination validated the database directory without symlink ancestors.
+	// An absolute URL path selects that same file; a relative URL path would be
+	// encoded as a file://authority and rejected by SQLite.
+	sqlitePath, err := filepath.Abs(cfg.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(sqlitePath)}).String()
 	db, err := sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=1000&_txlock=immediate")
 	if err != nil {
 		return nil, err

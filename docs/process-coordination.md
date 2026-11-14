@@ -28,6 +28,12 @@ Lock identities are empty files. Directory ancestors must belong to root or
 the invoking user and cannot be writable by others, except for sticky shared
 directories such as `/tmp`.
 
+Database and external-key paths must not contain `..` components. These are
+rejected before filesystem access rather than silently cleaned: a symlink
+followed by `..` could otherwise select a different database than its locks.
+Ordinary relative paths such as `data/state.sqlite` and `./data/state.sqlite`
+remain supported.
+
 Access contention during initialization/maintenance fails within approximately
 one second; retry once that operation finishes. Compatible SQLite transactions
 also have a one-second busy timeout. A busy error does not authorize deleting
