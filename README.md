@@ -105,6 +105,10 @@ is disabled after the administrator account is created. Then sign in at
 Treat setup and recovery links as secrets. Their grants are carried in URL
 fragments, not query strings; do not share them or put them in logs.
 
+Only one daemon may use an installation. Setup/recovery commands can run beside
+it; see [process coordination](docs/process-coordination.md) for locking,
+contention, compatibility limitations, and offline-restore requirements.
+
 ### Behind a local HTTPS reverse proxy
 
 Bind the application to loopback and configure the external origin:

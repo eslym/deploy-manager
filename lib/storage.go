@@ -4,8 +4,8 @@ import "fmt"
 
 // readyStorage owns prepared persistence. Obtaining it starts no recovery,
 // cleanup, grants or workers. Only a successful preparation can release normal
-// startup. Future singleton/maintenance policy belongs before this release,
-// not in domain constructors or HTTP handlers.
+// startup. Ownership/access coordination and future version/maintenance policy
+// belong before this release, not in domain constructors or HTTP handlers.
 type readyStorage struct {
 	app *App
 }
@@ -40,10 +40,16 @@ func (g *GrantIssuer) RecoveryURL(base, token string) (string, error) {
 // New prepares storage before performing normal application recovery/startup.
 // Failure returns no usable application and releases opened resources.
 func New(cfg Config) (*App, error) {
-	storage, err := prepareStorage(cfg)
+	ownership, err := acquireDaemonOwnership(cfg)
 	if err != nil {
 		return nil, err
 	}
+	storage, err := prepareStorage(cfg)
+	if err != nil {
+		_ = ownership.Close()
+		return nil, err
+	}
+	storage.app.daemonOwnership = ownership
 	return storage.start()
 }
 
