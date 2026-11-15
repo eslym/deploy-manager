@@ -19,18 +19,20 @@ runtime.
 - Verified GitHub and Gitea webhooks with independent per-project secrets,
   durable acceptance, deduplication, and coalesced branch updates.
 - Per-deployment Pause/Resume, including manual updates while paused.
-- Searchable, paginated first-parent history and temporary rollback to an
-  eligible branch ancestor without changing the configured branch.
+- Searchable, paginated first-parent history with temporary and permanent
+  rollback to an eligible branch ancestor, without changing the configured branch.
 - Managed SSH keys, encrypted private-key storage, and explicit SSH host trust.
 - Git LFS hydration with approved HTTPS destinations and verified payload caches.
+- Per-project Git and LFS cache-size reporting.
 - Atomic real-directory publication, restart reconciliation, delayed cleanup,
-  durable job status, and sanitized logs.
+  durable job history with sanitized logs, and bounded transient-fetch retries.
 - Single-administrator registration, login, password changes, and recovery using
   RFC 9807 OPAQUE with browser-local password processing.
 
-The project is under active development; the [agreed design](docs/design.md)
-also describes work not yet implemented. Dependency upgrades and distribution
-notice work remain open; see [Security and distribution](#security-and-distribution).
+The project is under active development. The [agreed design](docs/design.md)
+defines the full v1 requirements; dependency upgrades and distribution notice
+work remain open. See [Security and distribution](#security-and-distribution)
+and the [current cache-clearing limitation](#caches-and-job-history).
 
 ## Requirements
 
@@ -78,8 +80,9 @@ host.
 
 ## First run
 
-Use the same data directory for every command. The following example serves the
-dashboard directly over TLS; replace the hostname and certificate paths:
+Use the same executable, data directory, and external-key configuration for
+every command. The following example serves the dashboard directly over TLS;
+replace the hostname and certificate paths:
 
 ```sh
 ./deploy-manager setup \
@@ -106,8 +109,9 @@ Treat setup and recovery links as secrets. Their grants are carried in URL
 fragments, not query strings; do not share them or put them in logs.
 
 Only one daemon may use an installation. Setup/recovery commands can run beside
-it; see [process coordination](docs/process-coordination.md) for locking,
-contention, compatibility limitations, and offline-restore requirements.
+it when their executable supports the exact database schema and maintenance is
+not in progress. See [process coordination](docs/process-coordination.md) for
+locking, contention, compatibility limitations, and offline-restore requirements.
 
 ### Behind a local HTTPS reverse proxy
 
@@ -165,6 +169,9 @@ substitute for HTTPS login and authenticated dashboard use.
 - **Resume:** clears the pause and immediately queues the latest branch tip.
 - **Temporary rollback:** recreates a selected branch ancestor while preserving
   the branch and automation state. Later Deploy/webhook work may replace it.
+- **Permanent rollback:** preserves the branch and pauses automation as soon as
+  the request is accepted, then publishes the selected ancestor. The pause remains
+  even if publication fails; Resume explicitly catches up to the branch tip.
 
 Changing a paused deployment to another branch preserves the pause and queues
 one publication. Changing it to a tag or commit clears branch-only pause state.
@@ -174,6 +181,25 @@ Rollback uses Git objects and LFS payloads, not retained release directories.
 Replaced directories are retained only for the reader grace period (60 seconds
 by default), then cleaned up. Atomic switching does not guarantee that every
 request from a browser sees the same release.
+
+### Caches and job history
+
+The dashboard shows each project's Git and verified LFS cache sizes. There is no
+automatic Git garbage collection or LFS payload eviction. Clearing caches requires
+confirmation and preserves deployment configuration and published content, but
+can permanently lose unreachable commits or payloads no longer available upstream.
+
+**Current limitation:** clearing caches removes the Git repository cache without
+re-cloning it. Refresh and deployment fetches currently require that cache to
+exist, so they do not automatically rebuild it afterward. Avoid clearing a cache
+you still need for deployment or rollback.
+
+Each deployment shows its latest 100 jobs with status and expandable logs. Job
+and log retention defaults to 30 days; active work and pending recovery/cleanup
+records are preserved. Interrupted jobs are marked failed on restart, separately
+from publication reconciliation. Only transient deployment fetch failures are
+retried, with a bounded number of attempts; authentication and host-trust failures
+require corrective action instead.
 
 ## Configuration and data
 
@@ -189,13 +215,36 @@ Run `./deploy-manager serve -h` for all flags. Common settings include:
 - `--deploy-max-bytes`: `1073741824` (1 GiB).
 - `--deploy-grace-period`: `1m`.
 - `--job-retention`: `720h` (30 days).
+- `--fetch-retry-attempts`: `3` total attempts, including the initial fetch
+  (supported range: `1`–`5`).
+- `--login-ttl`: `2m` for a pending OPAQUE login handshake.
 - `--session-ttl`: `12h`.
 - `--grant-ttl`: `15m`.
+- `--recent-auth-ttl`: `5m` for password changes.
+- `--auth-rate-per-minute`: `20` authentication requests per client per minute.
 
 Keep the publication root manager-owned. Live publication paths must be real
 directories, not symlinks; staging and live content must be on the same mount.
 Do not manually rename or remove publication/recovery state while the manager
 is running.
+
+### Startup and upgrades
+
+The default data directory contains `state.sqlite`, `opaque-server.key`, and
+`repository-key-master.key`, plus caches and publication/recovery state. Keep
+both key files with their matching backup generation; neither is password-derived.
+If `--repository-key-master` points elsewhere, supply the same path to setup,
+recovery, and serving commands.
+
+The server returns HTTP 503 maintenance responses until startup is ready. For a
+supported database upgrade, the daemon excludes other database users, creates a
+verified database-only backup, and applies embedded migrations before normal
+workers start. Setup/recovery commands never migrate an existing database.
+
+A failed upgrade leaves a durable maintenance marker and requires operator
+recovery; restarting does not retry or clear it. Do not delete locks, key files,
+or the maintenance marker to force startup. See the
+[upgrade recovery procedure](docs/operations/upgrade-recovery.md).
 
 ### Recovery and backups
 
@@ -259,6 +308,13 @@ go test -race ./...
 go vet ./...
 govulncheck ./...
 ```
+
+The full race suite is currently slow and can exceed Go's default per-package
+test timeout. For a complete run, choose an explicit `-timeout` appropriate to
+your environment; use `-run` to narrow investigations. Repeated executable hashing
+is tracked in [#42](https://github.com/eslym/deploy-manager/issues/42); increasing
+the deadline does not fix that bottleneck. CLI tests share one executable build
+per package run and also instrument child executables when run with `-race`.
 
 The pinned container suite builds the combined executable and tests it from an
 unrelated working directory, including real Chromium authentication and
