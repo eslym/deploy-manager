@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent/projectref"
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -27,6 +28,18 @@ import (
 var commitIDPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 func validCommitTarget(id string) bool { return commitIDPattern.MatchString(id) }
+
+func (a *App) cachedProjectRef(ctx context.Context, projectID, kind, name string) (string, error) {
+	ref, err := a.store.ProjectRef.Query().Where(
+		projectref.IDEQ(projectID),
+		projectref.KindEQ(kind),
+		projectref.NameEQ(name),
+	).Only(ctx)
+	if err != nil {
+		return "", err
+	}
+	return ref.CommitID, nil
+}
 
 type deployment struct {
 	Rollback         bool   `json:"-"`
@@ -737,9 +750,11 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			}
 		} else if d.TargetKind == "branch" || d.TargetKind == "tag" {
 			kind := d.TargetKind
-			if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind=? AND name=?`, d.ProjectID, kind, d.TargetName).Scan(&d.Commit); err != nil {
+			if commit, err := a.cachedProjectRef(ctx, d.ProjectID, kind, d.TargetName); err != nil {
 				a.failJob(jobID, d.ID, generation, "The configured Git target is missing from the refreshed repository; the current publication was kept")
 				return
+			} else {
+				d.Commit = commit
 			}
 			if kind == "tag" {
 				// Hard re-deploy is the explicit tag-refresh operation. Persist its
@@ -1459,10 +1474,12 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "choose a cached Git target", 400)
 			return
 		}
-		if err := a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind=? AND name=?`, in.ProjectID, kind, in.TargetName).Scan(&in.Commit); err != nil {
+		commit, refErr := a.cachedProjectRef(r.Context(), in.ProjectID, kind, in.TargetName)
+		if refErr != nil {
 			http.Error(w, "the selected target is not in the cached refs", 400)
 			return
 		}
+		in.Commit = commit
 	} else if !validCommitTarget(in.Commit) {
 		http.Error(w, "enter a full 40-character commit ID", 400)
 		return
@@ -1655,10 +1672,16 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	if input.TargetKind == "branch" || input.TargetKind == "tag" {
 		kind := input.TargetKind
-		if input.TargetName == "" || len(input.TargetName) > 255 || a.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind=? AND name=?`, projectID, kind, input.TargetName).Scan(&input.Commit) != nil {
+		if input.TargetName == "" || len(input.TargetName) > 255 {
 			http.Error(w, "choose a target from the cached refs", http.StatusBadRequest)
 			return
 		}
+		commit, refErr := a.cachedProjectRef(r.Context(), projectID, kind, input.TargetName)
+		if refErr != nil {
+			http.Error(w, "choose a target from the cached refs", http.StatusBadRequest)
+			return
+		}
+		input.Commit = commit
 	} else if input.TargetKind != "commit" || !validCommitTarget(input.Commit) {
 		http.Error(w, "choose a branch, tag, or full commit ID", http.StatusBadRequest)
 		return

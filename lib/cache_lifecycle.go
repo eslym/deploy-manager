@@ -1,7 +1,7 @@
 package lib
 
 import (
-	"database/sql"
+	"context"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/eslym/deploy-manager/lib/ent/projectrefreshjournal"
 )
 
 type projectCacheFS interface {
@@ -93,22 +95,17 @@ func (p *projectManager) cleanupStage(path string) error {
 }
 
 func (p *projectManager) markRefreshIntent(id string) error {
-	_, err := p.db.Exec(`INSERT INTO project_refresh_journal(project_id) VALUES(?)`, id)
+	_, err := p.store.ProjectRefreshJournal.Create().SetID(id).Save(context.Background())
 	return err
 }
 
 func (p *projectManager) clearRefreshIntent(id string) error {
-	_, err := p.db.Exec(`DELETE FROM project_refresh_journal WHERE project_id=?`, id)
+	_, err := p.store.ProjectRefreshJournal.Delete().Where(projectrefreshjournal.IDEQ(id)).Exec(context.Background())
 	return err
 }
 
 func (p *projectManager) refreshIntentExists(id string) (bool, error) {
-	var exists int
-	err := p.db.QueryRow(`SELECT 1 FROM project_refresh_journal WHERE project_id=?`, id).Scan(&exists)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil, err
+	return p.store.ProjectRefreshJournal.Query().Where(projectrefreshjournal.IDEQ(id)).Exist(context.Background())
 }
 
 // rollbackRefresh restores the previous cache before clearing its durable
@@ -149,27 +146,12 @@ func (p *projectManager) rollbackRefresh(id string, liveIsUncommitted bool) erro
 // recovery must restore the previous cache. Unjournaled backup directories are
 // post-commit leftovers and can be safely deleted.
 func (p *projectManager) reconcileCacheFiles() error {
-	rows, err := p.db.Query(`SELECT project_id FROM project_refresh_journal ORDER BY project_id`)
+	journals, err := p.store.ProjectRefreshJournal.Query().Order(projectrefreshjournal.ByID()).All(context.Background())
 	if err != nil {
 		return err
 	}
-	var pending []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		pending = append(pending, id)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	for _, id := range pending {
+	for _, journal := range journals {
+		id := journal.ID
 		if !validProjectID(id) {
 			return errors.New("cache recovery journal contains an invalid project identifier")
 		}
