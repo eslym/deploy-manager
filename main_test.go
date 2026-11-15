@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"database/sql"
 	"encoding/pem"
 	"fmt"
 	"io"
@@ -38,6 +39,122 @@ func buildCommand(t *testing.T) string {
 		t.Fatalf("build executable: %v\n%s", err, out)
 	}
 	return binary
+}
+
+func TestBuiltExecutableRunsEmbeddedApplicationOutsideSourceTree(t *testing.T) {
+	binary := buildCommand(t)
+	installation := t.TempDir()
+	workDir := t.TempDir()
+	setup := boundedCommand(t, binary, "setup", "--data", installation, "--url", "https://manager.example")
+	setup.Dir = workDir
+	if output, err := setup.CombinedOutput(); err != nil || !strings.Contains(string(output), "https://manager.example/register#") {
+		t.Fatalf("embedded executable setup failed outside source tree: %v\n%s", err, output)
+	}
+	db, err := sql.Open("sqlite3", filepath.Join(installation, "state.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var sqliteVersion string
+	if err := db.QueryRow(`SELECT sqlite_version()`).Scan(&sqliteVersion); err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(sqliteVersion, ".")
+	if len(parts) < 3 {
+		t.Fatalf("unexpected SQLite version from shipped executable: %q", sqliteVersion)
+	}
+	var major, minor, patch int
+	if _, err := fmt.Sscanf(sqliteVersion, "%d.%d.%d", &major, &minor, &patch); err != nil || major < 3 || major == 3 && (minor < 51 || minor == 51 && patch < 3) {
+		t.Fatalf("shipped SQLite %q lacks the required WAL-reset fix: %v", sqliteVersion, err)
+	}
+	var version, applied int64
+	if err := db.QueryRow(`SELECT version_id,is_applied FROM goose_db_version WHERE is_applied=1 ORDER BY version_id DESC LIMIT 1`).Scan(&version, &applied); err != nil || version != 1 || applied != 1 {
+		t.Fatalf("shipped migration history = %d/%d, err=%v; want embedded v1", version, applied, err)
+	}
+	if _, err := os.Stat(filepath.Join(installation, "opaque-server.key")); err != nil {
+		t.Fatalf("production executable did not create external OPAQUE key: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(installation, "repository-key-master.key")); err != nil {
+		t.Fatalf("production executable did not create external repository master key: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	address := freeAddress(t)
+	client := startCommand(t, binary, installation, address)
+	request, err := http.NewRequest(http.MethodGet, "http://"+address+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Accept", "text/html")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil || response.StatusCode != http.StatusOK || !strings.Contains(string(body), "_app/immutable/entry/start.") {
+		t.Fatalf("embedded SPA unavailable from unrelated working directory: status=%d err=%v body=%q", response.StatusCode, err, body)
+	}
+}
+
+func TestBuiltExecutableRefusesOlderAndNewerCLIStorageWithoutMutation(t *testing.T) {
+	binary := buildCommand(t)
+	for _, tc := range []struct {
+		name, update string
+	}{
+		{"older", `UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`},
+		{"newer", `INSERT INTO goose_db_version(version_id,is_applied) VALUES(2,1)`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			data := t.TempDir()
+			setup := boundedCommand(t, binary, "setup", "--data", data, "--url", "https://manager.example")
+			if output, err := setup.CombinedOutput(); err != nil {
+				t.Fatalf("initialize fixture installation: %v\n%s", err, output)
+			}
+			dbPath := filepath.Join(data, "state.sqlite")
+			db, err := sql.Open("sqlite3", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(tc.update); err != nil {
+				db.Close()
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			paths := []string{dbPath, filepath.Join(data, "opaque-server.key"), filepath.Join(data, "repository-key-master.key")}
+			before := make(map[string][]byte, len(paths))
+			for _, path := range paths {
+				before[path], err = os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, command := range []string{"setup", "recover"} {
+				cmd := boundedCommand(t, binary, command, "--data", data, "--url", "https://manager.example")
+				cmd.Dir = t.TempDir()
+				var stdout, stderr bytes.Buffer
+				cmd.Stdout, cmd.Stderr = &stdout, &stderr
+				if err := cmd.Run(); err == nil || stdout.Len() != 0 || !(strings.Contains(stderr.String(), "schema version mismatch") || strings.Contains(stderr.String(), "cannot upgrade an existing database")) {
+					t.Fatalf("%s accepted unsupported schema: err=%v stdout=%q stderr=%q", command, err, &stdout, &stderr)
+				}
+			}
+			for path, want := range before {
+				got, err := os.ReadFile(path)
+				if err != nil || string(got) != string(want) {
+					t.Fatalf("CLI mismatch changed %s: %v", path, err)
+				}
+			}
+			if _, err := os.Lstat(dbPath + ".maintenance.json"); !os.IsNotExist(err) {
+				t.Fatalf("CLI mismatch created maintenance marker: %v", err)
+			}
+			if _, err := os.Lstat(dbPath + ".upgrade-backups"); !os.IsNotExist(err) {
+				t.Fatalf("CLI mismatch created backup artifacts: %v", err)
+			}
+		})
+	}
 }
 
 func freeAddress(t *testing.T) string {
