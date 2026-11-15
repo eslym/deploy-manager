@@ -3,15 +3,14 @@ package lib
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"net"
 	"net/http"
 	"time"
 
 	"github.com/bytemare/opaque"
+	"github.com/eslym/deploy-manager/lib/ent"
 )
 
 const (
@@ -55,17 +54,16 @@ func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid protocol message", http.StatusBadRequest)
 		return
 	}
-	var registration []byte
-	var generation int64
-	if err = a.db.QueryRow(`SELECT registration_record,credential_generation FROM administrator WHERE id=1`).Scan(&registration, &generation); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
+	adminRecord, err := a.store.Administrator.Get(r.Context(), 1)
+	if err != nil {
+		if ent.IsNotFound(err) {
 			http.Error(w, "login unavailable", http.StatusUnauthorized)
 		} else {
 			http.Error(w, "login temporarily unavailable", http.StatusInternalServerError)
 		}
 		return
 	}
-	record, err := a.des.RegistrationRecord(registration)
+	record, err := a.des.RegistrationRecord(adminRecord.RegistrationRecord)
 	if err != nil || record == nil {
 		http.Error(w, "login temporarily unavailable", http.StatusInternalServerError)
 		return
@@ -95,7 +93,7 @@ func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	a.logins[transaction] = pendingLogin{clientMAC: append([]byte(nil), output.ClientMAC...), expires: now.Add(a.cfg.LoginTTL), origin: r.Header.Get("Origin"), remoteIP: remoteIP, generation: generation}
+	a.logins[transaction] = pendingLogin{clientMAC: append([]byte(nil), output.ClientMAC...), expires: now.Add(a.cfg.LoginTTL), origin: r.Header.Get("Origin"), remoteIP: remoteIP, generation: adminRecord.CredentialGeneration}
 	a.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")

@@ -20,6 +20,21 @@ copyright, attribution, and patent notice before distributing source or
 binaries. Go transitive modules include MIT and Go Authors BSD-3-Clause
 licensed works; their upstream notices remain applicable as well.
 
+Typed query mappings add `entgo.io/ent v0.14.5`; its upstream Apache-2.0
+license is retained at `third_party/licenses/entgo.io/ent@v0.14.5/LICENSE`.
+Ent's generated runtime schema package depends on `ariga.io/atlas
+v0.32.1-0.20250325101103-175b25e1c1b9`; its upstream license is retained at
+`third_party/licenses/ariga.io/atlas@v0.32.1-0.20250325101103-175b25e1c1b9/LICENSE`.
+The resolved Ent/Atlas graph is pinned by `go.mod`/`go.sum`; applicable source
+license and notice files for newly resolved modules are retained under
+`third_party/licenses/`. The Ent code generator itself is pinned to v0.14.5 in
+the schema's `go:generate` directive and is invoked only by maintainers; no
+generator executable or source checkout is needed to build or run the program.
+Ent schema reconciliation is not invoked; goose remains the sole migration
+executor. `github.com/go-openapi/inflect v0.19.0` is present in the resolved
+graph but its module archive contains no root license/notice file; distribution
+license clearance remains subject to the repository-wide issue #26 inventory.
+
 Public repository support adds `github.com/go-git/go-git/v5 v5.19.3`. The
 source-provided license and notice files for the newly added Go modules are
 retained verbatim under `third_party/licenses/go-git/`, using module/version

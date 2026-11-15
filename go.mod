@@ -3,6 +3,7 @@ module github.com/eslym/deploy-manager
 go 1.26.11
 
 require (
+	entgo.io/ent v0.14.5
 	github.com/bytemare/opaque v0.18.0
 	github.com/git-lfs/git-lfs/v3 v3.8.1
 	github.com/go-git/go-billy/v5 v5.9.2
@@ -15,13 +16,17 @@ require (
 )
 
 require (
+	ariga.io/atlas v0.32.1-0.20250325101103-175b25e1c1b9 // indirect
 	dario.cat/mergo v1.0.0 // indirect
 	filippo.io/edwards25519 v1.2.0 // indirect
 	filippo.io/nistec v0.0.4 // indirect
 	github.com/Microsoft/go-winio v0.6.4 // indirect
 	github.com/ProtonMail/go-crypto v1.1.6 // indirect
+	github.com/agext/levenshtein v1.2.3 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20210105120005-909beea2cc74 // indirect
+	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
 	github.com/avast/retry-go v3.0.0+incompatible // indirect
+	github.com/bmatcuk/doublestar v1.3.4 // indirect
 	github.com/bytemare/ecc v0.9.0 // indirect
 	github.com/bytemare/hash v0.6.2 // indirect
 	github.com/bytemare/hash2curve v0.5.4 // indirect
@@ -36,9 +41,13 @@ require (
 	github.com/git-lfs/pktline v0.0.0-20210330133718-06e9096e2825 // indirect
 	github.com/git-lfs/wildmatch/v2 v2.0.1 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
+	github.com/go-openapi/inflect v0.19.0 // indirect
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
+	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/gtank/ristretto255 v0.2.0 // indirect
 	github.com/hashicorp/go-uuid v1.0.2 // indirect
+	github.com/hashicorp/hcl/v2 v2.18.1 // indirect
 	github.com/jbenet/go-context v0.0.0-20150711004518-d14ea06fba99 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect
@@ -52,6 +61,7 @@ require (
 	github.com/leonelquinteros/gotext v1.7.2 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mfridman/interpolate v0.2.0 // indirect
+	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
 	github.com/olekukonko/ts v0.0.0-20171002115256-78ecb04241c0 // indirect
 	github.com/pjbgf/sha1cd v0.7.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
@@ -61,7 +71,10 @@ require (
 	github.com/skeema/knownhosts v1.3.1 // indirect
 	github.com/ssgelm/cookiejarparser v1.0.1 // indirect
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
+	github.com/zclconf/go-cty v1.14.4 // indirect
+	github.com/zclconf/go-cty-yaml v1.1.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
+	golang.org/x/mod v0.42.0 // indirect
 	golang.org/x/sync v0.25.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect

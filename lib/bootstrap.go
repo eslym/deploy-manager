@@ -22,7 +22,11 @@ import (
 	"sync"
 	"time"
 
+	entdialect "entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/bytemare/opaque"
+	"github.com/eslym/deploy-manager/lib/ent"
+	"github.com/eslym/deploy-manager/lib/ent/registrationgrant"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sys/unix"
 )
@@ -70,6 +74,7 @@ type Config struct {
 type App struct {
 	cfg                  Config
 	db                   *sql.DB
+	store                *ent.Client
 	protocol             *opaque.Server
 	des                  *opaque.Deserializer
 	keyGeneration        string
@@ -251,6 +256,7 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
+	store := ent.NewClient(ent.Driver(entsql.OpenDB(entdialect.SQLite, db)))
 	if err = initializeSchemaWithConfig(db, !prior, cfg); err != nil {
 		db.Close()
 		return nil, err
@@ -304,7 +310,7 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 	}
 	const profile = "RFC9807-OPAQUE-3DH;ristretto255-SHA512;HKDF-SHA512;HMAC-SHA512;Argon2id-v19-i1-m65536-p4;context-empty;identities-default"
 	if !prior {
-		if _, err = db.Exec(`INSERT INTO opaque_profile(singleton,profile_generation,key_generation,profile) VALUES(1,1,?,?)`, keyGeneration, profile); err != nil {
+		if _, err = store.OpaqueProfile.Create().SetID(1).SetProfileGeneration(1).SetKeyGeneration(keyGeneration).SetProfile(profile).Save(context.Background()); err != nil {
 			db.Close()
 			return nil, fmt.Errorf("could not initialize fresh OPAQUE profile binding; preserve key and database evidence and use isolated rebootstrap if interrupted: %w", err)
 		}
@@ -312,28 +318,33 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 	var storedProfile string
 	var profileGeneration int
 	var storedKeyGeneration string
-	if err = db.QueryRow(`SELECT profile_generation,key_generation,profile FROM opaque_profile WHERE singleton=1`).Scan(&profileGeneration, &storedKeyGeneration, &storedProfile); err != nil {
+	profileRecord, profileErr := store.OpaqueProfile.Get(context.Background(), 1)
+	if err = profileErr; err != nil {
 		db.Close()
 		return nil, err
 	}
+	profileGeneration, storedKeyGeneration, storedProfile = profileRecord.ProfileGeneration, profileRecord.KeyGeneration, profileRecord.Profile
 	if profileGeneration != 1 || storedKeyGeneration != keyGeneration || storedProfile != profile {
 		db.Close()
 		return nil, errors.New("OPAQUE key/profile generation mismatch; refusing authentication startup")
 	}
 	var accountGeneration int
-	err = db.QueryRow(`SELECT profile_generation FROM administrator WHERE id=1`).Scan(&accountGeneration)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	adminRecord, adminErr := store.Administrator.Get(context.Background(), 1)
+	err = adminErr
+	if err != nil && !ent.IsNotFound(err) {
 		db.Close()
 		return nil, err
 	}
-	if err == nil && accountGeneration != profileGeneration {
+	if adminRecord != nil {
+		accountGeneration = adminRecord.ProfileGeneration
+	}
+	if adminRecord != nil && accountGeneration != profileGeneration {
 		db.Close()
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
 	var credentialGeneration int64
-	if err = db.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&credentialGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		db.Close()
-		return nil, err
+	if adminRecord != nil {
+		credentialGeneration = adminRecord.CredentialGeneration
 	}
 	if masterInfo, masterErr := os.Lstat(cfg.RepositoryKeyPath); masterErr == nil {
 		if dbInfo, dbErr := os.Stat(dbPath); dbErr == nil && os.SameFile(masterInfo, dbInfo) {
@@ -345,7 +356,7 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 			return nil, errors.New("repository key master file must not share the OPAQUE key file")
 		}
 	}
-	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	app := &App{cfg: cfg, db: db, store: store, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
 	masterTransferred = true
 	ready := false
 	defer func() {
@@ -482,13 +493,14 @@ func (a *App) IssueRegistrationGrant() (string, error) {
 func (a *App) IssueRecoveryGrant() (string, error) { return a.issueGrant("recovery") }
 
 func (a *App) issueGrant(purpose string) (string, error) {
-	tx, e := a.db.Begin()
+	ctx := context.Background()
+	tx, e := a.store.Tx(ctx)
 	if e != nil {
 		return "", e
 	}
 	defer tx.Rollback()
-	var n int
-	if e = tx.QueryRow(`SELECT count(*) FROM administrator`).Scan(&n); e != nil {
+	n, e := tx.Administrator.Query().Count(ctx)
+	if e != nil {
 		return "", e
 	}
 	if (purpose == "setup" && n != 0) || (purpose == "recovery" && n != 1) {
@@ -499,15 +511,17 @@ func (a *App) issueGrant(purpose string) (string, error) {
 	}
 	var generation int64
 	if n == 1 {
-		if e = tx.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&generation); e != nil {
-			return "", e
+		adminRecord, err := tx.Administrator.Get(ctx, 1)
+		if err != nil {
+			return "", err
 		}
+		generation = adminRecord.CredentialGeneration
 	}
 	now := a.cfg.Now()
-	if _, e = tx.Exec(`DELETE FROM registration_grants WHERE expires_at<?`, now.UnixNano()); e != nil {
+	if _, e = tx.RegistrationGrant.Delete().Where(registrationgrant.ExpiresAtLT(now.UnixNano())).Exec(ctx); e != nil {
 		return "", e
 	}
-	if e = tx.QueryRow(`SELECT count(*) FROM registration_grants`).Scan(&n); e != nil {
+	if n, e = tx.RegistrationGrant.Query().Count(ctx); e != nil {
 		return "", e
 	}
 	if n >= 10 {
@@ -519,7 +533,7 @@ func (a *App) issueGrant(purpose string) (string, error) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(b)
 	h := sha256.Sum256([]byte(token))
-	if _, e = tx.Exec(`INSERT INTO registration_grants(token_hash,expires_at,created_at,purpose,credential_generation) VALUES(?,?,?,?,?)`, h[:], now.Add(a.cfg.GrantTTL).UnixNano(), now.UnixNano(), purpose, generation); e != nil {
+	if _, e = tx.RegistrationGrant.Create().SetID(h[:]).SetExpiresAt(now.Add(a.cfg.GrantTTL).UnixNano()).SetCreatedAt(now.UnixNano()).SetPurpose(purpose).SetCredentialGeneration(generation).Save(ctx); e != nil {
 		return "", e
 	}
 	if e = tx.Commit(); e != nil {
@@ -878,8 +892,8 @@ func (a *App) newRegistrationTransactionLocked(grant, purpose, origin string, ge
 		return "", errors.New("registration is busy; try again")
 	}
 	grantHash := sha256.Sum256([]byte(grant))
-	var expires int64
-	if err := a.db.QueryRow(`SELECT expires_at FROM registration_grants WHERE token_hash=? AND purpose=? AND credential_generation=?`, grantHash[:], purpose, generation).Scan(&expires); err != nil || expires < now.UnixNano() {
+	grantRecord, err := a.store.RegistrationGrant.Get(context.Background(), grantHash[:])
+	if err != nil || grantRecord.Purpose != purpose || grantRecord.CredentialGeneration != generation || grantRecord.ExpiresAt < now.UnixNano() {
 		return "", errors.New("invalid or expired grant")
 	}
 	var raw [32]byte
@@ -888,7 +902,7 @@ func (a *App) newRegistrationTransactionLocked(grant, purpose, origin string, ge
 	}
 	handle := base64.RawURLEncoding.EncodeToString(raw[:])
 	deadline := now.Add(registrationTransactionTTL)
-	grantDeadline := time.Unix(0, expires)
+	grantDeadline := time.Unix(0, grantRecord.ExpiresAt)
 	if grantDeadline.Before(deadline) {
 		deadline = grantDeadline
 	}
@@ -1036,14 +1050,15 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		a.replaceCredential(w, pending.grantHash[:], b, "recovery", [32]byte{}, handle, r.Header.Get("Origin"))
 		return
 	}
-	tx, e := a.db.Begin()
+	ctx := r.Context()
+	tx, e := a.store.Tx(ctx)
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
 	defer tx.Rollback()
-	var count int
-	if e = tx.QueryRow(`SELECT count(*) FROM administrator`).Scan(&count); e != nil {
+	count, e := tx.Administrator.Query().Count(ctx)
+	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
@@ -1052,21 +1067,20 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	res, e := tx.Exec(`DELETE FROM registration_grants WHERE token_hash=? AND purpose='setup' AND credential_generation=? AND expires_at>=?`, pending.grantHash[:], pending.generation, now)
+	res, e := tx.RegistrationGrant.Delete().Where(registrationgrant.IDEQ(pending.grantHash[:]), registrationgrant.PurposeEQ("setup"), registrationgrant.CredentialGenerationEQ(pending.generation), registrationgrant.ExpiresAtGTE(now)).Exec(ctx)
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
-	n, _ := res.RowsAffected()
-	if n != 1 {
+	if res != 1 {
 		http.Error(w, "grant expired or already used", 410)
 		return
 	}
-	if _, e = tx.Exec(`INSERT INTO administrator(id,registration_record,profile_generation,created_at) VALUES(1,?,1,?)`, b, now); e != nil {
+	if _, e = tx.Administrator.Create().SetID(1).SetRegistrationRecord(b).SetProfileGeneration(1).SetCredentialGeneration(1).SetCreatedAt(now).Save(ctx); e != nil {
 		http.Error(w, "administrator already registered", 409)
 		return
 	}
-	if _, e = tx.Exec(`DELETE FROM registration_grants`); e != nil {
+	if _, e = tx.RegistrationGrant.Delete().Exec(ctx); e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
@@ -1084,13 +1098,11 @@ func (a *App) grantValid(token, purpose string, generation int64) bool {
 		return false
 	}
 	h := sha256.Sum256([]byte(token))
-	var exp, storedGeneration int64
-	err := a.db.QueryRow(`SELECT expires_at,credential_generation FROM registration_grants WHERE token_hash=? AND purpose=?`, h[:], purpose).Scan(&exp, &storedGeneration)
-	return err == nil && exp >= a.cfg.Now().UnixNano() && storedGeneration == generation
+	grant, err := a.store.RegistrationGrant.Get(context.Background(), h[:])
+	return err == nil && grant.ExpiresAt >= a.cfg.Now().UnixNano() && grant.Purpose == purpose && grant.CredentialGeneration == generation
 }
 func (a *App) HasAdministrator() (bool, error) {
-	var n int
-	e := a.db.QueryRow(`SELECT count(*) FROM administrator`).Scan(&n)
+	n, e := a.store.Administrator.Query().Count(context.Background())
 	return n > 0, e
 }
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.Handler().ServeHTTP(w, r) }
