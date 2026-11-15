@@ -28,7 +28,7 @@ directories. The pinned modules and copied files are:
 | Module | Retained upstream files |
 | --- | --- |
 | `dario.cat/mergo v1.0.0` | `LICENSE` |
-| `github.com/Microsoft/go-winio v0.6.2` | `LICENSE` |
+| `github.com/Microsoft/go-winio v0.6.4` | `LICENSE` |
 | `github.com/ProtonMail/go-crypto v1.1.6` | `LICENSE` |
 | `github.com/cloudflare/circl v1.6.3` | `LICENSE` |
 | `github.com/cyphar/filepath-securejoin v0.6.1` | `LICENSE.BSD`, `LICENSE.MPL-2.0`, `COPYING.md` |
@@ -78,6 +78,7 @@ the corresponding module/version directories there:
 | `github.com/git-lfs/pktline v0.0.0-20210330133718-06e9096e2825` | `LICENSE.md` |
 | `github.com/git-lfs/wildmatch/v2 v2.0.1` | `LICENSE.md` |
 | `github.com/hashicorp/go-uuid v1.0.2` | `LICENSE` |
+
 | `github.com/jcmturner/aescts/v2 v2.0.0` | `LICENSE` |
 | `github.com/jcmturner/dnsutils/v2 v2.0.0` | `LICENSE` |
 | `github.com/jcmturner/gofork v1.0.0` | `LICENSE` |
@@ -85,7 +86,7 @@ the corresponding module/version directories there:
 | `github.com/jcmturner/gokrb5/v8 v8.4.2` | `LICENSE` |
 | `github.com/jcmturner/rpc/v2 v2.0.3` | `LICENSE` |
 | `github.com/jmhodges/clock v1.2.0` | `LICENSE` |
-| `github.com/klauspost/compress v1.20.2` | `LICENSE` |
+| `github.com/klauspost/compress v1.20.4` | `LICENSE` |
 | `github.com/leonelquinteros/gotext v1.7.2` | `LICENSE` |
 | `github.com/mattn/go-isatty v0.0.24` | `LICENSE` |
 | `github.com/olekukonko/ts v0.0.0-20171002115256-78ecb04241c0` | `LICENCE` |
@@ -96,3 +97,22 @@ the corresponding module/version directories there:
 This records upstream files for the selected graph, not a legal review or a
 complete distribution inventory. Continue the dependency and advisory review
 tracked by #26 before distribution.
+
+Database initialization embeds reviewed SQL migrations executed in-process by
+`github.com/pressly/goose/v3 v3.30.1` (MIT). The existing `database/sql`
+SQLite driver remains `github.com/mattn/go-sqlite3`, upgraded from v1.14.24 to
+v1.14.53; its bundled engine reports SQLite 3.54.1, which includes the WAL-reset
+fix introduced in 3.51.3. Goose's linked dependency notices are retained under
+`third_party/licenses/goose/`:
+
+| Module | Retained upstream license file |
+| --- | --- |
+| `github.com/pressly/goose/v3 v3.30.1` | `LICENSE` |
+| `github.com/mattn/go-sqlite3 v1.14.53` | `LICENSE` |
+| `github.com/mfridman/interpolate v0.2.0` | `LICENSE.txt` |
+| `github.com/sethvargo/go-retry v0.5.0` | `LICENSE` |
+| `go.uber.org/multierr v1.11.0` | `LICENSE.txt` |
+
+This is the selected migration/runtime dependency scope, not a complete license
+inventory of the entire module graph. The exact runtime SQLite version is
+checked at startup so a build using an older system SQLite fails closed.

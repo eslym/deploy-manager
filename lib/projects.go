@@ -126,38 +126,6 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheB
 	return manager, nil
 }
 
-func initProjectSchema(db *sql.DB) error {
-	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,remote_url TEXT NOT NULL,created_at INTEGER NOT NULL,last_fetched INTEGER,warning TEXT NOT NULL DEFAULT '')`,
-		`CREATE TABLE IF NOT EXISTS project_refs(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,kind TEXT NOT NULL,name TEXT NOT NULL,commit_id TEXT NOT NULL,PRIMARY KEY(project_id,kind,name))`,
-		`CREATE TABLE IF NOT EXISTS project_refresh_journal(project_id TEXT PRIMARY KEY)`,
-		`CREATE TABLE IF NOT EXISTS project_ssh_keys(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,key_id TEXT NOT NULL REFERENCES repository_keys(id) ON DELETE RESTRICT)`,
-		`CREATE TABLE IF NOT EXISTS project_deletions(project_id TEXT PRIMARY KEY,cache_dev INTEGER NOT NULL,cache_ino INTEGER NOT NULL,lfs_dev INTEGER NOT NULL DEFAULT 0,lfs_ino INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,last_error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS ssh_host_trust(host TEXT NOT NULL,port INTEGER NOT NULL,trusted_key BLOB,observed_key BLOB,observed_fingerprint TEXT NOT NULL DEFAULT '',warning TEXT NOT NULL DEFAULT '',PRIMARY KEY(host,port))`,
-		`CREATE TABLE IF NOT EXISTS project_lfs_settings(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,endpoint TEXT NOT NULL,object_origins TEXT NOT NULL,allow_internal INTEGER NOT NULL DEFAULT 0,internal_addresses TEXT NOT NULL DEFAULT '[]',updated_at INTEGER NOT NULL)`,
-	} {
-		if _, err := db.Exec(q); err != nil {
-			return err
-		}
-	}
-	if err := ensureColumn(db, "project_lfs_settings", "internal_addresses", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
-		return err
-	}
-	if err := ensureColumn(db, "project_deletions", "attempts", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	if err := ensureColumn(db, "project_deletions", "retry_after", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	if err := ensureColumn(db, "project_deletions", "lfs_dev", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	if err := ensureColumn(db, "project_deletions", "lfs_ino", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	return nil
-}
-
 func safeRemote(raw string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Scheme != "https" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" {

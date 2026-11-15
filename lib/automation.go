@@ -32,43 +32,6 @@ func (a *App) finishAutomaticFetch(jobID, id string, generation int64, paused bo
 	}
 }
 
-// Automation has its own revision: pausing invalidates accepted automatic work
-// without cancelling a deliberately requested one-off manual publication.
-func (a *App) initDeploymentAutomation() error {
-	for _, column := range []struct{ name, definition string }{
-		{"automation_paused", `INTEGER NOT NULL DEFAULT 0`},
-		{"automation_epoch", `INTEGER NOT NULL DEFAULT 0`},
-	} {
-		if err := ensureColumn(a.db, "deployments", column.name, column.definition); err != nil {
-			return err
-		}
-	}
-	var exists int
-	if err := a.db.QueryRow(`SELECT count(*) FROM pragma_table_info('deployment_jobs') WHERE name='automatic'`).Scan(&exists); err != nil {
-		return err
-	}
-	if err := ensureColumn(a.db, "deployment_jobs", "automation_epoch", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	// Before explicit job provenance existed, durable jobs were exclusively
-	// verified webhooks. Migrate once; newer durable manual jobs stay manual.
-	if exists == 0 {
-		tx, err := a.db.Begin()
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback()
-		if _, err = tx.Exec(`ALTER TABLE deployment_jobs ADD COLUMN automatic INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return err
-		}
-		if _, err = tx.Exec(`UPDATE deployment_jobs SET automatic=1 WHERE durable=1 AND rollback_commit=''`); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
-	return nil
-}
-
 func (a *App) pauseDeployment(w http.ResponseWriter, r *http.Request) {
 	a.controlDeploymentAutomation(w, r, true)
 }

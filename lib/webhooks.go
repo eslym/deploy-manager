@@ -24,19 +24,6 @@ const giteaWebhookProvider = "gitea"
 
 var webhookDeliveryID = regexp.MustCompile(`^[A-Za-z0-9-]{1,128}$`)
 
-func (a *App) initWebhooks() error {
-	for _, query := range []string{
-		`CREATE TABLE IF NOT EXISTS project_webhooks(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,secret BLOB NOT NULL,created_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS project_gitea_webhooks(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,secret BLOB NOT NULL,created_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS webhook_deliveries(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,provider TEXT NOT NULL,delivery_id TEXT NOT NULL,event TEXT NOT NULL,outcome TEXT NOT NULL,created_at INTEGER NOT NULL,PRIMARY KEY(project_id,provider,delivery_id))`,
-	} {
-		if _, err := a.db.Exec(query); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (a *App) webhookCipher() (cipher.AEAD, error) {
 	block, err := aes.NewCipher(a.repositoryMaster)
 	if err != nil {

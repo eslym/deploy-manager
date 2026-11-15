@@ -183,54 +183,6 @@ func (a *App) initDeployments() error {
 	return a.recoverDeployments()
 }
 
-func (a *App) initDeploymentSchema() error {
-	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS deployments(id TEXT PRIMARY KEY,project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,name TEXT NOT NULL,commit_id TEXT NOT NULL,generation INTEGER NOT NULL DEFAULT 1,live_commit TEXT NOT NULL DEFAULT '',live_dev INTEGER NOT NULL DEFAULT 0,live_ino INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'queued',error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,UNIQUE(project_id,name))`,
-		`CREATE TABLE IF NOT EXISTS deployment_jobs(id TEXT PRIMARY KEY,deployment_id TEXT NOT NULL REFERENCES deployments(id) ON DELETE CASCADE,commit_id TEXT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL,log TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,force_redeploy INTEGER NOT NULL DEFAULT 0)`,
-		`CREATE TABLE IF NOT EXISTS publication_intents(deployment_id TEXT PRIMARY KEY REFERENCES deployments(id) ON DELETE CASCADE,job_id TEXT NOT NULL,stage_name TEXT NOT NULL,had_old INTEGER NOT NULL,old_dev INTEGER NOT NULL,old_ino INTEGER NOT NULL,new_dev INTEGER NOT NULL,new_ino INTEGER NOT NULL,phase TEXT NOT NULL,created_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS publication_cleanup(deployment_id TEXT NOT NULL,job_id TEXT NOT NULL,path_name TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,not_before INTEGER NOT NULL,last_error TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(deployment_id,job_id))`,
-		`CREATE TABLE IF NOT EXISTS deployment_removal_paths(deployment_id TEXT NOT NULL,path_name TEXT NOT NULL,dev INTEGER NOT NULL,ino INTEGER NOT NULL,last_error TEXT NOT NULL DEFAULT '',attempts INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(deployment_id,path_name))`,
-		`CREATE TABLE IF NOT EXISTS deployment_deletions(deployment_id TEXT PRIMARY KEY,status TEXT NOT NULL,last_error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS archived_deployment_jobs(id TEXT PRIMARY KEY,deployment_id TEXT NOT NULL,commit_id TEXT NOT NULL,generation INTEGER NOT NULL,status TEXT NOT NULL,log TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
-	} {
-		if _, err := a.db.Exec(q); err != nil {
-			return err
-		}
-	}
-	for _, column := range []struct{ name, definition string }{{"target_kind", `TEXT NOT NULL DEFAULT 'commit'`}, {"target_name", `TEXT NOT NULL DEFAULT ''`}} {
-		if err := ensureColumn(a.db, "deployments", column.name, column.definition); err != nil {
-			return err
-		}
-	}
-	if err := ensureColumn(a.db, "deployment_jobs", "force_redeploy", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	if err := ensureColumn(a.db, "deployment_jobs", "rollback_commit", `TEXT NOT NULL DEFAULT ''`); err != nil {
-		return err
-	}
-	if err := ensureColumn(a.db, "deployment_jobs", "durable", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	if err := ensureColumn(a.db, "deployment_jobs", "retry_enqueued", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	if err := a.initDeploymentAutomation(); err != nil {
-		return err
-	}
-	if err := ensureColumn(a.db, "deployment_deletions", "retry_after", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	if err := ensureColumn(a.db, "publication_cleanup", "attempts", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return err
-	}
-	for _, column := range []struct{ name, definition string }{{"live_dev", `INTEGER NOT NULL DEFAULT 0`}, {"live_ino", `INTEGER NOT NULL DEFAULT 0`}} {
-		if err := ensureColumn(a.db, "deployments", column.name, column.definition); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 func (a *App) recoverDeployments() error {
 	// Jobs interrupted by process termination are terminalized separately from
 	// filesystem intent reconciliation, which uses observed inode identities.
