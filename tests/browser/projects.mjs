@@ -279,7 +279,7 @@ try {
   const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
   const featureCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
   milestone("open rollback history");
-  await page.getByRole("button", { name: "Temporary rollback", exact: true }).click();
+  await page.getByRole("button", { name: "Rollback", exact: true }).click();
   const history = page.getByRole("region", { name: "Rollback history for Production site" });
   await history.getByText("Page 1", { exact: true }).waitFor();
   for (const [commit, title] of [[mainCommit, "main"], [featureCommit, "feature search"]]) {
@@ -364,7 +364,7 @@ try {
     return jobs.find(job => job.id === resumedJob.jobId)?.status === "succeeded";
   }, "deployment after permanent rollback resume");
   milestone("change branch target and deploy no-op");
-  await page.getByRole("button", { name: "Temporary rollback", exact: true }).click();
+  await page.getByRole("button", { name: "Rollback", exact: true }).click();
   await page.getByLabel("Target for Production site").selectOption("branch:main");
   const targetUpdate = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/target`));
   await page.getByRole("button", { name: "Change target" }).click();
@@ -374,7 +374,7 @@ try {
   }, "replacement publication files");
   if ((await stat(publishedPath)).ino === firstDirectoryIdentity) throw new Error("replacement did not switch the live directory");
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
-  await page.getByText(/Latest deployment: noop/).waitFor({ timeout: 10000 });
+  await page.getByRole("region", { name: `Job history for Production site` }).getByText("No changes", { exact: true }).first().waitFor({ timeout: 10000 });
 
   const productionCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "Production site", exact: true }) });
   await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
@@ -409,7 +409,7 @@ try {
   const manualWhilePaused = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/deploy`));
   await productionCard.getByRole("button", { name: "Deploy", exact: true }).click();
   if ((await manualWhilePaused).status() !== 202) throw new Error("manual Deploy was blocked while paused");
-  await productionCard.getByText(/Latest deployment: noop/).waitFor();
+  await productionCard.getByRole("region", { name: "Job history for Production site" }).getByText("No changes", { exact: true }).first().waitFor();
   const stillPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id).automationPaused, deploymentID);
   if (!stillPaused) throw new Error("manual Deploy cleared automation pause");
   const resumedResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/resume`));

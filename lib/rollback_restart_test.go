@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,6 +17,113 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 )
+
+func TestPermanentRollbackCrashRestartRace(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "accepted.json")
+	child := exec.Command(os.Args[0], "-test.run=^TestPermanentRollbackCrashRestartRaceChild$")
+	child.Env = append(os.Environ(), "DM_AUTOMATION_FIXTURE_DIR="+root, "DM_ROLLBACK_CRASH_CHILD="+marker)
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if child.ProcessState == nil {
+			_ = child.Process.Kill()
+			_, _ = child.Process.Wait()
+		}
+	})
+	markerBytes := waitForFile(t, marker)
+	var state struct {
+		DeploymentID string `json:"deploymentId"`
+		JobID        string `json:"jobId"`
+		LivePath     string `json:"livePath"`
+		LiveContent  string `json:"liveContent"`
+	}
+	if err := json.Unmarshal(markerBytes, &state); err != nil {
+		t.Fatal(err)
+	}
+	// Kill the application while the accepted rollback worker is still held at
+	// its pre-publication boundary. A graceful close would release the job.
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = child.Process.Wait()
+	app, err := New(Config{DatabasePath: filepath.Join(root, "state.db"), OPAQUEKeyPath: filepath.Join(root, "opaque.key")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	server := httptest.NewTLSServer(app.Handler())
+	defer server.Close()
+	cookie := installAPITestSession(t, app)
+	assertAutomationPaused(t, server, cookie, state.DeploymentID, true)
+	waitForDeploymentJob(t, server.Client(), server.URL, cookie, state.DeploymentID, state.JobID, "failed")
+	content, err := os.ReadFile(filepath.Join(state.LivePath, "README.md"))
+	if err != nil || string(content) != state.LiveContent {
+		t.Fatalf("crash/recovery changed live publication: content=%q err=%v", content, err)
+	}
+}
+
+func waitForFile(t *testing.T, path string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil {
+			return data
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("subprocess did not accept and pause the permanent rollback")
+	return nil
+}
+
+func TestPermanentRollbackCrashRestartRaceChild(t *testing.T) {
+	marker := os.Getenv("DM_ROLLBACK_CRASH_CHILD")
+	if marker == "" {
+		return
+	}
+	f := newAutomationFixture(t)
+	id := f.createBranch(t, "permanent-rollback-process-crash")
+	livePath := f.app.deploymentPath(id)
+	live, err := os.ReadFile(filepath.Join(livePath, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	previous := setPublicationFaultPoint(func(point string) error {
+		if point == "before-job-lock" {
+			close(started)
+			select {}
+		}
+		return nil
+	})
+	defer setPublicationFaultPoint(previous)
+	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments/"+id+"/rollback", `{"commit":"`+f.initialCommit+`","permanent":true}`)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("rollback request status=%d body=%s", response.StatusCode, responseText(response))
+	}
+	var accepted struct {
+		JobID string `json:"jobId"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback worker did not block before publication")
+	}
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	data, err := json.Marshal(map[string]string{"deploymentId": id, "jobId": accepted.JobID, "livePath": livePath, "liveContent": string(live)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {}
+}
 
 func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) {
 	f := newAutomationFixture(t)
