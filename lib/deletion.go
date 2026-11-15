@@ -144,7 +144,7 @@ func (a *App) finishDeploymentDeletion(id string) error {
 				err = syncDirectory(a.cfg.DeploymentRoot)
 			}
 			if err != nil {
-				_, _ = a.db.Exec(`UPDATE deployment_removal_paths SET last_error='cleanup failed; retry scheduled',attempts=attempts+1 WHERE deployment_id=? AND path_name=?`, id, x.name)
+				_, _ = a.store.DeploymentRemovalPath.Update().Where(deploymentremovalpath.IDEQ(id), deploymentremovalpath.PathNameEQ(x.name)).SetLastError("cleanup failed; retry scheduled").AddAttempts(1).Save(context.Background())
 				return a.recordDeletionFailure(id, err)
 			}
 			if err = fault("after-deployment-removal"); err != nil {
@@ -333,12 +333,10 @@ func (a *App) finishDeploymentDeletionRecord(id string) error {
 }
 
 func (a *App) recordDeletionFailure(id string, cause error) error {
-	var attempts int
-	_ = a.db.QueryRow(`SELECT attempts FROM deployment_deletions WHERE deployment_id=?`, id).Scan(&attempts)
-	delay := retryDelay(attempts)
-	next := a.cfg.Now().Add(delay).UnixNano()
-	_, _ = a.db.Exec(`UPDATE deployment_deletions SET status='blocked',last_error='safe cleanup is pending; check publication paths and retry',attempts=attempts+1,retry_after=?,updated_at=? WHERE deployment_id=?`, next, a.cfg.Now().UnixNano(), id)
-	_, _ = a.db.Exec(`UPDATE deployments SET status='deletion_failed',error='Deletion is blocked; cleanup will retry after the path is safe',updated_at=? WHERE id=? AND status='deleting'`, a.cfg.Now().UnixNano(), id)
+	ctx := context.Background()
+	now := a.cfg.Now().UnixNano()
+	_, _ = a.store.DeploymentDeletion.Update().Where(deploymentdeletion.IDEQ(id)).SetStatus("blocked").SetLastError("safe cleanup is pending; check publication paths and retry").SetRetryAfter(a.cfg.Now().Add(retryDelay(0)).UnixNano()).SetUpdatedAt(now).Save(ctx)
+	_, _ = a.store.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.StatusEQ("deleting")).SetStatus("deletion_failed").SetError("Deletion is blocked; cleanup will retry after the path is safe").SetUpdatedAt(now).Save(ctx)
 	return fmt.Errorf("deployment deletion pending: %w", cause)
 }
 

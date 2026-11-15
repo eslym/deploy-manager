@@ -1350,7 +1350,7 @@ func (a *App) cleanupPublications(startup bool) error {
 			return liveErr
 		}
 		if liveIdentity == c.identity {
-			if _, err := a.db.Exec(`UPDATE publication_cleanup SET last_error='cleanup blocked because the old directory is still live' WHERE deployment_id=? AND job_id=?`, c.id, c.job); err != nil {
+			if _, err := a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("cleanup blocked because the old directory is still live").Save(context.Background()); err != nil {
 				return fmt.Errorf("record blocked publication cleanup: %w", err)
 			}
 			continue
@@ -1366,7 +1366,7 @@ func (a *App) cleanupPublications(startup bool) error {
 				}
 				continue
 			}
-			if _, e = a.db.Exec(`UPDATE publication_cleanup SET last_error='directory identity changed; cleanup blocked' WHERE deployment_id=? AND job_id=?`, c.id, c.job); e != nil {
+			if _, e = a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("directory identity changed; cleanup blocked").Save(context.Background()); e != nil {
 				return fmt.Errorf("record ambiguous publication cleanup: %w", e)
 			}
 			continue
