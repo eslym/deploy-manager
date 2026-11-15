@@ -101,7 +101,7 @@ func (s *readyStorage) start() (*App, error) {
 			return nil, fmt.Errorf("prepare deployment queue recovery: %w", err)
 		}
 	}
-	restoredJobs, err := restoreQueuedDeploymentJobs(db, deploymentQueueCapacity)
+	restoredJobs, err := restoreQueuedDeploymentJobs(app.store, deploymentQueueCapacity)
 	if err != nil {
 		_ = app.Close()
 		return nil, fmt.Errorf("restore accepted deployment work: %w", err)

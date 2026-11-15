@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/eslym/deploy-manager/lib/ent"
+	"github.com/eslym/deploy-manager/lib/ent/projectdeletion"
 	"github.com/eslym/deploy-manager/lib/ent/projectsshkey"
 )
 
@@ -137,11 +138,11 @@ func (a *App) projectLFSHydrator(projectID string) (*lfsHydrator, error) {
 		return nil, err
 	}
 	hydrator.cacheAllowed = func() error {
-		var pending int
-		if err := a.db.QueryRow(`SELECT count(*) FROM project_deletions WHERE project_id=?`, projectID).Scan(&pending); err != nil {
+		pending, err := a.store.ProjectDeletion.Query().Where(projectdeletion.IDEQ(projectID)).Exist(context.Background())
+		if err != nil {
 			return errors.New("project LFS cache lifecycle is unavailable")
 		}
-		if pending != 0 {
+		if pending {
 			return errors.New("project deletion is in progress; LFS cache writes are blocked")
 		}
 		if _, err := a.store.Project.Get(context.Background(), projectID); err != nil {

@@ -3,7 +3,6 @@ package lib
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,9 +17,14 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent"
+	"github.com/eslym/deploy-manager/lib/ent/archiveddeploymentjob"
 	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
 	jobmodel "github.com/eslym/deploy-manager/lib/ent/deploymentjob"
+	"github.com/eslym/deploy-manager/lib/ent/deploymentremovalpath"
 	"github.com/eslym/deploy-manager/lib/ent/projectref"
+	"github.com/eslym/deploy-manager/lib/ent/publicationcleanup"
+	"github.com/eslym/deploy-manager/lib/ent/publicationintent"
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -266,7 +270,7 @@ func (a *App) lockDeployment(id string) (func(), error) {
 }
 
 func (a *App) validateLivePublicationIdentities() error {
-	rows, err := a.db.Query(`SELECT id,live_commit,live_dev,live_ino,status FROM deployments ORDER BY id`)
+	deployments, err := a.store.Deployment.Query().Order(ent.Asc(deploymentmodel.FieldID)).All(context.Background())
 	if err != nil {
 		return err
 	}
@@ -274,20 +278,10 @@ func (a *App) validateLivePublicationIdentities() error {
 		id, commit, status string
 		identity           dirIdentity
 	}
-	var records []liveRecord
-	for rows.Next() {
-		var r liveRecord
-		if err = rows.Scan(&r.id, &r.commit, &r.identity.Dev, &r.identity.Ino, &r.status); err != nil {
-			rows.Close()
-			return err
-		}
-		records = append(records, r)
+	records := make([]liveRecord, 0, len(deployments))
+	for _, d := range deployments {
+		records = append(records, liveRecord{id: d.ID, commit: d.LiveCommit, status: d.Status, identity: dirIdentity{Dev: uint64(d.LiveDev), Ino: uint64(d.LiveIno)}})
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	for _, r := range records {
 		if !validProjectID(r.id) {
 			return errors.New("deployment record contains an invalid identifier")
@@ -332,11 +326,19 @@ func (a *App) removeOrphanStages() error {
 		if !pattern.MatchString(name) {
 			return errors.New("unrecognized publication staging path; refusing startup cleanup")
 		}
-		var present int
-		if err := a.db.QueryRow(`SELECT (SELECT count(*) FROM publication_intents WHERE stage_name=?)+(SELECT count(*) FROM publication_cleanup WHERE path_name=?)+(SELECT count(*) FROM deployment_removal_paths WHERE path_name=?)`, name, name, name).Scan(&present); err != nil {
+		intent, err := a.store.PublicationIntent.Query().Where(publicationintent.StageNameEQ(name)).Exist(context.Background())
+		if err != nil {
 			return err
 		}
-		if present > 0 {
+		cleanup, err := a.store.PublicationCleanup.Query().Where(publicationcleanup.PathNameEQ(name)).Exist(context.Background())
+		if err != nil {
+			return err
+		}
+		removal, err := a.store.DeploymentRemovalPath.Query().Where(deploymentremovalpath.PathNameEQ(name)).Exist(context.Background())
+		if err != nil {
+			return err
+		}
+		if intent || cleanup || removal {
 			continue
 		}
 		path := filepath.Join(a.cfg.DeploymentRoot, name)
@@ -583,25 +585,9 @@ func randomID() (string, error) {
 
 const deploymentQueueCapacity = 160
 
-func restoreQueuedDeploymentJobs(db *sql.DB, capacity int) ([]string, error) {
-	rows, err := db.Query(`SELECT id FROM deployment_jobs WHERE status='queued' AND durable=1 ORDER BY created_at,id LIMIT ?`, capacity)
+func restoreQueuedDeploymentJobs(store *ent.Client, capacity int) ([]string, error) {
+	ids, err := store.DeploymentJob.Query().Where(jobmodel.StatusEQ("queued"), jobmodel.DurableEQ(1)).Order(ent.Asc(jobmodel.FieldCreatedAt), ent.Asc(jobmodel.FieldID)).Limit(capacity).IDs(context.Background())
 	if err != nil {
-		return nil, err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	return ids, nil
@@ -717,15 +703,14 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 	if _, claimErr := a.store.DeploymentJob.UpdateOneID(jobID).Where(jobmodel.Status("queued")).SetStatus("running").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); claimErr != nil {
 		return
 	}
-	var liveTarget string
-	var currentGeneration int64
-	var currentStatus string
 	// Another job in this generation may have published while this worker was
 	// waiting for the deployment lock (notably a preceding rollback).
-	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status,live_commit,live_dev,live_ino FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus, &d.LiveCommit, &d.LiveDev, &d.LiveIno); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
-		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before work began',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+	currentAtLock, checkErr := a.store.Deployment.Get(ctx, d.ID)
+	if checkErr != nil || currentAtLock.Generation != generation || currentAtLock.Status == "deleting" || currentAtLock.Status == "deletion_failed" || (d.TargetKind != "branch" && currentAtLock.CommitID != d.Commit) {
+		_ = a.supersedeJob(jobID, "Target changed before work began")
 		return
 	}
+	d.LiveCommit, d.LiveDev, d.LiveIno = currentAtLock.LiveCommit, uint64(currentAtLock.LiveDev), uint64(currentAtLock.LiveIno)
 	if d.TargetKind == "branch" || forceRedeploy {
 		if err := a.fetchProjectForBranch(ctx, d.ProjectID); err != nil {
 			message := "Could not refresh the configured Git target; the current publication was kept"
@@ -758,25 +743,25 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			if kind == "tag" {
 				// Hard re-deploy is the explicit tag-refresh operation. Persist its
 				// new pin after fetch, before export; later failures and restarts keep it.
-				result, updateErr := a.db.Exec(`UPDATE deployments SET commit_id=?,updated_at=? WHERE id=? AND generation=? AND target_kind='tag' AND target_name=?`, d.Commit, a.cfg.Now().UnixNano(), d.ID, generation, d.TargetName)
+				updated, updateErr := a.store.Deployment.Update().Where(deploymentmodel.IDEQ(d.ID), deploymentmodel.GenerationEQ(generation), deploymentmodel.TargetKindEQ("tag"), deploymentmodel.TargetNameEQ(d.TargetName)).SetCommitID(d.Commit).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
 				if updateErr != nil {
 					a.failJob(jobID, d.ID, generation, "The refreshed tag resolution could not be saved; the current publication was kept")
 					return
 				}
-				if affected, _ := result.RowsAffected(); affected != 1 {
-					_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before refreshed tag resolution was saved',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+				if updated != 1 {
+					_ = a.supersedeJob(jobID, "Target changed before refreshed tag resolution was saved")
 					return
 				}
 			}
 		}
-		if _, err := a.db.Exec(`UPDATE deployment_jobs SET commit_id=?,updated_at=? WHERE id=? AND status='running'`, d.Commit, a.cfg.Now().UnixNano(), jobID); err != nil {
+		if _, err := a.store.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).SetCommitID(d.Commit).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); err != nil {
 			a.failJob(jobID, d.ID, generation, "The resolved branch commit could not be recorded; the current publication was kept")
 			return
 		}
 	}
 	currentDeployment, checkErr := a.store.Deployment.Get(ctx, d.ID)
 	if checkErr != nil || currentDeployment.Generation != generation || currentDeployment.Status == "deleting" || currentDeployment.Status == "deletion_failed" || (d.TargetKind != "branch" && currentDeployment.CommitID != d.Commit) {
-		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+		_ = a.supersedeJob(jobID, "Target changed before publication")
 		return
 	}
 	if d.automatic {
@@ -799,7 +784,7 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			return
 		}
 	}
-	if _, err = a.db.Exec(`UPDATE deployments SET status='publishing',error='' WHERE id=? AND generation=?`, d.ID, generation); err != nil {
+	if _, err = a.store.Deployment.Update().Where(deploymentmodel.IDEQ(d.ID), deploymentmodel.GenerationEQ(generation)).SetStatus("publishing").SetError("").Save(ctx); err != nil {
 		return
 	}
 	select {
@@ -824,7 +809,7 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			if d.automatic {
 				a.finishAutomaticFetch(jobID, d.ID, generation, false)
 			} else {
-				_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+				_ = a.supersedeJob(jobID, "Target changed before publication")
 			}
 			return
 		}
@@ -837,11 +822,11 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 }
 
 func (a *App) cleanupUnpublishedStage(id, jobID string) error {
-	var count int
-	if err := a.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=? AND job_id=?`, id, jobID).Scan(&count); err != nil {
+	pending, err := a.store.PublicationIntent.Query().Where(publicationintent.IDEQ(id), publicationintent.JobIDEQ(jobID)).Exist(context.Background())
+	if err != nil {
 		return err
 	}
-	if count != 0 {
+	if pending {
 		return nil
 	}
 	path := a.stagePath(id, jobID)
@@ -860,37 +845,49 @@ func (a *App) cleanupUnpublishedStage(id, jobID string) error {
 }
 
 func (a *App) failJob(jobID, id string, generation int64, message string) {
-	var hasIntent int
-	if err := a.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, id).Scan(&hasIntent); err != nil {
+	ctx := context.Background()
+	tx, err := a.store.Tx(ctx)
+	if err != nil {
+		log.Printf("cannot begin failure record for deployment job %s: %v", jobID, err)
+		return
+	}
+	defer tx.Rollback()
+	hasIntent, err := tx.PublicationIntent.Query().Where(publicationintent.IDEQ(id)).Exist(ctx)
+	if err != nil {
 		log.Printf("cannot inspect publication recovery state for deployment %s: %v", id, err)
 		message = "Publication outcome could not be recorded. New publications are paused until the service reconciles it."
-		hasIntent = 1
+		hasIntent = true
 	}
-	if hasIntent > 0 {
+	if hasIntent {
 		message = "Publication outcome needs recovery. New publications are paused until the service reconciles it."
 	} else {
 		message = sanitizePublicationError(errors.New(message))
 	}
 	message = truncate(message, 512)
 	now := a.cfg.Now().UnixNano()
-	result, err := a.db.Exec(`UPDATE deployment_jobs SET status='failed',log=substr(log || char(10) || ?,1,8192),updated_at=? WHERE id=? AND status IN ('queued','running')`, message, now, jobID)
+	job, err := tx.DeploymentJob.Get(ctx, jobID)
+	if err != nil {
+		log.Printf("cannot read failed deployment job %s: %v", jobID, err)
+		return
+	}
+	updated, err := tx.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusIn("queued", "running")).SetStatus("failed").SetLog(appendJobLog(job.Log, message)).SetUpdatedAt(now).Save(ctx)
 	if err != nil {
 		log.Printf("cannot record failed deployment job %s: %v", jobID, err)
 		return
 	}
-	if result != nil {
-		if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-			log.Printf("cannot inspect failed deployment job update %s: %v", jobID, rowsErr)
-		} else if affected == 0 {
-			return
-		}
+	if updated == 0 {
+		return
 	}
 	status := "failed"
-	if hasIntent > 0 {
+	if hasIntent {
 		status = "recovery_required"
 	}
-	if _, err := a.db.Exec(`UPDATE deployments SET status=?,error=?,updated_at=? WHERE id=? AND generation=?`, status, message, now, id, generation); err != nil {
+	if _, err = tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.GenerationEQ(generation)).SetStatus(status).SetError(message).SetUpdatedAt(now).Save(ctx); err != nil {
 		log.Printf("cannot record failed deployment %s: %v", id, err)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		log.Printf("cannot commit failed deployment record %s: %v", id, err)
 	}
 }
 
@@ -1013,27 +1010,24 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if oldErr != nil && !os.IsNotExist(oldErr) {
 		return oldErr
 	}
+	dbCtx := context.Background()
 	// Recheck the saved configuration at the final database/filesystem boundary.
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(dbCtx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var currentCommit string
-	var currentGeneration int64
-	var currentStatus string
-	var paused bool
-	var epoch int64
-	if err = tx.QueryRow(`SELECT commit_id,generation,status,automation_paused,automation_epoch FROM deployments WHERE id=?`, d.ID).Scan(&currentCommit, &currentGeneration, &currentStatus, &paused, &epoch); err != nil {
+	current, err := tx.Deployment.Get(dbCtx, d.ID)
+	if err != nil {
 		return errors.New("deployment was deleted before publication")
 	}
-	if currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && currentCommit != d.Commit) || (d.automatic && (paused || epoch != d.automationEpoch)) {
+	if current.Generation != generation || current.Status == "deleting" || current.Status == "deletion_failed" || (d.TargetKind != "branch" && current.CommitID != d.Commit) || (d.automatic && (current.AutomationPaused != 0 || current.AutomationEpoch != d.automationEpoch)) {
 		return errors.New("publication target changed; job superseded")
 	}
 	if err = fault("before-intent"); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`INSERT INTO publication_intents(deployment_id,job_id,stage_name,had_old,old_dev,old_ino,new_dev,new_ino,phase,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, d.ID, jobID, filepath.Base(stage), boolInt(hadOld), oldID.Dev, oldID.Ino, newID.Dev, newID.Ino, "intent", a.cfg.Now().UnixNano()); err != nil {
+	if _, err = tx.PublicationIntent.Create().SetID(d.ID).SetJobID(jobID).SetStageName(filepath.Base(stage)).SetHadOld(boolInt(hadOld)).SetOldDev(int64(oldID.Dev)).SetOldIno(int64(oldID.Ino)).SetNewDev(int64(newID.Dev)).SetNewIno(int64(newID.Ino)).SetPhase("intent").SetCreatedAt(a.cfg.Now().UnixNano()).Save(dbCtx); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1045,20 +1039,32 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	// Hold a SQLite write transaction from the final generation check through
 	// the namespace switch and durable state update. Target edits may supersede
 	// work during preparation, but cannot slip between this check and exchange.
-	boundaryTx, err := a.db.Begin()
+	boundaryTx, err := a.store.Tx(dbCtx)
 	if err != nil {
 		return err
 	}
 	defer boundaryTx.Rollback()
-	guard, err := boundaryTx.Exec(`UPDATE deployments SET updated_at=updated_at WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed') AND (?=0 OR (automation_paused=0 AND automation_epoch=?))`, d.ID, generation, boolInt(d.automatic), d.automationEpoch)
+	boundaryDeployment, err := boundaryTx.Deployment.Get(dbCtx, d.ID)
+	if err != nil {
+		return errors.New("deployment was deleted before publication")
+	}
+	guard := boundaryTx.Deployment.Update().Where(
+		deploymentmodel.IDEQ(d.ID),
+		deploymentmodel.GenerationEQ(generation),
+		deploymentmodel.StatusNotIn("deleting", "deletion_failed"),
+	)
+	if d.automatic {
+		guard.Where(deploymentmodel.AutomationPausedEQ(0), deploymentmodel.AutomationEpochEQ(d.automationEpoch))
+	}
+	changed, err := guard.SetUpdatedAt(boundaryDeployment.UpdatedAt).Save(dbCtx)
 	if err != nil {
 		return err
 	}
-	if changed, _ := guard.RowsAffected(); changed != 1 {
+	if changed != 1 {
 		// No namespace operation has happened. Remove only this job's intent
 		// while holding the same write transaction, so cleanup is safe now and
 		// a subsequent manual publication does not require restart recovery.
-		if _, err = boundaryTx.Exec(`DELETE FROM publication_intents WHERE deployment_id=? AND job_id=?`, d.ID, jobID); err != nil {
+		if _, err = boundaryTx.PublicationIntent.Delete().Where(publicationintent.IDEQ(d.ID), publicationintent.JobIDEQ(jobID)).Exec(dbCtx); err != nil {
 			return err
 		}
 		if err = boundaryTx.Commit(); err != nil {
@@ -1096,28 +1102,32 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if err = fault("before-state"); err != nil {
 		return err
 	}
-	tx = boundaryTx
-	var latest string
-	var latestGen int64
-	var latestStatus string
-	if err = tx.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&latest, &latestGen, &latestStatus); err != nil || latestGen != generation || latestStatus == "deleting" || latestStatus == "deletion_failed" || (d.TargetKind != "branch" && latest != d.Commit) {
+	latest, err := boundaryTx.Deployment.Get(dbCtx, d.ID)
+	if err != nil || latest.Generation != generation || latest.Status == "deleting" || latest.Status == "deletion_failed" || (d.TargetKind != "branch" && latest.CommitID != d.Commit) {
 		return errors.New("target changed after directory switch; publication requires reconciliation")
 	}
-	if _, err = tx.Exec(`UPDATE deployments SET live_commit=?,live_dev=?,live_ino=?,status='live',error='',updated_at=? WHERE id=? AND generation=?`, d.Commit, newID.Dev, newID.Ino, a.cfg.Now().UnixNano(), d.ID, generation); err != nil {
+	if _, err = boundaryTx.Deployment.Update().Where(deploymentmodel.IDEQ(d.ID), deploymentmodel.GenerationEQ(generation)).SetLiveCommit(d.Commit).SetLiveDev(int64(newID.Dev)).SetLiveIno(int64(newID.Ino)).SetStatus("live").SetError("").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(dbCtx); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`UPDATE deployment_jobs SET status='succeeded',log=substr(log || char(10) || 'Published successfully',1,8192),updated_at=? WHERE id=?`, a.cfg.Now().UnixNano(), jobID); err != nil {
+	job, err := boundaryTx.DeploymentJob.Get(dbCtx, jobID)
+	if err != nil {
+		return err
+	}
+	if _, err = boundaryTx.DeploymentJob.UpdateOneID(jobID).SetStatus("succeeded").SetLog(appendJobLog(job.Log, "Published successfully")).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(dbCtx); err != nil {
 		return err
 	}
 	if hadOld {
-		if _, err = tx.Exec(`INSERT OR REPLACE INTO publication_cleanup(deployment_id,job_id,path_name,dev,ino,not_before,last_error) VALUES(?,?,?,?,?,?, '')`, d.ID, jobID, filepath.Base(stage), oldID.Dev, oldID.Ino, a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano()); err != nil {
+		if _, err = boundaryTx.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(d.ID), publicationcleanup.JobIDEQ(jobID)).Exec(dbCtx); err != nil {
+			return err
+		}
+		if _, err = boundaryTx.PublicationCleanup.Create().SetID(d.ID).SetJobID(jobID).SetPathName(filepath.Base(stage)).SetDev(int64(oldID.Dev)).SetIno(int64(oldID.Ino)).SetNotBefore(a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano()).SetLastError("").Save(dbCtx); err != nil {
 			return err
 		}
 	}
-	if _, err = tx.Exec(`DELETE FROM publication_intents WHERE deployment_id=?`, d.ID); err != nil {
+	if _, err = boundaryTx.PublicationIntent.Delete().Where(publicationintent.IDEQ(d.ID)).Exec(dbCtx); err != nil {
 		return err
 	}
-	if err = tx.Commit(); err != nil {
+	if err = boundaryTx.Commit(); err != nil {
 		return err
 	}
 	if err = fault("after-state"); err != nil {
@@ -1136,6 +1146,24 @@ func boolInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func appendJobLog(log, message string) string {
+	combined := []rune(log + "\n" + message)
+	if len(combined) > 8192 {
+		combined = combined[:8192]
+	}
+	return string(combined)
+}
+
+func (a *App) supersedeJob(jobID, message string) error {
+	ctx := context.Background()
+	job, err := a.store.DeploymentJob.Query().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).Only(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = a.store.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).SetStatus("superseded").SetLog(appendJobLog(job.Log, message)).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
+	return err
 }
 
 func sanitizePublicationError(err error) string {
@@ -1171,13 +1199,11 @@ func (a *App) reconcilePublications() error {
 }
 
 func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
-	query := `SELECT deployment_id,job_id,stage_name,had_old,old_dev,old_ino,new_dev,new_ino FROM publication_intents`
-	args := []any{}
+	query := a.store.PublicationIntent.Query()
 	if onlyDeployment != "" {
-		query += ` WHERE deployment_id=?`
-		args = append(args, onlyDeployment)
+		query = query.Where(publicationintent.IDEQ(onlyDeployment))
 	}
-	rows, err := a.db.Query(query, args...)
+	intents, err := query.All(context.Background())
 	if err != nil {
 		return err
 	}
@@ -1186,21 +1212,9 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 		had            int
 		old, new       dirIdentity
 	}
-	var all []intent
-	for rows.Next() {
-		var x intent
-		if err = rows.Scan(&x.id, &x.job, &x.stage, &x.had, &x.old.Dev, &x.old.Ino, &x.new.Dev, &x.new.Ino); err != nil {
-			rows.Close()
-			return err
-		}
-		all = append(all, x)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err = rows.Close(); err != nil {
-		return err
+	all := make([]intent, 0, len(intents))
+	for _, row := range intents {
+		all = append(all, intent{id: row.ID, job: row.JobID, stage: row.StageName, had: row.HadOld, old: dirIdentity{Dev: uint64(row.OldDev), Ino: uint64(row.OldIno)}, new: dirIdentity{Dev: uint64(row.NewDev), Ino: uint64(row.NewIno)}})
 	}
 	for _, x := range all {
 		if !validProjectID(x.id) || !validProjectID(x.job) || x.stage != "."+x.id+".stage-"+x.job {
@@ -1231,29 +1245,45 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 				if !ok {
 					return errors.New("ambiguous publication recovery: old directory identity is not at its recorded staging path")
 				}
-				_, err = a.db.Exec(`INSERT OR REPLACE INTO publication_cleanup(deployment_id,job_id,path_name,dev,ino,not_before,last_error) VALUES(?,?,?,?,?,?, '')`, x.id, x.job, x.stage, x.old.Dev, x.old.Ino, a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano())
-				if err != nil {
-					return err
-				}
 			}
-			var commit string
-			if err = a.db.QueryRow(`SELECT commit_id FROM deployment_jobs WHERE id=?`, x.job).Scan(&commit); err != nil {
+			job, getErr := a.store.DeploymentJob.Get(context.Background(), x.job)
+			if getErr != nil {
+				return getErr
+			}
+			commit := job.CommitID
+			if commit == "" {
+				err = errors.New("publication job has no commit")
 				return err
 			}
-			tx, e := a.db.Begin()
+			ctx := context.Background()
+			tx, e := a.store.Tx(ctx)
 			if e != nil {
 				return e
 			}
-			if _, e = tx.Exec(`UPDATE deployments SET live_commit=?,live_dev=?,live_ino=?,status=CASE WHEN status IN ('deleting','deletion_failed') THEN status ELSE 'live' END,error=CASE WHEN status IN ('deleting','deletion_failed') THEN error ELSE '' END,updated_at=? WHERE id=?`, commit, x.new.Dev, x.new.Ino, a.cfg.Now().UnixNano(), x.id); e != nil {
-				tx.Rollback()
+			defer tx.Rollback()
+			deployment, queryErr := tx.Deployment.Get(ctx, x.id)
+			if queryErr != nil {
+				return queryErr
+			}
+			update := tx.Deployment.UpdateOneID(x.id).SetLiveCommit(commit).SetLiveDev(int64(x.new.Dev)).SetLiveIno(int64(x.new.Ino)).SetUpdatedAt(a.cfg.Now().UnixNano())
+			if deployment.Status != "deleting" && deployment.Status != "deletion_failed" {
+				update.SetStatus("live").SetError("")
+			}
+			if _, e = update.Save(ctx); e != nil {
 				return e
 			}
-			if _, e = tx.Exec(`UPDATE deployment_jobs SET log=substr(log || char(10) || 'Filesystem outcome reconciled after restart',1,8192),updated_at=? WHERE id=?`, a.cfg.Now().UnixNano(), x.job); e != nil {
-				tx.Rollback()
+			if _, e = tx.DeploymentJob.UpdateOneID(x.job).SetLog(appendJobLog(job.Log, "Filesystem outcome reconciled after restart")).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); e != nil {
 				return e
 			}
-			if _, e = tx.Exec(`DELETE FROM publication_intents WHERE deployment_id=?`, x.id); e != nil {
-				tx.Rollback()
+			if x.had == 1 {
+				if _, e = tx.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(x.id), publicationcleanup.JobIDEQ(x.job)).Exec(ctx); e != nil {
+					return e
+				}
+				if _, e = tx.PublicationCleanup.Create().SetID(x.id).SetJobID(x.job).SetPathName(x.stage).SetDev(int64(x.old.Dev)).SetIno(int64(x.old.Ino)).SetNotBefore(a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano()).SetLastError("").Save(ctx); e != nil {
+					return e
+				}
+			}
+			if _, e = tx.PublicationIntent.Delete().Where(publicationintent.IDEQ(x.id)).Exec(ctx); e != nil {
 				return e
 			}
 			if e = tx.Commit(); e != nil {
@@ -1274,13 +1304,25 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 			} else if _, e = os.Lstat(stage); !os.IsNotExist(e) {
 				return errors.New("ambiguous publication recovery: staged directory identity changed")
 			}
-			_, err = a.db.Exec(`UPDATE deployments SET status=CASE WHEN status IN ('deleting','deletion_failed') THEN status ELSE 'failed' END,error=CASE WHEN status IN ('deleting','deletion_failed') THEN error ELSE 'publication did not switch before restart' END,updated_at=? WHERE id=?`, a.cfg.Now().UnixNano(), x.id)
-			if err != nil {
-				return err
+			ctx := context.Background()
+			tx, txErr := a.store.Tx(ctx)
+			if txErr != nil {
+				return txErr
 			}
-			_, err = a.db.Exec(`DELETE FROM publication_intents WHERE deployment_id=?`, x.id)
-			if err != nil {
-				return err
+			defer tx.Rollback()
+			deployment, queryErr := tx.Deployment.Get(ctx, x.id)
+			if queryErr == nil && deployment.Status != "deleting" && deployment.Status != "deletion_failed" {
+				if _, txErr = tx.Deployment.UpdateOneID(x.id).SetStatus("failed").SetError("publication did not switch before restart").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); txErr != nil {
+					return txErr
+				}
+			} else if queryErr != nil && !ent.IsNotFound(queryErr) {
+				return queryErr
+			}
+			if _, txErr = tx.PublicationIntent.Delete().Where(publicationintent.IDEQ(x.id)).Exec(ctx); txErr != nil {
+				return txErr
+			}
+			if txErr = tx.Commit(); txErr != nil {
+				return txErr
 			}
 		} else {
 			return errors.New("ambiguous publication recovery: live directory identity matches neither recorded state")
@@ -1296,7 +1338,7 @@ func (a *App) cleanupPublications(startup bool) error {
 	if err := a.assertPublicationRoot(); err != nil {
 		return err
 	}
-	rows, err := a.db.Query(`SELECT deployment_id,job_id,path_name,dev,ino,not_before,attempts FROM publication_cleanup ORDER BY not_before`)
+	cleanups, err := a.store.PublicationCleanup.Query().Order(publicationcleanup.ByNotBefore()).All(context.Background())
 	if err != nil {
 		return err
 	}
@@ -1306,20 +1348,10 @@ func (a *App) cleanupPublications(startup bool) error {
 		before        int64
 		attempts      int
 	}
-	var all []cleanup
-	for rows.Next() {
-		var c cleanup
-		if err = rows.Scan(&c.id, &c.job, &c.path, &c.identity.Dev, &c.identity.Ino, &c.before, &c.attempts); err != nil {
-			rows.Close()
-			return err
-		}
-		all = append(all, c)
+	all := make([]cleanup, 0, len(cleanups))
+	for _, row := range cleanups {
+		all = append(all, cleanup{id: row.ID, job: row.JobID, path: row.PathName, identity: dirIdentity{Dev: uint64(row.Dev), Ino: uint64(row.Ino)}, before: row.NotBefore, attempts: row.Attempts})
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	for _, c := range all {
 		if !validProjectID(c.id) || !validProjectID(c.job) || c.path != "."+c.id+".stage-"+c.job {
 			return errors.New("publication cleanup record contains an unsafe path or identifier")
@@ -1329,7 +1361,7 @@ func (a *App) cleanupPublications(startup bool) error {
 		}
 		if err := fault("before-cleanup"); err != nil {
 			delay := time.Second << min(c.attempts, 10)
-			if _, recordErr := a.db.Exec(`UPDATE publication_cleanup SET last_error='old publication cleanup failed; retry scheduled',attempts=attempts+1,not_before=? WHERE deployment_id=? AND job_id=?`, a.cfg.Now().Add(delay).UnixNano(), c.id, c.job); recordErr != nil {
+			if _, recordErr := a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("old publication cleanup failed; retry scheduled").AddAttempts(1).SetNotBefore(a.cfg.Now().Add(delay).UnixNano()).Save(context.Background()); recordErr != nil {
 				return fmt.Errorf("record publication cleanup failure: %w", recordErr)
 			}
 			continue
@@ -1340,7 +1372,7 @@ func (a *App) cleanupPublications(startup bool) error {
 			return liveErr
 		}
 		if liveIdentity == c.identity {
-			if _, err := a.db.Exec(`UPDATE publication_cleanup SET last_error='cleanup blocked because the old directory is still live' WHERE deployment_id=? AND job_id=?`, c.id, c.job); err != nil {
+			if _, err := a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("cleanup blocked because the old directory is still live").Save(context.Background()); err != nil {
 				return fmt.Errorf("record blocked publication cleanup: %w", err)
 			}
 			continue
@@ -1351,12 +1383,12 @@ func (a *App) cleanupPublications(startup bool) error {
 		}
 		if !ok {
 			if _, e = os.Lstat(path); os.IsNotExist(e) {
-				if _, e = a.db.Exec(`DELETE FROM publication_cleanup WHERE deployment_id=? AND job_id=?`, c.id, c.job); e != nil {
+				if _, e = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).Exec(context.Background()); e != nil {
 					return fmt.Errorf("reconcile removed publication cleanup: %w", e)
 				}
 				continue
 			}
-			if _, e = a.db.Exec(`UPDATE publication_cleanup SET last_error='directory identity changed; cleanup blocked' WHERE deployment_id=? AND job_id=?`, c.id, c.job); e != nil {
+			if _, e = a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("directory identity changed; cleanup blocked").Save(context.Background()); e != nil {
 				return fmt.Errorf("record ambiguous publication cleanup: %w", e)
 			}
 			continue
@@ -1370,10 +1402,10 @@ func (a *App) cleanupPublications(startup bool) error {
 			}
 		}
 		if err == nil {
-			_, err = a.db.Exec(`DELETE FROM publication_cleanup WHERE deployment_id=? AND job_id=?`, c.id, c.job)
+			_, err = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).Exec(context.Background())
 		} else {
 			delay := time.Second << min(c.attempts, 10)
-			_, recordErr := a.db.Exec(`UPDATE publication_cleanup SET last_error='old publication cleanup failed; retry scheduled',attempts=attempts+1,not_before=? WHERE deployment_id=? AND job_id=?`, a.cfg.Now().Add(delay).UnixNano(), c.id, c.job)
+			_, recordErr := a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("old publication cleanup failed; retry scheduled").AddAttempts(1).SetNotBefore(a.cfg.Now().Add(delay).UnixNano()).Save(context.Background())
 			if recordErr != nil {
 				return fmt.Errorf("record publication cleanup failure: %w", recordErr)
 			}
@@ -1385,7 +1417,7 @@ func (a *App) cleanupPublications(startup bool) error {
 	if _, err := a.db.Exec(`DELETE FROM deployment_jobs WHERE updated_at<? AND status IN ('succeeded','failed','superseded','noop') AND id NOT IN (SELECT job_id FROM publication_cleanup) AND id NOT IN (SELECT job_id FROM publication_intents)`, a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano()); err != nil {
 		return fmt.Errorf("prune expired deployment jobs: %w", err)
 	}
-	if _, err := a.db.Exec(`DELETE FROM archived_deployment_jobs WHERE updated_at<?`, a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano()); err != nil {
+	if _, err := a.store.ArchivedDeploymentJob.Delete().Where(archiveddeploymentjob.UpdatedAtLT(a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano())).Exec(context.Background()); err != nil {
 		return fmt.Errorf("prune expired archived deployment jobs: %w", err)
 	}
 	return nil
@@ -1546,23 +1578,14 @@ func (a *App) deploymentJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	rows, err := a.db.Query(`SELECT id,deployment_id,commit_id,status,log,created_at,updated_at,force_redeploy FROM deployment_jobs WHERE deployment_id=? ORDER BY created_at DESC LIMIT 100`, id)
+	jobs, err := a.store.DeploymentJob.Query().Where(jobmodel.DeploymentIDEQ(id)).Order(ent.Desc(jobmodel.FieldCreatedAt)).Limit(100).All(r.Context())
 	if err != nil {
 		http.Error(w, "publication history is unavailable", 500)
 		return
 	}
-	defer rows.Close()
-	out := []deploymentJob{}
-	for rows.Next() {
-		var j deploymentJob
-		var c, u int64
-		if rows.Scan(&j.ID, &j.DeploymentID, &j.Commit, &j.Status, &j.Log, &c, &u, &j.Force) != nil {
-			http.Error(w, "publication history is unavailable", 500)
-			return
-		}
-		j.CreatedAt = time.Unix(0, c).UTC()
-		j.UpdatedAt = time.Unix(0, u).UTC()
-		out = append(out, j)
+	out := make([]deploymentJob, 0, len(jobs))
+	for _, row := range jobs {
+		out = append(out, deploymentJob{ID: row.ID, DeploymentID: row.DeploymentID, Commit: row.CommitID, Status: row.Status, Log: row.Log, CreatedAt: time.Unix(0, row.CreatedAt).UTC(), UpdatedAt: time.Unix(0, row.UpdatedAt).UTC(), Force: row.ForceRedeploy != 0})
 	}
 	writeJSON(w, out)
 }
@@ -1572,17 +1595,16 @@ func (a *App) deployNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var commit, status string
-	var gen int64
-	if err := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, id).Scan(&commit, &gen, &status); err != nil {
+	deployment, err := a.store.Deployment.Get(r.Context(), id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if status == "deleting" || status == "deletion_failed" {
+	if deployment.Status == "deleting" || deployment.Status == "deletion_failed" {
 		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
 		return
 	}
-	job, err := a.enqueueDeployment(id, commit, gen)
+	job, err := a.enqueueDeployment(id, deployment.CommitID, deployment.Generation)
 	if err != nil {
 		if strings.Contains(err.Error(), "queue is full") {
 			http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
@@ -1664,11 +1686,12 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var projectID string
-	if err := a.db.QueryRow(`SELECT project_id FROM deployments WHERE id=?`, id).Scan(&projectID); err != nil {
+	currentDeployment, err := a.store.Deployment.Get(r.Context(), id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
+	projectID := currentDeployment.ProjectID
 	if input.TargetKind == "" {
 		input.TargetKind = "commit"
 	}
