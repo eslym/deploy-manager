@@ -607,6 +607,7 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/projects/{id}/delete", a.deleteProject)
 	m.HandleFunc("GET /api/projects/{id}/refs", a.projectRefs)
 	m.HandleFunc("POST /api/projects/{id}/refresh", a.refreshProject)
+	m.HandleFunc("POST /api/projects/{id}/cache/recreate", a.recreateProjectCache)
 	m.HandleFunc("POST /api/projects/{id}/key", a.assignProjectKey)
 	m.HandleFunc("GET /api/deployments", a.listDeployments)
 	m.HandleFunc("POST /api/deployments", a.createDeployment)

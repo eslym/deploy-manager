@@ -27,6 +27,8 @@ type automationFixture struct {
 	secret                                      []byte
 	provider                                    string
 	gitFetches                                  atomic.Int32
+	fetchStarted                                chan struct{}
+	fetchRelease                                chan struct{}
 	fetchFailureStatus                          atomic.Int32
 }
 
@@ -60,6 +62,13 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 		defer session.Close()
 		if r.Method == http.MethodGet {
 			f.gitFetches.Add(1)
+			if f.fetchStarted != nil {
+				select {
+				case f.fetchStarted <- struct{}{}:
+				default:
+				}
+				<-f.fetchRelease
+			}
 			adv, err := session.AdvertisedReferencesContext(r.Context())
 			if err != nil {
 				http.Error(w, "advertisement failed", 500)
@@ -109,7 +118,10 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	f.app.cfg.AuthRequestsPerMinute = 1000
 	t.Cleanup(func() { _ = f.app.Close() })
 	f.cookie = installAPITestSession(t, f.app)
-	f.server = httptest.NewTLSServer(f.app.Handler())
+	f.server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.app.Handler().ServeHTTP(w, r)
+	}))
+	f.server.StartTLS()
 	t.Cleanup(func() { f.server.Close() })
 	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects", `{"name":"fixture","url":"`+remote.URL+`/repo.git"}`)
 	if response.StatusCode != http.StatusCreated {
@@ -129,6 +141,95 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	response.Body.Close()
 	f.secret = []byte(setup.Secret)
 	return f
+}
+
+func TestBranchFetchAndCacheRecreationCompleteWithoutUsingPartialCache(t *testing.T) {
+	f := newAutomationFixture(t)
+	deploymentID := f.createBranch(t, "cache-recreation-lock-order")
+	livePath := f.app.deploymentPath(deploymentID)
+	before, err := identity(livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeContents, err := os.ReadFile(filepath.Join(livePath, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recreationAtLifecycle := make(chan struct{})
+	allowRecreation := make(chan struct{})
+	f.app.projects.cacheRecreationBeforeLifecycleLock = func() {
+		close(recreationAtLifecycle)
+		<-allowRecreation
+	}
+	fetchAtProjectLock := make(chan struct{}, 1)
+	f.app.projects.branchFetchBeforeProjectLock = func() { fetchAtProjectLock <- struct{}{} }
+	t.Cleanup(func() {
+		select {
+		case <-allowRecreation:
+		default:
+			close(allowRecreation)
+		}
+	})
+
+	type recreationResult struct {
+		response *http.Response
+		err      error
+	}
+	recreationDone := make(chan recreationResult, 1)
+	go func() {
+		request, requestErr := http.NewRequest(http.MethodPost, f.server.URL+"/api/projects/"+f.projectID+"/cache/recreate", strings.NewReader(`{"confirm":true}`))
+		if requestErr != nil {
+			recreationDone <- recreationResult{err: requestErr}
+			return
+		}
+		request.Header.Set("Origin", f.server.URL)
+		request.Header.Set("Content-Type", "application/json")
+		request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
+		response, requestErr := f.server.Client().Do(request)
+		recreationDone <- recreationResult{response: response, err: requestErr}
+	}()
+	select {
+	case <-recreationAtLifecycle:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cache recreation never reached the lifecycle boundary")
+	}
+
+	jobID := f.action(t, deploymentID, "deploy", `{}`)
+	select {
+	case <-fetchAtProjectLock:
+	case <-time.After(5 * time.Second):
+		t.Fatal("branch fetch never reached project coordination")
+	}
+	close(allowRecreation)
+
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, deploymentID, jobID, "failed")
+	select {
+	case result := <-recreationDone:
+		if result.err != nil {
+			t.Fatalf("cache recreation request failed: %v", result.err)
+		}
+		if result.response.StatusCode != http.StatusNoContent {
+			t.Fatalf("cache recreation status=%d body=%q", result.response.StatusCode, responseText(result.response))
+		}
+		result.response.Body.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("cache recreation deadlocked with branch fetch")
+	}
+
+	if _, err := os.Stat(f.app.projects.repoPath(f.projectID)); !os.IsNotExist(err) {
+		t.Fatalf("cache recreation did not finish after branch fetch: %v", err)
+	}
+	jobs := f.waitJobs(t, deploymentID)
+	if len(jobs) == 0 || jobs[0].ID != jobID || jobs[0].Status != "failed" || !strings.Contains(jobs[0].Log, "current live files were kept") {
+		t.Fatalf("waiting deployment did not preserve and report the live publication: %+v", jobs)
+	}
+	if current, err := identity(livePath); err != nil || current != before {
+		t.Fatalf("cache recreation or waiting fetch changed the live publication: %v", err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(livePath, "README.md")); err != nil || string(contents) != string(beforeContents) {
+		t.Fatalf("live publication content changed: %q: %v", contents, err)
+	}
 }
 
 func (f *automationFixture) createBranch(t *testing.T, name string) string {

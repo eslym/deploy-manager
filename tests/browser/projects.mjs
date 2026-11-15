@@ -194,6 +194,11 @@ try {
   await page.getByText("LFS settings saved.").waitFor();
 
   const id = await page.evaluate(async () => (await (await fetch("/api/projects")).json())[0].id);
+  const cacheRecreationPath = `/api/projects/${id}/cache/recreate`;
+  const unauthenticatedCacheRecreation = await httpsRequestStatus("127.0.0.1", 18440, cacheRecreationPath, "POST", JSON.stringify({ confirm: true }), { Origin: `https://${appListen}`, "Content-Type": "application/json" });
+  if (unauthenticatedCacheRecreation !== 401) throw new Error(`unauthenticated cache recreation returned ${unauthenticatedCacheRecreation}`);
+  const crossOriginCacheRecreation = await httpsRequestStatus("127.0.0.1", 18440, cacheRecreationPath, "POST", JSON.stringify({ confirm: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" });
+  if (crossOriginCacheRecreation !== 403) throw new Error(`cross-origin cache recreation returned ${crossOriginCacheRecreation}`);
   const giteaSettingsPath = `/api/projects/${id}/gitea-webhook`;
   for (const method of ["GET", "POST"]) {
     const unauthenticatedStatus = await httpsRequestStatus("127.0.0.1", 18440, giteaSettingsPath, method, method === "POST" ? JSON.stringify({ rotate: true }) : "", { Origin: `https://${appListen}`, "Content-Type": "application/json" });
@@ -584,8 +589,79 @@ try {
   if (confirmedProjectDelete.status() !== 204) throw new Error(`confirmed project deletion returned ${confirmedProjectDelete.status()}: ${await confirmedProjectDelete.text()}`);
   if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
   try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }
+  milestone("review and confirm project cache recreation");
+  await page.getByText("Fixture site", { exact: true }).click();
+  const pinnedDeploymentResponse = await page.evaluate(async ({ id, commit }) => {
+    const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: id, name: "Pinned cache check", commit }) });
+    return { status: response.status, body: await response.json() };
+  }, { id, commit: featureCommit });
+  if (pinnedDeploymentResponse.status !== 201) throw new Error(`could not create pinned cache check: ${JSON.stringify(pinnedDeploymentResponse)}`);
+  await waitFor(async () => {
+    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), pinnedDeploymentResponse.body.id);
+    return jobs[0]?.status === "succeeded";
+  }, "pinned cache check publication");
+  const pinnedPublicationPath = join(dir, "state.sqlite.publications", pinnedDeploymentResponse.body.id);
+  const pinnedPublicationBeforeCacheRecreation = await readFile(join(pinnedPublicationPath, "index.html"), "utf8");
+  const cacheSection = page.getByRole("region", { name: "Repository storage" });
+  await cacheSection.getByText(/Git cache: [1-9]/).waitFor();
+  await cacheSection.getByRole("button", { name: "Clear cache…" }).click();
+  const cacheConfirmation = cacheSection.getByRole("dialog", { name: "Confirm clearing repository storage" });
+  if (await page.evaluate(() => document.activeElement?.id) !== "cache-recreate-confirm") throw new Error("cache confirmation did not move focus to its primary action");
+  if (await cacheConfirmation.getAttribute("aria-modal") !== "true" || !(await cacheConfirmation.getAttribute("aria-describedby"))) throw new Error("cache confirmation is missing modal or description semantics");
+  if (!(await cacheConfirmation.locator('[role="alert"]').count())) throw new Error("cache warning is not announced to assistive technology");
+  await cacheConfirmation.getByText(/no longer reachable from a\s+branch or tag/).waitFor();
+  await cacheConfirmation.getByText(/server can no longer provide/).waitFor();
+  await cacheSection.getByRole("button", { name: "Cancel" }).click();
+  await page.waitForFunction(() => document.activeElement?.id === "cache-recreate-trigger");
+  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).gitCacheBytes > 0, id))) throw new Error("cancelling cache recreation changed the Git cache");
+  const liveBeforeCacheRecreation = await readFile(join(publishedPath, "index.html"), "utf8");
+  await cacheSection.getByRole("button", { name: "Clear cache…" }).click();
+  const cacheRecreation = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/cache/recreate`));
+  await cacheSection.getByRole("button", { name: "Clear cache", exact: true }).click();
+  if ((await cacheRecreation).status() !== 204) throw new Error("confirmed cache recreation did not finish");
+  await page.waitForFunction(() => document.activeElement?.id === "cache-recreate-trigger");
+  const recreatedProject = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id), id);
+  if (recreatedProject.gitCacheBytes !== 0 || recreatedProject.lfsCacheBytes !== 0) throw new Error(`cache sizes after recreation are not zero: ${JSON.stringify(recreatedProject)}`);
+  await cacheSection.getByText("Git cache: 0 bytes · LFS cache: 0 bytes").waitFor();
+  if ((await readFile(join(publishedPath, "index.html"), "utf8")) !== liveBeforeCacheRecreation) throw new Error("cache recreation changed live published content");
+  if (await httpsRequestStatus("127.0.0.1", 18441, "/__fixture/fail", "POST") !== 204) throw new Error("could not make the Git server unavailable for the missing-cache check");
+  const deployPinnedAfterCacheClear = await page.evaluate(async id => {
+    const response = await fetch(`/api/deployments/${id}/hard-redeploy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    return { status: response.status, body: await response.json() };
+  }, pinnedDeploymentResponse.body.id);
+  if (deployPinnedAfterCacheClear.status !== 202) throw new Error(`pinned deployment was not accepted after cache clear: ${JSON.stringify(deployPinnedAfterCacheClear)}`);
+  let missingCommitJob;
+  try {
+    await waitFor(async () => {
+      const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), pinnedDeploymentResponse.body.id);
+      missingCommitJob = jobs.find(job => job.id === deployPinnedAfterCacheClear.body.jobId);
+      return missingCommitJob?.status === "failed";
+    }, "pinned commit failure after cache recreation");
+  } catch (error) {
+    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), pinnedDeploymentResponse.body.id);
+    throw new Error(`${error.message}; job history: ${JSON.stringify(jobs)}`);
+  }
+  if ((await readFile(join(pinnedPublicationPath, "index.html"), "utf8")) !== pinnedPublicationBeforeCacheRecreation) throw new Error("unavailable pinned commit changed its live publication");
+  const deployAfterCacheClear = await page.evaluate(async id => {
+    const response = await fetch(`/api/deployments/${id}/deploy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    return { status: response.status, body: await response.json() };
+  }, deploymentID);
+  if (deployAfterCacheClear.status !== 202 || !deployAfterCacheClear.body.jobId) throw new Error(`post-clear deployment was not accepted: ${JSON.stringify(deployAfterCacheClear)}`);
+  let unavailableJob;
+  await waitFor(async () => {
+    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+    unavailableJob = jobs.find(job => job.id === deployAfterCacheClear.body.jobId);
+    return unavailableJob?.status === "failed";
+  }, "deployment failure after the repository became unavailable");
+  if (!unavailableJob.log.includes("current live files were kept")) throw new Error(`unavailable repository failure did not preserve the publication: ${unavailableJob.log}`);
+  if ((await readFile(join(publishedPath, "index.html"), "utf8")) !== liveBeforeCacheRecreation) throw new Error("failed recovery after cache recreation changed live published content");
+  const unavailableOldCommit = await page.evaluate(async ({ id, commit }) => {
+    const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: id, name: "Unavailable cached commit", commit }) });
+    return { status: response.status, body: await response.text() };
+  }, { id, commit: featureCommit });
+  if (unavailableOldCommit.status !== 400 || !unavailableOldCommit.body.includes("commit is not available")) throw new Error(`removed commit remained deployable: ${JSON.stringify(unavailableOldCommit)}`);
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
-  console.log("combined-binary authenticated project workflow passed: publication and deletion confirmation/cancel, private SSH/LFS publication, host trust, cross-origin mutation rejection, and cached-ref retention");
+  console.log("combined-binary authenticated project workflow passed: publication and deletion confirmation/cancel, private SSH/LFS publication, cache size/recreation warning and confirmation, restart-safe cache lifecycle, host trust, cross-origin mutation rejection, and cached-ref retention");
 } catch (error) {
   console.error(`[projects-browser] failed during: ${currentStep}`);
   throw error;
