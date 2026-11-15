@@ -110,6 +110,9 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	backend = gitserver.NewServer(gitserver.MapLoader{endpoint.String(): repo.Storer})
 	installTrustedSmartHTTPTestClient(t, remote)
 	dir := t.TempDir()
+	if sharedDir := os.Getenv("DM_AUTOMATION_FIXTURE_DIR"); sharedDir != "" {
+		dir = sharedDir
+	}
 	f.app, err = New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), FetchRetryAttempts: 2})
 	if err != nil {
 		t.Fatal(err)

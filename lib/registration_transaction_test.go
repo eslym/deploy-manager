@@ -2,7 +2,9 @@ package lib
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -81,8 +83,154 @@ func TestRegistrationAndRecoveryRequireOriginBoundOneUseTransaction(t *testing.T
 	}
 }
 
+func TestRestoredInstallationGrantPurgeAndCLIRecovery(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.sqlite"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupGrant, err := app.IssueRegistrationGrant()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, record := newRegistrationFlow(t, app, setupGrant, "https://manager.example", "restore-test password")
+	if got := finishTestRegistration(app, "", handle, record, "https://manager.example"); got != http.StatusNoContent {
+		t.Fatalf("initial registration status=%d", got)
+	}
+	oldSession := completeFixtureLogin(t, app, "restore-test password")
+	pendingLoginFinish := pendingFixtureLoginFinish(t, app, "restore-test password")
+	resurrected, err := app.IssueRecoveryGrant()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the documented offline restore action: delete all possibly
+	// resurrected grants while no application process has the database open.
+	db, err := sql.Open("sqlite3", cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.ExecContext(context.Background(), "DELETE FROM registration_grants"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart the application as a restore would. It must invalidate in-memory
+	// sessions/login handshakes, and the offline purge must reject old grants.
+	app, err = New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/projects", nil)
+	request.RemoteAddr, request.Host = "127.0.0.1:12345", "manager.example"
+	request.TLS = &tls.ConnectionState{}
+	request.Header.Set("Origin", "https://manager.example")
+	request.AddCookie(oldSession)
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("pre-restore session status=%d, want 401", response.Code)
+	}
+	if got := registrationRequest(app, http.MethodPost, "/opaque/login/finish", pendingLoginFinish, "https://manager.example").Code; got != http.StatusUnauthorized {
+		t.Fatalf("pre-restore pending login finish status=%d, want 401", got)
+	}
+	client, err := opaque.NewClient(opaque.DefaultConfiguration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestInit, err := client.RegistrationInit([]byte("must not be accepted"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldBody, err := json.Marshal(protocolMessage{Grant: resurrected, Value: base64.RawURLEncoding.EncodeToString(requestInit.Serialize())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := registrationRequest(app, http.MethodPost, "/opaque/register/start", oldBody, "https://manager.example").Code; got != http.StatusGone {
+		t.Fatalf("restored consumed/revoked grant status=%d, want 410", got)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// The real CLI uses this compatible grant-issuer path; it must not migrate
+	// the restored store and can issue a fresh one-use recovery grant.
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newGrant, err := issuer.IssueRecoveryGrant()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	app, err = New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	newHandle, newRecord := newRegistrationFlow(t, app, newGrant, "https://manager.example", "replacement restore password")
+	if got := finishTestRegistration(app, "", newHandle, newRecord, "https://manager.example"); got != http.StatusNoContent {
+		t.Fatalf("new CLI-issued recovery grant status=%d, want 204", got)
+	}
+}
+
+func pendingFixtureLoginFinish(t *testing.T, app *App, password string) []byte {
+	t.Helper()
+	client, err := opaque.NewClient(opaque.DefaultConfiguration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.ClearState()
+	ke1, err := client.GenerateKE1([]byte(password))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startBody, err := json.Marshal(protocolMessage{Value: base64.RawURLEncoding.EncodeToString(ke1.Serialize())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := registrationRequest(app, http.MethodPost, "/opaque/login/start", startBody, "https://manager.example")
+	if start.Code != http.StatusOK {
+		t.Fatalf("pre-restore OPAQUE login start status=%d: %s", start.Code, start.Body.String())
+	}
+	var response struct {
+		Transaction string `json:"transaction"`
+		Value       string `json:"value"`
+	}
+	if err := json.Unmarshal(start.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	ke2Bytes, err := base64.RawURLEncoding.DecodeString(response.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ke2, err := client.Deserialize.KE2(ke2Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ke3, _, _, err := client.GenerateKE3(ke2, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishBody, err := json.Marshal(protocolMessage{Transaction: &response.Transaction, Value: base64.RawURLEncoding.EncodeToString(ke3.Serialize())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return finishBody
+}
+
 func newRegistrationFlow(t *testing.T, app *App, grant, origin, password string) (string, []byte) {
-	return newRegistrationFlowWithIdentities(t, app, grant, origin, password, []byte("administrator"), nil)
+	return newRegistrationFlowWithIdentities(t, app, grant, origin, password, nil, nil)
 }
 
 func newRegistrationFlowWithIdentities(t *testing.T, app *App, grant, origin, password string, clientIdentity, serverIdentity []byte) (string, []byte) {
