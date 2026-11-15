@@ -2,7 +2,6 @@ package lib
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent"
 	"github.com/eslym/deploy-manager/lib/ent/archiveddeploymentjob"
 	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
 	"github.com/eslym/deploy-manager/lib/ent/deploymentdeletion"
@@ -40,14 +40,14 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	tx, err := a.db.Begin()
+	ctx := r.Context()
+	tx, err := a.store.Tx(ctx)
 	if err != nil {
 		http.Error(w, "deployment deletion is temporarily unavailable", 500)
 		return
 	}
-	var generation int64
-	err = tx.QueryRow(`SELECT generation FROM deployments WHERE id=?`, id).Scan(&generation)
-	if errors.Is(err, sql.ErrNoRows) {
+	deployment, err := tx.Deployment.Get(ctx, id)
+	if ent.IsNotFound(err) {
 		_ = tx.Rollback()
 		http.NotFound(w, r)
 		return
@@ -57,11 +57,24 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "deployment deletion is temporarily unavailable", 500)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO deployment_deletions(deployment_id,status,created_at,updated_at,retry_after) VALUES(?,'deleting',?,?,0) ON CONFLICT(deployment_id) DO UPDATE SET status='deleting',last_error='',updated_at=excluded.updated_at,retry_after=0`, id, now, now); err == nil {
-		_, err = tx.Exec(`UPDATE deployments SET generation=generation+1,status='deleting',error='',updated_at=? WHERE id=? AND generation=?`, now, id, generation)
+	deletionExists, err := tx.DeploymentDeletion.Query().Where(deploymentdeletion.IDEQ(id)).Exist(ctx)
+	if err == nil && deletionExists {
+		_, err = tx.DeploymentDeletion.Update().Where(deploymentdeletion.IDEQ(id)).SetStatus("deleting").SetLastError("").SetUpdatedAt(now).SetRetryAfter(0).Save(ctx)
+	} else if err == nil {
+		_, err = tx.DeploymentDeletion.Create().SetID(id).SetStatus("deleting").SetLastError("").SetCreatedAt(now).SetUpdatedAt(now).SetRetryAfter(0).Save(ctx)
 	}
 	if err == nil {
-		_, err = tx.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Deployment deletion requested',1,8192),updated_at=? WHERE deployment_id=? AND status IN ('queued','running')`, now, id)
+		_, err = tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.GenerationEQ(deployment.Generation)).AddGeneration(1).SetStatus("deleting").SetError("").SetUpdatedAt(now).Save(ctx)
+	}
+	if err == nil {
+		jobs, queryErr := tx.DeploymentJob.Query().Where(deploymentjob.DeploymentIDEQ(id), deploymentjob.StatusIn("queued", "running")).All(ctx)
+		err = queryErr
+		for _, job := range jobs {
+			if err != nil {
+				break
+			}
+			_, err = tx.DeploymentJob.UpdateOneID(job.ID).SetStatus("superseded").SetLog(appendJobLog(job.Log, "Deployment deletion requested")).SetUpdatedAt(now).Save(ctx)
+		}
 	}
 	if err == nil {
 		err = tx.Commit()
@@ -373,14 +386,15 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cacheMu.Lock()
 	defer p.cacheMu.Unlock()
-	tx, err := a.db.Begin()
+	ctx := r.Context()
+	tx, err := a.store.Tx(ctx)
 	if err != nil {
 		http.Error(w, "project deletion is temporarily unavailable", 500)
 		return
 	}
 	defer tx.Rollback()
-	var count int
-	if err = tx.QueryRow(`SELECT count(*) FROM deployments WHERE project_id=?`, id).Scan(&count); err != nil {
+	count, err := tx.Deployment.Query().Where(deploymentmodel.ProjectID(id)).Count(ctx)
+	if err != nil {
 		http.Error(w, "project deletion is temporarily unavailable", 500)
 		return
 	}
@@ -388,8 +402,8 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "remove this project's deployments before deleting the project", http.StatusConflict)
 		return
 	}
-	var exists int
-	if err = tx.QueryRow(`SELECT 1 FROM projects WHERE id=?`, id).Scan(&exists); err != nil {
+	exists, err := tx.Project.Query().Where(projectmodel.IDEQ(id)).Exist(ctx)
+	if err != nil || !exists {
 		http.NotFound(w, r)
 		return
 	}
@@ -416,7 +430,13 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	if _, err = tx.Exec(`INSERT INTO project_deletions(project_id,cache_dev,cache_ino,lfs_dev,lfs_ino,status,last_error,created_at,updated_at,retry_after) VALUES(?,?,?,?,?,'deleting','',?,?,0) ON CONFLICT(project_id) DO UPDATE SET cache_dev=excluded.cache_dev,cache_ino=excluded.cache_ino,lfs_dev=excluded.lfs_dev,lfs_ino=excluded.lfs_ino,status='deleting',last_error='',updated_at=excluded.updated_at,retry_after=0`, id, cacheID.Dev, cacheID.Ino, lfsCacheID.Dev, lfsCacheID.Ino, now, now); err != nil {
+	deletionExists, err := tx.ProjectDeletion.Query().Where(projectdeletion.IDEQ(id)).Exist(ctx)
+	if err == nil && deletionExists {
+		_, err = tx.ProjectDeletion.Update().Where(projectdeletion.IDEQ(id)).SetCacheDev(int64(cacheID.Dev)).SetCacheIno(int64(cacheID.Ino)).SetLfsDev(int64(lfsCacheID.Dev)).SetLfsIno(int64(lfsCacheID.Ino)).SetStatus("deleting").SetLastError("").SetUpdatedAt(now).SetRetryAfter(0).Save(ctx)
+	} else if err == nil {
+		_, err = tx.ProjectDeletion.Create().SetID(id).SetCacheDev(int64(cacheID.Dev)).SetCacheIno(int64(cacheID.Ino)).SetLfsDev(int64(lfsCacheID.Dev)).SetLfsIno(int64(lfsCacheID.Ino)).SetStatus("deleting").SetLastError("").SetCreatedAt(now).SetUpdatedAt(now).SetRetryAfter(0).Save(ctx)
+	}
+	if err != nil {
 		p.lfsCacheMu.Unlock()
 		http.Error(w, "project deletion could not be recorded", 500)
 		return

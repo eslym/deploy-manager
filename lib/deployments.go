@@ -822,11 +822,11 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 }
 
 func (a *App) cleanupUnpublishedStage(id, jobID string) error {
-	var count int
-	if err := a.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=? AND job_id=?`, id, jobID).Scan(&count); err != nil {
+	pending, err := a.store.PublicationIntent.Query().Where(publicationintent.IDEQ(id), publicationintent.JobIDEQ(jobID)).Exist(context.Background())
+	if err != nil {
 		return err
 	}
-	if count != 0 {
+	if pending {
 		return nil
 	}
 	path := a.stagePath(id, jobID)
@@ -845,37 +845,49 @@ func (a *App) cleanupUnpublishedStage(id, jobID string) error {
 }
 
 func (a *App) failJob(jobID, id string, generation int64, message string) {
-	var hasIntent int
-	if err := a.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, id).Scan(&hasIntent); err != nil {
+	ctx := context.Background()
+	tx, err := a.store.Tx(ctx)
+	if err != nil {
+		log.Printf("cannot begin failure record for deployment job %s: %v", jobID, err)
+		return
+	}
+	defer tx.Rollback()
+	hasIntent, err := tx.PublicationIntent.Query().Where(publicationintent.IDEQ(id)).Exist(ctx)
+	if err != nil {
 		log.Printf("cannot inspect publication recovery state for deployment %s: %v", id, err)
 		message = "Publication outcome could not be recorded. New publications are paused until the service reconciles it."
-		hasIntent = 1
+		hasIntent = true
 	}
-	if hasIntent > 0 {
+	if hasIntent {
 		message = "Publication outcome needs recovery. New publications are paused until the service reconciles it."
 	} else {
 		message = sanitizePublicationError(errors.New(message))
 	}
 	message = truncate(message, 512)
 	now := a.cfg.Now().UnixNano()
-	result, err := a.db.Exec(`UPDATE deployment_jobs SET status='failed',log=substr(log || char(10) || ?,1,8192),updated_at=? WHERE id=? AND status IN ('queued','running')`, message, now, jobID)
+	job, err := tx.DeploymentJob.Get(ctx, jobID)
+	if err != nil {
+		log.Printf("cannot read failed deployment job %s: %v", jobID, err)
+		return
+	}
+	updated, err := tx.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusIn("queued", "running")).SetStatus("failed").SetLog(appendJobLog(job.Log, message)).SetUpdatedAt(now).Save(ctx)
 	if err != nil {
 		log.Printf("cannot record failed deployment job %s: %v", jobID, err)
 		return
 	}
-	if result != nil {
-		if affected, rowsErr := result.RowsAffected(); rowsErr != nil {
-			log.Printf("cannot inspect failed deployment job update %s: %v", jobID, rowsErr)
-		} else if affected == 0 {
-			return
-		}
+	if updated == 0 {
+		return
 	}
 	status := "failed"
-	if hasIntent > 0 {
+	if hasIntent {
 		status = "recovery_required"
 	}
-	if _, err := a.db.Exec(`UPDATE deployments SET status=?,error=?,updated_at=? WHERE id=? AND generation=?`, status, message, now, id, generation); err != nil {
+	if _, err = tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.GenerationEQ(generation)).SetStatus(status).SetError(message).SetUpdatedAt(now).Save(ctx); err != nil {
 		log.Printf("cannot record failed deployment %s: %v", id, err)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		log.Printf("cannot commit failed deployment record %s: %v", id, err)
 	}
 }
 
