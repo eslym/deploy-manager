@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -46,6 +47,11 @@ func main() {
 	deployGrace := flags.Duration("deploy-grace-period", 60*time.Second, "minimum time before replaced files are cleaned up")
 	jobRetention := flags.Duration("job-retention", 30*24*time.Hour, "how long publication job details and logs are retained")
 	fetchRetryAttempts := flags.Int("fetch-retry-attempts", 3, "maximum attempts for transient Git fetch failures (1-5)")
+	if command == "serve" {
+		if err := applyEnvironmentDefaults(flags, os.LookupEnv); err != nil {
+			log.Fatal(err)
+		}
+	}
 	_ = flags.Parse(os.Args[2:])
 	// Preserve caller traversal until the storage boundary validates it. Join
 	// would erase "link/.." and silently select a different installation.
@@ -107,6 +113,24 @@ func main() {
 	default:
 		log.Fatalf("unknown command %q", command)
 	}
+}
+
+// applyEnvironmentDefaults maps flag names to DM_* variables. Setting values
+// before parsing arguments lets explicit command-line flags take precedence.
+func applyEnvironmentDefaults(flags *flag.FlagSet, lookup func(string) (string, bool)) error {
+	var err error
+	flags.VisitAll(func(option *flag.Flag) {
+		if err != nil {
+			return
+		}
+		name := "DM_" + strings.ToUpper(strings.ReplaceAll(option.Name, "-", "_"))
+		if value, ok := lookup(name); ok {
+			if setErr := flags.Set(option.Name, value); setErr != nil {
+				err = fmt.Errorf("invalid %s value: %w", name, setErr)
+			}
+		}
+	})
+	return err
 }
 
 // Establish transport prerequisites before constructing anything that can open

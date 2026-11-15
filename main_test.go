@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/pem"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -25,6 +26,74 @@ import (
 	"github.com/eslym/deploy-manager/internal/testbuild"
 	"golang.org/x/sys/unix"
 )
+
+func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.String("data", "./data", "")
+	fs.String("listen", "127.0.0.1:8080", "")
+	fs.String("url", "", "")
+	fs.String("origin", "", "")
+	fs.String("tls-cert", "", "")
+	fs.String("tls-key", "", "")
+	fs.String("repository-key-master", "", "")
+	fs.Duration("login-ttl", 2*time.Minute, "")
+	fs.Duration("session-ttl", 12*time.Hour, "")
+	fs.Duration("git-timeout", 2*time.Minute, "")
+	fs.Duration("grant-ttl", 15*time.Minute, "")
+	fs.Duration("recent-auth-ttl", 5*time.Minute, "")
+	fs.Int("auth-rate-per-minute", 20, "")
+	fs.String("publication-root", "", "")
+	fs.Int("deploy-max-files", 10000, "")
+	fs.Int64("deploy-max-bytes", 1<<30, "")
+	fs.Duration("deploy-timeout", 2*time.Minute, "")
+	fs.Int("deploy-concurrency", 2, "")
+	fs.Duration("deploy-grace-period", 60*time.Second, "")
+	fs.Duration("job-retention", 30*24*time.Hour, "")
+	fs.Int("fetch-retry-attempts", 3, "")
+	lookup := func(key string) (string, bool) {
+		values := map[string]string{
+			"DM_DATA": "/env/data", "DM_LISTEN": "0.0.0.0:9000", "DM_URL": "https://example.test",
+			"DM_ORIGIN": "https://example.test", "DM_TLS_CERT": "cert.pem", "DM_TLS_KEY": "key.pem",
+			"DM_REPOSITORY_KEY_MASTER": "master.key", "DM_LOGIN_TTL": "3m", "DM_SESSION_TTL": "13h",
+			"DM_GIT_TIMEOUT": "4m", "DM_GRANT_TTL": "16m", "DM_RECENT_AUTH_TTL": "6m",
+			"DM_AUTH_RATE_PER_MINUTE": "21", "DM_PUBLICATION_ROOT": "/published", "DM_DEPLOY_MAX_FILES": "10001",
+			"DM_DEPLOY_MAX_BYTES": "2147483648", "DM_DEPLOY_TIMEOUT": "3m", "DM_DEPLOY_CONCURRENCY": "4",
+			"DM_DEPLOY_GRACE_PERIOD": "61s", "DM_JOB_RETENTION": "31h", "DM_FETCH_RETRY_ATTEMPTS": "4",
+		}
+		v, ok := values[key]
+		return v, ok
+	}
+	if err := applyEnvironmentDefaults(fs, lookup); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Parse([]string{"--listen", "127.0.0.1:7777"}); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{
+		"data": "/env/data", "listen": "127.0.0.1:7777", "url": "https://example.test", "origin": "https://example.test",
+		"tls-cert": "cert.pem", "tls-key": "key.pem", "repository-key-master": "master.key", "login-ttl": "3m0s",
+		"session-ttl": "13h0m0s", "git-timeout": "4m0s", "grant-ttl": "16m0s", "recent-auth-ttl": "6m0s",
+		"auth-rate-per-minute": "21", "publication-root": "/published", "deploy-max-files": "10001",
+		"deploy-max-bytes": "2147483648", "deploy-timeout": "3m0s", "deploy-concurrency": "4",
+		"deploy-grace-period": "1m1s", "job-retention": "31h0m0s", "fetch-retry-attempts": "4",
+	}
+	for name, value := range want {
+		if got := fs.Lookup(name).Value.String(); got != value {
+			t.Errorf("%s = %q, want %q", name, got, value)
+		}
+	}
+}
+
+func TestDMEnvironmentValuesAreValidatedAsFlagValues(t *testing.T) {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.Int("deploy-concurrency", 2, "")
+	err := applyEnvironmentDefaults(fs, func(key string) (string, bool) {
+		return "many", key == "DM_DEPLOY_CONCURRENCY"
+	})
+	if err == nil || !strings.Contains(err.Error(), "DM_DEPLOY_CONCURRENCY") {
+		t.Fatalf("invalid environment value error = %v, want named DM variable", err)
+	}
+}
 
 var commandBuild struct {
 	sync.Once
