@@ -160,7 +160,7 @@ func TestStorageCoordinationChild(t *testing.T) {
 			}
 			return nil
 		}
-		g, e := NewGrantIssuer(cfg)
+		g, e := New(cfg)
 		if g != nil {
 			_ = g.Close()
 		}

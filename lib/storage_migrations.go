@@ -192,11 +192,7 @@ func validateStoragePragmas(db *sql.DB) error {
 	return validateDatabaseIntegrity(db)
 }
 
-func preflightExistingSchema(dbURL string, configs ...Config) error {
-	cfg := Config{}
-	if len(configs) > 0 {
-		cfg = configs[0]
-	}
+func preflightExistingSchema(dbURL string, cfg Config) error {
 	db, err := sql.Open("sqlite3", dbURL+"?mode=ro&_busy_timeout=1000")
 	if err != nil {
 		return err

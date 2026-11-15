@@ -208,6 +208,21 @@ func applyProtectedUpgrade(cfg Config, dbURL, markerPath string, marker maintena
 		}
 		return nil
 	}
+	setPhase := func(name string) error {
+		if cfg.storageFault != nil {
+			if err := cfg.storageFault("marker-phase-"+name, nil); err != nil {
+				return fmt.Errorf("cannot durably record upgrade phase %s; previous maintenance marker retained: %w", name, err)
+			}
+		}
+		marker.Phase = name
+		if err := durableJSONReplace(markerPath, marker); err != nil {
+			return fmt.Errorf("cannot durably record upgrade phase %s; previous maintenance marker retained: %w", name, err)
+		}
+		return nil
+	}
+	if err := setPhase("vacuum"); err != nil {
+		return err
+	}
 	if err := phase("upgrade-vacuum", nil); err != nil {
 		return fmt.Errorf("upgrade VACUUM cancelled or unavailable; verified backup retained: %w", err)
 	}
@@ -227,6 +242,9 @@ func applyProtectedUpgrade(cfg Config, dbURL, markerPath string, marker maintena
 	}
 	if err != nil {
 		return fmt.Errorf("upgrade VACUUM failed; verified backup retained: %w", err)
+	}
+	if err := setPhase("migration"); err != nil {
+		return err
 	}
 	files, err := migrationSource(cfg)
 	if err != nil {
@@ -254,6 +272,9 @@ func applyProtectedUpgrade(cfg Config, dbURL, markerPath string, marker maintena
 	if err != nil {
 		return fmt.Errorf("embedded migration failed; verified backup retained: %w", err)
 	}
+	if err := setPhase("verification"); err != nil {
+		return err
+	}
 	if err = phase("upgrade-verify", nil); err != nil {
 		return fmt.Errorf("post-upgrade verification failed; verified backup retained: %w", err)
 	}
@@ -278,6 +299,9 @@ func applyProtectedUpgrade(cfg Config, dbURL, markerPath string, marker maintena
 	}
 	if err != nil {
 		return fmt.Errorf("post-upgrade verification or database close failed; verified backup retained: %w", err)
+	}
+	if err := setPhase("unlock"); err != nil {
+		return err
 	}
 	if err := phase("marker-remove", nil); err != nil {
 		return fmt.Errorf("verified upgrade could not durably remove maintenance marker; backup retained: %w", err)

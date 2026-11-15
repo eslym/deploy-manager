@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 )
 
 func TestGrantIssuerAlongsideDaemonDoesNotRunRecovery(t *testing.T) {
@@ -42,6 +43,60 @@ func TestGrantIssuerAlongsideDaemonDoesNotRunRecovery(t *testing.T) {
 	for _, path := range []string{cache, stage} {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("CLI performed daemon recovery on %s: %v", path, err)
+		}
+	}
+}
+
+func TestGrantIssuerRefusesPendingUpgradeWithoutChangingStorage(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.upgradeTargetVersion = 2
+	cfg.migrationFS = fstest.MapFS{
+		"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+		"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE cli_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE cli_upgrade_witness;\n")},
+	}
+	databaseBefore, err := os.ReadFile(cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opaqueBefore, err := os.ReadFile(cfg.OPAQUEKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	masterBefore, err := os.ReadFile(cfg.DatabasePath + ".repository-master-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cli, err := NewGrantIssuer(cfg); err == nil {
+		_ = cli.Close()
+		t.Fatal("CLI grant issuer accepted a pending existing-store upgrade")
+	}
+	for path, before := range map[string][]byte{cfg.DatabasePath: databaseBefore, cfg.OPAQUEKeyPath: opaqueBefore, cfg.DatabasePath + ".repository-master-key": masterBefore} {
+		after, err := os.ReadFile(path)
+		if err != nil || string(after) != string(before) {
+			t.Fatalf("CLI changed %s: read error=%v", path, err)
+		}
+	}
+	for _, path := range []string{cfg.DatabasePath + ".maintenance.json", cfg.DatabasePath + ".upgrade-backups"} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("CLI created upgrade artifact %s: %v", path, err)
 		}
 	}
 }

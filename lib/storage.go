@@ -24,7 +24,7 @@ func NewGrantIssuer(cfg Config) (*GrantIssuer, error) {
 	if err := validateStoragePaths(cfg); err != nil {
 		return nil, err
 	}
-	storage, err := prepareStorage(cfg)
+	storage, err := prepareStorage(cfg, false)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +66,7 @@ func startDaemon(cfg Config) (*App, *storageLock, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	storage, err := prepareStorage(cfg)
+	storage, err := prepareStorage(cfg, true)
 	if errors.Is(err, ErrMaintenance) {
 		return nil, ownership, err
 	}

@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"testing/fstest"
@@ -126,11 +127,11 @@ func TestPendingUpgradeCompletesThroughStorageStartupWithFixtureMigration(t *tes
 		lockChecked = true
 		return nil
 	}
-	issuer, err := NewGrantIssuer(cfg)
+	app, err := New(cfg)
 	if err != nil {
 		t.Fatalf("startup did not finish protected upgrade: %v", err)
 	}
-	if err := issuer.Close(); err != nil {
+	if err := app.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if !lockChecked {
@@ -217,7 +218,7 @@ func TestPendingUpgradeValidatesExternalKeyBindingBeforeEstablishingMaintenance(
 	if err := os.WriteFile(masterPath, key, 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewGrantIssuer(cfg); err == nil || errors.Is(err, ErrMaintenance) {
+	if _, err := New(cfg); err == nil || errors.Is(err, ErrMaintenance) {
 		t.Fatalf("mismatched key binding should fail before entering maintenance: %v", err)
 	}
 	if _, err := os.Lstat(cfg.DatabasePath + ".maintenance.json"); !os.IsNotExist(err) {
@@ -229,7 +230,12 @@ func TestPendingUpgradeValidatesExternalKeyBindingBeforeEstablishingMaintenance(
 }
 
 func TestProtectedUpgradeFailuresRemainLockedAndDoNotRunLaterPhases(t *testing.T) {
-	for _, failedPhase := range []string{"upgrade-vacuum", "upgrade-migration", "upgrade-verify", "marker-remove", "marker-remove-sync"} {
+	for _, test := range []struct{ fault, marker string }{
+		{"upgrade-vacuum", "vacuum"}, {"upgrade-migration", "migration"}, {"upgrade-verify", "verification"},
+		{"marker-remove", "unlock"}, {"marker-remove-sync", "unlock"},
+		{"marker-phase-vacuum", "migration"},
+	} {
+		failedPhase := test.fault
 		t.Run(failedPhase, func(t *testing.T) {
 			dir := t.TempDir()
 			cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
@@ -266,6 +272,30 @@ func TestProtectedUpgradeFailuresRemainLockedAndDoNotRunLaterPhases(t *testing.T
 			}
 			if _, err := os.Lstat(markerPath); err != nil {
 				t.Fatalf("failure cleared maintenance marker: %v", err)
+			}
+			markerBytes, err := os.ReadFile(markerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var persisted maintenanceMarker
+			if err := json.Unmarshal(markerBytes, &persisted); err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Phase != test.marker {
+				t.Fatalf("failure phase=%q, want durable marker phase %q", persisted.Phase, test.marker)
+			}
+			daemon, err := OpenDaemon(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer daemon.Close()
+			if diagnostic := daemon.Diagnostic(); !strings.Contains(diagnostic, "source=1 target=1") || !strings.Contains(diagnostic, "operation=fixture") || !strings.Contains(diagnostic, "backup=") || !strings.Contains(diagnostic, "phase=") {
+				t.Fatalf("operator diagnostic lacks recovery context: %q", diagnostic)
+			}
+			recorder := httptest.NewRecorder()
+			daemon.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/", nil))
+			if recorder.Code != http.StatusServiceUnavailable || strings.Contains(recorder.Body.String(), persisted.Backup) {
+				t.Fatalf("maintenance HTTP response exposed diagnostics or escaped lock: code=%d body=%q", recorder.Code, recorder.Body.String())
 			}
 			if _, err := NewGrantIssuer(cfg); !errors.Is(err, ErrMaintenance) {
 				t.Fatalf("failed upgrade did not remain locked: %v", err)
@@ -463,7 +493,7 @@ func TestPendingUpgradeFinalizesIndependentVerifiedDatabaseBackupAndStaysLocked(
 		t.Fatal(err)
 	}
 	var marker maintenanceMarker
-	if _, err := NewGrantIssuer(cfg); !errors.Is(err, ErrMaintenance) {
+	if _, err := New(cfg); !errors.Is(err, ErrMaintenance) {
 		t.Fatalf("pending upgrade result=%v, want locked", err)
 	}
 	if err := db.Close(); err != nil {
@@ -476,7 +506,7 @@ func TestPendingUpgradeFinalizesIndependentVerifiedDatabaseBackupAndStaysLocked(
 	if err := json.Unmarshal(markerData, &marker); err != nil {
 		t.Fatal(err)
 	}
-	if marker.SourceVersion != 0 || marker.TargetVersion != 1 || marker.Operation == "" || marker.Program == "" || marker.Phase != "backup-complete-upgrade-paused" {
+	if marker.SourceVersion != 0 || marker.TargetVersion != 1 || marker.Operation == "" || marker.Program == "" || marker.Phase != "verification" {
 		t.Fatalf("incomplete maintenance marker: %+v", marker)
 	}
 	backupInfo, err := os.Lstat(marker.Backup)
@@ -594,7 +624,7 @@ func TestPendingUpgradeFailureKeepsDurableMarkerWithoutCompletedBackup(t *testin
 		}
 		return nil
 	}
-	if _, err := NewGrantIssuer(cfg); !errors.Is(err, ErrMaintenance) {
+	if _, err := New(cfg); !errors.Is(err, ErrMaintenance) {
 		t.Fatalf("failed preparation did not lock: %v", err)
 	}
 	if _, err := os.Stat(cfg.DatabasePath + ".maintenance.json"); err != nil {
