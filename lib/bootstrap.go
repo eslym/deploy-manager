@@ -58,6 +58,7 @@ type Config struct {
 	DeployConcurrency           int
 	DeployGracePeriod           time.Duration
 	JobRetention                time.Duration
+	FetchRetryAttempts          int
 	WebhookMaxBodyBytes         int64
 	beforeRestoreDeploymentJobs func(*sql.DB) error
 	// storageFault is a per-startup test seam, never configured by the CLI or HTTP.

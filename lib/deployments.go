@@ -172,8 +172,11 @@ func (a *App) configureDeployments() error {
 	if d.JobRetention == 0 {
 		d.JobRetention = 30 * 24 * time.Hour
 	}
-	if d.DeployMaxFiles < 1 || d.DeployMaxFiles > 1_000_000 || d.DeployMaxBytes < 1 || d.DeployMaxBytes > 1<<40 || d.DeployTimeout < time.Second || d.DeployTimeout > 10*time.Minute || d.DeployConcurrency < 1 || d.DeployConcurrency > 32 || d.DeployGracePeriod < 0 || d.DeployGracePeriod > 24*time.Hour || d.JobRetention < time.Hour || d.JobRetention > 365*24*time.Hour {
-		return errors.New("deployment limits, timeout, concurrency, or retention are outside supported bounds")
+	if d.FetchRetryAttempts == 0 {
+		d.FetchRetryAttempts = 3
+	}
+	if d.DeployMaxFiles < 1 || d.DeployMaxFiles > 1_000_000 || d.DeployMaxBytes < 1 || d.DeployMaxBytes > 1<<40 || d.DeployTimeout < time.Second || d.DeployTimeout > 10*time.Minute || d.DeployConcurrency < 1 || d.DeployConcurrency > 32 || d.DeployGracePeriod < 0 || d.DeployGracePeriod > 24*time.Hour || d.JobRetention < time.Hour || d.JobRetention > 365*24*time.Hour || d.FetchRetryAttempts < 1 || d.FetchRetryAttempts > 5 {
+		return errors.New("deployment limits, timeout, concurrency, retention, or fetch retry attempts are outside supported bounds")
 	}
 	a.cfg = d
 	return nil
@@ -715,7 +718,7 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 		if err := a.fetchProjectForBranch(ctx, d.ProjectID); err != nil {
 			message := "Could not refresh the configured Git target; the current publication was kept"
 			if errors.Is(err, errBranchFetchRetriesExhausted) {
-				message = fmt.Sprintf("Temporary repository transport failures persisted through %d bounded attempts; the current publication was kept", branchFetchMaxAttempts)
+				message = fmt.Sprintf("Temporary repository transport failures persisted through %d bounded attempts; the current publication was kept", a.cfg.FetchRetryAttempts)
 			}
 			a.failJob(jobID, d.ID, generation, message)
 			return

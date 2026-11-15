@@ -55,8 +55,6 @@
 	let projectDeleteConfirmation = $state('');
 	let cacheRecreateConfirmation = $state('');
 	let cacheRecreateTrigger: HTMLButtonElement | undefined = $state();
-	let cacheRecreateDialog: HTMLDivElement | undefined = $state();
-	let cacheRecreateConfirmButton: HTMLButtonElement | undefined = $state();
 	let cacheRecreateBusy = $state(false);
 	let cacheRecreateError = $state('');
 	let cacheRecreateNotice = $state('');
@@ -395,11 +393,11 @@
 		cacheRecreateError = '';
 		cacheRecreateNotice = '';
 		await tick();
-		cacheRecreateConfirmButton?.focus();
+		document.getElementById('cache-recreate-confirm')?.focus();
 	}
 	function closeCacheRecreateConfirmation() {
 		cacheRecreateConfirmation = '';
-		void tick().then(() => cacheRecreateTrigger?.focus());
+		void tick().then(() => document.getElementById('cache-recreate-trigger')?.focus());
 	}
 	function trapCacheRecreateFocus(event: KeyboardEvent) {
 		if (event.key === 'Escape' && !cacheRecreateBusy) {
@@ -407,10 +405,9 @@
 			closeCacheRecreateConfirmation();
 			return;
 		}
-		if (event.key !== 'Tab' || !cacheRecreateDialog) return;
-		const focusable = Array.from(
-			cacheRecreateDialog.querySelectorAll<HTMLElement>('button:not(:disabled)')
-		);
+		const dialog = document.getElementById('cache-recreate-dialog');
+		if (event.key !== 'Tab' || !dialog) return;
+		const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled)'));
 		const first = focusable[0];
 		const last = focusable.at(-1);
 		if (event.shiftKey && document.activeElement === first) {
@@ -654,7 +651,7 @@
 						</p>{/if}
 					{#if cacheRecreateConfirmation === project?.id}
 						<div
-							bind:this={cacheRecreateDialog}
+							id="cache-recreate-dialog"
 							class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3"
 							role="dialog"
 							aria-modal="true"
@@ -673,7 +670,7 @@
 							</p>
 							<div class="mt-3 flex flex-wrap gap-2">
 								<button
-									bind:this={cacheRecreateConfirmButton}
+									id="cache-recreate-confirm"
 									class="min-h-9 rounded-lg bg-amber-900 px-3 text-sm font-semibold text-white disabled:opacity-60"
 									onclick={() => project && recreateCache(project)}
 									disabled={cacheRecreateBusy || !project}>Clear cache</button
@@ -687,6 +684,7 @@
 						</div>
 					{:else}
 						<button
+							id="cache-recreate-trigger"
 							class="mt-2 min-h-9 rounded-lg border border-amber-500 px-3 text-sm font-semibold text-amber-950 disabled:opacity-60"
 							onclick={() => project && openCacheRecreateConfirmation(project)}
 							disabled={cacheRecreateBusy || !project}>Clear cache…</button

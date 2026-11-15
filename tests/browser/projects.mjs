@@ -225,6 +225,21 @@ try {
   await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).waitFor();
   if ((await page.locator("body").innerText()).includes(rotatedGiteaSecret)) throw new Error("Gitea secret remained after dashboard reload");
   milestone("create branch deployment");
+  let releaseJobHistory;
+  const jobHistoryRequest = new Promise(resolveRequest => {
+    page.route("**/api/deployments/*/jobs", async route => {
+      if (route.request().method() === "GET" && releaseJobHistory) {
+        const release = releaseJobHistory;
+        releaseJobHistory = null;
+        resolveRequest(route);
+        await release;
+        return;
+      }
+      await route.continue();
+    });
+  });
+  let finishJobHistory;
+  releaseJobHistory = new Promise(resolveRelease => { finishJobHistory = resolveRelease; });
   await page.getByLabel("Deployment name").fill("Production site");
   await page.locator("form").locator("select").selectOption("branch:feature/search");
   const deploymentResponse = page.waitForResponse(response => response.url().endsWith("/api/deployments") && response.request().method() === "POST");
@@ -233,6 +248,25 @@ try {
   if (deploymentCreated.status() !== 201) throw new Error(`deployment creation returned ${deploymentCreated.status()}: ${await deploymentCreated.text()}`);
   await page.getByText("Production site", { exact: true }).waitFor();
   const deploymentID = await page.evaluate(async () => (await (await fetch("/api/deployments")).json())[0].id);
+  const delayedHistoryRoute = await jobHistoryRequest;
+  const productionHistory = page.getByRole("region", { name: "Job history for Production site" });
+  await productionHistory.getByText("Loading history…", { exact: true }).waitFor();
+  if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("pending deployment history was shown as empty");
+  finishJobHistory();
+  await delayedHistoryRoute.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  await productionHistory.getByText("No deployment history yet.", { exact: true }).waitFor();
+  if (await productionHistory.getByText("No deployment jobs recorded yet.", { exact: true }).count()) throw new Error("outdated deployment history empty message remained visible");
+  let failHistoryRoute;
+  const failedHistoryRequest = new Promise(resolveRequest => { failHistoryRoute = resolveRequest; });
+  await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
+    await page.unroute(`**/api/deployments/${deploymentID}/jobs`);
+    failHistoryRoute(route);
+    await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE JOB HISTORY ERROR" });
+  });
+  await failedHistoryRequest;
+  await productionHistory.getByRole("alert").filter({ hasText: "Could not load deployment history" }).waitFor();
+  if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("failed deployment history was shown as empty");
+  if ((await productionHistory.innerText()).includes("SENSITIVE JOB HISTORY ERROR")) throw new Error("deployment history exposed an HTTP response body");
   try {
   await waitFor(async () => {
       try {
