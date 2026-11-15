@@ -1351,7 +1351,7 @@ func (a *App) cleanupPublications(startup bool) error {
 		}
 		if err := fault("before-cleanup"); err != nil {
 			delay := time.Second << min(c.attempts, 10)
-			if _, recordErr := a.db.Exec(`UPDATE publication_cleanup SET last_error='old publication cleanup failed; retry scheduled',attempts=attempts+1,not_before=? WHERE deployment_id=? AND job_id=?`, a.cfg.Now().Add(delay).UnixNano(), c.id, c.job); recordErr != nil {
+			if _, recordErr := a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("old publication cleanup failed; retry scheduled").AddAttempts(1).SetNotBefore(a.cfg.Now().Add(delay).UnixNano()).Save(context.Background()); recordErr != nil {
 				return fmt.Errorf("record publication cleanup failure: %w", recordErr)
 			}
 			continue
@@ -1395,7 +1395,7 @@ func (a *App) cleanupPublications(startup bool) error {
 			_, err = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).Exec(context.Background())
 		} else {
 			delay := time.Second << min(c.attempts, 10)
-			_, recordErr := a.db.Exec(`UPDATE publication_cleanup SET last_error='old publication cleanup failed; retry scheduled',attempts=attempts+1,not_before=? WHERE deployment_id=? AND job_id=?`, a.cfg.Now().Add(delay).UnixNano(), c.id, c.job)
+			_, recordErr := a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("old publication cleanup failed; retry scheduled").AddAttempts(1).SetNotBefore(a.cfg.Now().Add(delay).UnixNano()).Save(context.Background())
 			if recordErr != nil {
 				return fmt.Errorf("record publication cleanup failure: %w", recordErr)
 			}
