@@ -75,9 +75,9 @@ try {
   const listen = "127.0.0.1:18437";
   const setup = spawnSync(executable, ["setup", "--data", dir, "--listen", listen], { cwd: dir, encoding: "utf8" });
   if (setup.status !== 0) throw new Error(setup.stderr || "CLI setup failed");
-  const link = setup.stdout.trim();
+  let link = setup.stdout.trim();
   const issuedURL = new URL(link);
-  const grant = issuedURL.hash.slice(1);
+  let grant = issuedURL.hash.slice(1);
   if (issuedURL.origin !== `http://${listen}` || issuedURL.pathname !== "/register" || issuedURL.search || !grant) {
     throw new Error("setup CLI did not issue a fragment-only loopback setup URL");
   }
@@ -103,6 +103,16 @@ try {
     });
   };
   await startServer();
+
+  // A different listener must not bypass installation ownership. Routine setup
+  // and (below) account recovery still work while the owning daemon is live.
+  const secondDaemon = spawnSync(executable, ["serve", "--data", dir, "--listen", "127.0.0.1:0"], { cwd: dir, encoding: "utf8", timeout: 5000 });
+  if (secondDaemon.error || secondDaemon.status === 0 || !secondDaemon.stderr.includes("daemon ownership")) throw new Error(`second daemon was not promptly refused: ${secondDaemon.stderr}`);
+  const liveSetup = spawnSync(executable, ["setup", "--data", dir, "--listen", listen], { cwd: dir, encoding: "utf8", timeout: 5000 });
+  if (liveSetup.error || liveSetup.status !== 0 || !new URL(liveSetup.stdout.trim()).hash) throw new Error(liveSetup.stderr || "setup alongside daemon failed");
+  const initialGrant = grant;
+  link = liveSetup.stdout.trim();
+  grant = new URL(link).hash.slice(1);
 
   const pageResponse = await fetch(`http://${listen}/register`, { headers: { Accept: "text/html" } });
   const shell = await pageResponse.text();
@@ -285,7 +295,7 @@ try {
     body: JSON.stringify({ grant: new URL(failedInitLink).hash.slice(1), value: "AA" })
   });
   if (signupClosed.status !== 410) throw new Error(`registration remained open after account creation: ${signupClosed.status}`);
-  const issuedTokens = [grant, new URL(failedInitLink).hash.slice(1)];
+  const issuedTokens = [grant, initialGrant, new URL(failedInitLink).hash.slice(1)];
   if (issuedTokens.some(token => serverOutput.includes(token))) throw new Error("setup grants appeared in routine application logs");
 
   server.kill("SIGTERM");

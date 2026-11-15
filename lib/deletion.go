@@ -1,7 +1,7 @@
 package lib
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +10,17 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/eslym/deploy-manager/lib/ent"
+	"github.com/eslym/deploy-manager/lib/ent/archiveddeploymentjob"
+	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
+	"github.com/eslym/deploy-manager/lib/ent/deploymentdeletion"
+	"github.com/eslym/deploy-manager/lib/ent/deploymentjob"
+	"github.com/eslym/deploy-manager/lib/ent/deploymentremovalpath"
+	projectmodel "github.com/eslym/deploy-manager/lib/ent/project"
+	"github.com/eslym/deploy-manager/lib/ent/projectdeletion"
+	"github.com/eslym/deploy-manager/lib/ent/publicationcleanup"
+	"github.com/eslym/deploy-manager/lib/ent/publicationintent"
 )
 
 func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
@@ -29,14 +40,14 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	tx, err := a.db.Begin()
+	ctx := r.Context()
+	tx, err := a.store.Tx(ctx)
 	if err != nil {
 		http.Error(w, "deployment deletion is temporarily unavailable", 500)
 		return
 	}
-	var generation int64
-	err = tx.QueryRow(`SELECT generation FROM deployments WHERE id=?`, id).Scan(&generation)
-	if errors.Is(err, sql.ErrNoRows) {
+	deployment, err := tx.Deployment.Get(ctx, id)
+	if ent.IsNotFound(err) {
 		_ = tx.Rollback()
 		http.NotFound(w, r)
 		return
@@ -46,11 +57,24 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "deployment deletion is temporarily unavailable", 500)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO deployment_deletions(deployment_id,status,created_at,updated_at,retry_after) VALUES(?,'deleting',?,?,0) ON CONFLICT(deployment_id) DO UPDATE SET status='deleting',last_error='',updated_at=excluded.updated_at,retry_after=0`, id, now, now); err == nil {
-		_, err = tx.Exec(`UPDATE deployments SET generation=generation+1,status='deleting',error='',updated_at=? WHERE id=? AND generation=?`, now, id, generation)
+	deletionExists, err := tx.DeploymentDeletion.Query().Where(deploymentdeletion.IDEQ(id)).Exist(ctx)
+	if err == nil && deletionExists {
+		_, err = tx.DeploymentDeletion.Update().Where(deploymentdeletion.IDEQ(id)).SetStatus("deleting").SetLastError("").SetUpdatedAt(now).SetRetryAfter(0).Save(ctx)
+	} else if err == nil {
+		_, err = tx.DeploymentDeletion.Create().SetID(id).SetStatus("deleting").SetLastError("").SetCreatedAt(now).SetUpdatedAt(now).SetRetryAfter(0).Save(ctx)
 	}
 	if err == nil {
-		_, err = tx.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Deployment deletion requested',1,8192),updated_at=? WHERE deployment_id=? AND status IN ('queued','running')`, now, id)
+		_, err = tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.GenerationEQ(deployment.Generation)).AddGeneration(1).SetStatus("deleting").SetError("").SetUpdatedAt(now).Save(ctx)
+	}
+	if err == nil {
+		jobs, queryErr := tx.DeploymentJob.Query().Where(deploymentjob.DeploymentIDEQ(id), deploymentjob.StatusIn("queued", "running")).All(ctx)
+		err = queryErr
+		for _, job := range jobs {
+			if err != nil {
+				break
+			}
+			_, err = tx.DeploymentJob.UpdateOneID(job.ID).SetStatus("superseded").SetLog(appendJobLog(job.Log, "Deployment deletion requested")).SetUpdatedAt(now).Save(ctx)
+		}
 	}
 	if err == nil {
 		err = tx.Commit()
@@ -70,36 +94,23 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) resumeDeploymentDeletions() error {
-	var pending int
-	if err := a.db.QueryRow(`SELECT count(*) FROM deployment_deletions`).Scan(&pending); err != nil {
-		return err
-	}
-	if pending == 0 {
-		return nil
-	}
-	rows, err := a.db.Query(`SELECT deployment_id FROM deployment_deletions WHERE status!='deleted' AND retry_after<=? ORDER BY created_at`, a.cfg.Now().UnixNano())
+	pending, err := a.store.DeploymentDeletion.Query().Exist(context.Background())
 	if err != nil {
 		return err
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err = rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
-		}
-		ids = append(ids, id)
+	if !pending {
+		return nil
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
+	entries, err := a.store.DeploymentDeletion.Query().Where(
+		deploymentdeletion.StatusNEQ("deleted"),
+		deploymentdeletion.RetryAfterLTE(a.cfg.Now().UnixNano()),
+	).Order(deploymentdeletion.ByCreatedAt()).All(context.Background())
+	if err != nil {
 		return err
 	}
-	if err = rows.Close(); err != nil {
-		return err
-	}
-	for _, id := range ids {
-		if err = a.finishDeploymentDeletion(id); err != nil {
-			_, _ = a.db.Exec(`UPDATE deployment_deletions SET status='blocked',last_error='safe cleanup is pending; check publication paths and retry',updated_at=? WHERE deployment_id=?`, a.cfg.Now().UnixNano(), id)
+	for _, entry := range entries {
+		if err = a.finishDeploymentDeletion(entry.ID); err != nil {
+			_, _ = a.store.DeploymentDeletion.Update().Where(deploymentdeletion.IDEQ(entry.ID)).SetStatus("blocked").SetLastError("safe cleanup is pending; check publication paths and retry").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(context.Background())
 		}
 	}
 	return nil
@@ -117,7 +128,7 @@ func (a *App) finishDeploymentDeletion(id string) error {
 	if err = a.recordDeploymentRemovalPaths(id); err != nil {
 		return a.recordDeletionFailure(id, err)
 	}
-	rows, err := a.db.Query(`SELECT path_name,dev,ino FROM deployment_removal_paths WHERE deployment_id=?`, id)
+	removals, err := a.store.DeploymentRemovalPath.Query().Where(deploymentremovalpath.IDEQ(id)).All(context.Background())
 	if err != nil {
 		return a.recordDeletionFailure(id, err)
 	}
@@ -125,20 +136,10 @@ func (a *App) finishDeploymentDeletion(id string) error {
 		name     string
 		identity dirIdentity
 	}
-	var pending []removal
-	for rows.Next() {
-		var x removal
-		if err = rows.Scan(&x.name, &x.identity.Dev, &x.identity.Ino); err != nil {
-			rows.Close()
-			return a.recordDeletionFailure(id, err)
-		}
-		pending = append(pending, x)
+	pending := make([]removal, 0, len(removals))
+	for _, row := range removals {
+		pending = append(pending, removal{name: row.PathName, identity: dirIdentity{Dev: uint64(row.Dev), Ino: uint64(row.Ino)}})
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return a.recordDeletionFailure(id, err)
-	}
-	rows.Close()
 	for _, x := range pending {
 		path := filepath.Join(a.cfg.DeploymentRoot, x.name)
 		if err = validateRemovalName(id, x.name); err != nil {
@@ -156,7 +157,7 @@ func (a *App) finishDeploymentDeletion(id string) error {
 				err = syncDirectory(a.cfg.DeploymentRoot)
 			}
 			if err != nil {
-				_, _ = a.db.Exec(`UPDATE deployment_removal_paths SET last_error='cleanup failed; retry scheduled',attempts=attempts+1 WHERE deployment_id=? AND path_name=?`, id, x.name)
+				_, _ = a.store.DeploymentRemovalPath.Update().Where(deploymentremovalpath.IDEQ(id), deploymentremovalpath.PathNameEQ(x.name)).SetLastError("cleanup failed; retry scheduled").AddAttempts(1).Save(context.Background())
 				return a.recordDeletionFailure(id, err)
 			}
 			if err = fault("after-deployment-removal"); err != nil {
@@ -165,10 +166,10 @@ func (a *App) finishDeploymentDeletion(id string) error {
 		} else if _, e = os.Lstat(path); !os.IsNotExist(e) {
 			return a.recordDeletionFailure(id, errors.New("removal path identity changed; cleanup blocked"))
 		}
-		if _, err = a.db.Exec(`DELETE FROM deployment_removal_paths WHERE deployment_id=? AND path_name=?`, id, x.name); err != nil {
+		if _, err = a.store.DeploymentRemovalPath.Delete().Where(deploymentremovalpath.IDEQ(id), deploymentremovalpath.PathNameEQ(x.name)).Exec(context.Background()); err != nil {
 			return a.recordDeletionFailure(id, err)
 		}
-		_, _ = a.db.Exec(`DELETE FROM publication_cleanup WHERE deployment_id=? AND path_name=?`, id, x.name)
+		_, _ = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(id), publicationcleanup.PathNameEQ(x.name)).Exec(context.Background())
 	}
 	return a.finishDeploymentDeletionRecord(id)
 }
@@ -184,9 +185,8 @@ func validateRemovalName(id, name string) error {
 }
 
 func (a *App) recordDeploymentRemovalPaths(id string) error {
-	var liveCommit string
-	var dev, ino uint64
-	if err := a.db.QueryRow(`SELECT live_commit,live_dev,live_ino FROM deployments WHERE id=?`, id).Scan(&liveCommit, &dev, &ino); err != nil {
+	deployment, err := a.store.Deployment.Get(context.Background(), id)
+	if err != nil {
 		return err
 	}
 	add := func(name string, want dirIdentity) error {
@@ -196,7 +196,7 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 		path := filepath.Join(a.cfg.DeploymentRoot, name)
 		actual, e := identity(path)
 		if os.IsNotExist(e) {
-			_, _ = a.db.Exec(`DELETE FROM publication_cleanup WHERE deployment_id=? AND path_name=?`, id, name)
+			_, _ = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(id), publicationcleanup.PathNameEQ(name)).Exec(context.Background())
 			return nil
 		}
 		if e != nil {
@@ -208,8 +208,8 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 		_, e = a.db.Exec(`INSERT OR IGNORE INTO deployment_removal_paths(deployment_id,path_name,dev,ino) VALUES(?,?,?,?)`, id, name, want.Dev, want.Ino)
 		return e
 	}
-	if liveCommit != "" {
-		if err := add(id, dirIdentity{dev, ino}); err != nil {
+	if deployment.LiveCommit != "" {
+		if err := add(id, dirIdentity{uint64(deployment.LiveDev), uint64(deployment.LiveIno)}); err != nil {
 			return err
 		}
 	} else if _, err := os.Lstat(a.deploymentPath(id)); err == nil {
@@ -217,7 +217,7 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	rows, err := a.db.Query(`SELECT path_name,dev,ino FROM publication_cleanup WHERE deployment_id=?`, id)
+	cleanups, err := a.store.PublicationCleanup.Query().Where(publicationcleanup.IDEQ(id)).All(context.Background())
 	if err != nil {
 		return err
 	}
@@ -225,20 +225,10 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 		name string
 		id   dirIdentity
 	}
-	var items []item
-	for rows.Next() {
-		var x item
-		if err = rows.Scan(&x.name, &x.id.Dev, &x.id.Ino); err != nil {
-			rows.Close()
-			return err
-		}
-		items = append(items, x)
+	items := make([]item, 0, len(cleanups))
+	for _, row := range cleanups {
+		items = append(items, item{name: row.PathName, id: dirIdentity{Dev: uint64(row.Dev), Ino: uint64(row.Ino)}})
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	for _, x := range items {
 		if err = add(x.name, x.id); err != nil {
 			return err
@@ -261,9 +251,12 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 		if !validProjectID(job) {
 			return errors.New("unrecognized deployment stage path; cleanup blocked")
 		}
-		var known int
-		if e := a.db.QueryRow(`SELECT 1 FROM deployment_jobs WHERE id=? AND deployment_id=?`, job, id).Scan(&known); e != nil {
+		known, e := a.store.DeploymentJob.Query().Where(deploymentjob.IDEQ(job), deploymentjob.DeploymentIDEQ(id)).Exist(context.Background())
+		if e != nil {
 			return e
+		}
+		if !known {
+			return errors.New("stage has no recorded deployment job")
 		}
 		dirID, e := identity(filepath.Join(a.cfg.DeploymentRoot, name))
 		if e != nil {
@@ -277,71 +270,86 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 }
 
 func (a *App) reconcileDeploymentIntent(id string) error {
-	var exists int
-	if err := a.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, id).Scan(&exists); err != nil {
+	exists, err := a.store.PublicationIntent.Query().Where(publicationintent.IDEQ(id)).Exist(context.Background())
+	if err != nil {
 		return err
 	}
-	if exists == 0 {
+	if !exists {
 		return nil
 	}
 	if err := a.reconcilePublicationsFor(id); err != nil {
 		return err
 	}
-	if err := a.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, id).Scan(&exists); err != nil {
+	exists, err = a.store.PublicationIntent.Query().Where(publicationintent.IDEQ(id)).Exist(context.Background())
+	if err != nil {
 		return err
 	}
-	if exists != 0 {
+	if exists {
 		return errors.New("publication intent remains unresolved")
 	}
 	return nil
 }
 
 func (a *App) finishDeploymentDeletionRecord(id string) error {
-	tx, err := a.db.Begin()
+	ctx := context.Background()
+	tx, err := a.store.Tx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var remaining int
-	if err = tx.QueryRow(`SELECT count(*) FROM deployment_removal_paths WHERE deployment_id=?`, id).Scan(&remaining); err != nil {
+	remaining, err := tx.DeploymentRemovalPath.Query().Where(deploymentremovalpath.IDEQ(id)).Count(ctx)
+	if err != nil {
 		return err
 	}
 	if remaining != 0 {
 		return errors.New("publication cleanup remains pending")
 	}
-	var intent, cleanup int
-	if err = tx.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, id).Scan(&intent); err != nil {
+	intent, err := tx.PublicationIntent.Query().Where(publicationintent.IDEQ(id)).Exist(ctx)
+	if err != nil {
 		return err
 	}
-	if err = tx.QueryRow(`SELECT count(*) FROM publication_cleanup WHERE deployment_id=?`, id).Scan(&cleanup); err != nil {
+	cleanup, err := tx.PublicationCleanup.Query().Where(publicationcleanup.IDEQ(id)).Exist(ctx)
+	if err != nil {
 		return err
 	}
-	if intent+cleanup != 0 {
+	if intent || cleanup {
 		return errors.New("publication cleanup journal remains pending")
 	}
-	if _, err = tx.Exec(`INSERT OR REPLACE INTO archived_deployment_jobs SELECT id,deployment_id,commit_id,generation,status,log,created_at,updated_at FROM deployment_jobs WHERE deployment_id=?`, id); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(`DELETE FROM deployment_jobs WHERE deployment_id=?`, id); err != nil {
-		return err
-	}
-	if _, err = tx.Exec(`DELETE FROM deployments WHERE id=?`, id); err != nil {
-		return err
-	}
-	_, err = tx.Exec(`DELETE FROM deployment_deletions WHERE deployment_id=?`, id)
+	jobs, err := tx.DeploymentJob.Query().Where(deploymentjob.DeploymentIDEQ(id)).All(ctx)
 	if err != nil {
+		return err
+	}
+	jobIDs := make([]string, 0, len(jobs))
+	for _, job := range jobs {
+		jobIDs = append(jobIDs, job.ID)
+	}
+	if len(jobIDs) != 0 {
+		if _, err = tx.ArchivedDeploymentJob.Delete().Where(archiveddeploymentjob.IDIn(jobIDs...)).Exec(ctx); err != nil {
+			return err
+		}
+	}
+	for _, job := range jobs {
+		if _, err = tx.ArchivedDeploymentJob.Create().SetID(job.ID).SetDeploymentID(job.DeploymentID).SetCommitID(job.CommitID).SetGeneration(job.Generation).SetStatus(job.Status).SetLog(job.Log).SetCreatedAt(job.CreatedAt).SetUpdatedAt(job.UpdatedAt).Save(ctx); err != nil {
+			return err
+		}
+	}
+	if _, err = tx.DeploymentJob.Delete().Where(deploymentjob.DeploymentIDEQ(id)).Exec(ctx); err != nil {
+		return err
+	}
+	if err = tx.Deployment.DeleteOneID(id).Exec(ctx); err != nil {
+		return err
+	}
+	if err = tx.DeploymentDeletion.DeleteOneID(id).Exec(ctx); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
 func (a *App) recordDeletionFailure(id string, cause error) error {
-	var attempts int
-	_ = a.db.QueryRow(`SELECT attempts FROM deployment_deletions WHERE deployment_id=?`, id).Scan(&attempts)
-	delay := retryDelay(attempts)
-	next := a.cfg.Now().Add(delay).UnixNano()
-	_, _ = a.db.Exec(`UPDATE deployment_deletions SET status='blocked',last_error='safe cleanup is pending; check publication paths and retry',attempts=attempts+1,retry_after=?,updated_at=? WHERE deployment_id=?`, next, a.cfg.Now().UnixNano(), id)
-	_, _ = a.db.Exec(`UPDATE deployments SET status='deletion_failed',error='Deletion is blocked; cleanup will retry after the path is safe',updated_at=? WHERE id=? AND status='deleting'`, a.cfg.Now().UnixNano(), id)
+	ctx := context.Background()
+	now := a.cfg.Now().UnixNano()
+	_, _ = a.store.DeploymentDeletion.Update().Where(deploymentdeletion.IDEQ(id)).SetStatus("blocked").SetLastError("safe cleanup is pending; check publication paths and retry").SetRetryAfter(a.cfg.Now().Add(retryDelay(0)).UnixNano()).SetUpdatedAt(now).Save(ctx)
+	_, _ = a.store.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.StatusEQ("deleting")).SetStatus("deletion_failed").SetError("Deletion is blocked; cleanup will retry after the path is safe").SetUpdatedAt(now).Save(ctx)
 	return fmt.Errorf("deployment deletion pending: %w", cause)
 }
 
@@ -378,14 +386,15 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cacheMu.Lock()
 	defer p.cacheMu.Unlock()
-	tx, err := a.db.Begin()
+	ctx := r.Context()
+	tx, err := a.store.Tx(ctx)
 	if err != nil {
 		http.Error(w, "project deletion is temporarily unavailable", 500)
 		return
 	}
 	defer tx.Rollback()
-	var count int
-	if err = tx.QueryRow(`SELECT count(*) FROM deployments WHERE project_id=?`, id).Scan(&count); err != nil {
+	count, err := tx.Deployment.Query().Where(deploymentmodel.ProjectID(id)).Count(ctx)
+	if err != nil {
 		http.Error(w, "project deletion is temporarily unavailable", 500)
 		return
 	}
@@ -393,8 +402,8 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "remove this project's deployments before deleting the project", http.StatusConflict)
 		return
 	}
-	var exists int
-	if err = tx.QueryRow(`SELECT 1 FROM projects WHERE id=?`, id).Scan(&exists); err != nil {
+	exists, err := tx.Project.Query().Where(projectmodel.IDEQ(id)).Exist(ctx)
+	if err != nil || !exists {
 		http.NotFound(w, r)
 		return
 	}
@@ -421,7 +430,13 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	if _, err = tx.Exec(`INSERT INTO project_deletions(project_id,cache_dev,cache_ino,lfs_dev,lfs_ino,status,last_error,created_at,updated_at,retry_after) VALUES(?,?,?,?,?,'deleting','',?,?,0) ON CONFLICT(project_id) DO UPDATE SET cache_dev=excluded.cache_dev,cache_ino=excluded.cache_ino,lfs_dev=excluded.lfs_dev,lfs_ino=excluded.lfs_ino,status='deleting',last_error='',updated_at=excluded.updated_at,retry_after=0`, id, cacheID.Dev, cacheID.Ino, lfsCacheID.Dev, lfsCacheID.Ino, now, now); err != nil {
+	deletionExists, err := tx.ProjectDeletion.Query().Where(projectdeletion.IDEQ(id)).Exist(ctx)
+	if err == nil && deletionExists {
+		_, err = tx.ProjectDeletion.Update().Where(projectdeletion.IDEQ(id)).SetCacheDev(int64(cacheID.Dev)).SetCacheIno(int64(cacheID.Ino)).SetLfsDev(int64(lfsCacheID.Dev)).SetLfsIno(int64(lfsCacheID.Ino)).SetStatus("deleting").SetLastError("").SetUpdatedAt(now).SetRetryAfter(0).Save(ctx)
+	} else if err == nil {
+		_, err = tx.ProjectDeletion.Create().SetID(id).SetCacheDev(int64(cacheID.Dev)).SetCacheIno(int64(cacheID.Ino)).SetLfsDev(int64(lfsCacheID.Dev)).SetLfsIno(int64(lfsCacheID.Ino)).SetStatus("deleting").SetLastError("").SetCreatedAt(now).SetUpdatedAt(now).SetRetryAfter(0).Save(ctx)
+	}
+	if err != nil {
 		p.lfsCacheMu.Unlock()
 		http.Error(w, "project deletion could not be recorded", 500)
 		return
@@ -483,14 +498,14 @@ func (a *App) finishProjectDeletion(id string, want, wantLFS dirIdentity) error 
 		a.setProjectDeletionError(id)
 		return err
 	}
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(context.Background())
 	if err != nil {
 		a.setProjectDeletionError(id)
 		return err
 	}
 	defer tx.Rollback()
-	var n int
-	if err = tx.QueryRow(`SELECT count(*) FROM deployments WHERE project_id=?`, id).Scan(&n); err != nil {
+	n, err := tx.Deployment.Query().Where(deploymentmodel.ProjectID(id)).Count(context.Background())
+	if err != nil {
 		_ = tx.Rollback()
 		a.setProjectDeletionError(id)
 		return err
@@ -500,12 +515,12 @@ func (a *App) finishProjectDeletion(id string, want, wantLFS dirIdentity) error 
 		a.setProjectDeletionError(id)
 		return errors.New("project has deployments")
 	}
-	if _, err = tx.Exec(`DELETE FROM projects WHERE id=?`, id); err != nil {
+	if err = tx.Project.DeleteOneID(id).Exec(context.Background()); err != nil {
 		_ = tx.Rollback()
 		a.setProjectDeletionError(id)
 		return err
 	}
-	if _, err = tx.Exec(`DELETE FROM project_deletions WHERE project_id=?`, id); err != nil {
+	if err = tx.ProjectDeletion.DeleteOneID(id).Exec(context.Background()); err != nil {
 		_ = tx.Rollback()
 		a.setProjectDeletionError(id)
 		return err
@@ -517,19 +532,18 @@ func (a *App) finishProjectDeletion(id string, want, wantLFS dirIdentity) error 
 	return nil
 }
 func (a *App) setProjectDeletionError(id string) {
-	var attempts int
-	_ = a.db.QueryRow(`SELECT attempts FROM project_deletions WHERE project_id=?`, id).Scan(&attempts)
-	_, _ = a.db.Exec(`UPDATE project_deletions SET status='blocked',last_error='cache cleanup is pending; retry deletion',attempts=attempts+1,retry_after=?,updated_at=? WHERE project_id=?`, a.cfg.Now().Add(retryDelay(attempts)).UnixNano(), a.cfg.Now().UnixNano(), id)
-	_, _ = a.db.Exec(`UPDATE projects SET warning='Deletion is blocked; cache cleanup will retry' WHERE id=?`, id)
+	deletion, err := a.store.ProjectDeletion.Get(context.Background(), id)
+	if err != nil {
+		return
+	}
+	now := a.cfg.Now()
+	_, _ = a.store.ProjectDeletion.Update().Where(projectdeletion.IDEQ(id)).SetStatus("blocked").SetLastError("cache cleanup is pending; retry deletion").AddAttempts(1).SetRetryAfter(now.Add(retryDelay(deletion.Attempts)).UnixNano()).SetUpdatedAt(now.UnixNano()).Save(context.Background())
+	_, _ = a.store.Project.Update().Where(projectmodel.IDEQ(id)).SetWarning("Deletion is blocked; cache cleanup will retry").Save(context.Background())
 }
 
 func (a *App) retryProjectDeletions() {
-	var pending int
-	if err := a.db.QueryRow(`SELECT count(*) FROM project_deletions`).Scan(&pending); err != nil || pending == 0 {
-		return
-	}
-	rows, err := a.db.Query(`SELECT project_id,cache_dev,cache_ino,lfs_dev,lfs_ino FROM project_deletions WHERE retry_after<=?`, a.cfg.Now().UnixNano())
-	if err != nil {
+	entries, err := a.store.ProjectDeletion.Query().Where(projectdeletion.RetryAfterLTE(a.cfg.Now().UnixNano())).All(context.Background())
+	if err != nil || len(entries) == 0 {
 		return
 	}
 	type x struct {
@@ -537,14 +551,10 @@ func (a *App) retryProjectDeletions() {
 		identity dirIdentity
 		lfs      dirIdentity
 	}
-	var xs []x
-	for rows.Next() {
-		var v x
-		if rows.Scan(&v.id, &v.identity.Dev, &v.identity.Ino, &v.lfs.Dev, &v.lfs.Ino) == nil {
-			xs = append(xs, v)
-		}
+	xs := make([]x, 0, len(entries))
+	for _, entry := range entries {
+		xs = append(xs, x{id: entry.ID, identity: dirIdentity{Dev: uint64(entry.CacheDev), Ino: uint64(entry.CacheIno)}, lfs: dirIdentity{Dev: uint64(entry.LfsDev), Ino: uint64(entry.LfsIno)}})
 	}
-	rows.Close()
 	for _, v := range xs {
 		a.projects.mu.Lock()
 		a.projects.lfsAuthMu.Lock()

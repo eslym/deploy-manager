@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent/projectsshkey"
+
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/transport"
@@ -92,20 +94,22 @@ func (a *App) fetchProjectForBranchAttempt(ctx context.Context, id string) error
 	if err := p.ensureCacheReady(); err != nil {
 		return err
 	}
-	var remote string
-	if err := p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote); err != nil {
+	storedProject, err := a.store.Project.Get(ctx, id)
+	if err != nil {
 		return errors.New("project is unavailable")
 	}
+	remote := storedProject.RemoteURL
 	var auth transport.AuthMethod
 	if strings.HasPrefix(remote, "ssh://") {
 		parsed, host, port, _, err := safeSSHRemote(remote)
 		if err != nil {
 			return errors.New("SSH repository configuration is invalid")
 		}
-		var keyID string
-		if err := p.db.QueryRow(`SELECT key_id FROM project_ssh_keys WHERE project_id=?`, id).Scan(&keyID); err != nil {
+		assignment, err := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(id)).Only(ctx)
+		if err != nil {
 			return errors.New("SSH repository key is unavailable")
 		}
+		keyID := assignment.KeyID
 		user := "git"
 		if parsed.User != nil {
 			user = parsed.User.Username()
@@ -196,7 +200,7 @@ func (a *App) fetchProjectForBranchAttempt(ctx context.Context, id string) error
 		}
 		return errors.New("refreshed project cache could not be promoted")
 	}
-	if err := replaceProjectMetadata(p.db, id, refs, time.Now().UTC()); err != nil {
+	if err := replaceProjectMetadata(ctx, p.store, id, refs, time.Now().UTC()); err != nil {
 		if p.rollbackRefresh(id, true) != nil {
 			return errors.New("project cache recovery is required")
 		}

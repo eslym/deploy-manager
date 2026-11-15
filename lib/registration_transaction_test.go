@@ -82,6 +82,10 @@ func TestRegistrationAndRecoveryRequireOriginBoundOneUseTransaction(t *testing.T
 }
 
 func newRegistrationFlow(t *testing.T, app *App, grant, origin, password string) (string, []byte) {
+	return newRegistrationFlowWithIdentities(t, app, grant, origin, password, []byte("administrator"), nil)
+}
+
+func newRegistrationFlowWithIdentities(t *testing.T, app *App, grant, origin, password string, clientIdentity, serverIdentity []byte) (string, []byte) {
 	t.Helper()
 	client, err := opaque.NewClient(opaque.DefaultConfiguration())
 	if err != nil {
@@ -111,7 +115,7 @@ func newRegistrationFlow(t *testing.T, app *App, grant, origin, password string)
 	if err != nil {
 		t.Fatal(err)
 	}
-	record, _, err := client.RegistrationFinalize(registrationResponse, []byte("administrator"), nil)
+	record, _, err := client.RegistrationFinalize(registrationResponse, clientIdentity, serverIdentity)
 	if err != nil {
 		t.Fatal(err)
 	}

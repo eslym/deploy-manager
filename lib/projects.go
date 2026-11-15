@@ -20,6 +20,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent"
+	projectent "github.com/eslym/deploy-manager/lib/ent/project"
+	"github.com/eslym/deploy-manager/lib/ent/projectref"
+	"github.com/eslym/deploy-manager/lib/ent/projectrefreshjournal"
+	"github.com/eslym/deploy-manager/lib/ent/projectsshkey"
+
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/filemode"
@@ -31,6 +37,7 @@ import (
 
 type projectManager struct {
 	db                    *sql.DB
+	store                 *ent.Client
 	root                  string
 	rootIdentity          dirIdentity
 	timeout               time.Duration
@@ -84,7 +91,7 @@ type projectRef struct {
 	Commit string `json:"commit"`
 }
 
-func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheBytes int64) (*projectManager, error) {
+func newProjectManager(db *sql.DB, store *ent.Client, root string, timeout time.Duration, maxCacheBytes int64) (*projectManager, error) {
 	if err := configureTestGitTransport(); err != nil {
 		return nil, fmt.Errorf("invalid test Git transport configuration: %w", err)
 	}
@@ -112,39 +119,11 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheB
 	if err := os.Chmod(root, 0700); err != nil {
 		return nil, err
 	}
-	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,remote_url TEXT NOT NULL,created_at INTEGER NOT NULL,last_fetched INTEGER,warning TEXT NOT NULL DEFAULT '')`,
-		`CREATE TABLE IF NOT EXISTS project_refs(project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,kind TEXT NOT NULL,name TEXT NOT NULL,commit_id TEXT NOT NULL,PRIMARY KEY(project_id,kind,name))`,
-		`CREATE TABLE IF NOT EXISTS project_refresh_journal(project_id TEXT PRIMARY KEY)`,
-		`CREATE TABLE IF NOT EXISTS project_ssh_keys(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,key_id TEXT NOT NULL REFERENCES repository_keys(id) ON DELETE RESTRICT)`,
-		`CREATE TABLE IF NOT EXISTS project_deletions(project_id TEXT PRIMARY KEY,cache_dev INTEGER NOT NULL,cache_ino INTEGER NOT NULL,lfs_dev INTEGER NOT NULL DEFAULT 0,lfs_ino INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL,last_error TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS ssh_host_trust(host TEXT NOT NULL,port INTEGER NOT NULL,trusted_key BLOB,observed_key BLOB,observed_fingerprint TEXT NOT NULL DEFAULT '',warning TEXT NOT NULL DEFAULT '',PRIMARY KEY(host,port))`,
-		`CREATE TABLE IF NOT EXISTS project_lfs_settings(project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,endpoint TEXT NOT NULL,object_origins TEXT NOT NULL,allow_internal INTEGER NOT NULL DEFAULT 0,internal_addresses TEXT NOT NULL DEFAULT '[]',updated_at INTEGER NOT NULL)`,
-	} {
-		if _, err := db.Exec(q); err != nil {
-			return nil, err
-		}
-	}
-	if err := ensureColumn(db, "project_lfs_settings", "internal_addresses", `TEXT NOT NULL DEFAULT '[]'`); err != nil {
-		return nil, err
-	}
-	if err := ensureColumn(db, "project_deletions", "attempts", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return nil, err
-	}
-	if err := ensureColumn(db, "project_deletions", "retry_after", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return nil, err
-	}
-	if err := ensureColumn(db, "project_deletions", "lfs_dev", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return nil, err
-	}
-	if err := ensureColumn(db, "project_deletions", "lfs_ino", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		return nil, err
-	}
 	rootIdentity, err := identity(root)
 	if err != nil {
 		return nil, err
 	}
-	manager := &projectManager{db: db, root: root, rootIdentity: rootIdentity, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
+	manager := &projectManager{db: db, store: store, root: root, rootIdentity: rootIdentity, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
 	if err := manager.reconcileCacheFiles(); err != nil {
 		return nil, fmt.Errorf("project cache recovery failed; refusing to start: %w", err)
 	}
@@ -230,29 +209,43 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT p.id,p.name,p.remote_url,p.last_fetched,p.warning,COALESCE(k.key_id,'') FROM projects p LEFT JOIN project_ssh_keys k ON p.id=k.project_id ORDER BY p.created_at,p.id`)
+	projects, err := a.store.Project.Query().Order(ent.Asc(projectent.FieldCreatedAt), ent.Asc(projectent.FieldID)).All(r.Context())
 	if err != nil {
 		http.Error(w, "projects are temporarily unavailable", 500)
 		return
 	}
-	defer rows.Close()
 	out := []project{}
-	for rows.Next() {
-		var x project
-		var fetched sql.NullInt64
-		if err := rows.Scan(&x.ID, &x.Name, &x.URL, &fetched, &x.Warning, &x.KeyID); err != nil {
-			http.Error(w, "projects are temporarily unavailable", 500)
-			return
-		}
-		if fetched.Valid {
-			t := time.Unix(0, fetched.Int64).UTC()
+	for _, stored := range projects {
+		x := project{ID: stored.ID, Name: stored.Name, URL: stored.RemoteURL, Warning: stored.Warning}
+		if stored.LastFetched != nil {
+			t := time.Unix(0, *stored.LastFetched).UTC()
 			x.LastFetched = &t
 		}
 		out = append(out, x)
 	}
-	if rows.Err() != nil {
-		http.Error(w, "projects are temporarily unavailable", 500)
-		return
+	if len(out) != 0 {
+		assignedKeyIDs := make(map[string]string)
+		const assignmentBatchSize = 500
+		for start := 0; start < len(out); start += assignmentBatchSize {
+			end := min(start+assignmentBatchSize, len(out))
+			projectIDs := make([]string, end-start)
+			for i := start; i < end; i++ {
+				projectIDs[i-start] = out[i].ID
+			}
+			assignments, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDIn(projectIDs...)).All(r.Context())
+			if assignmentErr != nil {
+				http.Error(w, "projects are temporarily unavailable", 500)
+				return
+			}
+			for _, assignment := range assignments {
+				assignedKeyIDs[assignment.ID] = assignment.KeyID
+			}
+		}
+		for i := range out {
+			if keyID, ok := assignedKeyIDs[out[i].ID]; ok {
+				out[i].KeyID = keyID
+			}
+		}
 	}
 	writeJSON(w, out)
 }
@@ -309,8 +302,7 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if keyID != "" {
-		var exists int
-		if err := p.db.QueryRow(`SELECT 1 FROM repository_keys WHERE id=?`, keyID).Scan(&exists); err != nil {
+		if _, err := a.store.RepositoryKey.Get(r.Context(), keyID); err != nil {
 			http.Error(w, "select an available repository key", 400)
 			return
 		}
@@ -378,11 +370,11 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	}
 	stage = ""
 	now := time.Now().UTC()
-	tx, txErr := p.db.Begin()
+	tx, txErr := a.store.Tx(ctx)
 	if txErr == nil {
-		_, txErr = tx.Exec(`INSERT INTO projects(id,name,remote_url,created_at,last_fetched,warning) VALUES(?,?,?,?,?,'')`, id, strings.TrimSpace(input.Name), remote, now.UnixNano(), now.UnixNano())
+		_, txErr = tx.Project.Create().SetID(id).SetName(strings.TrimSpace(input.Name)).SetRemoteURL(remote).SetCreatedAt(now.UnixNano()).SetLastFetched(now.UnixNano()).SetWarning("").Save(ctx)
 		if txErr == nil && keyID != "" {
-			_, txErr = tx.Exec(`INSERT INTO project_ssh_keys(project_id,key_id) VALUES(?,?)`, id, keyID)
+			_, txErr = tx.ProjectSSHKey.Create().SetID(id).SetKeyID(keyID).Save(ctx)
 		}
 		if txErr == nil {
 			txErr = tx.Commit()
@@ -396,8 +388,15 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not save project", 500)
 		return
 	}
-	if err = saveProjectRefs(p.db, id, p.repoPath(id), p.maxRefs); err != nil {
-		_, _ = p.db.Exec(`DELETE FROM projects WHERE id=?`, id)
+	if err = saveProjectRefs(context.Background(), p.store, id, p.repoPath(id), p.maxRefs); err != nil {
+		if cleanupTx, cleanupErr := p.store.Tx(r.Context()); cleanupErr == nil {
+			cleanupErr = cleanupTx.Project.DeleteOneID(id).Exec(r.Context())
+			if cleanupErr == nil {
+				cleanupErr = cleanupTx.Commit()
+			} else {
+				_ = cleanupTx.Rollback()
+			}
+		}
 		_ = os.RemoveAll(p.repoPath(id))
 		if errors.Is(err, errGitIncompleteRepository) || errors.Is(err, errGitTooManyRefs) {
 			http.Error(w, sanitizeGitError(err, remote), http.StatusBadRequest)
@@ -414,25 +413,18 @@ func (a *App) projectRefs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var found int
-	if a.db.QueryRow(`SELECT 1 FROM projects WHERE id=?`, id).Scan(&found) != nil {
+	if _, err := a.store.Project.Get(r.Context(), id); err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	rows, err := a.db.Query(`SELECT kind,name,commit_id FROM project_refs WHERE project_id=? ORDER BY kind,name`, id)
+	storedRefs, err := a.store.ProjectRef.Query().Where(projectref.IDEQ(id)).Order(ent.Asc(projectref.FieldKind), ent.Asc(projectref.FieldName)).All(r.Context())
 	if err != nil {
 		http.Error(w, "refs are temporarily unavailable", 500)
 		return
 	}
-	defer rows.Close()
-	refs := []projectRef{}
-	for rows.Next() {
-		var x projectRef
-		if rows.Scan(&x.Kind, &x.Name, &x.Commit) != nil {
-			http.Error(w, "refs are temporarily unavailable", 500)
-			return
-		}
-		refs = append(refs, x)
+	refs := make([]projectRef, 0, len(storedRefs))
+	for _, stored := range storedRefs {
+		refs = append(refs, projectRef{Kind: stored.Kind, Name: stored.Name, Commit: stored.CommitID})
 	}
 	writeJSON(w, refs)
 }
@@ -456,19 +448,22 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	var remote string
-	if p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote) != nil {
+	storedProject, projectErr := a.store.Project.Get(r.Context(), id)
+	if projectErr != nil {
 		http.NotFound(w, r)
 		return
 	}
+	remote := storedProject.RemoteURL
 	var keyID, sshUser string
 	var sshAuth transport.AuthMethod
 	if strings.HasPrefix(remote, "ssh://") {
 		parsed, host, port, _, parseErr := safeSSHRemote(remote)
-		if parseErr != nil || p.db.QueryRow(`SELECT key_id FROM project_ssh_keys WHERE project_id=?`, id).Scan(&keyID) != nil {
+		assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(id)).Only(r.Context())
+		if parseErr != nil || assignmentErr != nil {
 			http.Error(w, "SSH repository key is unavailable", 400)
 			return
 		}
+		keyID = assignment.KeyID
 		sshUser = "git"
 		if parsed.User != nil {
 			sshUser = parsed.User.Username()
@@ -499,7 +494,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}()
 	if err := copyGitCache(p.repoPath(id), stage, p.maxCacheBytes); err != nil {
 		warning := "could not stage the existing repository within the configured cache limit"
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		p.setProjectWarning(r.Context(), id, warning)
 		http.Error(w, warning, http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -512,7 +507,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		warning := sanitizeGitError(err, remote)
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		p.setProjectWarning(r.Context(), id, warning)
 		status := http.StatusBadGateway
 		if errors.Is(err, errGitCacheLimit) {
 			status = http.StatusRequestEntityTooLarge
@@ -523,7 +518,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	refs, err := projectRefsFromRepository(stage, p.maxRefs)
 	if err != nil {
 		warning := sanitizeGitError(err, remote)
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		p.setProjectWarning(r.Context(), id, warning)
 		http.Error(w, warning, 502)
 		return
 	}
@@ -532,7 +527,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	liveSize, liveErr := directorySize(p.repoPath(id), p.maxCacheBytes)
 	if sizeErr != nil || stageErr != nil || liveErr != nil || stageSize > p.maxCacheBytes || used < liveSize || used-liveSize > p.maxCacheBytes {
 		warning := "refreshed repository exceeds the configured persistent cache limit; previous cache retained"
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		p.setProjectWarning(r.Context(), id, warning)
 		http.Error(w, warning, http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -573,7 +568,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "refreshed repository could not be safely promoted; previous cache restored", 500)
 		return
 	}
-	if err = replaceProjectMetadata(p.db, id, refs, now); err != nil {
+	if err = replaceProjectMetadata(r.Context(), p.store, id, refs, now); err != nil {
 		pending, journalErr := p.refreshIntentExists(id)
 		if journalErr != nil || pending {
 			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
@@ -590,7 +585,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	if err := p.removeOwnedPath(backup); err != nil {
 		cleanupWarning = "refresh committed but previous cache cleanup failed; restart to reconcile before further project changes"
 		p.setBlocked(cleanupWarning)
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, cleanupWarning, id)
+		p.setProjectWarning(r.Context(), id, cleanupWarning)
 	}
 	writeJSON(w, map[string]any{"lastFetched": now, "warning": cleanupWarning})
 }
@@ -612,27 +607,33 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 	p.lfsAuthMu.Lock()
 	defer p.lfsAuthMu.Unlock()
 	id := r.PathValue("id")
-	var remote string
-	if p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote) != nil {
+	storedProject, projectErr := a.store.Project.Get(r.Context(), id)
+	if projectErr != nil {
 		http.NotFound(w, r)
 		return
 	}
+	remote := storedProject.RemoteURL
 	if !strings.HasPrefix(remote, "ssh://") {
 		http.Error(w, "repository keys can only be assigned to SSH projects", 400)
 		return
 	}
-	tx, err := p.db.Begin()
+	tx, err := a.store.Tx(r.Context())
 	if err != nil {
 		http.Error(w, "project key assignment is temporarily unavailable", 500)
 		return
 	}
 	defer tx.Rollback()
-	var found int
-	if tx.QueryRow(`SELECT 1 FROM repository_keys WHERE id=?`, input.KeyID).Scan(&found) != nil {
+	if _, err = tx.RepositoryKey.Get(r.Context(), input.KeyID); err != nil {
 		http.Error(w, "repository key was not found", 404)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO project_ssh_keys(project_id,key_id) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET key_id=excluded.key_id`, id, input.KeyID); err != nil {
+	exists, err := tx.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(id)).Exist(r.Context())
+	if err == nil && exists {
+		_, err = tx.ProjectSSHKey.Update().Where(projectsshkey.IDEQ(id)).SetKeyID(input.KeyID).Save(r.Context())
+	} else if err == nil {
+		_, err = tx.ProjectSSHKey.Create().SetID(id).SetKeyID(input.KeyID).Save(r.Context())
+	}
+	if err != nil {
 		http.Error(w, "project key assignment is temporarily unavailable", 500)
 		return
 	}
@@ -643,12 +644,12 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func saveProjectRefs(db *sql.DB, id, dir string, maxRefs int) error {
+func saveProjectRefs(ctx context.Context, store *ent.Client, id, dir string, maxRefs int) error {
 	refs, err := projectRefsFromRepository(dir, maxRefs)
 	if err != nil {
 		return err
 	}
-	return replaceProjectMetadataRefs(db, id, refs)
+	return replaceProjectMetadataRefs(ctx, store, id, refs)
 }
 
 func projectRefsFromRepository(dir string, maxRefs int) ([]projectRef, error) {
@@ -707,46 +708,50 @@ func projectRefsFromRepository(dir string, maxRefs int) ([]projectRef, error) {
 	return result, nil
 }
 
-func replaceProjectMetadata(db *sql.DB, id string, refs []projectRef, fetched time.Time) error {
-	tx, err := db.Begin()
+func replaceProjectMetadata(ctx context.Context, store *ent.Client, id string, refs []projectRef, fetched time.Time) error {
+	tx, err := store.Tx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := replaceProjectMetadataRefsTx(tx, id, refs); err != nil {
+	if err := replaceProjectMetadataRefsTx(ctx, tx, id, refs); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE projects SET last_fetched=?,warning='' WHERE id=?`, fetched.UnixNano(), id); err != nil {
+	if _, err := tx.Project.Update().Where(projectent.ID(id)).SetLastFetched(fetched.UnixNano()).SetWarning("").Save(ctx); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM project_refresh_journal WHERE project_id=?`, id); err != nil {
+	if _, err := tx.ProjectRefreshJournal.Delete().Where(projectrefreshjournal.IDEQ(id)).Exec(ctx); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func replaceProjectMetadataRefs(db *sql.DB, id string, refs []projectRef) error {
-	tx, err := db.Begin()
+func replaceProjectMetadataRefs(ctx context.Context, store *ent.Client, id string, refs []projectRef) error {
+	tx, err := store.Tx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := replaceProjectMetadataRefsTx(tx, id, refs); err != nil {
+	if err := replaceProjectMetadataRefsTx(ctx, tx, id, refs); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func replaceProjectMetadataRefsTx(tx *sql.Tx, id string, refs []projectRef) error {
-	if _, err := tx.Exec(`DELETE FROM project_refs WHERE project_id=?`, id); err != nil {
+func replaceProjectMetadataRefsTx(ctx context.Context, tx *ent.Tx, id string, refs []projectRef) error {
+	if _, err := tx.ProjectRef.Delete().Where(projectref.IDEQ(id)).Exec(ctx); err != nil {
 		return err
 	}
 	for _, ref := range refs {
-		if _, err := tx.Exec(`INSERT INTO project_refs(project_id,kind,name,commit_id) VALUES(?,?,?,?)`, id, ref.Kind, ref.Name, ref.Commit); err != nil {
+		if _, err := tx.ProjectRef.Create().SetID(id).SetKind(ref.Kind).SetName(ref.Name).SetCommitID(ref.Commit).Save(ctx); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (p *projectManager) setProjectWarning(ctx context.Context, id, warning string) {
+	_, _ = p.store.Project.Update().Where(projectent.ID(id)).SetWarning(warning).Save(ctx)
 }
 
 func verifyCompleteCommit(repo *git.Repository, commit *object.Commit, checked map[plumbing.Hash]struct{}, maxObjects int) error {

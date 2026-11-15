@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdsa"
@@ -24,6 +25,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent"
+	"github.com/eslym/deploy-manager/lib/ent/projectsshkey"
+	"github.com/eslym/deploy-manager/lib/ent/repositorykey"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -40,69 +44,63 @@ type repositoryKey struct {
 	CreatedAt   time.Time `json:"createdAt"`
 }
 
-func initializeRepositoryKeyStore(db *sql.DB, path string, priorStore bool) error {
-	key, err := loadRepositoryMasterKey(path, priorStore)
+// prepareRepositoryKeyStore consumes the pre-schema classification. The mere
+// existence of freshly created tables must never authorize key regeneration.
+func prepareRepositoryKeyStore(store *ent.Client, db *sql.DB, path string, priorDatabase bool) error {
+	key, err := loadRepositoryMasterKey(path, priorDatabase)
 	if err != nil {
 		return err
 	}
 	defer clear(key)
-	mac := hmac.New(sha256.New, key)
-	_, _ = mac.Write([]byte(repositoryKeyVerifierContext))
-	verifier := mac.Sum(nil)
-	if !priorStore {
-		tx, txErr := db.Begin()
+	if !priorDatabase {
+		tx, txErr := store.Tx(context.Background())
 		if txErr != nil {
 			return errors.New("could not initialize repository key store")
 		}
 		defer tx.Rollback()
-		for _, statement := range []string{
-			`CREATE TABLE repository_key_store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),verifier BLOB NOT NULL)`,
-			`CREATE TABLE repository_keys(id TEXT PRIMARY KEY,name TEXT NOT NULL,algorithm TEXT NOT NULL,bits INTEGER NOT NULL,fingerprint TEXT NOT NULL,public_key TEXT NOT NULL,ciphertext BLOB NOT NULL,created_at INTEGER NOT NULL)`,
-		} {
-			if _, txErr = tx.Exec(statement); txErr != nil {
-				return errors.New("could not initialize repository key store")
-			}
-		}
-		if _, txErr = tx.Exec(`INSERT INTO repository_key_store(singleton,verifier) VALUES(1,?)`, verifier); txErr != nil {
+		if _, txErr = tx.RepositoryKeyStore.Create().SetID(1).SetVerifier(repositoryKeyVerifier(key)).Save(context.Background()); txErr != nil {
 			return errors.New("could not initialize repository key store")
 		}
 		if txErr = tx.Commit(); txErr != nil {
 			return errors.New("could not initialize repository key store")
 		}
-	} else {
-		var tables int
-		if err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('repository_key_store','repository_keys')`).Scan(&tables); err != nil || tables != 2 {
-			return errors.New("repository key store schema is incomplete; refusing startup")
-		}
-		var stored []byte
-		if err = db.QueryRow(`SELECT verifier FROM repository_key_store WHERE singleton=1`).Scan(&stored); err != nil {
-			return errors.New("repository key master-key verifier is missing or unavailable; refusing startup")
-		}
-		if !hmac.Equal(stored, verifier) {
-			return errors.New("repository key master key does not match this database; refusing startup")
-		}
 	}
-	rows, err := db.Query(`SELECT id,ciphertext FROM repository_keys`)
+	return validateRepositoryKeyStore(store, db, key)
+}
+
+func repositoryKeyVerifier(key []byte) []byte {
+	mac := hmac.New(sha256.New, key)
+	_, _ = mac.Write([]byte(repositoryKeyVerifierContext))
+	return mac.Sum(nil)
+}
+
+func validateRepositoryKeyStore(store *ent.Client, db *sql.DB, key []byte) error {
+	var tables int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('repository_key_store','repository_keys')`).Scan(&tables); err != nil || tables != 2 {
+		return errors.New("repository key store schema is incomplete; refusing startup")
+	}
+	binding, err := store.RepositoryKeyStore.Get(context.Background(), 1)
+	if err != nil {
+		return errors.New("repository key master-key verifier is missing or unavailable; refusing startup")
+	}
+	if !hmac.Equal(binding.Verifier, repositoryKeyVerifier(key)) {
+		return errors.New("repository key master key does not match this database; refusing startup")
+	}
+	rows, err := store.RepositoryKey.Query().All(context.Background())
 	if err != nil {
 		return errors.New("repository keys could not be validated")
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var id string
-		var ciphertext []byte
-		if err := rows.Scan(&id, &ciphertext); err != nil {
-			return errors.New("repository keys could not be validated")
-		}
-		plain, err := decryptRepositoryKey(key, id, ciphertext)
+	for _, row := range rows {
+		plain, err := decryptRepositoryKey(key, row.ID, row.Ciphertext)
 		if err != nil {
 			return errors.New("repository key ciphertext is invalid; refusing startup")
 		}
 		clear(plain)
 	}
-	return rows.Err()
+	return nil
 }
 
-func loadRepositoryMasterKey(path string, priorKeyStore bool) ([]byte, error) {
+func loadRepositoryMasterKey(path string, priorDatabase bool) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err == nil {
 		defer f.Close()
@@ -122,8 +120,8 @@ func loadRepositoryMasterKey(path string, priorKeyStore bool) ([]byte, error) {
 	if !os.IsNotExist(err) {
 		return nil, errors.New("repository key master file is unavailable")
 	}
-	if priorKeyStore {
-		return nil, errors.New("repository key master file is missing; refusing to regenerate it")
+	if priorDatabase {
+		return nil, errors.New("repository key master file is missing; refusing to regenerate it; preserve the database and key-file evidence, and use isolated rebootstrap only if this was an interrupted fresh initialization")
 	}
 	b := make([]byte, 32)
 	if _, err = rand.Read(b); err != nil {
@@ -262,7 +260,7 @@ func (a *App) createRepositoryKey(name string, private []byte, generated bool) (
 	public := ssh.MarshalAuthorizedKey(pub)
 	fingerprint := ssh.FingerprintSHA256(pub)
 	created := a.cfg.Now().UTC()
-	_, err = a.db.Exec(`INSERT INTO repository_keys(id,name,algorithm,bits,fingerprint,public_key,ciphertext,created_at) VALUES(?,?,?,?,?,?,?,?)`, id, name, alg, bits, fingerprint, string(public), ciphertext, created.UnixNano())
+	_, err = a.store.RepositoryKey.Create().SetID(id).SetName(name).SetAlgorithm(alg).SetBits(bits).SetFingerprint(fingerprint).SetPublicKey(string(public)).SetCiphertext(ciphertext).SetCreatedAt(created.UnixNano()).Save(context.Background())
 	if err != nil {
 		return repositoryKey{}, errors.New("could not save repository key")
 	}
@@ -273,27 +271,14 @@ func (a *App) listRepositoryKeys(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT id,name,algorithm,bits,fingerprint,public_key,created_at FROM repository_keys ORDER BY created_at,id`)
+	keys, err := a.store.RepositoryKey.Query().Order(repositorykey.ByCreatedAt(), repositorykey.ByID()).All(r.Context())
 	if err != nil {
 		http.Error(w, "repository keys are temporarily unavailable", 500)
 		return
 	}
-	defer rows.Close()
 	out := []repositoryKey{}
-	for rows.Next() {
-		var k repositoryKey
-		var created int64
-		if rows.Scan(&k.ID, &k.Name, &k.Algorithm, &k.Bits, &k.Fingerprint, &k.PublicKey, &created) != nil {
-			http.Error(w, "repository keys are temporarily unavailable", 500)
-			return
-		}
-		k.PublicKey = strings.TrimSpace(k.PublicKey)
-		k.CreatedAt = time.Unix(0, created).UTC()
-		out = append(out, k)
-	}
-	if rows.Err() != nil {
-		http.Error(w, "repository keys are temporarily unavailable", 500)
-		return
+	for _, record := range keys {
+		out = append(out, repositoryKey{ID: record.ID, Name: record.Name, Algorithm: record.Algorithm, Bits: record.Bits, Fingerprint: record.Fingerprint, PublicKey: strings.TrimSpace(record.PublicKey), CreatedAt: time.Unix(0, record.CreatedAt).UTC()})
 	}
 	writeJSON(w, out)
 }
@@ -355,19 +340,18 @@ func (a *App) deleteRepositoryKey(w http.ResponseWriter, r *http.Request) {
 	a.projects.lfsAuthMu.Lock()
 	defer a.projects.lfsAuthMu.Unlock()
 	id := r.PathValue("id")
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(r.Context())
 	if err != nil {
 		http.Error(w, "repository key is temporarily unavailable", 500)
 		return
 	}
 	defer tx.Rollback()
-	var found int
-	if tx.QueryRow(`SELECT 1 FROM repository_keys WHERE id=?`, id).Scan(&found) != nil {
+	if _, err := tx.RepositoryKey.Get(r.Context(), id); err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	var assignments int
-	if tx.QueryRow(`SELECT count(*) FROM project_ssh_keys WHERE key_id=?`, id).Scan(&assignments) != nil {
+	assignments, err := tx.ProjectSSHKey.Query().Where(projectsshkey.KeyIDEQ(id)).Count(r.Context())
+	if err != nil {
 		http.Error(w, "repository key is temporarily unavailable", 500)
 		return
 	}
@@ -375,7 +359,7 @@ func (a *App) deleteRepositoryKey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "remove this key from every SSH project before deleting it", http.StatusConflict)
 		return
 	}
-	if _, err = tx.Exec(`DELETE FROM repository_keys WHERE id=?`, id); err != nil {
+	if _, err = tx.RepositoryKey.Delete().Where(repositorykey.IDEQ(id)).Exec(r.Context()); err != nil {
 		http.Error(w, "repository key is temporarily unavailable", 500)
 		return
 	}
@@ -387,11 +371,11 @@ func (a *App) deleteRepositoryKey(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) repositoryKeyCanSign(id string, challenge []byte) bool {
-	var ciphertext []byte
-	if a.db.QueryRow(`SELECT ciphertext FROM repository_keys WHERE id=?`, id).Scan(&ciphertext) != nil {
+	record, err := a.store.RepositoryKey.Get(context.Background(), id)
+	if err != nil {
 		return false
 	}
-	plain, err := decryptRepositoryKey(a.repositoryMaster, id, ciphertext)
+	plain, err := decryptRepositoryKey(a.repositoryMaster, id, record.Ciphertext)
 	if err != nil {
 		return false
 	}

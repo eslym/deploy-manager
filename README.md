@@ -105,6 +105,10 @@ is disabled after the administrator account is created. Then sign in at
 Treat setup and recovery links as secrets. Their grants are carried in URL
 fragments, not query strings; do not share them or put them in logs.
 
+Only one daemon may use an installation. Setup/recovery commands can run beside
+it; see [process coordination](docs/process-coordination.md) for locking,
+contention, compatibility limitations, and offline-restore requirements.
+
 ### Behind a local HTTPS reverse proxy
 
 Bind the application to loopback and configure the external origin:
@@ -223,6 +227,11 @@ Protect backups as secrets. Missing or mismatched key files fail closed; do not
 delete them to repair startup. Retain repository/LFS caches if you need rollback
 material that may no longer be available upstream. Explicit cache recreation
 can lose that material.
+
+For a startup migration failure, follow the dedicated [operator upgrade recovery
+procedure](docs/operations/upgrade-recovery.md). It restores the exact prior
+program with its verified database-only upgrade backup and must not be confused
+with deployment rollback or whole-installation recovery.
 
 ## Supported scope
 

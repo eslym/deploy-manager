@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -21,8 +22,13 @@ import (
 	"sync"
 	"time"
 
+	entdialect "entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/bytemare/opaque"
+	"github.com/eslym/deploy-manager/lib/ent"
+	"github.com/eslym/deploy-manager/lib/ent/registrationgrant"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/sys/unix"
 )
 
 // Config controls durable administrator bootstrap. OPAQUEKeyPath must be external to SQLite.
@@ -54,11 +60,28 @@ type Config struct {
 	JobRetention                time.Duration
 	WebhookMaxBodyBytes         int64
 	beforeRestoreDeploymentJobs func(*sql.DB) error
+	// storageFault is a per-startup test seam, never configured by the CLI or HTTP.
+	// "access" runs under the access guard before DB/key work, with a nil DB;
+	// "verify" runs after preparation and before storage readiness.
+	storageFault   func(string, *sql.DB) error
+	upgradeContext context.Context
+	// migrationFS is a deterministic test fixture seam; production migrations
+	// remain the embedded immutable set.
+	migrationFS          fs.FS
+	upgradeTargetVersion int64
+}
+
+// WithUpgradeContext bounds and cancels protected startup maintenance when the
+// daemon's serving process receives a termination signal.
+func (c Config) WithUpgradeContext(ctx context.Context) Config {
+	c.upgradeContext = ctx
+	return c
 }
 
 type App struct {
 	cfg                  Config
 	db                   *sql.DB
+	store                *ent.Client
 	protocol             *opaque.Server
 	des                  *opaque.Deserializer
 	keyGeneration        string
@@ -83,9 +106,21 @@ type App struct {
 	deploymentJobsMu     sync.Mutex
 	deploymentJobCancels map[string]activeDeploymentJob
 	webhookFault         func(string) error
+	daemonOwnership      *storageLock
+	storageAccess        *storageLock
+	storageCloseOnce     sync.Once
+	storageCloseErr      error
 }
 
-func New(cfg Config) (*App, error) {
+// prepareStorage performs only schema/key preparation and validation. Runtime
+// recovery and all background work belong to readyStorage.start.
+func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
+	if err := validateStoragePaths(cfg); err != nil {
+		return nil, err
+	}
+	if err := CheckMaintenance(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
 	}
@@ -105,11 +140,6 @@ func New(cfg Config) (*App, error) {
 	masterPath := filepath.Clean(cfg.RepositoryKeyPath)
 	if masterPath == dbPath || masterPath == dbPath+"-wal" || masterPath == dbPath+"-shm" || masterPath == keyPath {
 		return nil, errors.New("repository key master file must be separate from SQLite and the OPAQUE key")
-	}
-	if dbInfo, dbErr := os.Stat(dbPath); dbErr == nil {
-		if keyInfo, keyErr := os.Stat(keyPath); keyErr == nil && os.SameFile(dbInfo, keyInfo) {
-			return nil, errors.New("OPAQUE key must not share the SQLite database file")
-		}
 	}
 	if cfg.GrantTTL == 0 {
 		cfg.GrantTTL = 15 * time.Minute
@@ -156,9 +186,68 @@ func New(cfg Config) (*App, error) {
 	if cfg.GitMaxTransferBytes < 1024 || cfg.GitMaxTransferBytes > 1<<30 || cfg.GitMaxCacheBytes < 1 || cfg.GitMaxCacheBytes > 1<<40 || cfg.GitMaxRefs < 1 || cfg.GitMaxRefs > 100000 || cfg.GitMaxAdvertisementBytes < 1024 || cfg.GitMaxAdvertisementBytes > 64<<20 || cfg.GitMaxAdvertisementBytes > cfg.GitMaxTransferBytes {
 		return nil, errors.New("Git transfer, cache, or reference limit is outside the supported range")
 	}
-	prior, err := pathExists(cfg.DatabasePath)
+	access, prior, err := acquireStorageAccess(cfg)
 	if err != nil {
 		return nil, err
+	}
+	accessTransferred := false
+	defer func() {
+		if !accessTransferred {
+			_ = access.Close()
+		}
+	}()
+	if dbInfo, dbErr := os.Stat(dbPath); dbErr == nil {
+		if keyInfo, keyErr := os.Stat(keyPath); keyErr == nil && os.SameFile(dbInfo, keyInfo) {
+			return nil, errors.New("OPAQUE key must not share the SQLite database file")
+		}
+	}
+	if cfg.storageFault != nil {
+		if err := cfg.storageFault("access", nil); err != nil {
+			return nil, err
+		}
+	}
+	// Existing stores are opened read-only first. This prevents a DSN pragma
+	// (notably journal_mode=WAL) from changing unsupported state before exact
+	// migration history has been accepted.
+	sqlitePath, err := filepath.Abs(cfg.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(sqlitePath)}).String()
+	if prior {
+		if err := preflightExistingSchema(dbURL, cfg); err != nil {
+			var pending pendingUpgrade
+			if !errors.As(err, &pending) {
+				return nil, err
+			}
+			if !daemonUpgrade {
+				return nil, errors.New("CLI commands cannot upgrade an existing database; start the daemon to perform protected maintenance")
+			}
+			if err := access.acquire(unix.LOCK_EX); err != nil {
+				return nil, err
+			}
+			if err := CheckMaintenance(cfg); err != nil {
+				return nil, err
+			}
+			priorNow, err := inspectGuardedStorage(cfg)
+			if err != nil || !priorNow {
+				if err == nil {
+					err = errors.New("database changed during maintenance transition")
+				}
+				return nil, err
+			}
+			err = preflightExistingSchema(dbURL, cfg)
+			if err == nil {
+				return nil, errors.New("database upgrade state changed during maintenance transition; refusing startup")
+			}
+			if !errors.As(err, &pending) {
+				return nil, err
+			}
+			if err := prepareUpgradeBackup(cfg, pending.source, pending.target, dbURL); err != nil {
+				return nil, err
+			}
+			prior = true
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0700); err != nil {
 		return nil, err
@@ -169,47 +258,13 @@ func New(cfg Config) (*App, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.RepositoryKeyPath), 0700); err != nil {
 		return nil, err
 	}
-	c := opaque.DefaultConfiguration()
-	material, keyGeneration, err := loadOPAQUEServerKey(c, cfg.OPAQUEKeyPath, prior)
-	if err != nil {
-		return nil, err
-	}
-	protocol, err := opaque.NewServer(c)
-	if err != nil {
-		return nil, err
-	}
-	if err = protocol.SetKeyMaterial(material); err != nil {
-		return nil, err
-	}
-	des, err := c.Deserializer()
-	if err != nil {
-		return nil, err
-	}
-	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String()
-	db, err := sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on")
+	db, err := sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=1000&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS registration_grants(token_hash BLOB PRIMARY KEY,expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL,purpose TEXT NOT NULL DEFAULT 'setup',credential_generation INTEGER NOT NULL DEFAULT 0)`,
-		`CREATE TABLE IF NOT EXISTS administrator(id INTEGER PRIMARY KEY CHECK(id=1),registration_record BLOB NOT NULL,profile_generation INTEGER NOT NULL,credential_generation INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS opaque_profile(singleton INTEGER PRIMARY KEY CHECK(singleton=1),profile_generation INTEGER NOT NULL,key_generation TEXT NOT NULL,profile TEXT NOT NULL)`,
-	} {
-		if _, err = db.Exec(q); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	if err := ensureColumn(db, "registration_grants", "purpose", `TEXT NOT NULL DEFAULT 'setup'`); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := ensureColumn(db, "registration_grants", "credential_generation", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := ensureColumn(db, "administrator", "credential_generation", `INTEGER NOT NULL DEFAULT 1`); err != nil {
+	store := ent.NewClient(ent.Driver(entsql.OpenDB(entdialect.SQLite, db)))
+	if err = initializeSchemaWithConfig(db, !prior, cfg); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -217,12 +272,7 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
-	var priorRepositoryKeyStore int
-	if err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('repository_key_store','repository_keys')`).Scan(&priorRepositoryKeyStore); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err = initializeRepositoryKeyStore(db, cfg.RepositoryKeyPath, priorRepositoryKeyStore != 0); err != nil {
+	if err = prepareRepositoryKeyStore(store, db, cfg.RepositoryKeyPath, prior); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -231,6 +281,12 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, err
 	}
+	masterTransferred := false
+	defer func() {
+		if !masterTransferred {
+			clear(repositoryMaster)
+		}
+	}()
 	for _, suffix := range []string{"-wal", "-shm"} {
 		if path := cfg.DatabasePath + suffix; fileInfo(path) {
 			if err = os.Chmod(path, 0600); err != nil {
@@ -239,42 +295,63 @@ func New(cfg Config) (*App, error) {
 			}
 		}
 	}
-	const profile = "RFC9807-OPAQUE-3DH;ristretto255-SHA512;HKDF-SHA512;HMAC-SHA512;Argon2id-v19-i1-m65536-p4;context-empty;identities-default"
-	if _, err = db.Exec(`INSERT OR IGNORE INTO opaque_profile(singleton,profile_generation,key_generation,profile) VALUES(1,1,?,?)`, keyGeneration, profile); err != nil {
+	c := opaque.DefaultConfiguration()
+	material, keyGeneration, err := loadOPAQUEServerKey(c, cfg.OPAQUEKeyPath, prior)
+	if err != nil {
 		db.Close()
 		return nil, err
+	}
+	protocol, err := opaque.NewServer(c)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err = protocol.SetKeyMaterial(material); err != nil {
+		db.Close()
+		return nil, err
+	}
+	des, err := c.Deserializer()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	const profile = "RFC9807-OPAQUE-3DH;ristretto255-SHA512;HKDF-SHA512;HMAC-SHA512;Argon2id-v19-i1-m65536-p4;context-empty;identities-default"
+	if !prior {
+		if _, err = store.OpaqueProfile.Create().SetID(1).SetProfileGeneration(1).SetKeyGeneration(keyGeneration).SetProfile(profile).Save(context.Background()); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("could not initialize fresh OPAQUE profile binding; preserve key and database evidence and use isolated rebootstrap if interrupted: %w", err)
+		}
 	}
 	var storedProfile string
 	var profileGeneration int
 	var storedKeyGeneration string
-	if err = db.QueryRow(`SELECT profile_generation,key_generation,profile FROM opaque_profile WHERE singleton=1`).Scan(&profileGeneration, &storedKeyGeneration, &storedProfile); err != nil {
+	profileRecord, profileErr := store.OpaqueProfile.Get(context.Background(), 1)
+	if err = profileErr; err != nil {
 		db.Close()
 		return nil, err
 	}
+	profileGeneration, storedKeyGeneration, storedProfile = profileRecord.ProfileGeneration, profileRecord.KeyGeneration, profileRecord.Profile
 	if profileGeneration != 1 || storedKeyGeneration != keyGeneration || storedProfile != profile {
 		db.Close()
 		return nil, errors.New("OPAQUE key/profile generation mismatch; refusing authentication startup")
 	}
 	var accountGeneration int
-	err = db.QueryRow(`SELECT profile_generation FROM administrator WHERE id=1`).Scan(&accountGeneration)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+	adminRecord, adminErr := store.Administrator.Get(context.Background(), 1)
+	err = adminErr
+	if err != nil && !ent.IsNotFound(err) {
 		db.Close()
 		return nil, err
 	}
-	if err == nil && accountGeneration != profileGeneration {
+	if adminRecord != nil {
+		accountGeneration = adminRecord.ProfileGeneration
+	}
+	if adminRecord != nil && accountGeneration != profileGeneration {
 		db.Close()
 		return nil, errors.New("administrator/profile generation mismatch; refusing authentication startup")
 	}
-	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout, cfg.GitMaxCacheBytes)
-	if err != nil {
-		db.Close()
-		return nil, err
-	}
-	projects.maxTransferBytes, projects.maxCacheBytes, projects.maxRefs, projects.maxAdvertisementBytes = cfg.GitMaxTransferBytes, cfg.GitMaxCacheBytes, cfg.GitMaxRefs, cfg.GitMaxAdvertisementBytes
 	var credentialGeneration int64
-	if err = db.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&credentialGeneration); err != nil && !errors.Is(err, sql.ErrNoRows) {
-		db.Close()
-		return nil, err
+	if adminRecord != nil {
+		credentialGeneration = adminRecord.CredentialGeneration
 	}
 	if masterInfo, masterErr := os.Lstat(cfg.RepositoryKeyPath); masterErr == nil {
 		if dbInfo, dbErr := os.Stat(dbPath); dbErr == nil && os.SameFile(masterInfo, dbInfo) {
@@ -286,7 +363,14 @@ func New(cfg Config) (*App, error) {
 			return nil, errors.New("repository key master file must not share the OPAQUE key file")
 		}
 	}
-	app := &App{cfg: cfg, db: db, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), projects: projects, repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	app := &App{cfg: cfg, db: db, store: store, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	masterTransferred = true
+	ready := false
+	defer func() {
+		if !ready {
+			_ = app.Close()
+		}
+	}()
 	if app.cfg.WebhookMaxBodyBytes == 0 {
 		app.cfg.WebhookMaxBodyBytes = 1 << 20
 	}
@@ -294,54 +378,28 @@ func New(cfg Config) (*App, error) {
 		db.Close()
 		return nil, errors.New("webhook body limit must be between 1 KiB and 16 MiB")
 	}
-	if err := app.initWebhooks(); err != nil {
-		db.Close()
+	if err := app.configureDeployments(); err != nil {
 		return nil, err
 	}
-	if err := app.initDeployments(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if app.cfg.beforeRestoreDeploymentJobs != nil {
-		if err := app.cfg.beforeRestoreDeploymentJobs(db); err != nil {
-			_ = app.Close()
-			return nil, fmt.Errorf("prepare deployment queue recovery: %w", err)
+	if cfg.storageFault != nil {
+		if err := cfg.storageFault("verify", db); err != nil {
+			return nil, fmt.Errorf("storage verification: %w", err)
 		}
 	}
-	restoredJobs, err := restoreQueuedDeploymentJobs(db, deploymentQueueCapacity)
-	if err != nil {
+	ready = true
+	if err := access.share(); err != nil {
 		_ = app.Close()
-		return nil, fmt.Errorf("restore accepted deployment work: %w", err)
+		return nil, err
 	}
-	app.retryProjectDeletions()
-	app.startDeploymentWorkers(restoredJobs)
-	app.deployWG.Add(1)
-	go app.publicationCleanupLoop()
-	return app, nil
-}
-
-func ensureColumn(db *sql.DB, table, column, definition string) error {
-	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notnull, pk int
-		var name, typ string
-		var def any
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
-			return err
-		}
-		if name == column {
-			return rows.Err()
+	if daemonUpgrade {
+		if err := writeProgramProvenance(cfg, db); err != nil {
+			_ = app.Close()
+			return nil, fmt.Errorf("record verified daemon program provenance: %w", err)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
-	return err
+	app.storageAccess = access
+	accessTransferred = true
+	return &readyStorage{app: app}, nil
 }
 
 func loadOPAQUEServerKey(c *opaque.Configuration, path string, priorDatabase bool) (*opaque.ServerKeyMaterial, string, error) {
@@ -368,7 +426,7 @@ func loadOPAQUEServerKey(c *opaque.Configuration, path string, priorDatabase boo
 		return nil, "", err
 	}
 	if priorDatabase {
-		return nil, "", errors.New("OPAQUE key file is missing; refusing to regenerate authentication keys")
+		return nil, "", errors.New("OPAQUE key file is missing; refusing to regenerate authentication keys; preserve the database and key-file evidence, and use isolated rebootstrap only if this was an interrupted fresh initialization")
 	}
 	priv, pub := c.KeyGen()
 	material := &opaque.ServerKeyMaterial{PrivateKey: priv, PublicKeyBytes: pub.Encode(), OPRFGlobalSeed: c.GenerateOPRFSeed(), Identity: []byte("deploy-manager-keyfile")}
@@ -432,8 +490,11 @@ func (a *App) Close() error {
 			a.deployWG.Wait()
 		}
 	})
-	clear(a.repositoryMaster)
-	return a.db.Close()
+	a.storageCloseOnce.Do(func() {
+		clear(a.repositoryMaster)
+		a.storageCloseErr = errors.Join(a.db.Close(), a.storageAccess.Close(), a.daemonOwnership.Close())
+	})
+	return a.storageCloseErr
 }
 
 // IssueRegistrationGrant returns a random one-time token; only its SHA-256 digest is stored.
@@ -445,13 +506,14 @@ func (a *App) IssueRegistrationGrant() (string, error) {
 func (a *App) IssueRecoveryGrant() (string, error) { return a.issueGrant("recovery") }
 
 func (a *App) issueGrant(purpose string) (string, error) {
-	tx, e := a.db.Begin()
+	ctx := context.Background()
+	tx, e := a.store.Tx(ctx)
 	if e != nil {
 		return "", e
 	}
 	defer tx.Rollback()
-	var n int
-	if e = tx.QueryRow(`SELECT count(*) FROM administrator`).Scan(&n); e != nil {
+	n, e := tx.Administrator.Query().Count(ctx)
+	if e != nil {
 		return "", e
 	}
 	if (purpose == "setup" && n != 0) || (purpose == "recovery" && n != 1) {
@@ -462,15 +524,17 @@ func (a *App) issueGrant(purpose string) (string, error) {
 	}
 	var generation int64
 	if n == 1 {
-		if e = tx.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&generation); e != nil {
-			return "", e
+		adminRecord, err := tx.Administrator.Get(ctx, 1)
+		if err != nil {
+			return "", err
 		}
+		generation = adminRecord.CredentialGeneration
 	}
 	now := a.cfg.Now()
-	if _, e = tx.Exec(`DELETE FROM registration_grants WHERE expires_at<?`, now.UnixNano()); e != nil {
+	if _, e = tx.RegistrationGrant.Delete().Where(registrationgrant.ExpiresAtLT(now.UnixNano())).Exec(ctx); e != nil {
 		return "", e
 	}
-	if e = tx.QueryRow(`SELECT count(*) FROM registration_grants`).Scan(&n); e != nil {
+	if n, e = tx.RegistrationGrant.Query().Count(ctx); e != nil {
 		return "", e
 	}
 	if n >= 10 {
@@ -482,7 +546,7 @@ func (a *App) issueGrant(purpose string) (string, error) {
 	}
 	token := base64.RawURLEncoding.EncodeToString(b)
 	h := sha256.Sum256([]byte(token))
-	if _, e = tx.Exec(`INSERT INTO registration_grants(token_hash,expires_at,created_at,purpose,credential_generation) VALUES(?,?,?,?,?)`, h[:], now.Add(a.cfg.GrantTTL).UnixNano(), now.UnixNano(), purpose, generation); e != nil {
+	if _, e = tx.RegistrationGrant.Create().SetID(h[:]).SetExpiresAt(now.Add(a.cfg.GrantTTL).UnixNano()).SetCreatedAt(now.UnixNano()).SetPurpose(purpose).SetCredentialGeneration(generation).Save(ctx); e != nil {
 		return "", e
 	}
 	if e = tx.Commit(); e != nil {
@@ -841,8 +905,8 @@ func (a *App) newRegistrationTransactionLocked(grant, purpose, origin string, ge
 		return "", errors.New("registration is busy; try again")
 	}
 	grantHash := sha256.Sum256([]byte(grant))
-	var expires int64
-	if err := a.db.QueryRow(`SELECT expires_at FROM registration_grants WHERE token_hash=? AND purpose=? AND credential_generation=?`, grantHash[:], purpose, generation).Scan(&expires); err != nil || expires < now.UnixNano() {
+	grantRecord, err := a.store.RegistrationGrant.Get(context.Background(), grantHash[:])
+	if err != nil || grantRecord.Purpose != purpose || grantRecord.CredentialGeneration != generation || grantRecord.ExpiresAt < now.UnixNano() {
 		return "", errors.New("invalid or expired grant")
 	}
 	var raw [32]byte
@@ -851,7 +915,7 @@ func (a *App) newRegistrationTransactionLocked(grant, purpose, origin string, ge
 	}
 	handle := base64.RawURLEncoding.EncodeToString(raw[:])
 	deadline := now.Add(registrationTransactionTTL)
-	grantDeadline := time.Unix(0, expires)
+	grantDeadline := time.Unix(0, grantRecord.ExpiresAt)
 	if grantDeadline.Before(deadline) {
 		deadline = grantDeadline
 	}
@@ -999,14 +1063,15 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		a.replaceCredential(w, pending.grantHash[:], b, "recovery", [32]byte{}, handle, r.Header.Get("Origin"))
 		return
 	}
-	tx, e := a.db.Begin()
+	ctx := r.Context()
+	tx, e := a.store.Tx(ctx)
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
 	defer tx.Rollback()
-	var count int
-	if e = tx.QueryRow(`SELECT count(*) FROM administrator`).Scan(&count); e != nil {
+	count, e := tx.Administrator.Query().Count(ctx)
+	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
@@ -1015,21 +1080,20 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	res, e := tx.Exec(`DELETE FROM registration_grants WHERE token_hash=? AND purpose='setup' AND credential_generation=? AND expires_at>=?`, pending.grantHash[:], pending.generation, now)
+	res, e := tx.RegistrationGrant.Delete().Where(registrationgrant.IDEQ(pending.grantHash[:]), registrationgrant.PurposeEQ("setup"), registrationgrant.CredentialGenerationEQ(pending.generation), registrationgrant.ExpiresAtGTE(now)).Exec(ctx)
 	if e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
-	n, _ := res.RowsAffected()
-	if n != 1 {
+	if res != 1 {
 		http.Error(w, "grant expired or already used", 410)
 		return
 	}
-	if _, e = tx.Exec(`INSERT INTO administrator(id,registration_record,profile_generation,created_at) VALUES(1,?,1,?)`, b, now); e != nil {
+	if _, e = tx.Administrator.Create().SetID(1).SetRegistrationRecord(b).SetProfileGeneration(1).SetCredentialGeneration(1).SetCreatedAt(now).Save(ctx); e != nil {
 		http.Error(w, "administrator already registered", 409)
 		return
 	}
-	if _, e = tx.Exec(`DELETE FROM registration_grants`); e != nil {
+	if _, e = tx.RegistrationGrant.Delete().Exec(ctx); e != nil {
 		http.Error(w, "registration unavailable", 500)
 		return
 	}
@@ -1047,13 +1111,11 @@ func (a *App) grantValid(token, purpose string, generation int64) bool {
 		return false
 	}
 	h := sha256.Sum256([]byte(token))
-	var exp, storedGeneration int64
-	err := a.db.QueryRow(`SELECT expires_at,credential_generation FROM registration_grants WHERE token_hash=? AND purpose=?`, h[:], purpose).Scan(&exp, &storedGeneration)
-	return err == nil && exp >= a.cfg.Now().UnixNano() && storedGeneration == generation
+	grant, err := a.store.RegistrationGrant.Get(context.Background(), h[:])
+	return err == nil && grant.ExpiresAt >= a.cfg.Now().UnixNano() && grant.Purpose == purpose && grant.CredentialGeneration == generation
 }
 func (a *App) HasAdministrator() (bool, error) {
-	var n int
-	e := a.db.QueryRow(`SELECT count(*) FROM administrator`).Scan(&n)
+	n, e := a.store.Administrator.Query().Count(context.Background())
 	return n > 0, e
 }
 func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.Handler().ServeHTTP(w, r) }
