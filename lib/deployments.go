@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/eslym/deploy-manager/lib/ent"
+	"github.com/eslym/deploy-manager/lib/ent/archiveddeploymentjob"
 	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
 	jobmodel "github.com/eslym/deploy-manager/lib/ent/deploymentjob"
 	"github.com/eslym/deploy-manager/lib/ent/deploymentremovalpath"
@@ -1416,7 +1417,7 @@ func (a *App) cleanupPublications(startup bool) error {
 	if _, err := a.db.Exec(`DELETE FROM deployment_jobs WHERE updated_at<? AND status IN ('succeeded','failed','superseded','noop') AND id NOT IN (SELECT job_id FROM publication_cleanup) AND id NOT IN (SELECT job_id FROM publication_intents)`, a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano()); err != nil {
 		return fmt.Errorf("prune expired deployment jobs: %w", err)
 	}
-	if _, err := a.db.Exec(`DELETE FROM archived_deployment_jobs WHERE updated_at<?`, a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano()); err != nil {
+	if _, err := a.store.ArchivedDeploymentJob.Delete().Where(archiveddeploymentjob.UpdatedAtLT(a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano())).Exec(context.Background()); err != nil {
 		return fmt.Errorf("prune expired archived deployment jobs: %w", err)
 	}
 	return nil
