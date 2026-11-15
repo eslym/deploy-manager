@@ -102,6 +102,23 @@ func TestNewFailsWhenAcceptedWebhookQueueCannotBeRestoredThenRestartsWork(t *tes
 	t.Fatal("durable accepted work remained queued after a successful restart")
 }
 
+func TestApplicationRejectsRetryAttemptsOutsideSupportedBounds(t *testing.T) {
+	base := t.TempDir()
+	cfg := Config{
+		DatabasePath:       filepath.Join(base, "state.sqlite"),
+		OPAQUEKeyPath:      filepath.Join(base, "opaque.key"),
+		FetchRetryAttempts: 6,
+	}
+	app, err := New(cfg)
+	if err == nil {
+		_ = app.Close()
+		t.Fatal("application accepted a retry policy above its safety bound")
+	}
+	if !strings.Contains(err.Error(), "retry") {
+		t.Fatalf("configuration error does not identify retry policy: %v", err)
+	}
+}
+
 func TestExportPublishesDotfilesAndRejectsTrackedSymlinks(t *testing.T) {
 	repoDir := filepath.Join(t.TempDir(), "repo")
 	commitID := createSmartFixture(t, repoDir)

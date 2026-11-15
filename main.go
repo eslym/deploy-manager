@@ -45,6 +45,7 @@ func main() {
 	deployConcurrency := flags.Int("deploy-concurrency", 2, "maximum publications running across deployments")
 	deployGrace := flags.Duration("deploy-grace-period", 60*time.Second, "minimum time before replaced files are cleaned up")
 	jobRetention := flags.Duration("job-retention", 30*24*time.Hour, "how long publication job details and logs are retained")
+	fetchRetryAttempts := flags.Int("fetch-retry-attempts", 3, "maximum attempts for transient Git fetch failures (1-5)")
 	_ = flags.Parse(os.Args[2:])
 	// Preserve caller traversal until the storage boundary validates it. Join
 	// would erase "link/.." and silently select a different installation.
@@ -57,7 +58,7 @@ func main() {
 	if repositoryMasterPath == "" {
 		repositoryMasterPath = dataPath("repository-key-master.key")
 	}
-	cfg := lib.Config{DatabasePath: dataPath("state.sqlite"), OPAQUEKeyPath: dataPath("opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention}
+	cfg := lib.Config{DatabasePath: dataPath("state.sqlite"), OPAQUEKeyPath: dataPath("opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention, FetchRetryAttempts: *fetchRetryAttempts}
 	switch command {
 	case "setup", "recover":
 		app, err := lib.NewGrantIssuer(cfg)
