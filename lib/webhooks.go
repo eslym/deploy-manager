@@ -96,7 +96,7 @@ func (a *App) providerWebhookSettings(w http.ResponseWriter, r *http.Request, pr
 		if !a.projectAuthorized(w, r, false) {
 			return
 		}
-		configured, err := a.webhookSettingsExist(provider, id)
+		configured, err := a.webhookSettingsExist(r.Context(), provider, id)
 		if err != nil {
 			http.Error(w, "webhook settings are unavailable", http.StatusInternalServerError)
 			return
@@ -189,14 +189,7 @@ func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider s
 		http.NotFound(w, r)
 		return
 	}
-	deliveryID := r.Header.Get("X-GitHub-Delivery")
-	event := r.Header.Get("X-GitHub-Event")
-	signature := r.Header.Get("X-Hub-Signature-256")
-	if provider == giteaWebhookProvider {
-		deliveryID = r.Header.Get("X-Gitea-Delivery")
-		event = r.Header.Get("X-Gitea-Event")
-		signature = r.Header.Get("X-Gitea-Signature")
-	}
+	deliveryID, event, signature := providerWebhookHeaders(r, provider)
 	if !webhookDeliveryID.MatchString(deliveryID) || len(event) == 0 || len(event) > 64 || strings.ContainsAny(event, "\r\n\x00") {
 		http.Error(w, "invalid webhook headers", http.StatusBadRequest)
 		return
@@ -217,20 +210,7 @@ func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider s
 		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
 		return
 	}
-	var sealed []byte
-	if provider == giteaWebhookProvider {
-		row, getErr := a.store.ProjectGiteaWebhook.Get(r.Context(), projectID)
-		err = getErr
-		if err == nil {
-			sealed = row.Secret
-		}
-	} else {
-		row, getErr := a.store.ProjectWebhook.Get(r.Context(), projectID)
-		err = getErr
-		if err == nil {
-			sealed = row.Secret
-		}
-	}
+	sealed, err := loadProviderWebhookSecret(r.Context(), a.store, provider, projectID)
 	if err != nil {
 		http.Error(w, "webhook is not configured", http.StatusNotFound)
 		return
@@ -299,17 +279,12 @@ var errWebhookQueueFull = errors.New("webhook queue full")
 
 func saveProviderWebhookSecret(ctx context.Context, tx *entdb.Tx, provider, projectID string, sealed []byte, createdAt int64) error {
 	if provider == giteaWebhookProvider {
-		exists, err := tx.ProjectGiteaWebhook.Query().Where(projectgiteawebhook.ID(projectID)).Exist(ctx)
-		if err != nil {
-			return err
-		}
-		if exists {
-			_, err := tx.ProjectGiteaWebhook.UpdateOneID(projectID).SetSecret(sealed).SetCreatedAt(createdAt).Save(ctx)
-			return err
-		}
-		_, err = tx.ProjectGiteaWebhook.Create().SetID(projectID).SetSecret(sealed).SetCreatedAt(createdAt).Save(ctx)
-		return err
+		return upsertGiteaWebhookSecret(ctx, tx, projectID, sealed, createdAt)
 	}
+	return upsertGitHubWebhookSecret(ctx, tx, projectID, sealed, createdAt)
+}
+
+func upsertGitHubWebhookSecret(ctx context.Context, tx *entdb.Tx, projectID string, sealed []byte, createdAt int64) error {
 	exists, err := tx.ProjectWebhook.Query().Where(projectwebhook.ID(projectID)).Exist(ctx)
 	if err != nil {
 		return err
@@ -322,11 +297,46 @@ func saveProviderWebhookSecret(ctx context.Context, tx *entdb.Tx, provider, proj
 	return err
 }
 
-func (a *App) webhookSettingsExist(provider, projectID string) (bool, error) {
+func providerWebhookHeaders(r *http.Request, provider string) (deliveryID, event, signature string) {
 	if provider == giteaWebhookProvider {
-		return a.store.ProjectGiteaWebhook.Query().Where(projectgiteawebhook.ID(projectID)).Exist(context.Background())
+		return r.Header.Get("X-Gitea-Delivery"), r.Header.Get("X-Gitea-Event"), r.Header.Get("X-Gitea-Signature")
 	}
-	return a.store.ProjectWebhook.Query().Where(projectwebhook.ID(projectID)).Exist(context.Background())
+	return r.Header.Get("X-GitHub-Delivery"), r.Header.Get("X-GitHub-Event"), r.Header.Get("X-Hub-Signature-256")
+}
+
+func loadProviderWebhookSecret(ctx context.Context, store *entdb.Client, provider, projectID string) ([]byte, error) {
+	if provider == giteaWebhookProvider {
+		row, err := store.ProjectGiteaWebhook.Get(ctx, projectID)
+		if err != nil {
+			return nil, err
+		}
+		return row.Secret, nil
+	}
+	row, err := store.ProjectWebhook.Get(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	return row.Secret, nil
+}
+
+func upsertGiteaWebhookSecret(ctx context.Context, tx *entdb.Tx, projectID string, sealed []byte, createdAt int64) error {
+	exists, err := tx.ProjectGiteaWebhook.Query().Where(projectgiteawebhook.ID(projectID)).Exist(ctx)
+	if err != nil {
+		return err
+	}
+	if exists {
+		_, err = tx.ProjectGiteaWebhook.UpdateOneID(projectID).SetSecret(sealed).SetCreatedAt(createdAt).Save(ctx)
+		return err
+	}
+	_, err = tx.ProjectGiteaWebhook.Create().SetID(projectID).SetSecret(sealed).SetCreatedAt(createdAt).Save(ctx)
+	return err
+}
+
+func (a *App) webhookSettingsExist(ctx context.Context, provider, projectID string) (bool, error) {
+	if provider == giteaWebhookProvider {
+		return a.store.ProjectGiteaWebhook.Query().Where(projectgiteawebhook.ID(projectID)).Exist(ctx)
+	}
+	return a.store.ProjectWebhook.Query().Where(projectwebhook.ID(projectID)).Exist(ctx)
 }
 
 func (a *App) webhookSecret(projectID string) ([]byte, error) {

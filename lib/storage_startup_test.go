@@ -1,7 +1,9 @@
 package lib
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -9,6 +11,42 @@ import (
 	"testing"
 	"testing/fstest"
 )
+
+func TestDaemonRecordsProgramProvenanceAndGrantCLILeavesItUntouched(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := provenancePath(cfg)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recorded programProvenance
+	if err := json.Unmarshal(before, &recorded); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := fileSHA256(recorded.Executable)
+	if err != nil || hash != recorded.SHA256 || recorded.Schema != 1 || recorded.Database != cfg.DatabasePath {
+		t.Fatalf("recorded daemon provenance is not bound to this executable/install/schema: %+v err=%v", recorded, err)
+	}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("compatible CLI overwrote daemon provenance: %v", err)
+	}
+}
 
 func TestGrantIssuerAlongsideDaemonDoesNotRunRecovery(t *testing.T) {
 	base := t.TempDir()

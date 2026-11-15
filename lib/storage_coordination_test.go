@@ -410,6 +410,25 @@ func TestCrashBeforeMaintenanceMarkerDurabilityLeavesStoreUsableAndUnchanged(t *
 
 func startUpgradeCrashChild(t *testing.T, cfg Config, phase string, fixture ...bool) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
 	t.Helper()
+	db, err := sql.Open("sqlite3", cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema int64
+	if err := db.QueryRow(`SELECT COALESCE(max(version_id),0) FROM goose_db_version WHERE is_applied=1`).Scan(&schema); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	provenance, err := currentProgramProvenance(cfg, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := durableJSONReplace(provenancePath(cfg), provenance); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command(os.Args[0], "-test.run=^TestStorageCoordinationChild$")
 	cmd.Env = append(os.Environ(), "DM_COORDINATION_CHILD=upgrade-crash", "DM_COORDINATION_DIR="+filepath.Dir(cfg.DatabasePath), "DM_UPGRADE_CRASH_PHASE="+phase)
 	if len(fixture) > 0 && fixture[0] {
@@ -511,6 +530,18 @@ func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
 	if err != nil || v1Hash == v2Hash {
 		t.Fatalf("fixture binaries must have distinct build identities: v1=%s v2=%s err=%v", v1Hash, v2Hash, err)
 	}
+	v1Absolute, err := filepath.Abs(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	databaseIdentity, err := databaseFileIdentity(cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	priorRecord := programProvenance{Format: 1, Database: cfg.DatabasePath, DatabaseIdentity: databaseIdentity, Schema: 1, Executable: v1Absolute, Version: "fixture-v1", SHA256: v1Hash}
+	if err := durableJSONReplace(provenancePath(cfg), priorRecord); err != nil {
+		t.Fatal(err)
+	}
 	child := exec.Command(v2, "-test.run=^TestStorageCoordinationChild$")
 	child.Env = append(os.Environ(), "DM_COORDINATION_CHILD=upgrade-fail", "DM_COORDINATION_DIR="+dir)
 	if output, err := child.CombinedOutput(); err == nil {
@@ -538,14 +569,22 @@ func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
 		t.Fatal(err)
 	}
 	var manifest struct {
-		Status        string `json:"status"`
-		Program       string `json:"program"`
+		Status       string `json:"status"`
+		Program      string `json:"program"`
+		PriorProgram struct {
+			Executable string `json:"executable"`
+			Version    string `json:"version"`
+			SHA256     string `json:"sha256"`
+		} `json:"prior_program"`
 		SourceVersion int64  `json:"source_version"`
 		TargetVersion int64  `json:"target_version"`
 		SHA256        string `json:"sha256"`
 	}
 	if err := json.Unmarshal(manifestBytes, &manifest); err != nil || manifest.Status != "complete" || manifest.SourceVersion != 1 || manifest.TargetVersion != 2 || !strings.HasPrefix(manifest.Program, "fixture-v2") {
 		t.Fatalf("verified backup manifest does not identify the failing fixture build: %+v err=%v", manifest, err)
+	}
+	if manifest.PriorProgram.Version != "fixture-v1" || manifest.PriorProgram.SHA256 != v1Hash || manifest.PriorProgram.Executable != v1Absolute {
+		t.Fatalf("manifest prior-program identity does not match source fixture: %+v", manifest.PriorProgram)
 	}
 	backupBefore, err := os.ReadFile(backup)
 	if err != nil {

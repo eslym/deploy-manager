@@ -71,6 +71,13 @@ type Config struct {
 	upgradeTargetVersion int64
 }
 
+// WithUpgradeContext bounds and cancels protected startup maintenance when the
+// daemon's serving process receives a termination signal.
+func (c Config) WithUpgradeContext(ctx context.Context) Config {
+	c.upgradeContext = ctx
+	return c
+}
+
 type App struct {
 	cfg                  Config
 	db                   *sql.DB
@@ -383,6 +390,12 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 	if err := access.share(); err != nil {
 		_ = app.Close()
 		return nil, err
+	}
+	if daemonUpgrade {
+		if err := writeProgramProvenance(cfg, db); err != nil {
+			_ = app.Close()
+			return nil, fmt.Errorf("record verified daemon program provenance: %w", err)
+		}
 	}
 	app.storageAccess = access
 	accessTransferred = true

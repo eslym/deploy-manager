@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"flag"
@@ -9,6 +10,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/eslym/deploy-manager/lib"
@@ -128,31 +132,108 @@ func serve(cfg lib.Config, address, cert, key string) error {
 			return errors.New("HTTPS is required unless listening on loopback")
 		}
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return serveWithStartup(ctx, address, tlsConfig, func(startupCtx context.Context) (http.Handler, func(), error) {
+		daemon, err := lib.OpenDaemon(cfg.WithUpgradeContext(startupCtx))
+		if err != nil {
+			return nil, nil, err
+		}
+		if daemon.Locked() {
+			log.Print(daemon.Diagnostic())
+		}
+		return daemon.Handler(), func() { _ = daemon.Close() }, nil
+	})
+}
+
+// serveWithStartup makes maintenance the only reachable application state until
+// protected initialization has completed. Listener errors and cancellation are
+// observed while initialization is running; a late successful initializer is
+// immediately closed rather than published after the server has stopped.
+func serveWithStartup(ctx context.Context, address string, tlsConfig *tls.Config, startup func(context.Context) (http.Handler, func(), error)) error {
+	startupCtx, cancelStartup := context.WithCancel(ctx)
+	defer cancelStartup()
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return err
 	}
 	defer listener.Close()
-	daemon, err := lib.OpenDaemon(cfg)
-	if err != nil {
+	var active atomic.Pointer[handlerBox]
+	active.Store(&handlerBox{handler: lib.MaintenanceHandler()})
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		active.Load().handler.ServeHTTP(w, r)
+	}), DisableGeneralOptionsHandler: true, TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
+	serveErr := make(chan error, 1)
+	go func() {
+		if tlsConfig != nil {
+			serveErr <- server.ServeTLS(listener, "", "")
+		} else {
+			serveErr <- server.Serve(listener)
+		}
+	}()
+	type startupResult struct {
+		handler http.Handler
+		close   func()
+		err     error
+	}
+	started := make(chan startupResult, 1)
+	go func() {
+		h, closeFn, startErr := startup(startupCtx)
+		started <- startupResult{handler: h, close: closeFn, err: startErr}
+	}()
+	select {
+	case result := <-started:
+		if result.err != nil {
+			_ = server.Close()
+			<-serveErr
+			return result.err
+		}
+		if ctx.Err() != nil {
+			if result.close != nil {
+				result.close()
+			}
+			_ = server.Close()
+			<-serveErr
+			return ctx.Err()
+		}
+		active.Store(&handlerBox{handler: result.handler})
+		select {
+		case err := <-serveErr:
+			if result.close != nil {
+				result.close()
+			}
+			if errors.Is(err, http.ErrServerClosed) {
+				return nil
+			}
+			return err
+		case <-ctx.Done():
+			_ = server.Close()
+			<-serveErr
+			if result.close != nil {
+				result.close()
+			}
+			return ctx.Err()
+		}
+	case err := <-serveErr:
+		cancelStartup()
+		_ = server.Close()
+		result := <-started
+		if result.close != nil {
+			result.close()
+		}
 		return err
+	case <-ctx.Done():
+		cancelStartup()
+		_ = server.Close()
+		result := <-started
+		if result.close != nil {
+			result.close()
+		}
+		<-serveErr
+		return ctx.Err()
 	}
-	defer daemon.Close()
-	if daemon.Locked() {
-		log.Print(daemon.Diagnostic())
-	}
-	// OPTIONS * must reach the daemon handler, including during maintenance,
-	// rather than net/http's default server-wide success response.
-	server := &http.Server{Handler: daemon.Handler(), DisableGeneralOptionsHandler: true, TLSConfig: tlsConfig, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, MaxHeaderBytes: 1 << 16}
-	if tlsConfig != nil {
-		err = server.ServeTLS(listener, "", "")
-	} else {
-		err = server.Serve(listener)
-	}
-	if errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-	return err
 }
+
+type handlerBox struct{ handler http.Handler }
 
 func port(address string) string { _, p, _ := net.SplitHostPort(address); return p }

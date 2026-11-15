@@ -388,7 +388,7 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not save project", 500)
 		return
 	}
-	if err = saveProjectRefs(p.store, id, p.repoPath(id), p.maxRefs); err != nil {
+	if err = saveProjectRefs(context.Background(), p.store, id, p.repoPath(id), p.maxRefs); err != nil {
 		if cleanupTx, cleanupErr := p.store.Tx(r.Context()); cleanupErr == nil {
 			cleanupErr = cleanupTx.Project.DeleteOneID(id).Exec(r.Context())
 			if cleanupErr == nil {
@@ -568,7 +568,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "refreshed repository could not be safely promoted; previous cache restored", 500)
 		return
 	}
-	if err = replaceProjectMetadata(p.store, id, refs, now); err != nil {
+	if err = replaceProjectMetadata(r.Context(), p.store, id, refs, now); err != nil {
 		pending, journalErr := p.refreshIntentExists(id)
 		if journalErr != nil || pending {
 			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
@@ -644,12 +644,12 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func saveProjectRefs(store *ent.Client, id, dir string, maxRefs int) error {
+func saveProjectRefs(ctx context.Context, store *ent.Client, id, dir string, maxRefs int) error {
 	refs, err := projectRefsFromRepository(dir, maxRefs)
 	if err != nil {
 		return err
 	}
-	return replaceProjectMetadataRefs(store, id, refs)
+	return replaceProjectMetadataRefs(ctx, store, id, refs)
 }
 
 func projectRefsFromRepository(dir string, maxRefs int) ([]projectRef, error) {
@@ -708,42 +708,42 @@ func projectRefsFromRepository(dir string, maxRefs int) ([]projectRef, error) {
 	return result, nil
 }
 
-func replaceProjectMetadata(store *ent.Client, id string, refs []projectRef, fetched time.Time) error {
-	tx, err := store.Tx(context.Background())
+func replaceProjectMetadata(ctx context.Context, store *ent.Client, id string, refs []projectRef, fetched time.Time) error {
+	tx, err := store.Tx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := replaceProjectMetadataRefsTx(tx, id, refs); err != nil {
+	if err := replaceProjectMetadataRefsTx(ctx, tx, id, refs); err != nil {
 		return err
 	}
-	if _, err := tx.Project.Update().Where(projectent.ID(id)).SetLastFetched(fetched.UnixNano()).SetWarning("").Save(context.Background()); err != nil {
+	if _, err := tx.Project.Update().Where(projectent.ID(id)).SetLastFetched(fetched.UnixNano()).SetWarning("").Save(ctx); err != nil {
 		return err
 	}
-	if _, err := tx.ProjectRefreshJournal.Delete().Where(projectrefreshjournal.IDEQ(id)).Exec(context.Background()); err != nil {
+	if _, err := tx.ProjectRefreshJournal.Delete().Where(projectrefreshjournal.IDEQ(id)).Exec(ctx); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func replaceProjectMetadataRefs(store *ent.Client, id string, refs []projectRef) error {
-	tx, err := store.Tx(context.Background())
+func replaceProjectMetadataRefs(ctx context.Context, store *ent.Client, id string, refs []projectRef) error {
+	tx, err := store.Tx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if err := replaceProjectMetadataRefsTx(tx, id, refs); err != nil {
+	if err := replaceProjectMetadataRefsTx(ctx, tx, id, refs); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func replaceProjectMetadataRefsTx(tx *ent.Tx, id string, refs []projectRef) error {
-	if _, err := tx.ProjectRef.Delete().Where(projectref.IDEQ(id)).Exec(context.Background()); err != nil {
+func replaceProjectMetadataRefsTx(ctx context.Context, tx *ent.Tx, id string, refs []projectRef) error {
+	if _, err := tx.ProjectRef.Delete().Where(projectref.IDEQ(id)).Exec(ctx); err != nil {
 		return err
 	}
 	for _, ref := range refs {
-		if _, err := tx.ProjectRef.Create().SetID(id).SetKind(ref.Kind).SetName(ref.Name).SetCommitID(ref.Commit).Save(context.Background()); err != nil {
+		if _, err := tx.ProjectRef.Create().SetID(id).SetKind(ref.Kind).SetName(ref.Name).SetCommitID(ref.Commit).Save(ctx); err != nil {
 			return err
 		}
 	}

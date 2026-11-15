@@ -1,16 +1,19 @@
 package lib
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -19,6 +22,7 @@ import (
 	"testing/fstest"
 
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/sys/unix"
 )
 
 func TestFreshSchemaIsCompleteAndReopenIsNoOp(t *testing.T) {
@@ -103,6 +107,7 @@ func TestPendingUpgradeCompletesThroughStorageStartupWithFixtureMigration(t *tes
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
+	writeTestProgramProvenance(t, cfg, 1)
 	before, err := os.ReadFile(cfg.OPAQUEKeyPath)
 	if err != nil {
 		t.Fatal(err)
@@ -524,6 +529,7 @@ func TestPendingUpgradeFinalizesIndependentVerifiedDatabaseBackupAndStaysLocked(
 	if _, err := db.Exec(`CREATE TABLE backup_wal_witness(value TEXT NOT NULL); INSERT INTO backup_wal_witness VALUES('committed-in-wal'); UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
 		t.Fatal(err)
 	}
+	writeTestProgramProvenance(t, cfg, 0)
 	var marker maintenanceMarker
 	if _, err := New(cfg); !errors.Is(err, ErrMaintenance) {
 		t.Fatalf("pending upgrade result=%v, want locked", err)
@@ -650,6 +656,7 @@ func TestPendingUpgradeFailureKeepsDurableMarkerWithoutCompletedBackup(t *testin
 		t.Fatal(err)
 	}
 	_ = db.Close()
+	writeTestProgramProvenance(t, cfg, 0)
 	cfg.storageFault = func(phase string, _ *sql.DB) error {
 		if phase == "backup-checkpoint" {
 			return errors.New("injected")
@@ -691,6 +698,13 @@ func TestUpgradePreparationFaultsNeverUnlockAndOnlyFinalizedBackupsAreComplete(t
 				t.Fatal(err)
 			}
 			_ = db.Close()
+			provenance, err := currentProgramProvenance(cfg, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := durableJSONReplace(provenancePath(cfg), provenance); err != nil {
+				t.Fatal(err)
+			}
 			cfg.storageFault = func(got string, _ *sql.DB) error {
 				if got == phase {
 					return errors.New("injected " + phase)
@@ -725,6 +739,132 @@ func TestUpgradePreparationFaultsNeverUnlockAndOnlyFinalizedBackupsAreComplete(t
 				t.Fatalf("phase %s completed-copy status=%v", phase, completed)
 			}
 		})
+	}
+}
+
+func TestBackupCopyCrashChild(t *testing.T) {
+	if os.Getenv("DM_BACKUP_CRASH_CHILD") != "1" {
+		return
+	}
+	database, opaqueKey := os.Getenv("DM_BACKUP_CRASH_DATABASE"), os.Getenv("DM_BACKUP_CRASH_OPAQUE")
+	cfg := Config{DatabasePath: database, OPAQUEKeyPath: opaqueKey, InsecureLocalHTTP: true}
+	cfg.storageFault = func(phase string, _ *sql.DB) error {
+		if phase == "backup-copy-chunk" {
+			_ = unix.Kill(os.Getpid(), unix.SIGKILL)
+		}
+		return nil
+	}
+	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(database)}).String()
+	if err := prepareUpgradeBackup(cfg, 0, 1, dbURL); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
+	os.Exit(0)
+}
+
+func TestRealProcessCrashDuringPartialBackupCopyStaysLocked(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE copy_witness(payload BLOB NOT NULL); INSERT INTO copy_witness VALUES(zeroblob(2097152)); UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	databaseIdentity, err := databaseFileIdentity(cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provenance := programProvenance{Format: 1, Database: cfg.DatabasePath, DatabaseIdentity: databaseIdentity, Schema: 0, Executable: "/test/prior", Version: "fixture-v1", SHA256: strings.Repeat("a", 64)}
+	if err := durableJSONReplace(provenancePath(cfg), provenance); err != nil {
+		t.Fatal(err)
+	}
+	backupDir := cfg.DatabasePath + ".upgrade-backups"
+	if err := ensurePrivateDirectory(backupDir); err != nil {
+		t.Fatal(err)
+	}
+	completed := filepath.Join(backupDir, "prior-completed.db")
+	if err := os.WriteFile(completed, []byte("immutable completed backup"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	completedManifest := completed + ".json"
+	if err := os.WriteFile(completedManifest, []byte(`{"status":"complete","sha256":"fixture"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	completedBefore, _ := os.ReadFile(completed)
+	completedManifestBefore, _ := os.ReadFile(completedManifest)
+	databaseBefore, _ := os.ReadFile(cfg.DatabasePath)
+	keyBefore, _ := os.ReadFile(cfg.OPAQUEKeyPath)
+	child := exec.Command(os.Args[0], "-test.run=^TestBackupCopyCrashChild$")
+	child.Env = append(os.Environ(), "DM_BACKUP_CRASH_CHILD=1", "DM_BACKUP_CRASH_DATABASE="+cfg.DatabasePath, "DM_BACKUP_CRASH_OPAQUE="+cfg.OPAQUEKeyPath)
+	childOutput, childErr := child.CombinedOutput()
+	if childErr == nil {
+		t.Fatalf("backup child unexpectedly survived SIGKILL: %s", childOutput)
+	}
+	t.Logf("backup child terminated: %v; %s", childErr, childOutput)
+	entries, err := os.ReadDir(backupDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	partialFound := false
+	for _, entry := range entries {
+		path := filepath.Join(backupDir, entry.Name())
+		if strings.HasSuffix(entry.Name(), ".db") && entry.Name() != "prior-completed.db" {
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.Size() > 0 && info.Size() < int64(len(databaseBefore)) {
+				partialFound = true
+			}
+		}
+		if strings.HasSuffix(entry.Name(), ".json") && entry.Name() != filepath.Base(completedManifest) {
+			t.Fatalf("partial backup received a finalized manifest: %s", entry.Name())
+		}
+	}
+	if !partialFound {
+		t.Fatalf("process was not killed after writing a partial nontrivial backup (source=%d entries=%v)", len(databaseBefore), entries)
+	}
+	if _, err := os.Stat(cfg.DatabasePath + ".maintenance.json"); err != nil {
+		t.Fatalf("durable marker missing after SIGKILL: %v", err)
+	}
+	locked, err := OpenDaemon(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !locked.Locked() {
+		t.Fatal("restart opened application after partial-copy crash")
+	}
+	if err := locked.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for path, before := range map[string][]byte{cfg.DatabasePath: databaseBefore, cfg.OPAQUEKeyPath: keyBefore, completed: completedBefore, completedManifest: completedManifestBefore} {
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(after, before) {
+			t.Fatalf("locked restart touched %s: %v", path, err)
+		}
+	}
+}
+
+func writeTestProgramProvenance(t *testing.T, cfg Config, schema int64) {
+	t.Helper()
+	provenance, err := currentProgramProvenance(cfg, schema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := durableJSONReplace(provenancePath(cfg), provenance); err != nil {
+		t.Fatal(err)
 	}
 }
 
