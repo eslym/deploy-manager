@@ -21,6 +21,9 @@ import (
 	"time"
 
 	"github.com/eslym/deploy-manager/lib/ent"
+	projectent "github.com/eslym/deploy-manager/lib/ent/project"
+	"github.com/eslym/deploy-manager/lib/ent/projectref"
+	"github.com/eslym/deploy-manager/lib/ent/projectrefreshjournal"
 	"github.com/eslym/deploy-manager/lib/ent/projectsshkey"
 
 	git "github.com/go-git/go-git/v5"
@@ -34,6 +37,7 @@ import (
 
 type projectManager struct {
 	db                    *sql.DB
+	store                 *ent.Client
 	root                  string
 	rootIdentity          dirIdentity
 	timeout               time.Duration
@@ -87,7 +91,7 @@ type projectRef struct {
 	Commit string `json:"commit"`
 }
 
-func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheBytes int64) (*projectManager, error) {
+func newProjectManager(db *sql.DB, store *ent.Client, root string, timeout time.Duration, maxCacheBytes int64) (*projectManager, error) {
 	if err := configureTestGitTransport(); err != nil {
 		return nil, fmt.Errorf("invalid test Git transport configuration: %w", err)
 	}
@@ -119,7 +123,7 @@ func newProjectManager(db *sql.DB, root string, timeout time.Duration, maxCacheB
 	if err != nil {
 		return nil, err
 	}
-	manager := &projectManager{db: db, root: root, rootIdentity: rootIdentity, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
+	manager := &projectManager{db: db, store: store, root: root, rootIdentity: rootIdentity, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
 	if err := manager.reconcileCacheFiles(); err != nil {
 		return nil, fmt.Errorf("project cache recovery failed; refusing to start: %w", err)
 	}
@@ -205,33 +209,19 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT id,name,remote_url,last_fetched,warning FROM projects ORDER BY created_at,id`)
+	projects, err := a.store.Project.Query().Order(ent.Asc(projectent.FieldCreatedAt), ent.Asc(projectent.FieldID)).All(r.Context())
 	if err != nil {
 		http.Error(w, "projects are temporarily unavailable", 500)
 		return
 	}
-	defer rows.Close()
 	out := []project{}
-	for rows.Next() {
-		var x project
-		var fetched sql.NullInt64
-		if err := rows.Scan(&x.ID, &x.Name, &x.URL, &fetched, &x.Warning); err != nil {
-			http.Error(w, "projects are temporarily unavailable", 500)
-			return
-		}
-		if fetched.Valid {
-			t := time.Unix(0, fetched.Int64).UTC()
+	for _, stored := range projects {
+		x := project{ID: stored.ID, Name: stored.Name, URL: stored.RemoteURL, Warning: stored.Warning}
+		if stored.LastFetched != nil {
+			t := time.Unix(0, *stored.LastFetched).UTC()
 			x.LastFetched = &t
 		}
 		out = append(out, x)
-	}
-	if rows.Err() != nil {
-		http.Error(w, "projects are temporarily unavailable", 500)
-		return
-	}
-	if err := rows.Close(); err != nil {
-		http.Error(w, "projects are temporarily unavailable", 500)
-		return
 	}
 	for i := range out {
 		assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(out[i].ID)).Only(r.Context())
@@ -383,8 +373,8 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "could not save project", 500)
 		return
 	}
-	if err = saveProjectRefs(p.db, id, p.repoPath(id), p.maxRefs); err != nil {
-		_, _ = p.db.Exec(`DELETE FROM projects WHERE id=?`, id)
+	if err = saveProjectRefs(p.store, id, p.repoPath(id), p.maxRefs); err != nil {
+		_, _ = p.store.Project.Delete().Where(projectent.ID(id)).Exec(r.Context())
 		_ = os.RemoveAll(p.repoPath(id))
 		if errors.Is(err, errGitIncompleteRepository) || errors.Is(err, errGitTooManyRefs) {
 			http.Error(w, sanitizeGitError(err, remote), http.StatusBadRequest)
@@ -401,25 +391,18 @@ func (a *App) projectRefs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var found int
-	if a.db.QueryRow(`SELECT 1 FROM projects WHERE id=?`, id).Scan(&found) != nil {
+	if _, err := a.store.Project.Get(r.Context(), id); err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	rows, err := a.db.Query(`SELECT kind,name,commit_id FROM project_refs WHERE project_id=? ORDER BY kind,name`, id)
+	storedRefs, err := a.store.ProjectRef.Query().Where(projectref.IDEQ(id)).Order(ent.Asc(projectref.FieldKind), ent.Asc(projectref.FieldName)).All(r.Context())
 	if err != nil {
 		http.Error(w, "refs are temporarily unavailable", 500)
 		return
 	}
-	defer rows.Close()
-	refs := []projectRef{}
-	for rows.Next() {
-		var x projectRef
-		if rows.Scan(&x.Kind, &x.Name, &x.Commit) != nil {
-			http.Error(w, "refs are temporarily unavailable", 500)
-			return
-		}
-		refs = append(refs, x)
+	refs := make([]projectRef, 0, len(storedRefs))
+	for _, stored := range storedRefs {
+		refs = append(refs, projectRef{Kind: stored.Kind, Name: stored.Name, Commit: stored.CommitID})
 	}
 	writeJSON(w, refs)
 }
@@ -443,11 +426,12 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	var remote string
-	if p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote) != nil {
+	storedProject, projectErr := a.store.Project.Get(r.Context(), id)
+	if projectErr != nil {
 		http.NotFound(w, r)
 		return
 	}
+	remote := storedProject.RemoteURL
 	var keyID, sshUser string
 	var sshAuth transport.AuthMethod
 	if strings.HasPrefix(remote, "ssh://") {
@@ -488,7 +472,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}()
 	if err := copyGitCache(p.repoPath(id), stage, p.maxCacheBytes); err != nil {
 		warning := "could not stage the existing repository within the configured cache limit"
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		p.setProjectWarning(r.Context(), id, warning)
 		http.Error(w, warning, http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -501,7 +485,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		warning := sanitizeGitError(err, remote)
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		p.setProjectWarning(r.Context(), id, warning)
 		status := http.StatusBadGateway
 		if errors.Is(err, errGitCacheLimit) {
 			status = http.StatusRequestEntityTooLarge
@@ -512,7 +496,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	refs, err := projectRefsFromRepository(stage, p.maxRefs)
 	if err != nil {
 		warning := sanitizeGitError(err, remote)
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		p.setProjectWarning(r.Context(), id, warning)
 		http.Error(w, warning, 502)
 		return
 	}
@@ -521,7 +505,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	liveSize, liveErr := directorySize(p.repoPath(id), p.maxCacheBytes)
 	if sizeErr != nil || stageErr != nil || liveErr != nil || stageSize > p.maxCacheBytes || used < liveSize || used-liveSize > p.maxCacheBytes {
 		warning := "refreshed repository exceeds the configured persistent cache limit; previous cache retained"
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, warning, id)
+		p.setProjectWarning(r.Context(), id, warning)
 		http.Error(w, warning, http.StatusRequestEntityTooLarge)
 		return
 	}
@@ -562,7 +546,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "refreshed repository could not be safely promoted; previous cache restored", 500)
 		return
 	}
-	if err = replaceProjectMetadata(p.db, id, refs, now); err != nil {
+	if err = replaceProjectMetadata(p.store, id, refs, now); err != nil {
 		pending, journalErr := p.refreshIntentExists(id)
 		if journalErr != nil || pending {
 			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
@@ -579,7 +563,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	if err := p.removeOwnedPath(backup); err != nil {
 		cleanupWarning = "refresh committed but previous cache cleanup failed; restart to reconcile before further project changes"
 		p.setBlocked(cleanupWarning)
-		_, _ = p.db.Exec(`UPDATE projects SET warning=? WHERE id=?`, cleanupWarning, id)
+		p.setProjectWarning(r.Context(), id, cleanupWarning)
 	}
 	writeJSON(w, map[string]any{"lastFetched": now, "warning": cleanupWarning})
 }
@@ -601,11 +585,12 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 	p.lfsAuthMu.Lock()
 	defer p.lfsAuthMu.Unlock()
 	id := r.PathValue("id")
-	var remote string
-	if p.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote) != nil {
+	storedProject, projectErr := a.store.Project.Get(r.Context(), id)
+	if projectErr != nil {
 		http.NotFound(w, r)
 		return
 	}
+	remote := storedProject.RemoteURL
 	if !strings.HasPrefix(remote, "ssh://") {
 		http.Error(w, "repository keys can only be assigned to SSH projects", 400)
 		return
@@ -637,12 +622,12 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func saveProjectRefs(db *sql.DB, id, dir string, maxRefs int) error {
+func saveProjectRefs(store *ent.Client, id, dir string, maxRefs int) error {
 	refs, err := projectRefsFromRepository(dir, maxRefs)
 	if err != nil {
 		return err
 	}
-	return replaceProjectMetadataRefs(db, id, refs)
+	return replaceProjectMetadataRefs(store, id, refs)
 }
 
 func projectRefsFromRepository(dir string, maxRefs int) ([]projectRef, error) {
@@ -701,8 +686,8 @@ func projectRefsFromRepository(dir string, maxRefs int) ([]projectRef, error) {
 	return result, nil
 }
 
-func replaceProjectMetadata(db *sql.DB, id string, refs []projectRef, fetched time.Time) error {
-	tx, err := db.Begin()
+func replaceProjectMetadata(store *ent.Client, id string, refs []projectRef, fetched time.Time) error {
+	tx, err := store.Tx(context.Background())
 	if err != nil {
 		return err
 	}
@@ -710,17 +695,17 @@ func replaceProjectMetadata(db *sql.DB, id string, refs []projectRef, fetched ti
 	if err := replaceProjectMetadataRefsTx(tx, id, refs); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE projects SET last_fetched=?,warning='' WHERE id=?`, fetched.UnixNano(), id); err != nil {
+	if _, err := tx.Project.Update().Where(projectent.ID(id)).SetLastFetched(fetched.UnixNano()).SetWarning("").Save(context.Background()); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM project_refresh_journal WHERE project_id=?`, id); err != nil {
+	if _, err := tx.ProjectRefreshJournal.Delete().Where(projectrefreshjournal.IDEQ(id)).Exec(context.Background()); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
 
-func replaceProjectMetadataRefs(db *sql.DB, id string, refs []projectRef) error {
-	tx, err := db.Begin()
+func replaceProjectMetadataRefs(store *ent.Client, id string, refs []projectRef) error {
+	tx, err := store.Tx(context.Background())
 	if err != nil {
 		return err
 	}
@@ -731,16 +716,20 @@ func replaceProjectMetadataRefs(db *sql.DB, id string, refs []projectRef) error 
 	return tx.Commit()
 }
 
-func replaceProjectMetadataRefsTx(tx *sql.Tx, id string, refs []projectRef) error {
-	if _, err := tx.Exec(`DELETE FROM project_refs WHERE project_id=?`, id); err != nil {
+func replaceProjectMetadataRefsTx(tx *ent.Tx, id string, refs []projectRef) error {
+	if _, err := tx.ProjectRef.Delete().Where(projectref.IDEQ(id)).Exec(context.Background()); err != nil {
 		return err
 	}
 	for _, ref := range refs {
-		if _, err := tx.Exec(`INSERT INTO project_refs(project_id,kind,name,commit_id) VALUES(?,?,?,?)`, id, ref.Kind, ref.Name, ref.Commit); err != nil {
+		if _, err := tx.ProjectRef.Create().SetID(id).SetKind(ref.Kind).SetName(ref.Name).SetCommitID(ref.Commit).Save(context.Background()); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (p *projectManager) setProjectWarning(ctx context.Context, id, warning string) {
+	_, _ = p.store.Project.Update().Where(projectent.ID(id)).SetWarning(warning).Save(ctx)
 }
 
 func verifyCompleteCommit(repo *git.Repository, commit *object.Commit, checked map[plumbing.Hash]struct{}, maxObjects int) error {
