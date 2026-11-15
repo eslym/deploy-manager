@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent"
 	"github.com/eslym/deploy-manager/lib/ent/projectsshkey"
 
 	git "github.com/go-git/go-git/v5"
@@ -204,7 +205,7 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT p.id,p.name,p.remote_url,p.last_fetched,p.warning,COALESCE(k.key_id,'') FROM projects p LEFT JOIN project_ssh_keys k ON p.id=k.project_id ORDER BY p.created_at,p.id`)
+	rows, err := a.db.Query(`SELECT id,name,remote_url,last_fetched,warning FROM projects ORDER BY created_at,id`)
 	if err != nil {
 		http.Error(w, "projects are temporarily unavailable", 500)
 		return
@@ -214,7 +215,7 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var x project
 		var fetched sql.NullInt64
-		if err := rows.Scan(&x.ID, &x.Name, &x.URL, &fetched, &x.Warning, &x.KeyID); err != nil {
+		if err := rows.Scan(&x.ID, &x.Name, &x.URL, &fetched, &x.Warning); err != nil {
 			http.Error(w, "projects are temporarily unavailable", 500)
 			return
 		}
@@ -227,6 +228,19 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 	if rows.Err() != nil {
 		http.Error(w, "projects are temporarily unavailable", 500)
 		return
+	}
+	if err := rows.Close(); err != nil {
+		http.Error(w, "projects are temporarily unavailable", 500)
+		return
+	}
+	for i := range out {
+		assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(out[i].ID)).Only(r.Context())
+		if assignmentErr == nil {
+			out[i].KeyID = assignment.KeyID
+		} else if !ent.IsNotFound(assignmentErr) {
+			http.Error(w, "projects are temporarily unavailable", 500)
+			return
+		}
 	}
 	writeJSON(w, out)
 }
@@ -438,10 +452,12 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	var sshAuth transport.AuthMethod
 	if strings.HasPrefix(remote, "ssh://") {
 		parsed, host, port, _, parseErr := safeSSHRemote(remote)
-		if parseErr != nil || p.db.QueryRow(`SELECT key_id FROM project_ssh_keys WHERE project_id=?`, id).Scan(&keyID) != nil {
+		assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(id)).Only(r.Context())
+		if parseErr != nil || assignmentErr != nil {
 			http.Error(w, "SSH repository key is unavailable", 400)
 			return
 		}
+		keyID = assignment.KeyID
 		sshUser = "git"
 		if parsed.User != nil {
 			sshUser = parsed.User.Username()
