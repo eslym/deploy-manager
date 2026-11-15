@@ -150,7 +150,9 @@ key configured. Put it behind an HTTPS-terminating proxy, set `DM_ORIGIN` to
 the public HTTPS origin, and set `DM_TRUSTED_PROXY` to the proxy's source IP or
 CIDR if it is not loopback. TLS can still be enabled directly by setting both
 `DM_TLS_CERT` and `DM_TLS_KEY` (or passing the corresponding flags). Generate
-setup/recovery links with an explicit public HTTPS `--url`.
+setup/recovery links with an explicit public HTTPS `--url`. The image runs
+`serve` by default; pass `setup` or `recover` as the container command to use
+those CLI modes with the same mounted data and key paths.
 
 Loopback HTTP is allowed for initial local registration, but it is **not** a
 substitute for HTTPS login and authenticated dashboard use.

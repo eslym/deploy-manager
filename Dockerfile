@@ -34,4 +34,5 @@ ENV DM_DATA=/data \
 
 VOLUME ["/data", "/published"]
 EXPOSE 8080
-ENTRYPOINT ["/usr/bin/deploy-manager", "serve"]
+ENTRYPOINT ["/usr/bin/deploy-manager"]
+CMD ["serve"]
