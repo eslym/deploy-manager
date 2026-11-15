@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { tick } from 'svelte';
 	import Deployments from '#lib/components/Deployments.svelte';
 	import WebhookSetup from '#lib/components/WebhookSetup.svelte';
 	type Project = {
@@ -52,7 +53,10 @@
 	let lfsNotice = $state('');
 	let selected = $state('');
 	let projectDeleteConfirmation = $state('');
-	let cacheRecreateConfirmation = $state(false);
+	let cacheRecreateConfirmation = $state('');
+	let cacheRecreateTrigger: HTMLButtonElement | undefined = $state();
+	let cacheRecreateDialog: HTMLDivElement | undefined = $state();
+	let cacheRecreateConfirmButton: HTMLButtonElement | undefined = $state();
 	let cacheRecreateBusy = $state(false);
 	let cacheRecreateError = $state('');
 	let cacheRecreateNotice = $state('');
@@ -360,7 +364,7 @@
 		return `${size.toLocaleString(undefined, { maximumFractionDigits: unit === 0 ? 0 : 1 })} ${units[unit]}`;
 	}
 	async function recreateCache(project: Project) {
-		if (cacheRecreateBusy || !cacheRecreateConfirmation) return;
+		if (cacheRecreateBusy || cacheRecreateConfirmation !== project.id) return;
 		cacheRecreateBusy = true;
 		cacheRecreateError = '';
 		cacheRecreateNotice = '';
@@ -373,14 +377,48 @@
 			storageCleared = true;
 			const refreshedProjects: Project[] = await request('/api/projects');
 			projects = refreshedProjects;
-			cacheRecreateConfirmation = false;
-			cacheRecreateNotice = 'Repository storage cleared. Sizes updated.';
+			closeCacheRecreateConfirmation();
+			if (selected === project.id)
+				cacheRecreateNotice = 'Repository storage cleared. Sizes updated.';
 		} catch (cause) {
 			cacheRecreateError = storageCleared
 				? 'Storage was cleared, but the sizes could not be refreshed. Reload the page to check them.'
 				: 'Could not clear repository storage. Try again.';
 		} finally {
 			cacheRecreateBusy = false;
+		}
+	}
+	async function openCacheRecreateConfirmation(project: Project) {
+		cacheRecreateTrigger =
+			document.activeElement instanceof HTMLButtonElement ? document.activeElement : undefined;
+		cacheRecreateConfirmation = project.id;
+		cacheRecreateError = '';
+		cacheRecreateNotice = '';
+		await tick();
+		cacheRecreateConfirmButton?.focus();
+	}
+	function closeCacheRecreateConfirmation() {
+		cacheRecreateConfirmation = '';
+		void tick().then(() => cacheRecreateTrigger?.focus());
+	}
+	function trapCacheRecreateFocus(event: KeyboardEvent) {
+		if (event.key === 'Escape' && !cacheRecreateBusy) {
+			event.preventDefault();
+			closeCacheRecreateConfirmation();
+			return;
+		}
+		if (event.key !== 'Tab' || !cacheRecreateDialog) return;
+		const focusable = Array.from(
+			cacheRecreateDialog.querySelectorAll<HTMLElement>('button:not(:disabled)')
+		);
+		const first = focusable[0];
+		const last = focusable.at(-1);
+		if (event.shiftKey && document.activeElement === first) {
+			event.preventDefault();
+			last?.focus();
+		} else if (!event.shiftKey && document.activeElement === last) {
+			event.preventDefault();
+			first?.focus();
 		}
 	}
 	onMount(() => {
@@ -561,7 +599,7 @@
 								aria-pressed={selected === project.id}
 								onclick={() => {
 									selected = project.id;
-									cacheRecreateConfirmation = false;
+									closeCacheRecreateConfirmation();
 									cacheRecreateError = '';
 									cacheRecreateNotice = '';
 									search = '';
@@ -614,25 +652,35 @@
 					{#if cacheRecreateNotice}<p role="status" class="mt-2 text-sm text-[#214c30]">
 							{cacheRecreateNotice}
 						</p>{/if}
-					{#if cacheRecreateConfirmation}
+					{#if cacheRecreateConfirmation === project?.id}
 						<div
+							bind:this={cacheRecreateDialog}
 							class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3"
-							aria-label="Confirm clearing repository storage"
+							role="dialog"
+							aria-modal="true"
+							aria-labelledby="cache-recreate-title"
+							aria-describedby="cache-recreate-warning"
+							tabindex="-1"
+							onkeydown={trapCacheRecreateFocus}
 						>
-							<p class="m-0 text-sm text-amber-950">
+							<h4 id="cache-recreate-title" class="m-0 font-semibold text-amber-950">
+								Confirm clearing repository storage
+							</h4>
+							<p id="cache-recreate-warning" role="alert" class="mt-2 text-sm text-amber-950">
 								This can free disk space. It permanently removes commits no longer reachable from a
 								branch or tag, plus Git LFS files the server can no longer provide. You may lose the
 								ability to redeploy or roll back releases that need them.
 							</p>
 							<div class="mt-3 flex flex-wrap gap-2">
 								<button
+									bind:this={cacheRecreateConfirmButton}
 									class="min-h-9 rounded-lg bg-amber-900 px-3 text-sm font-semibold text-white disabled:opacity-60"
 									onclick={() => project && recreateCache(project)}
 									disabled={cacheRecreateBusy || !project}>Clear cache</button
 								>
 								<button
 									class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold disabled:opacity-60"
-									onclick={() => (cacheRecreateConfirmation = false)}
+									onclick={closeCacheRecreateConfirmation}
 									disabled={cacheRecreateBusy}>Cancel</button
 								>
 							</div>
@@ -640,7 +688,7 @@
 					{:else}
 						<button
 							class="mt-2 min-h-9 rounded-lg border border-amber-500 px-3 text-sm font-semibold text-amber-950 disabled:opacity-60"
-							onclick={() => (cacheRecreateConfirmation = true)}
+							onclick={() => project && openCacheRecreateConfirmation(project)}
 							disabled={cacheRecreateBusy || !project}>Clear cache…</button
 						>
 					{/if}

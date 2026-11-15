@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,8 @@ type automationFixture struct {
 	secret                                      []byte
 	provider                                    string
 	gitFetches                                  atomic.Int32
+	fetchStarted                                chan struct{}
+	fetchRelease                                chan struct{}
 }
 
 func newAutomationFixture(t *testing.T, providers ...string) *automationFixture {
@@ -54,6 +57,13 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 		defer session.Close()
 		if r.Method == http.MethodGet {
 			f.gitFetches.Add(1)
+			if f.fetchStarted != nil {
+				select {
+				case f.fetchStarted <- struct{}{}:
+				default:
+				}
+				<-f.fetchRelease
+			}
 			adv, err := session.AdvertisedReferencesContext(r.Context())
 			if err != nil {
 				http.Error(w, "advertisement failed", 500)
@@ -120,6 +130,52 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	response.Body.Close()
 	f.secret = []byte(setup.Secret)
 	return f
+}
+
+func TestBranchFetchAndCacheRecreationCompleteWithoutUsingPartialCache(t *testing.T) {
+	f := newAutomationFixture(t)
+	f.fetchStarted = make(chan struct{}, 1)
+	f.fetchRelease = make(chan struct{})
+
+	fetchDone := make(chan error, 1)
+	go func() { fetchDone <- f.app.fetchProjectForBranch(context.Background(), f.projectID) }()
+	select {
+	case <-f.fetchStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("branch fetch never reached the remote repository")
+	}
+
+	recreationStarted := make(chan struct{})
+	recreationDone := make(chan *http.Response, 1)
+	go func() {
+		close(recreationStarted)
+		recreationDone <- projectPost(t, f.server.Client(), f.server.URL, f.cookie,
+			"/api/projects/"+f.projectID+"/cache/recreate", `{"confirm":true}`)
+	}()
+	<-recreationStarted
+	close(f.fetchRelease)
+
+	select {
+	case err := <-fetchDone:
+		if err != nil {
+			t.Fatalf("branch fetch failed before cache recreation: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("branch fetch deadlocked with cache recreation")
+	}
+	select {
+	case response := <-recreationDone:
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("cache recreation status=%d body=%q", response.StatusCode, responseText(response))
+		}
+		response.Body.Close()
+	case <-time.After(10 * time.Second):
+		t.Fatal("cache recreation deadlocked with branch fetch")
+	}
+
+	if _, err := os.Stat(f.app.projects.repoPath(f.projectID)); !os.IsNotExist(err) {
+		t.Fatalf("cache recreation did not finish after branch fetch: %v", err)
+	}
 }
 
 func (f *automationFixture) createBranch(t *testing.T, name string) string {
