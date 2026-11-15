@@ -1,11 +1,38 @@
 package lib
 
 import (
+	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) {
+	f := newAutomationFixture(t)
+	id := f.createBranch(t, "permanent-rollback")
+	before, err := identity(f.app.deploymentPath(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	missing := strings.Repeat("f", 40)
+	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments/"+id+"/rollback", `{"commit":"`+missing+`","permanent":true}`)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("permanent rollback request: %d %s", response.StatusCode, responseText(response))
+	}
+	var queued struct{ JobID string }
+	if err = json.NewDecoder(response.Body).Decode(&queued); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, queued.JobID, "failed")
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	if after, err := identity(f.app.deploymentPath(id)); err != nil || after != before {
+		t.Fatalf("failed permanent rollback changed live publication: %v", err)
+	}
+}
 
 func TestTemporaryRollbackSurvivesRestartWithoutUnsolicitedCatchUp(t *testing.T) {
 	for _, provider := range []string{"github", "gitea"} {

@@ -774,19 +774,19 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			return
 		}
 	}
-	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
+	currentDeployment, checkErr := a.store.Deployment.Get(ctx, d.ID)
+	if checkErr != nil || currentDeployment.Generation != generation || currentDeployment.Status == "deleting" || currentDeployment.Status == "deletion_failed" || (d.TargetKind != "branch" && currentDeployment.CommitID != d.Commit) {
 		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
 		return
 	}
 	if d.automatic {
-		var paused bool
-		var epoch int64
-		if err := a.db.QueryRow(`SELECT automation_paused,automation_epoch FROM deployments WHERE id=?`, d.ID).Scan(&paused, &epoch); err != nil {
+		currentDeployment, err := a.store.Deployment.Get(ctx, d.ID)
+		if err != nil {
 			a.failJob(jobID, d.ID, generation, "Automatic deployment status could not be checked; the current publication was kept")
 			return
 		}
-		if paused || epoch != d.automationEpoch {
-			a.finishAutomaticFetch(jobID, d.ID, generation, paused)
+		if currentDeployment.AutomationPaused != 0 || currentDeployment.AutomationEpoch != d.automationEpoch {
+			a.finishAutomaticFetch(jobID, d.ID, generation, currentDeployment.AutomationPaused != 0)
 			return
 		}
 	}
