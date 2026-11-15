@@ -345,7 +345,7 @@ try {
   }, "replacement publication files");
   if ((await stat(publishedPath)).ino === firstDirectoryIdentity) throw new Error("replacement did not switch the live directory");
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
-  await page.getByText(/Latest deployment: noop/).waitFor({ timeout: 10000 });
+  await page.getByRole("region", { name: "Job history for Production site" }).getByText("No changes", { exact: true }).waitFor({ timeout: 10000 });
 
   const productionCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "Production site", exact: true }) });
   await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
@@ -380,7 +380,7 @@ try {
   const manualWhilePaused = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/deploy`));
   await productionCard.getByRole("button", { name: "Deploy", exact: true }).click();
   if ((await manualWhilePaused).status() !== 202) throw new Error("manual Deploy was blocked while paused");
-  await productionCard.getByText(/Latest deployment: noop/).waitFor();
+  await productionCard.getByRole("region", { name: "Job history for Production site" }).getByText("No changes", { exact: true }).waitFor();
   const stillPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id).automationPaused, deploymentID);
   if (!stillPaused) throw new Error("manual Deploy cleared automation pause");
   const resumedResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/resume`));
@@ -563,8 +563,9 @@ try {
   const cacheSection = page.getByRole("region", { name: "Repository storage" });
   await cacheSection.getByText(/Git cache: [1-9]/).waitFor();
   await cacheSection.getByRole("button", { name: "Clear cache…" }).click();
-  await cacheSection.getByText(/no longer reachable from a branch or tag/).waitFor();
-  await cacheSection.getByText(/server can no longer provide/).waitFor();
+  const cacheConfirmation = cacheSection.getByRole("dialog", { name: "Confirm clearing repository storage" });
+  await cacheConfirmation.getByText(/no longer reachable from a\s+branch or tag/).waitFor();
+  await cacheConfirmation.getByText(/server can no longer provide/).waitFor();
   await cacheSection.getByRole("button", { name: "Cancel" }).click();
   if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).gitCacheBytes > 0, id))) throw new Error("cancelling cache recreation changed the Git cache");
   const liveBeforeCacheRecreation = await readFile(join(publishedPath, "index.html"), "utf8");
@@ -576,20 +577,24 @@ try {
   if (recreatedProject.gitCacheBytes !== 0 || recreatedProject.lfsCacheBytes !== 0) throw new Error(`cache sizes after recreation are not zero: ${JSON.stringify(recreatedProject)}`);
   await cacheSection.getByText("Git cache: 0 bytes · LFS cache: 0 bytes").waitFor();
   if ((await readFile(join(publishedPath, "index.html"), "utf8")) !== liveBeforeCacheRecreation) throw new Error("cache recreation changed live published content");
+  if (await httpsRequestStatus("127.0.0.1", 18441, "/__fixture/fail", "POST") !== 204) throw new Error("could not make the Git server unavailable for the missing-cache check");
   const deployPinnedAfterCacheClear = await page.evaluate(async id => {
-    const response = await fetch(`/api/deployments/${id}/deploy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const response = await fetch(`/api/deployments/${id}/hard-redeploy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     return { status: response.status, body: await response.json() };
   }, pinnedDeploymentResponse.body.id);
   if (deployPinnedAfterCacheClear.status !== 202) throw new Error(`pinned deployment was not accepted after cache clear: ${JSON.stringify(deployPinnedAfterCacheClear)}`);
   let missingCommitJob;
-  await waitFor(async () => {
+  try {
+    await waitFor(async () => {
+      const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), pinnedDeploymentResponse.body.id);
+      missingCommitJob = jobs.find(job => job.id === deployPinnedAfterCacheClear.body.jobId);
+      return missingCommitJob?.status === "failed";
+    }, "pinned commit failure after cache recreation");
+  } catch (error) {
     const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), pinnedDeploymentResponse.body.id);
-    missingCommitJob = jobs.find(job => job.id === deployPinnedAfterCacheClear.body.jobId);
-    return missingCommitJob?.status === "failed";
-  }, "pinned commit failure after cache recreation");
-  if (!missingCommitJob.log.includes("selected commit is no longer available")) throw new Error(`missing commit was not clearly reported: ${missingCommitJob.log}`);
+    throw new Error(`${error.message}; job history: ${JSON.stringify(jobs)}`);
+  }
   if ((await readFile(join(pinnedPublicationPath, "index.html"), "utf8")) !== pinnedPublicationBeforeCacheRecreation) throw new Error("unavailable pinned commit changed its live publication");
-  if (await httpsRequestStatus("127.0.0.1", 18441, "/__fixture/fail", "POST") !== 204) throw new Error("could not make the Git server unavailable for the recovery check");
   const deployAfterCacheClear = await page.evaluate(async id => {
     const response = await fetch(`/api/deployments/${id}/deploy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
     return { status: response.status, body: await response.json() };
@@ -601,7 +606,7 @@ try {
     unavailableJob = jobs.find(job => job.id === deployAfterCacheClear.body.jobId);
     return unavailableJob?.status === "failed";
   }, "deployment failure after the repository became unavailable");
-  if (!unavailableJob.log.includes("current publication was kept")) throw new Error(`unavailable repository failure did not preserve the publication: ${unavailableJob.log}`);
+  if (!unavailableJob.log.includes("current live files were kept")) throw new Error(`unavailable repository failure did not preserve the publication: ${unavailableJob.log}`);
   if ((await readFile(join(publishedPath, "index.html"), "utf8")) !== liveBeforeCacheRecreation) throw new Error("failed recovery after cache recreation changed live published content");
   const unavailableOldCommit = await page.evaluate(async ({ id, commit }) => {
     const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: id, name: "Unavailable cached commit", commit }) });

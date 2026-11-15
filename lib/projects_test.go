@@ -3,6 +3,7 @@ package lib
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -236,6 +237,39 @@ func TestProjectCacheSizesAndExplicitRecreationOverHTTP(t *testing.T) {
 	if len(projects) != 1 || projects[0].GitCacheBytes != 0 || projects[0].LFSCacheBytes != 0 {
 		t.Fatalf("cache sizes after recreation = %+v, want project retained with empty caches", projects)
 	}
+
+	// The LFS object was verified and cached before recreation. Its server now
+	// advertises the object but cannot serve its bytes; recreation must not
+	// leave stale local data that makes this object appear recoverable.
+	var lfsServerURL string
+	lfsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/objects/batch") {
+			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q}}}]}`, payloadOID, len(payload), lfsServerURL+"/unavailable")
+			return
+		}
+		http.Error(w, "object unavailable", http.StatusNotFound)
+	}))
+	defer lfsServer.Close()
+	lfsServerURL = lfsServer.URL
+	pool := x509.NewCertPool()
+	pool.AddCert(lfsServer.Certificate())
+	oldRoots := lfsTestRootCAs
+	lfsTestRootCAs = pool
+	t.Cleanup(func() { lfsTestRootCAs = oldRoots })
+	hydrator, err := newLFSHydratorWithBudget(projectID, lfsProjectSettings{
+		Endpoint: lfsServer.URL + "/info/lfs", ObjectOrigins: []string{lfsServer.URL},
+		AllowInternal: true, InternalAddresses: map[string][]string{lfsServer.URL: {"127.0.0.1"}},
+	}, app.projects.root, 1<<20, app.projects.maxCacheBytes, 5*time.Second, &app.projects.lfsCacheMu)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := hydrator.hydrate(context.Background(), lfsPointer{OID: payloadOID, Size: int64(len(payload))}); err == nil {
+		t.Fatal("recreated cache unexpectedly restored a payload unavailable from its LFS server")
+	}
+	if validCachedLFS(filepath.Join(app.projects.root, "lfs-cache", projectID, payloadOID), lfsPointer{OID: payloadOID, Size: int64(len(payload))}) {
+		t.Fatal("unavailable LFS payload was left cached after recreation")
+	}
+
 	type concurrentResult struct {
 		status int
 		body   []byte

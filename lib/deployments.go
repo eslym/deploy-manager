@@ -819,7 +819,17 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 		if cleanupErr := a.cleanupUnpublishedStage(d.ID, jobID); cleanupErr != nil {
 			err = errors.New("publication staging cleanup failed; restart reconciliation is required")
 		}
-		a.failJob(jobID, d.ID, generation, sanitizePublicationError(err))
+		failure := sanitizePublicationError(err)
+		pm := a.projects
+		pm.cacheMu.RLock()
+		repo, repositoryErr := git.PlainOpen(pm.repoPath(d.ProjectID))
+		if repositoryErr != nil {
+			failure = "The project Git cache is unavailable; the current live files were kept"
+		} else if _, commitErr := repo.CommitObject(plumbing.NewHash(d.Commit)); commitErr != nil {
+			failure = "The selected commit is no longer available in the project cache; the current live files were kept"
+		}
+		pm.cacheMu.RUnlock()
+		a.failJob(jobID, d.ID, generation, failure)
 		return
 	}
 }
@@ -1188,8 +1198,10 @@ func sanitizePublicationError(err error) string {
 		return "This commit has too many files to publish; no files were changed"
 	case strings.Contains(s, "byte limit"):
 		return "This commit is larger than the configured publication limit; no files were changed"
-	case strings.Contains(s, "target is not a complete commit"):
+	case strings.Contains(s, "target is not a complete commit") || strings.Contains(s, "target commit is missing or too large"):
 		return "The selected commit is no longer available in the project repository; the current live files were kept"
+	case strings.Contains(s, "project repository is unavailable"):
+		return "The project Git cache is unavailable, so the selected commit cannot be published; the current live files were kept"
 	case strings.Contains(s, "timeout"):
 		return "Publication timed out; no files were changed"
 	default:
