@@ -230,7 +230,7 @@ func pendingFixtureLoginFinish(t *testing.T, app *App, password string) []byte {
 }
 
 func newRegistrationFlow(t *testing.T, app *App, grant, origin, password string) (string, []byte) {
-	return newRegistrationFlowWithIdentities(t, app, grant, origin, password, []byte("administrator"), nil)
+	return newRegistrationFlowWithIdentities(t, app, grant, origin, password, nil, nil)
 }
 
 func newRegistrationFlowWithIdentities(t *testing.T, app *App, grant, origin, password string, clientIdentity, serverIdentity []byte) (string, []byte) {

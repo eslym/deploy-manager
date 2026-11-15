@@ -104,18 +104,47 @@ restore only database/key files while retaining unrelated publication state.
 Keep the restored snapshot and recovery evidence protected until the installation
 has been verified and a new backup has been completed.
 
-## Rehearsal
+## Application restore rehearsal
 
-The operator recovery rehearsal exercises the real daemon startup/maintenance
-path, the documented offline file actions, OPAQUE login, repository-key signing,
-durable jobs, and preservation of a live publication. Run after building the
-embedded frontend assets:
+Run the isolated full-installation rehearsal after building the embedded
+frontend assets:
 
 ```sh
-go test ./lib -run '^TestDocumentedOperatorRecoveryRehearsal$' -count=1 -v
+go test ./lib -run '^TestDocumentedFullInstallationRestoreRehearsal$' -count=1 -v
 ```
 
-This is specifically a startup-upgrade recovery rehearsal, not proof that a
-storage provider's whole-volume snapshot is atomic or identity preserving.
-Rehearse the full-installation snapshot and restore procedure on the actual
-storage/supervisor configuration before relying on it for disaster recovery.
+It sets up an administrator through the OPAQUE HTTP registration/login protocol,
+creates a managed SSH repository key, approves a real test SSH host, and fetches
+refs from an in-process SSH Git server. It stages a full installation snapshot,
+restores that generation while preserving directory identities, performs the
+documented offline grant purge, then starts the application. The post-restore
+checks perform OPAQUE login and recovery, a real SSH repository refresh using
+the restored encrypted key and SQLite host trust, reject stale sessions,
+pending logins, and recovery grants, reject mismatched external keys without
+rewriting them, and reconcile a publication interrupted after directory
+exchange plus a due cleanup obligation. It verifies the replaced directory is
+retained under the configured grace period rather than deleted prematurely.
+Recovery is issued using the same grant-issuer path used by the `recover` CLI
+command.
+
+The test's directory rename is an isolated identity-preserving snapshot/restore
+stand-in. It is application evidence, **not** a proof that a particular storage
+provider captures a consistent atomic snapshot. Separately, real child-process
+crash and restart fault-injection coverage for every publication boundary is
+available with:
+
+```sh
+go test ./lib -run '^TestPublicationProcessCrashesReconcileDirectoryIdentity$' -count=1 -v
+```
+
+The OPAQUE grant invalidation/CLI recovery slice can also be run independently:
+
+```sh
+go test ./lib -run '^TestRestoredInstallationGrantPurgeAndCLIRecovery$' -count=1 -v
+```
+
+The startup-upgrade rehearsal in
+[`upgrade-recovery.md`](upgrade-recovery.md#rehearsal) is a separate,
+database-only recovery scenario. Before relying on disaster recovery, operators
+must still rehearse the actual storage snapshot, filesystem identity preservation,
+and supervisor stop/restart procedure on their own installation.
