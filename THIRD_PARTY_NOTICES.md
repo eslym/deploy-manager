@@ -31,9 +31,10 @@ license and notice files for newly resolved modules are retained under
 the schema's `go:generate` directive and is invoked only by maintainers; no
 generator executable or source checkout is needed to build or run the program.
 Ent schema reconciliation is not invoked; goose remains the sole migration
-executor. `github.com/go-openapi/inflect v0.19.0` is present in the resolved
-graph but its module archive contains no root license/notice file; distribution
-license clearance remains subject to the repository-wide issue #26 inventory.
+executor. `github.com/go-openapi/inflect v0.19.0` includes an MIT/Expat license
+in its module archive's `LICENCE` file, retained verbatim at
+`third_party/licenses/github.com/go-openapi/inflect@v0.19.0/LICENCE`.
+The repository-wide issue #26 distribution inventory remains separate.
 
 Public repository support adds `github.com/go-git/go-git/v5 v5.19.3`. The
 source-provided license and notice files for the newly added Go modules are
