@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
+	jobmodel "github.com/eslym/deploy-manager/lib/ent/deploymentjob"
 	"github.com/eslym/deploy-manager/lib/ent/projectref"
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -542,26 +544,26 @@ func (a *App) enqueueDeployment(deploymentID, commit string, generation int64) (
 		return "", err
 	}
 	now := a.cfg.Now().UTC().UnixNano()
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(context.Background())
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
-	var currentStatus string
-	if err = tx.QueryRow(`SELECT status FROM deployments WHERE id=? AND generation=?`, deploymentID, generation).Scan(&currentStatus); err != nil {
-		return "", err
-	}
-	if currentStatus == "deleting" || currentStatus == "deletion_failed" {
-		return "", errors.New("deployment is being deleted")
-	}
-	if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at) VALUES(?,?,?,?,'queued','Publication queued',?,?)`, jobID, deploymentID, commit, generation, now, now); err != nil {
-		return "", err
-	}
-	res, err := tx.Exec(`UPDATE deployments SET status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, now, deploymentID, generation)
+	current, err := tx.Deployment.Query().Where(deploymentmodel.ID(deploymentID), deploymentmodel.Generation(generation)).Only(context.Background())
 	if err != nil {
 		return "", err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
+	if current.Status == "deleting" || current.Status == "deletion_failed" {
+		return "", errors.New("deployment is being deleted")
+	}
+	if _, err = tx.DeploymentJob.Create().SetID(jobID).SetDeploymentID(deploymentID).SetCommitID(commit).SetGeneration(generation).SetStatus("queued").SetLog("Publication queued").SetCreatedAt(now).SetUpdatedAt(now).Save(context.Background()); err != nil {
+		return "", err
+	}
+	res, err := tx.Deployment.Update().Where(deploymentmodel.ID(deploymentID), deploymentmodel.Generation(generation), deploymentmodel.StatusNotIn("deleting", "deletion_failed")).SetStatus("queued").SetError("").SetUpdatedAt(now).Save(context.Background())
+	if err != nil {
+		return "", err
+	}
+	if res != 1 {
 		return "", errors.New("deployment is being deleted")
 	}
 	if err = tx.Commit(); err != nil {
@@ -638,11 +640,11 @@ func (a *App) runDeploymentJob(jobID string) {
 		return
 	}
 	defer func() { <-a.deploySem }()
-	var deploymentID string
-	var generation int64
-	if err := a.db.QueryRow(`SELECT deployment_id,generation FROM deployment_jobs WHERE id=? AND status='queued'`, jobID).Scan(&deploymentID, &generation); err != nil {
+	job, err := a.store.DeploymentJob.Query().Where(jobmodel.ID(jobID), jobmodel.Status("queued")).Only(context.Background())
+	if err != nil {
 		return
 	}
+	deploymentID, generation := job.DeploymentID, job.Generation
 	if err := fault("before-job-lock"); err != nil {
 		a.failJob(jobID, deploymentID, generation, "publication locking was interrupted")
 		return
@@ -692,30 +694,27 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 	defer cancel()
 	var d deployment
 	var generation int64
-	var projectID string
-	var createdAt, updatedAt int64
 	var forceRedeploy bool
-	var rollbackCommit string
-	if err := a.db.QueryRow(`SELECT rollback_commit FROM deployment_jobs WHERE id=?`, jobID).Scan(&rollbackCommit); err != nil {
+	job, err := a.store.DeploymentJob.Query().Where(jobmodel.ID(jobID), jobmodel.Status("queued")).WithDeployment().Only(ctx)
+	if err != nil || job.Edges.Deployment == nil || job.Generation != job.Edges.Deployment.Generation {
+		_, _ = a.store.DeploymentJob.UpdateOneID(jobID).Where(jobmodel.Status("queued")).SetStatus("superseded").SetLog("deployment was removed or its target changed").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
 		return
 	}
-	err := a.db.QueryRow(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.generation,d.live_commit,d.live_dev,d.live_ino,d.status,d.error,d.created_at,d.updated_at,j.force_redeploy,j.automatic,j.automation_epoch FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.id=? AND j.status='queued' AND j.generation=d.generation`, jobID).Scan(&d.ID, &projectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &generation, &d.LiveCommit, &d.LiveDev, &d.LiveIno, &d.Status, &d.Error, &createdAt, &updatedAt, &forceRedeploy, &d.automatic, &d.automationEpoch)
-	if err != nil {
-		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log='deployment was removed or its target changed',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
-		return
-	}
-	d.ProjectID = projectID
-	d.Rollback = rollbackCommit != ""
-	d.CreatedAt = time.Unix(0, createdAt).UTC()
-	d.UpdatedAt = time.Unix(0, updatedAt).UTC()
+	model := job.Edges.Deployment
+	generation = job.Generation
+	d.ID, d.ProjectID, d.Name = model.ID, model.ProjectID, model.Name
+	d.Commit, d.TargetKind, d.TargetName = model.CommitID, model.TargetKind, model.TargetName
+	d.LiveCommit, d.LiveDev, d.LiveIno = model.LiveCommit, uint64(model.LiveDev), uint64(model.LiveIno)
+	d.Status, d.Error = model.Status, model.Error
+	d.automatic, d.automationEpoch = job.Automatic != 0, job.AutomationEpoch
+	forceRedeploy = job.ForceRedeploy != 0
+	d.CreatedAt = time.Unix(0, model.CreatedAt).UTC()
+	d.UpdatedAt = time.Unix(0, model.UpdatedAt).UTC()
+	d.Rollback = job.RollbackCommit != ""
 	d.Publication = a.deploymentPath(d.ID)
 	unregister := a.registerDeploymentJob(jobID, d.ID, generation, cancel)
 	defer unregister()
-	claimed, claimErr := a.db.Exec(`UPDATE deployment_jobs SET status='running',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), jobID)
-	if claimErr != nil {
-		return
-	}
-	if claimedRows, _ := claimed.RowsAffected(); claimedRows != 1 {
+	if _, claimErr := a.store.DeploymentJob.UpdateOneID(jobID).Where(jobmodel.Status("queued")).SetStatus("running").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); claimErr != nil {
 		return
 	}
 	var liveTarget string
@@ -737,7 +736,7 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			return
 		}
 		if d.Rollback {
-			d.Commit = rollbackCommit
+			d.Commit = job.RollbackCommit
 			a.projects.cacheMu.RLock()
 			repo, openErr := git.PlainOpen(a.projects.repoPath(d.ProjectID))
 			if openErr == nil {
@@ -898,22 +897,26 @@ func (a *App) failJob(jobID, id string, generation int64, message string) {
 func (a *App) finishJob(jobID, id string, generation int64, status, message, commit string) {
 	message = truncate(message, 512)
 	now := a.cfg.Now().UnixNano()
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(context.Background())
 	if err != nil {
 		log.Printf("cannot begin completion of deployment job %s: %v", jobID, err)
 		return
 	}
 	defer tx.Rollback()
+	update := tx.Deployment.Update().Where(deploymentmodel.ID(id), deploymentmodel.Generation(generation))
 	if status == "succeeded" {
-		if _, err = tx.Exec(`UPDATE deployments SET live_commit=?,status='live',error='',updated_at=? WHERE id=? AND generation=?`, commit, now, id, generation); err != nil {
-			log.Printf("cannot record live deployment %s: %v", id, err)
-			return
-		}
-	} else if _, err = tx.Exec(`UPDATE deployments SET status='live',error='',updated_at=? WHERE id=? AND generation=?`, now, id, generation); err != nil {
-		log.Printf("cannot record deployment status %s: %v", id, err)
+		update.SetLiveCommit(commit)
+	}
+	if _, err = update.SetStatus("live").SetError("").SetUpdatedAt(now).Save(context.Background()); err != nil {
+		log.Printf("cannot record live deployment %s: %v", id, err)
 		return
 	}
-	if _, err = tx.Exec(`UPDATE deployment_jobs SET status=?,log=substr(log || char(10) || ?,1,8192),updated_at=? WHERE id=?`, status, message, now, jobID); err != nil {
+	job, err := tx.DeploymentJob.Get(context.Background(), jobID)
+	if err != nil {
+		log.Printf("cannot read deployment job %s for completion: %v", jobID, err)
+		return
+	}
+	if _, err = tx.DeploymentJob.UpdateOneID(jobID).SetStatus(status).SetLog(truncate(job.Log+"\n"+message, 8192)).SetUpdatedAt(now).Save(context.Background()); err != nil {
 		log.Printf("cannot record completion of deployment job %s: %v", jobID, err)
 		return
 	}
@@ -1516,17 +1519,17 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UTC()
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(r.Context())
 	if err != nil {
 		http.Error(w, "deployment could not be saved", 500)
 		return
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,target_kind,target_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`, id, in.ProjectID, strings.TrimSpace(in.Name), in.Commit, in.TargetKind, in.TargetName, now.UnixNano(), now.UnixNano()); err != nil {
+	if _, err = tx.Deployment.Create().SetID(id).SetProjectID(in.ProjectID).SetName(strings.TrimSpace(in.Name)).SetCommitID(in.Commit).SetTargetKind(in.TargetKind).SetTargetName(in.TargetName).SetGeneration(1).SetCreatedAt(now.UnixNano()).SetUpdatedAt(now.UnixNano()).Save(r.Context()); err != nil {
 		http.Error(w, "a deployment with this name already exists or could not be saved", 409)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at) VALUES(?,?,?,1,'queued','Publication queued',?,?)`, job, id, in.Commit, now.UnixNano(), now.UnixNano()); err != nil {
+	if _, err = tx.DeploymentJob.Create().SetID(job).SetDeploymentID(id).SetCommitID(in.Commit).SetGeneration(1).SetStatus("queued").SetLog("Publication queued").SetCreatedAt(now.UnixNano()).SetUpdatedAt(now.UnixNano()).Save(r.Context()); err != nil {
 		http.Error(w, "deployment could not be queued", 500)
 		return
 	}
@@ -1608,32 +1611,31 @@ func (a *App) hardRedeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(r.Context())
 	if err != nil {
 		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
 		return
 	}
 	defer tx.Rollback()
-	var projectID, commit, status string
-	var generation int64
-	if err = tx.QueryRow(`SELECT project_id,commit_id,generation,status FROM deployments WHERE id=?`, id).Scan(&projectID, &commit, &generation, &status); err != nil {
+	current, err := tx.Deployment.Get(r.Context(), id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if status == "deleting" || status == "deletion_failed" {
+	if current.Status == "deleting" || current.Status == "deletion_failed" {
 		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
 		return
 	}
-	generationUpdate, updateErr := tx.Exec(`UPDATE deployments SET generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, now, id, generation)
+	generationUpdate, updateErr := tx.Deployment.Update().Where(deploymentmodel.ID(id), deploymentmodel.Generation(current.Generation), deploymentmodel.StatusNotIn("deleting", "deletion_failed")).AddGeneration(1).SetStatus("queued").SetError("").SetUpdatedAt(now).Save(r.Context())
 	if updateErr != nil {
 		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
 		return
 	}
-	if affected, _ := generationUpdate.RowsAffected(); affected != 1 {
+	if generationUpdate != 1 {
 		http.Error(w, "deployment target changed; refresh and try again", http.StatusConflict)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,force_redeploy) VALUES(?,?,?,?,'queued','Hard re-deploy queued; configured target will be refreshed',?,?,1)`, jobID, id, commit, generation+1, now, now); err != nil {
+	if _, err = tx.DeploymentJob.Create().SetID(jobID).SetDeploymentID(id).SetCommitID(current.CommitID).SetGeneration(current.Generation + 1).SetStatus("queued").SetLog("Hard re-deploy queued; configured target will be refreshed").SetCreatedAt(now).SetUpdatedAt(now).SetForceRedeploy(1).Save(r.Context()); err != nil {
 		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
 		return
 	}
@@ -1716,37 +1718,39 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(r.Context())
 	if err != nil {
 		http.Error(w, "publication could not be queued", 500)
 		return
 	}
 	defer tx.Rollback()
-	var currentCommit, currentStatus string
-	var generation int64
-	var currentKind, currentName string
-	if err = tx.QueryRow(`SELECT commit_id,target_kind,target_name,generation,status FROM deployments WHERE id=? AND project_id=?`, id, projectID).Scan(&currentCommit, &currentKind, &currentName, &generation, &currentStatus); err != nil {
+	current, err := tx.Deployment.Query().Where(deploymentmodel.ID(id), deploymentmodel.ProjectID(projectID)).Only(r.Context())
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if currentStatus == "deleting" || currentStatus == "deletion_failed" {
+	if current.Status == "deleting" || current.Status == "deletion_failed" {
 		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
 		return
 	}
-	if currentKind == input.TargetKind && currentName == input.TargetName && currentCommit == input.Commit {
+	if current.TargetKind == input.TargetKind && current.TargetName == input.TargetName && current.CommitID == input.Commit {
 		http.Error(w, "this deployment already has that target", http.StatusConflict)
 		return
 	}
-	res, err := tx.Exec(`UPDATE deployments SET commit_id=?,target_kind=?,target_name=?,automation_paused=CASE WHEN ?='branch' THEN automation_paused ELSE 0 END,generation=generation+1,status='queued',error='',updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, input.Commit, input.TargetKind, input.TargetName, input.TargetKind, now, id, generation)
+	update := tx.Deployment.Update().Where(deploymentmodel.ID(id), deploymentmodel.Generation(current.Generation), deploymentmodel.StatusNotIn("deleting", "deletion_failed")).SetCommitID(input.Commit).SetTargetKind(input.TargetKind).SetTargetName(input.TargetName).AddGeneration(1).SetStatus("queued").SetError("").SetUpdatedAt(now)
+	if input.TargetKind != "branch" {
+		update.SetAutomationPaused(0)
+	}
+	res, err := update.Save(r.Context())
 	if err != nil {
 		http.Error(w, "deployment target could not be saved", 500)
 		return
 	}
-	if affected, _ := res.RowsAffected(); affected != 1 {
+	if res != 1 {
 		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at) VALUES(?,?,?,?, 'queued','Commit target changed; publication queued',?,?)`, jobID, id, input.Commit, generation+1, now, now); err != nil {
+	if _, err = tx.DeploymentJob.Create().SetID(jobID).SetDeploymentID(id).SetCommitID(input.Commit).SetGeneration(current.Generation + 1).SetStatus("queued").SetLog("Commit target changed; publication queued").SetCreatedAt(now).SetUpdatedAt(now).Save(r.Context()); err != nil {
 		http.Error(w, "publication could not be queued", 500)
 		return
 	}

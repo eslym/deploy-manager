@@ -1,12 +1,12 @@
 package lib
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,8 +14,16 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 
+	entdb "github.com/eslym/deploy-manager/lib/ent"
+	depmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
+	jobmodel "github.com/eslym/deploy-manager/lib/ent/deploymentjob"
+	projectmodel "github.com/eslym/deploy-manager/lib/ent/project"
+	"github.com/eslym/deploy-manager/lib/ent/projectgiteawebhook"
+	"github.com/eslym/deploy-manager/lib/ent/projectwebhook"
+	"github.com/eslym/deploy-manager/lib/ent/webhookdelivery"
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
@@ -81,35 +89,25 @@ func (a *App) giteaWebhookSettings(w http.ResponseWriter, r *http.Request) {
 	a.providerWebhookSettings(w, r, giteaWebhookProvider)
 }
 
-// Keep existing GitHub encrypted records intact; each provider has its own
-// per-project credential. Table names are application constants, never input.
-func webhookSettingsTable(provider string) string {
-	if provider == giteaWebhookProvider {
-		return "project_gitea_webhooks"
-	}
-	return "project_webhooks"
-}
-
 func (a *App) providerWebhookSettings(w http.ResponseWriter, r *http.Request, provider string) {
 	id := r.PathValue("id")
-	table := webhookSettingsTable(provider)
 	if r.Method == http.MethodGet {
 		if !a.projectAuthorized(w, r, false) {
 			return
 		}
-		var configured int
-		if err := a.db.QueryRow(`SELECT count(*) FROM `+table+` WHERE project_id=?`, id).Scan(&configured); err != nil {
+		configured, err := a.webhookSettingsExist(provider, id)
+		if err != nil {
 			http.Error(w, "webhook settings are unavailable", http.StatusInternalServerError)
 			return
 		}
-		if configured == 0 {
-			var exists int
-			if err := a.db.QueryRow(`SELECT count(*) FROM projects WHERE id=?`, id).Scan(&exists); err != nil || exists == 0 {
+		if !configured {
+			exists, err := a.store.Project.Query().Where(projectmodel.ID(id)).Exist(r.Context())
+			if err != nil || !exists {
 				http.NotFound(w, r)
 				return
 			}
 		}
-		writeJSON(w, map[string]any{"configured": configured != 0, "url": "/webhooks/" + provider + "/" + id})
+		writeJSON(w, map[string]any{"configured": configured, "url": "/webhooks/" + provider + "/" + id})
 		return
 	}
 	if !a.projectAuthorized(w, r, true) {
@@ -142,18 +140,18 @@ func (a *App) providerWebhookSettings(w http.ResponseWriter, r *http.Request, pr
 		http.Error(w, "webhook secret could not be protected", http.StatusInternalServerError)
 		return
 	}
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(r.Context())
 	if err != nil {
 		http.Error(w, "webhook secret could not be saved", http.StatusInternalServerError)
 		return
 	}
 	defer tx.Rollback()
-	var exists int
-	if err = tx.QueryRow(`SELECT count(*) FROM projects WHERE id=?`, id).Scan(&exists); err != nil || exists == 0 {
+	exists, err := tx.Project.Query().Where(projectmodel.ID(id)).Exist(r.Context())
+	if err != nil || !exists {
 		http.NotFound(w, r)
 		return
 	}
-	if _, err = tx.Exec(`INSERT INTO `+table+`(project_id,secret,created_at) VALUES(?,?,?) ON CONFLICT(project_id) DO UPDATE SET secret=excluded.secret,created_at=excluded.created_at`, id, sealed, a.cfg.Now().UnixNano()); err != nil {
+	if err = saveProviderWebhookSecret(r.Context(), tx, provider, id, sealed, a.cfg.Now().UnixNano()); err != nil {
 		http.Error(w, "webhook secret could not be saved", http.StatusInternalServerError)
 		return
 	}
@@ -219,7 +217,19 @@ func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider s
 		return
 	}
 	var sealed []byte
-	err = a.db.QueryRow(`SELECT secret FROM `+webhookSettingsTable(provider)+` WHERE project_id=?`, projectID).Scan(&sealed)
+	if provider == giteaWebhookProvider {
+		row, getErr := a.store.ProjectGiteaWebhook.Get(r.Context(), projectID)
+		err = getErr
+		if err == nil {
+			sealed = row.Secret
+		}
+	} else {
+		row, getErr := a.store.ProjectWebhook.Get(r.Context(), projectID)
+		err = getErr
+		if err == nil {
+			sealed = row.Secret
+		}
+	}
 	if err != nil {
 		http.Error(w, "webhook is not configured", http.StatusNotFound)
 		return
@@ -286,12 +296,44 @@ func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider s
 
 var errWebhookQueueFull = errors.New("webhook queue full")
 
+func saveProviderWebhookSecret(ctx context.Context, tx *entdb.Tx, provider, projectID string, sealed []byte, createdAt int64) error {
+	if provider == giteaWebhookProvider {
+		exists, err := tx.ProjectGiteaWebhook.Query().Where(projectgiteawebhook.ID(projectID)).Exist(ctx)
+		if err != nil {
+			return err
+		}
+		if exists {
+			_, err := tx.ProjectGiteaWebhook.UpdateOneID(projectID).SetSecret(sealed).SetCreatedAt(createdAt).Save(ctx)
+			return err
+		}
+		_, err = tx.ProjectGiteaWebhook.Create().SetID(projectID).SetSecret(sealed).SetCreatedAt(createdAt).Save(ctx)
+		return err
+	}
+	exists, err := tx.ProjectWebhook.Query().Where(projectwebhook.ID(projectID)).Exist(ctx)
+	if err != nil {
+		return err
+	}
+	if exists {
+		_, err := tx.ProjectWebhook.UpdateOneID(projectID).SetSecret(sealed).SetCreatedAt(createdAt).Save(ctx)
+		return err
+	}
+	_, err = tx.ProjectWebhook.Create().SetID(projectID).SetSecret(sealed).SetCreatedAt(createdAt).Save(ctx)
+	return err
+}
+
+func (a *App) webhookSettingsExist(provider, projectID string) (bool, error) {
+	if provider == giteaWebhookProvider {
+		return a.store.ProjectGiteaWebhook.Query().Where(projectgiteawebhook.ID(projectID)).Exist(context.Background())
+	}
+	return a.store.ProjectWebhook.Query().Where(projectwebhook.ID(projectID)).Exist(context.Background())
+}
+
 func (a *App) webhookSecret(projectID string) ([]byte, error) {
-	var sealed []byte
-	if err := a.db.QueryRow(`SELECT secret FROM project_webhooks WHERE project_id=?`, projectID).Scan(&sealed); err != nil {
+	row, err := a.store.ProjectWebhook.Get(context.Background(), projectID)
+	if err != nil {
 		return nil, err
 	}
-	return sealed, nil
+	return row.Secret, nil
 }
 
 // A delivery acknowledged before a process crash may have been executing when
@@ -300,12 +342,13 @@ func (a *App) webhookSecret(projectID string) ([]byte, error) {
 func (a *App) requeueInterruptedWebhookJobs() error {
 	// Rollback jobs are durable too, but interruption must never convert an
 	// explicit commit selection into an unsolicited branch-tip catch-up.
-	tx, err := a.db.Begin()
+	ctx := context.Background()
+	tx, err := a.store.Tx(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.Query(`SELECT j.id,d.id,d.commit_id,d.generation,j.automation_epoch FROM deployment_jobs j JOIN deployments d ON d.id=j.deployment_id WHERE j.status='failed' AND j.durable=1 AND j.automatic=1 AND j.rollback_commit='' AND j.retry_enqueued=0 AND j.log LIKE '%interrupted by service restart%' AND d.target_kind='branch' AND d.status NOT IN ('deleting','deletion_failed') ORDER BY j.created_at`)
+	rows, err := tx.DeploymentJob.Query().Where(jobmodel.Status("failed"), jobmodel.Durable(1), jobmodel.Automatic(1), jobmodel.RollbackCommit(""), jobmodel.RetryEnqueued(0), jobmodel.LogContains("interrupted by service restart")).WithDeployment().Order(jobmodel.ByCreatedAt()).All(ctx)
 	if err != nil {
 		return err
 	}
@@ -315,20 +358,12 @@ func (a *App) requeueInterruptedWebhookJobs() error {
 		epoch                   int64
 	}
 	var items []interrupted
-	for rows.Next() {
-		var item interrupted
-		if err = rows.Scan(&item.job, &item.deployment, &item.commit, &item.generation, &item.epoch); err != nil {
-			rows.Close()
-			return err
+	for _, row := range rows {
+		deployment := row.Edges.Deployment
+		if deployment == nil || deployment.TargetKind != "branch" || deployment.Status == "deleting" || deployment.Status == "deletion_failed" {
+			continue
 		}
-		items = append(items, item)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err = rows.Close(); err != nil {
-		return err
+		items = append(items, interrupted{job: row.ID, deployment: deployment.ID, commit: deployment.CommitID, generation: row.Generation, epoch: row.AutomationEpoch})
 	}
 	for _, item := range items {
 		jobID, idErr := randomID()
@@ -336,13 +371,21 @@ func (a *App) requeueInterruptedWebhookJobs() error {
 			return idErr
 		}
 		now := a.cfg.Now().UnixNano()
-		if _, err = tx.Exec(`UPDATE deployment_jobs SET retry_enqueued=1 WHERE id=? AND retry_enqueued=0`, item.job); err != nil {
+		if _, err = tx.DeploymentJob.UpdateOneID(item.job).Where(jobmodel.RetryEnqueued(0)).SetRetryEnqueued(1).Save(ctx); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable,automatic,automation_epoch) VALUES(?,?,?,?,'queued','Recovered accepted branch update after restart',?,?,1,1,?)`, jobID, item.deployment, item.commit, item.generation, now, now, item.epoch); err != nil {
+		if _, err = tx.DeploymentJob.Create().SetID(jobID).SetDeploymentID(item.deployment).SetCommitID(item.commit).SetGeneration(item.generation).SetStatus("queued").SetLog("Recovered accepted branch update after restart").SetCreatedAt(now).SetUpdatedAt(now).SetDurable(1).SetAutomatic(1).SetAutomationEpoch(item.epoch).Save(ctx); err != nil {
 			return err
 		}
-		if _, err = tx.Exec(`UPDATE deployments SET status=CASE WHEN automation_paused=0 THEN 'queued' ELSE status END,error=CASE WHEN automation_paused=0 THEN '' ELSE error END,updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, now, item.deployment, item.generation); err != nil {
+		deployment, getErr := tx.Deployment.Get(ctx, item.deployment)
+		if getErr != nil {
+			return getErr
+		}
+		update := tx.Deployment.Update().Where(depmodel.ID(item.deployment), depmodel.Generation(item.generation), depmodel.StatusNotIn("deleting", "deletion_failed")).SetUpdatedAt(now)
+		if deployment.AutomationPaused == 0 {
+			update.SetStatus("queued").SetError("")
+		}
+		if _, err = update.Save(ctx); err != nil {
 			return err
 		}
 	}
@@ -360,13 +403,13 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 			}
 		}
 	}()
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(context.Background())
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.Exec(`INSERT INTO webhook_deliveries(project_id,provider,delivery_id,event,outcome,created_at) VALUES(?,?,?,?,?,?)`, projectID, provider, deliveryID, event, "ignored", a.cfg.Now().UnixNano()); err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+	if _, err = tx.WebhookDelivery.Create().SetID(projectID).SetProvider(provider).SetDeliveryID(deliveryID).SetEvent(event).SetOutcome("ignored").SetCreatedAt(a.cfg.Now().UnixNano()).Save(context.Background()); err != nil {
+		if entdb.IsConstraintError(err) {
 			return nil
 		}
 		return err
@@ -374,41 +417,23 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 	outcome := "ignored"
 	jobIDs := make([]string, 0)
 	if event == "push" && branch != "" && !deleted {
-		rows, queryErr := tx.Query(`SELECT id,generation,commit_id,automation_epoch FROM deployments WHERE project_id=? AND target_kind='branch' AND target_name=? AND status NOT IN ('deleting','deletion_failed') ORDER BY id`, projectID, branch)
+		targets, queryErr := tx.Deployment.Query().Where(depmodel.ProjectID(projectID), depmodel.TargetKind("branch"), depmodel.TargetName(branch), depmodel.StatusNotIn("deleting", "deletion_failed")).All(context.Background())
 		if queryErr != nil {
 			return queryErr
 		}
-		type target struct {
-			id, commit string
-			generation int64
-			epoch      int64
-		}
-		var targets []target
-		for rows.Next() {
-			var x target
-			if err = rows.Scan(&x.id, &x.generation, &x.commit, &x.epoch); err != nil {
-				rows.Close()
-				return err
-			}
-			targets = append(targets, x)
-		}
-		if err = rows.Err(); err != nil {
-			rows.Close()
-			return err
-		}
-		rows.Close()
+		sort.Slice(targets, func(i, j int) bool { return targets[i].ID < targets[j].ID })
 		for _, target := range targets {
-			var pending string
 			// A later webhook is separate tip work, not a coalesced rollback.
-			err = tx.QueryRow(`SELECT id FROM deployment_jobs WHERE deployment_id=? AND status='queued' AND automatic=1 AND rollback_commit='' AND generation=? AND automation_epoch=? ORDER BY created_at DESC LIMIT 1`, target.id, target.generation, target.epoch).Scan(&pending)
-			if err == nil {
-				if _, err = tx.Exec(`UPDATE deployment_jobs SET log='Latest branch update queued',updated_at=? WHERE id=? AND status='queued'`, a.cfg.Now().UnixNano(), pending); err != nil {
+			pendingJobs, queryErr := tx.DeploymentJob.Query().Where(jobmodel.DeploymentID(target.ID), jobmodel.Status("queued"), jobmodel.Automatic(1), jobmodel.RollbackCommit(""), jobmodel.Generation(target.Generation), jobmodel.AutomationEpoch(target.AutomationEpoch)).Order(jobmodel.ByCreatedAt()).All(context.Background())
+			if queryErr != nil {
+				return queryErr
+			}
+			if len(pendingJobs) != 0 {
+				pending := pendingJobs[len(pendingJobs)-1]
+				if _, err = tx.DeploymentJob.UpdateOneID(pending.ID).Where(jobmodel.Status("queued")).SetLog("Latest branch update queued").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(context.Background()); err != nil {
 					return err
 				}
 				continue
-			}
-			if !errors.Is(err, sql.ErrNoRows) {
-				return err
 			}
 			select {
 			case a.deploySlots <- struct{}{}:
@@ -420,10 +445,14 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 			if idErr != nil {
 				return idErr
 			}
-			if _, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable,automatic,automation_epoch) VALUES(?,?,?,?,'queued',?,?,?,1,1,?)`, jobID, target.id, target.commit, target.generation, "Verified "+provider+" branch update", a.cfg.Now().UnixNano(), a.cfg.Now().UnixNano(), target.epoch); err != nil {
+			if _, err = tx.DeploymentJob.Create().SetID(jobID).SetDeploymentID(target.ID).SetCommitID(target.CommitID).SetGeneration(target.Generation).SetStatus("queued").SetLog("Verified " + provider + " branch update").SetCreatedAt(a.cfg.Now().UnixNano()).SetUpdatedAt(a.cfg.Now().UnixNano()).SetDurable(1).SetAutomatic(1).SetAutomationEpoch(target.AutomationEpoch).Save(context.Background()); err != nil {
 				return err
 			}
-			if _, err = tx.Exec(`UPDATE deployments SET status=CASE WHEN automation_paused=0 THEN 'queued' ELSE status END,error=CASE WHEN automation_paused=0 THEN '' ELSE error END,updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed')`, a.cfg.Now().UnixNano(), target.id, target.generation); err != nil {
+			update := tx.Deployment.Update().Where(depmodel.ID(target.ID), depmodel.Generation(target.Generation), depmodel.StatusNotIn("deleting", "deletion_failed"))
+			if target.AutomationPaused == 0 {
+				update.SetStatus("queued").SetError("")
+			}
+			if _, err = update.SetUpdatedAt(a.cfg.Now().UnixNano()).Save(context.Background()); err != nil {
 				return err
 			}
 			jobIDs = append(jobIDs, jobID)
@@ -432,7 +461,7 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 			outcome = "queued"
 		}
 	}
-	if _, err = tx.Exec(`UPDATE webhook_deliveries SET outcome=? WHERE project_id=? AND provider=? AND delivery_id=?`, outcome, projectID, provider, deliveryID); err != nil {
+	if _, err = tx.WebhookDelivery.Update().Where(webhookdelivery.ID(projectID), webhookdelivery.Provider(provider), webhookdelivery.DeliveryID(deliveryID)).SetOutcome(outcome).Save(context.Background()); err != nil {
 		return err
 	}
 	if a.webhookFault != nil {
@@ -443,8 +472,8 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 	if err = tx.Commit(); err != nil {
 		// SQLite may report an uncertain commit outcome. Only treat it as accepted
 		// after checking the durable receipt; otherwise GitHub must retry.
-		var accepted int
-		if verifyErr := a.db.QueryRow(`SELECT count(*) FROM webhook_deliveries WHERE project_id=? AND provider=? AND delivery_id=?`, projectID, provider, deliveryID).Scan(&accepted); verifyErr != nil || accepted != 1 {
+		_, verifyErr := a.store.WebhookDelivery.Query().Where(webhookdelivery.ID(projectID), webhookdelivery.Provider(provider), webhookdelivery.DeliveryID(deliveryID)).Only(context.Background())
+		if verifyErr != nil {
 			return fmt.Errorf("commit outcome unavailable: %w", err)
 		}
 	}
