@@ -117,7 +117,7 @@
 		aria-expanded={open}
 		aria-controls={`${uid}-history`}
 		onclick={toggle}
-		disabled={busy}>Temporary rollback</button
+		disabled={busy}>Rollback</button
 	>
 	{#if open}
 		<section

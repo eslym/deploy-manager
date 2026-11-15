@@ -27,6 +27,7 @@ type automationFixture struct {
 	secret                                      []byte
 	provider                                    string
 	gitFetches                                  atomic.Int32
+	failGitFetch                                atomic.Bool
 }
 
 func newAutomationFixture(t *testing.T, providers ...string) *automationFixture {
@@ -46,6 +47,10 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	var endpoint *transport.Endpoint
 	var backend transport.Transport
 	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && f.failGitFetch.Load() {
+			http.Error(w, "injected fetch failure", http.StatusServiceUnavailable)
+			return
+		}
 		session, err := backend.NewUploadPackSession(endpoint, nil)
 		if err != nil {
 			http.Error(w, "session unavailable", 500)
