@@ -164,8 +164,17 @@ func TestStorageCoordinationChild(t *testing.T) {
 		err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 	case "upgrade-crash":
 		phase := os.Getenv("DM_UPGRADE_CRASH_PHASE")
+		if os.Getenv("DM_UPGRADE_CRASH_FIXTURE") == "1" {
+			cfg.upgradeTargetVersion = 2
+			cfg.migrationFS = fstest.MapFS{
+				"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+				"00002_fixture.sql": {Data: []byte("-- +goose Up\nCREATE TABLE crash_fixture(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE crash_fixture;\n")},
+			}
+		}
+		reached := false
 		cfg.storageFault = func(name string, _ *sql.DB) error {
 			if name == phase {
+				reached = true
 				fmt.Println("ready")
 				_, _ = io.Copy(io.Discard, os.Stdin)
 				return errors.New("test process interrupted")
@@ -175,6 +184,9 @@ func TestStorageCoordinationChild(t *testing.T) {
 		g, e := New(cfg)
 		if g != nil {
 			_ = g.Close()
+		}
+		if !reached {
+			t.Fatalf("upgrade exited before requested crash point %q: %v", phase, e)
 		}
 		if e == nil {
 			t.Fatal("pending upgrade unexpectedly completed")
@@ -314,10 +326,95 @@ func TestUpgradePreparationCrashWindowsRemainLockedAcrossRestart(t *testing.T) {
 	}
 }
 
-func startUpgradeCrashChild(t *testing.T, cfg Config, phase string) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
+func TestProtectedUpgradeProcessCrashesRemainLockedAcrossRestart(t *testing.T) {
+	for _, phase := range []string{"marker-phase-vacuum", "upgrade-vacuum", "upgrade-after-vacuum", "upgrade-migration", "marker-phase-verification", "upgrade-verify", "upgrade-clean-close", "marker-phase-unlock", "marker-remove"} {
+		t.Run(phase, func(t *testing.T) {
+			cfg := coordinationConfig(t)
+			issuer, err := NewGrantIssuer(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := issuer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			cmd, stdin, stdout := startUpgradeCrashChild(t, cfg, phase, true)
+			if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "ready\n" {
+				t.Fatalf("upgrade did not reach crash point %s: %q %v", phase, line, err)
+			}
+			if err := cmd.Process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			_ = stdin.Close()
+			_ = cmd.Wait()
+			if _, err := os.Stat(cfg.DatabasePath + ".maintenance.json"); err != nil {
+				t.Fatalf("process crash at %s lost durable maintenance marker: %v", phase, err)
+			}
+			restart, err := OpenDaemon(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restart.Close()
+			if !restart.Locked() {
+				t.Fatalf("restart after %s crash became ready", phase)
+			}
+		})
+	}
+}
+
+func TestCrashBeforeMaintenanceMarkerDurabilityLeavesStoreUsableAndUnchanged(t *testing.T) {
+	cfg := coordinationConfig(t)
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{cfg.DatabasePath, cfg.OPAQUEKeyPath, cfg.DatabasePath + ".repository-master-key"}
+	before := make(map[string][]byte, len(paths))
+	for _, path := range paths {
+		before[path], err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd, stdin, stdout := startUpgradeCrashChild(t, cfg, "marker-create", true)
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "ready\n" {
+		t.Fatalf("upgrade did not reach pre-marker crash point: %q %v", line, err)
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = stdin.Close()
+	_ = cmd.Wait()
+	if _, err := os.Lstat(cfg.DatabasePath + ".maintenance.json"); !os.IsNotExist(err) {
+		t.Fatalf("pre-durability crash unexpectedly left a marker: %v", err)
+	}
+	for path, want := range before {
+		got, err := os.ReadFile(path)
+		if err != nil || string(got) != string(want) {
+			t.Fatalf("pre-marker crash changed %s: %v", path, err)
+		}
+	}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatalf("untouched current store did not become ready after pre-marker crash: %v", err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if entries, err := os.ReadDir(cfg.DatabasePath + ".upgrade-backups"); err != nil || len(entries) != 0 {
+		t.Fatalf("pre-marker crash created maintenance backup artifacts: entries=%v err=%v", entries, err)
+	}
+}
+
+func startUpgradeCrashChild(t *testing.T, cfg Config, phase string, fixture ...bool) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestStorageCoordinationChild$")
 	cmd.Env = append(os.Environ(), "DM_COORDINATION_CHILD=upgrade-crash", "DM_COORDINATION_DIR="+filepath.Dir(cfg.DatabasePath), "DM_UPGRADE_CRASH_PHASE="+phase)
+	if len(fixture) > 0 && fixture[0] {
+		cmd.Env = append(cmd.Env, "DM_UPGRADE_CRASH_FIXTURE=1")
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		t.Fatal(err)

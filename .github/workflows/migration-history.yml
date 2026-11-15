@@ -1,0 +1,18 @@
+name: Migration history
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  immutable-history:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject edits to previously shipped migrations
+        run: scripts/check-migrations-immutable.sh "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
