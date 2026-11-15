@@ -3,7 +3,6 @@ package lib
 import (
 	"context"
 	"crypto/rand"
-	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -18,9 +17,13 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent"
 	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
 	jobmodel "github.com/eslym/deploy-manager/lib/ent/deploymentjob"
+	"github.com/eslym/deploy-manager/lib/ent/deploymentremovalpath"
 	"github.com/eslym/deploy-manager/lib/ent/projectref"
+	"github.com/eslym/deploy-manager/lib/ent/publicationcleanup"
+	"github.com/eslym/deploy-manager/lib/ent/publicationintent"
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
@@ -266,7 +269,7 @@ func (a *App) lockDeployment(id string) (func(), error) {
 }
 
 func (a *App) validateLivePublicationIdentities() error {
-	rows, err := a.db.Query(`SELECT id,live_commit,live_dev,live_ino,status FROM deployments ORDER BY id`)
+	deployments, err := a.store.Deployment.Query().Order(ent.Asc(deploymentmodel.FieldID)).All(context.Background())
 	if err != nil {
 		return err
 	}
@@ -274,20 +277,10 @@ func (a *App) validateLivePublicationIdentities() error {
 		id, commit, status string
 		identity           dirIdentity
 	}
-	var records []liveRecord
-	for rows.Next() {
-		var r liveRecord
-		if err = rows.Scan(&r.id, &r.commit, &r.identity.Dev, &r.identity.Ino, &r.status); err != nil {
-			rows.Close()
-			return err
-		}
-		records = append(records, r)
+	records := make([]liveRecord, 0, len(deployments))
+	for _, d := range deployments {
+		records = append(records, liveRecord{id: d.ID, commit: d.LiveCommit, status: d.Status, identity: dirIdentity{Dev: uint64(d.LiveDev), Ino: uint64(d.LiveIno)}})
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	for _, r := range records {
 		if !validProjectID(r.id) {
 			return errors.New("deployment record contains an invalid identifier")
@@ -332,11 +325,19 @@ func (a *App) removeOrphanStages() error {
 		if !pattern.MatchString(name) {
 			return errors.New("unrecognized publication staging path; refusing startup cleanup")
 		}
-		var present int
-		if err := a.db.QueryRow(`SELECT (SELECT count(*) FROM publication_intents WHERE stage_name=?)+(SELECT count(*) FROM publication_cleanup WHERE path_name=?)+(SELECT count(*) FROM deployment_removal_paths WHERE path_name=?)`, name, name, name).Scan(&present); err != nil {
+		intent, err := a.store.PublicationIntent.Query().Where(publicationintent.StageNameEQ(name)).Exist(context.Background())
+		if err != nil {
 			return err
 		}
-		if present > 0 {
+		cleanup, err := a.store.PublicationCleanup.Query().Where(publicationcleanup.PathNameEQ(name)).Exist(context.Background())
+		if err != nil {
+			return err
+		}
+		removal, err := a.store.DeploymentRemovalPath.Query().Where(deploymentremovalpath.PathNameEQ(name)).Exist(context.Background())
+		if err != nil {
+			return err
+		}
+		if intent || cleanup || removal {
 			continue
 		}
 		path := filepath.Join(a.cfg.DeploymentRoot, name)
@@ -583,25 +584,9 @@ func randomID() (string, error) {
 
 const deploymentQueueCapacity = 160
 
-func restoreQueuedDeploymentJobs(db *sql.DB, capacity int) ([]string, error) {
-	rows, err := db.Query(`SELECT id FROM deployment_jobs WHERE status='queued' AND durable=1 ORDER BY created_at,id LIMIT ?`, capacity)
+func restoreQueuedDeploymentJobs(store *ent.Client, capacity int) ([]string, error) {
+	ids, err := store.DeploymentJob.Query().Where(jobmodel.StatusEQ("queued"), jobmodel.DurableEQ(1)).Order(ent.Asc(jobmodel.FieldCreatedAt), ent.Asc(jobmodel.FieldID)).Limit(capacity).IDs(context.Background())
 	if err != nil {
-		return nil, err
-	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		return nil, err
-	}
-	if err := rows.Close(); err != nil {
 		return nil, err
 	}
 	return ids, nil
@@ -1171,13 +1156,11 @@ func (a *App) reconcilePublications() error {
 }
 
 func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
-	query := `SELECT deployment_id,job_id,stage_name,had_old,old_dev,old_ino,new_dev,new_ino FROM publication_intents`
-	args := []any{}
+	query := a.store.PublicationIntent.Query()
 	if onlyDeployment != "" {
-		query += ` WHERE deployment_id=?`
-		args = append(args, onlyDeployment)
+		query = query.Where(publicationintent.IDEQ(onlyDeployment))
 	}
-	rows, err := a.db.Query(query, args...)
+	intents, err := query.All(context.Background())
 	if err != nil {
 		return err
 	}
@@ -1186,21 +1169,9 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 		had            int
 		old, new       dirIdentity
 	}
-	var all []intent
-	for rows.Next() {
-		var x intent
-		if err = rows.Scan(&x.id, &x.job, &x.stage, &x.had, &x.old.Dev, &x.old.Ino, &x.new.Dev, &x.new.Ino); err != nil {
-			rows.Close()
-			return err
-		}
-		all = append(all, x)
-	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	if err = rows.Close(); err != nil {
-		return err
+	all := make([]intent, 0, len(intents))
+	for _, row := range intents {
+		all = append(all, intent{id: row.ID, job: row.JobID, stage: row.StageName, had: row.HadOld, old: dirIdentity{Dev: uint64(row.OldDev), Ino: uint64(row.OldIno)}, new: dirIdentity{Dev: uint64(row.NewDev), Ino: uint64(row.NewIno)}})
 	}
 	for _, x := range all {
 		if !validProjectID(x.id) || !validProjectID(x.job) || x.stage != "."+x.id+".stage-"+x.job {
@@ -1236,8 +1207,13 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 					return err
 				}
 			}
-			var commit string
-			if err = a.db.QueryRow(`SELECT commit_id FROM deployment_jobs WHERE id=?`, x.job).Scan(&commit); err != nil {
+			job, getErr := a.store.DeploymentJob.Get(context.Background(), x.job)
+			if getErr != nil {
+				return getErr
+			}
+			commit := job.CommitID
+			if commit == "" {
+				err = errors.New("publication job has no commit")
 				return err
 			}
 			tx, e := a.db.Begin()
@@ -1296,7 +1272,7 @@ func (a *App) cleanupPublications(startup bool) error {
 	if err := a.assertPublicationRoot(); err != nil {
 		return err
 	}
-	rows, err := a.db.Query(`SELECT deployment_id,job_id,path_name,dev,ino,not_before,attempts FROM publication_cleanup ORDER BY not_before`)
+	cleanups, err := a.store.PublicationCleanup.Query().Order(publicationcleanup.ByNotBefore()).All(context.Background())
 	if err != nil {
 		return err
 	}
@@ -1306,20 +1282,10 @@ func (a *App) cleanupPublications(startup bool) error {
 		before        int64
 		attempts      int
 	}
-	var all []cleanup
-	for rows.Next() {
-		var c cleanup
-		if err = rows.Scan(&c.id, &c.job, &c.path, &c.identity.Dev, &c.identity.Ino, &c.before, &c.attempts); err != nil {
-			rows.Close()
-			return err
-		}
-		all = append(all, c)
+	all := make([]cleanup, 0, len(cleanups))
+	for _, row := range cleanups {
+		all = append(all, cleanup{id: row.ID, job: row.JobID, path: row.PathName, identity: dirIdentity{Dev: uint64(row.Dev), Ino: uint64(row.Ino)}, before: row.NotBefore, attempts: row.Attempts})
 	}
-	if err = rows.Err(); err != nil {
-		rows.Close()
-		return err
-	}
-	rows.Close()
 	for _, c := range all {
 		if !validProjectID(c.id) || !validProjectID(c.job) || c.path != "."+c.id+".stage-"+c.job {
 			return errors.New("publication cleanup record contains an unsafe path or identifier")
@@ -1351,7 +1317,7 @@ func (a *App) cleanupPublications(startup bool) error {
 		}
 		if !ok {
 			if _, e = os.Lstat(path); os.IsNotExist(e) {
-				if _, e = a.db.Exec(`DELETE FROM publication_cleanup WHERE deployment_id=? AND job_id=?`, c.id, c.job); e != nil {
+				if _, e = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).Exec(context.Background()); e != nil {
 					return fmt.Errorf("reconcile removed publication cleanup: %w", e)
 				}
 				continue
@@ -1370,7 +1336,7 @@ func (a *App) cleanupPublications(startup bool) error {
 			}
 		}
 		if err == nil {
-			_, err = a.db.Exec(`DELETE FROM publication_cleanup WHERE deployment_id=? AND job_id=?`, c.id, c.job)
+			_, err = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).Exec(context.Background())
 		} else {
 			delay := time.Second << min(c.attempts, 10)
 			_, recordErr := a.db.Exec(`UPDATE publication_cleanup SET last_error='old publication cleanup failed; retry scheduled',attempts=attempts+1,not_before=? WHERE deployment_id=? AND job_id=?`, a.cfg.Now().Add(delay).UnixNano(), c.id, c.job)
@@ -1546,23 +1512,14 @@ func (a *App) deploymentJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	rows, err := a.db.Query(`SELECT id,deployment_id,commit_id,status,log,created_at,updated_at,force_redeploy FROM deployment_jobs WHERE deployment_id=? ORDER BY created_at DESC LIMIT 100`, id)
+	jobs, err := a.store.DeploymentJob.Query().Where(jobmodel.DeploymentIDEQ(id)).Order(ent.Desc(jobmodel.FieldCreatedAt)).Limit(100).All(r.Context())
 	if err != nil {
 		http.Error(w, "publication history is unavailable", 500)
 		return
 	}
-	defer rows.Close()
-	out := []deploymentJob{}
-	for rows.Next() {
-		var j deploymentJob
-		var c, u int64
-		if rows.Scan(&j.ID, &j.DeploymentID, &j.Commit, &j.Status, &j.Log, &c, &u, &j.Force) != nil {
-			http.Error(w, "publication history is unavailable", 500)
-			return
-		}
-		j.CreatedAt = time.Unix(0, c).UTC()
-		j.UpdatedAt = time.Unix(0, u).UTC()
-		out = append(out, j)
+	out := make([]deploymentJob, 0, len(jobs))
+	for _, row := range jobs {
+		out = append(out, deploymentJob{ID: row.ID, DeploymentID: row.DeploymentID, Commit: row.CommitID, Status: row.Status, Log: row.Log, CreatedAt: time.Unix(0, row.CreatedAt).UTC(), UpdatedAt: time.Unix(0, row.UpdatedAt).UTC(), Force: row.ForceRedeploy != 0})
 	}
 	writeJSON(w, out)
 }
@@ -1572,17 +1529,16 @@ func (a *App) deployNow(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var commit, status string
-	var gen int64
-	if err := a.db.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, id).Scan(&commit, &gen, &status); err != nil {
+	deployment, err := a.store.Deployment.Get(r.Context(), id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if status == "deleting" || status == "deletion_failed" {
+	if deployment.Status == "deleting" || deployment.Status == "deletion_failed" {
 		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
 		return
 	}
-	job, err := a.enqueueDeployment(id, commit, gen)
+	job, err := a.enqueueDeployment(id, deployment.CommitID, deployment.Generation)
 	if err != nil {
 		if strings.Contains(err.Error(), "queue is full") {
 			http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)

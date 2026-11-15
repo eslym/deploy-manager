@@ -389,7 +389,14 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err = saveProjectRefs(p.store, id, p.repoPath(id), p.maxRefs); err != nil {
-		_, _ = p.store.Project.Delete().Where(projectent.ID(id)).Exec(r.Context())
+		if cleanupTx, cleanupErr := p.store.Tx(r.Context()); cleanupErr == nil {
+			cleanupErr = cleanupTx.Project.DeleteOneID(id).Exec(r.Context())
+			if cleanupErr == nil {
+				cleanupErr = cleanupTx.Commit()
+			} else {
+				_ = cleanupTx.Rollback()
+			}
+		}
 		_ = os.RemoveAll(p.repoPath(id))
 		if errors.Is(err, errGitIncompleteRepository) || errors.Is(err, errGitTooManyRefs) {
 			http.Error(w, sanitizeGitError(err, remote), http.StatusBadRequest)
