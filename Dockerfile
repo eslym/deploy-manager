@@ -29,11 +29,9 @@ COPY --from=builder --chown=65532:65532 /runtime/data /data
 COPY --from=builder --chown=65532:65532 /runtime/published /published
 
 ENV DM_DATA=/data \
-    DM_LISTEN=0.0.0.0:8443 \
-    DM_PUBLICATION_ROOT=/published \
-    DM_TLS_CERT=/tls/tls.crt \
-    DM_TLS_KEY=/tls/tls.key
+    DM_LISTEN=0.0.0.0:8080 \
+    DM_PUBLICATION_ROOT=/published
 
 VOLUME ["/data", "/published"]
-EXPOSE 8443
+EXPOSE 8080
 ENTRYPOINT ["/usr/bin/deploy-manager", "serve"]

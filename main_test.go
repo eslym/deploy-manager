@@ -35,6 +35,7 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 	fs.String("origin", "", "")
 	fs.String("tls-cert", "", "")
 	fs.String("tls-key", "", "")
+	fs.String("trusted-proxy", "", "")
 	fs.String("repository-key-master", "", "")
 	fs.Duration("login-ttl", 2*time.Minute, "")
 	fs.Duration("session-ttl", 12*time.Hour, "")
@@ -54,6 +55,7 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 		values := map[string]string{
 			"DM_DATA": "/env/data", "DM_LISTEN": "0.0.0.0:9000", "DM_URL": "https://example.test",
 			"DM_ORIGIN": "https://example.test", "DM_TLS_CERT": "cert.pem", "DM_TLS_KEY": "key.pem",
+			"DM_TRUSTED_PROXY": "172.18.0.0/16,192.0.2.1",
 			"DM_REPOSITORY_KEY_MASTER": "master.key", "DM_LOGIN_TTL": "3m", "DM_SESSION_TTL": "13h",
 			"DM_GIT_TIMEOUT": "4m", "DM_GRANT_TTL": "16m", "DM_RECENT_AUTH_TTL": "6m",
 			"DM_AUTH_RATE_PER_MINUTE": "21", "DM_PUBLICATION_ROOT": "/published", "DM_DEPLOY_MAX_FILES": "10001",
@@ -71,7 +73,7 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 	}
 	want := map[string]string{
 		"data": "/env/data", "listen": "127.0.0.1:7777", "url": "https://example.test", "origin": "https://example.test",
-		"tls-cert": "cert.pem", "tls-key": "key.pem", "repository-key-master": "master.key", "login-ttl": "3m0s",
+		"tls-cert": "cert.pem", "tls-key": "key.pem", "trusted-proxy": "172.18.0.0/16,192.0.2.1", "repository-key-master": "master.key", "login-ttl": "3m0s",
 		"session-ttl": "13h0m0s", "git-timeout": "4m0s", "grant-ttl": "16m0s", "recent-auth-ttl": "6m0s",
 		"auth-rate-per-minute": "21", "publication-root": "/published", "deploy-max-files": "10001",
 		"deploy-max-bytes": "2147483648", "deploy-timeout": "3m0s", "deploy-concurrency": "4",
@@ -422,7 +424,8 @@ func startCommand(t *testing.T, binary, data, address string, flags ...string) *
 			t.Fatalf("server exited before listening: %v\n%s", err, &diagnostics)
 		default:
 		}
-		res, err := client.Get(scheme + "://" + address + "/")
+		probeAddress := strings.Replace(address, "0.0.0.0:", "127.0.0.1:", 1)
+		res, err := client.Get(scheme + "://" + probeAddress + "/")
 		if err == nil {
 			res.Body.Close()
 			if res.StatusCode != http.StatusServiceUnavailable {
@@ -473,6 +476,28 @@ func TestLockedCommandServesMaintenanceOverTLS(t *testing.T) {
 	entries, err := os.ReadDir(data)
 	if err != nil || len(entries) != 2 || entries[0].Name() != "state.sqlite.daemon.lock" || entries[1].Name() != "state.sqlite.maintenance.json" {
 		t.Fatalf("TLS locked start initialized state: entries=%v err=%v", entries, err)
+	}
+}
+
+func TestLockedCommandServesMaintenanceOverPublicHTTP(t *testing.T) {
+	data := t.TempDir()
+	if err := os.WriteFile(filepath.Join(data, "state.sqlite.maintenance.json"), []byte("interrupted maintenance"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+	client := startCommand(t, buildCommand(t), data, fmt.Sprintf("0.0.0.0:%d", port))
+	res, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/", port))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("public HTTP maintenance response: %d", res.StatusCode)
 	}
 }
 
@@ -814,7 +839,7 @@ func TestListenerPrerequisitesFailBeforeApplicationWork(t *testing.T) {
 			args             []string
 		}{
 			{"occupied", "bind", []string{"--listen", occupied.Addr().String()}},
-			{"public-http", "HTTPS is required", []string{"--listen", "0.0.0.0:0"}},
+			{"invalid-trusted-proxy", "invalid trusted proxy", []string{"--trusted-proxy", "not-an-ip"}},
 			{"invalid-listen", "address", []string{"--listen", "not-an-address"}},
 			{"missing-key", "both TLS", []string{"--tls-cert", "nonexistent-cert"}},
 			{"missing-cert", "both TLS", []string{"--tls-key", "nonexistent-key"}},

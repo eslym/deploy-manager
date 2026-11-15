@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -235,6 +236,37 @@ func TestExpiredGrantAndNonLoopbackHTTPFailClosed(t *testing.T) {
 	app.Handler().ServeHTTP(csrfRes, csrf)
 	if csrfRes.Code != http.StatusForbidden {
 		t.Fatalf("cross-origin registration POST status = %d, want 403", csrfRes.Code)
+	}
+}
+
+func TestTrustedProxyHTTPSAndOrigin(t *testing.T) {
+	app := &App{cfg: Config{TrustedProxies: []netip.Prefix{
+		netip.MustParsePrefix("172.18.0.0/16"), netip.MustParsePrefix("2001:db8::/32"),
+	}}}
+	for _, tc := range []struct {
+		peer, forwarded string
+		secure          bool
+	}{
+		{"172.18.4.2:5000", "https", true},
+		{"[2001:db8::1]:5000", "https", true},
+		{"127.0.0.1:5000", "https", true},
+		{"192.0.2.1:5000", "https", false},
+		{"172.19.4.2:5000", "https", false},
+		{"172.18.4.2:5000", "http", false},
+		{"172.18.4.2:5000", "https, http", false},
+	} {
+		t.Run(tc.peer+"/"+tc.forwarded, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "http://manager.example/opaque/login/start", nil)
+			r.RemoteAddr = tc.peer
+			r.Header.Set("X-Forwarded-Proto", tc.forwarded)
+			r.Header.Set("Origin", "https://manager.example")
+			if got := app.https(r); got != tc.secure {
+				t.Fatalf("HTTPS = %t, want %t", got, tc.secure)
+			}
+			if got := app.originOK(r); got != tc.secure {
+				t.Fatalf("origin OK = %t, want %t", got, tc.secure)
+			}
+		})
 	}
 }
 

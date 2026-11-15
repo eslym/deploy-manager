@@ -25,10 +25,12 @@ Issue a setup link and run the server:
 
 `setup` prints a short-lived, single-use registration URL once. Open it in a
 browser while the server is running. Loopback-only HTTP is available for local
-setup; non-loopback serving requires `--tls-cert` and `--tls-key`. Behind a
-local reverse proxy, pass an HTTPS setup URL with `--url` and proxy to a
-loopback listener; the application trusts `X-Forwarded-Proto: https` only from
-a loopback peer and checks the request Origin.
+setup; non-loopback serving can use HTTP only behind an HTTPS-terminating proxy
+with network access restricted to that proxy. Pass an HTTPS setup URL with
+`--url`. Loopback peers are trusted by default to set `X-Forwarded-Proto: https`;
+`--trusted-proxy` adds non-loopback proxy IPs or CIDRs to that trust list. The
+application checks the request Origin. Direct HTTPS remains available with
+`--tls-cert` and `--tls-key`.
 
 The confirmed singleton policy applies only to the main daemon, not local CLI
 utilities. Setup and password-recovery grant issuance must remain usable while

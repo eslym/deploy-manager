@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -30,8 +31,9 @@ func main() {
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP(S) listen address")
 	base := flags.String("url", "", "externally reachable HTTPS base URL for setup link")
 	origin := flags.String("origin", "", "canonical HTTPS origin used by the application")
-	cert := flags.String("tls-cert", "", "TLS certificate (required for non-loopback serving)")
+	cert := flags.String("tls-cert", "", "optional TLS certificate (requires --tls-key)")
 	key := flags.String("tls-key", "", "TLS private key")
+	trustedProxy := flags.String("trusted-proxy", "", "comma-separated proxy IPs or CIDRs trusted to set X-Forwarded-Proto (loopback trusted by default)")
 	repositoryMaster := flags.String("repository-key-master", "", "external repository-key encryption key file (defaults inside the data directory)")
 	loginTTL := flags.Duration("login-ttl", 2*time.Minute, "maximum lifetime of an OPAQUE login handshake")
 	sessionTTL := flags.Duration("session-ttl", 12*time.Hour, "maximum lifetime of an authenticated session")
@@ -107,6 +109,24 @@ func main() {
 		}
 		fmt.Println(link)
 	case "serve":
+		for _, entry := range strings.Split(*trustedProxy, ",") {
+			entry = strings.TrimSpace(entry)
+			if entry == "" {
+				if *trustedProxy != "" {
+					log.Fatal("invalid trusted proxy: empty entry")
+				}
+				continue
+			}
+			prefix, err := netip.ParsePrefix(entry)
+			if err != nil {
+				ip, ipErr := netip.ParseAddr(entry)
+				if ipErr != nil {
+					log.Fatalf("invalid trusted proxy %q: expected an IP or CIDR", entry)
+				}
+				prefix = netip.PrefixFrom(ip, ip.BitLen())
+			}
+			cfg.TrustedProxies = append(cfg.TrustedProxies, prefix.Masked())
+		}
 		if err := serve(cfg, *listen, *cert, *key); err != nil {
 			log.Fatal(err)
 		}
@@ -147,15 +167,6 @@ func serve(cfg lib.Config, address, cert, key string) error {
 			return errors.New("cannot load TLS certificate/key pair")
 		}
 		tlsConfig = &tls.Config{Certificates: []tls.Certificate{pair}, MinVersion: tls.VersionTLS12}
-	} else {
-		host, _, err := net.SplitHostPort(address)
-		if err != nil {
-			return err
-		}
-		ip := net.ParseIP(host)
-		if !(ip != nil && ip.IsLoopback() || host == "localhost") {
-			return errors.New("HTTPS is required unless listening on loopback")
-		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

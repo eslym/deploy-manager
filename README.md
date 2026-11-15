@@ -113,9 +113,10 @@ it when their executable supports the exact database schema and maintenance is
 not in progress. See [process coordination](docs/process-coordination.md) for
 locking, contention, compatibility limitations, and offline-restore requirements.
 
-### Behind a local HTTPS reverse proxy
+### Behind an HTTPS reverse proxy
 
-Bind the application to loopback and configure the external origin:
+For a proxy on the same host, bind the application to loopback and configure
+the external origin:
 
 ```sh
 ./deploy-manager serve \
@@ -124,11 +125,32 @@ Bind the application to loopback and configure the external origin:
   --origin https://manager.example.com
 ```
 
-The proxy must preserve the external Host and Origin headers and set
-`X-Forwarded-Proto: https`, replacing any client-supplied value. The application
-trusts that header only from a loopback peer. Proxy the dashboard, `/api`,
-`/opaque`, and `/webhooks` on the same origin. Do not expose the unencrypted
-backend listener to the network.
+For a proxy on another container or host, bind to a private interface and
+explicitly trust **only the proxy's source IP or CIDR** (multiple entries are
+comma-separated):
+
+```sh
+./deploy-manager serve \
+  --data ./data \
+  --listen 0.0.0.0:8080 \
+  --origin https://manager.example.com \
+  --trusted-proxy 172.18.0.5/32,172.19.0.0/24
+```
+
+The proxy must preserve the external Host and Origin headers and **replace**
+any client-supplied `X-Forwarded-Proto` with `https`. The application trusts
+that header from loopback or an explicitly trusted proxy peer; other peers
+cannot claim HTTPS. Proxy the dashboard, `/api`, `/opaque`, and `/webhooks` on
+the same origin. Restrict access to the unencrypted backend to the proxy with
+network/firewall rules; never expose it directly to untrusted clients. Avoid
+trusting an entire shared container network if clients can reach it directly.
+
+The Docker image listens on HTTP port 8080 by default, with no certificate or
+key configured. Put it behind an HTTPS-terminating proxy, set `DM_ORIGIN` to
+the public HTTPS origin, and set `DM_TRUSTED_PROXY` to the proxy's source IP or
+CIDR if it is not loopback. TLS can still be enabled directly by setting both
+`DM_TLS_CERT` and `DM_TLS_KEY` (or passing the corresponding flags). Generate
+setup/recovery links with an explicit public HTTPS `--url`.
 
 Loopback HTTP is allowed for initial local registration, but it is **not** a
 substitute for HTTPS login and authenticated dashboard use.
@@ -207,6 +229,10 @@ Run `./deploy-manager serve -h` for all flags. Common settings include:
 
 - `--data`: `./data`.
 - `--listen`: `127.0.0.1:8080`.
+- `--tls-cert` / `--tls-key`: optional pair for direct HTTPS; without both,
+  the listener uses HTTP on any configured address.
+- `--trusted-proxy`: comma-separated proxy source IPs or CIDRs allowed to set
+  `X-Forwarded-Proto: https` (loopback peers are trusted by default).
 - `--publication-root`: `<data>/state.sqlite.publications`.
 - `--repository-key-master`: `<data>/repository-key-master.key`.
 - `--git-timeout` / `--deploy-timeout`: `2m` each.

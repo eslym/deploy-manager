@@ -14,6 +14,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path"
@@ -37,6 +38,7 @@ type Config struct {
 	OPAQUEKeyPath         string
 	RepositoryKeyPath     string
 	CanonicalOrigin       string
+	TrustedProxies        []netip.Prefix
 	GrantTTL              time.Duration
 	LoginTTL              time.Duration
 	SessionTTL            time.Duration
@@ -812,8 +814,20 @@ func (a *App) https(r *http.Request) bool {
 		return true
 	}
 	ip, _, e := net.SplitHostPort(r.RemoteAddr)
-	if e == nil && isLoopback(ip) && strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")) == "https" {
+	if e != nil || strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")) != "https" {
+		return false
+	}
+	peer, err := netip.ParseAddr(ip)
+	if err != nil {
+		return false
+	}
+	if peer.IsLoopback() {
 		return true
+	}
+	for _, prefix := range a.cfg.TrustedProxies {
+		if prefix.Contains(peer.Unmap()) || prefix.Contains(peer) {
+			return true
+		}
 	}
 	return false
 }
@@ -834,11 +848,7 @@ func (a *App) originOK(r *http.Request) bool {
 	return e == nil && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == "" && u.Scheme == scheme && strings.EqualFold(u.Host, host)
 }
 func (a *App) requestScheme(r *http.Request) string {
-	if r.TLS != nil {
-		return "https"
-	}
-	ip, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err == nil && isLoopback(ip) && strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")) == "https" {
+	if a.https(r) {
 		return "https"
 	}
 	return "http"
