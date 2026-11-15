@@ -31,6 +31,9 @@
 	let lastFetched = $state<string | null>(null);
 	let deployments = $state<Deployment[]>([]);
 	let jobs = $state<Record<string, Job[]>>({});
+	let jobHistoryState = $state<
+		Record<string, { status: 'loading' | 'loaded' | 'error'; error?: string }>
+	>({});
 	let targetSelections = $state<Record<string, string>>({});
 	let targetSearches = $state<Record<string, string>>({});
 	let name = $state('');
@@ -95,13 +98,24 @@
 						? `${item.targetKind}:${item.targetName}`
 						: `commit:${item.commit}`;
 			}
-			const loaded = await Promise.all(
-				current.map(
-					async (item) => [item.id, await request(`/api/deployments/${item.id}/jobs`)] as const
-				)
+			for (const item of current) jobHistoryState[item.id] = { status: 'loading' };
+			await Promise.all(
+				current.map(async (item) => {
+					try {
+						const history: Job[] = await request(`/api/deployments/${item.id}/jobs`);
+						if (version !== loadVersion || id !== projectId) return;
+						jobs[item.id] = history;
+						jobHistoryState[item.id] = { status: 'loaded' };
+					} catch (cause) {
+						if (version !== loadVersion || id !== projectId) return;
+						jobHistoryState[item.id] = {
+							status: 'error',
+							error: cause instanceof Error ? cause.message : 'Could not load deployment history.'
+						};
+					}
+				})
 			);
 			if (version !== loadVersion || id !== projectId) return;
-			jobs = Object.fromEntries(loaded);
 		} catch (cause) {
 			if (version === loadVersion && id === projectId) {
 				const message = cause instanceof Error ? cause.message : 'Could not load deployments.';
@@ -427,7 +441,14 @@
 					aria-label={`Job history for ${item.name}`}
 				>
 					<h4 class="m-0 text-base font-semibold text-[#243528]">Deployment history</h4>
-					{#if jobs[item.id]?.length}
+					{#if jobHistoryState[item.id]?.status === 'loading'}
+						<p class="mt-2 text-sm text-[#58645b]">Loading history…</p>
+					{:else if jobHistoryState[item.id]?.status === 'error'}
+						<p role="alert" class="mt-2 text-sm text-red-800">
+							Could not load deployment history: {jobHistoryState[item.id].error} The app will retry automatically;
+							refresh the page to retry now.
+						</p>
+					{:else if jobHistoryState[item.id]?.status === 'loaded' && jobs[item.id]?.length}
 						<ul class="mt-3 grid gap-3 p-0">
 							{#each jobs[item.id] as job (job.id)}
 								<li class="list-none rounded-lg border border-[#d5ddd4] bg-[#fafbf9] p-3">
@@ -455,8 +476,8 @@
 								</li>
 							{/each}
 						</ul>
-					{:else}
-						<p class="mt-2 text-sm text-[#58645b]">No deployment jobs recorded yet.</p>
+					{:else if jobHistoryState[item.id]?.status === 'loaded'}
+						<p class="mt-2 text-sm text-[#58645b]">No deployment history yet.</p>
 					{/if}
 				</section>
 			</li>
