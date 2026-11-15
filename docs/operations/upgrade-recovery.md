@@ -51,20 +51,33 @@ with enough free space; do not put it inside the backup directory.
    The command can report the `pgrep` itself or unrelated matching text; inspect
    each result. Continue only when no manager process owns or uses this store and
    new CLI invocations are prevented. Do not manipulate SQLite files while any
-   user remains.
+   user remains. For the default layout, block the service account from invoking
+   the executable or opening the store while offline work is in progress:
+
+   ```sh
+   sudo chown root:root /srv/deploy-manager/data
+   sudo chmod 700 /srv/deploy-manager/data
+   sudo chmod 000 /usr/local/bin/deploy-manager
+   ```
+
+   Substitute actual paths and restrict any other executable copies that can
+   access the same state. The recovery script runs as root; restore the data
+   directory's owner before restarting. Do not use permission changes instead of
+   stopping processes that already have files open.
 
 3. **Identify both recovery members before changing files.** Read the local
    daemon diagnostic/log for the maintenance phase, source/target schema,
    operation, and backup location. The marker is
    `/srv/deploy-manager/data/state.sqlite.maintenance.json`. A recoverable
    backup is the `.db` file named by that marker **and** its adjacent `.db.json`
-   manifest with `"status":"complete"`, matching source version/program
-   identity, and a SHA-256 matching the database file. Verify it read-only with
-   the procedure below. The executable is not included in that backup: retrieve
-   and verify the exact previous release using the recorded program/build
-   identity (release archive/package or your independently retained executable).
-   Do not substitute an arbitrary older binary. If any member is missing or
-   cannot be verified, stop here and remain locked.
+   manifest with `"status":"complete"`, matching source version and the
+   failing program identity in the marker, and a SHA-256 matching the database
+   file. Verify it read-only with the procedure below. The executable is not
+   included in that backup. Retrieve and verify the exact previous release from
+   your pre-upgrade release inventory; do not mistake the manifest's failing
+   program identity for the rollback executable or substitute an arbitrary older
+   binary. If any member is missing or cannot be verified, stop here and remain
+   locked.
 
    Set the following shell variables from the inspected installation and
    manifest. Use the exact absolute backup path from the marker; do not guess
@@ -74,8 +87,11 @@ with enough free space; do not put it inside the backup directory.
    DATA=/srv/deploy-manager/data
    DB="$DATA/state.sqlite"
    MARKER="$DB.maintenance.json"
+   PROGRAM=/usr/local/bin/deploy-manager
    BACKUP=/srv/deploy-manager/data/state.sqlite.upgrade-backups/REPLACE-WITH-EXACT-FINALIZED-BACKUP.db
    PRIOR=/srv/deploy-manager/rollback/deploy-manager-REPLACE-WITH-RECORDED-PRIOR-BUILD
+   BACKUP_SHA256=REPLACE-WITH-SHA256-FROM-BACKUP-MANIFEST
+   PRIOR_SHA256=REPLACE-WITH-TRUSTED-PRIOR-RELEASE-SHA256
    OWNER=deploy-manager
    GROUP=deploy-manager
    RECOVERY_DIR=/srv/deploy-manager/recovery-REPLACE-WITH-UNIQUE-UTC-ID
@@ -95,46 +111,47 @@ with enough free space; do not put it inside the backup directory.
    trusted equivalent in read-only/immutable mode; if verification is not
    possible, do not restore. Do not modify the finalized backup.
 
+   `program` identifies the executable that attempted the failed upgrade; it is
+   not the prior executable. The exact previous build is identified by your
+   retained pre-upgrade release inventory (record its build/revision and trusted
+   artifact SHA-256 before installing a new version). Match that inventory to
+   the database's `source_version`, and verify `PRIOR_SHA256` against the
+   retained executable. If no trusted identity and exact prior artifact exist,
+   remain stopped.
+
 4. **Preserve failed state as evidence.** Capture service logs to a named file
    in the recovery directory. Quarantine the failed database and every existing
    SQLite sidecar together. Preserve, do not overwrite or remove, the marker.
-   These are individual file moves; a missing sidecar is expected and is not an
-   error:
+   Save logs as shown, then run the script's `quarantine` action. It moves the
+   DB and present sidecars together and copies the marker into new evidence:
 
    ```sh
-   sudo install -d -o "$OWNER" -g "$GROUP" -m 700 "$RECOVERY_DIR"
    sudo sh -c 'journalctl -u deploy-manager.service --no-pager >"$1"' sh "$RECOVERY_DIR/daemon.log"
    sudo chown "$OWNER:$GROUP" "$RECOVERY_DIR/daemon.log"
    sudo chmod 600 "$RECOVERY_DIR/daemon.log"
-   sudo mv -- "$DB" "$RECOVERY_DIR/failed-state.sqlite"
-   for suffix in -wal -shm -journal; do
-     if sudo test -e "$DB$suffix"; then
-       sudo mv -- "$DB$suffix" "$RECOVERY_DIR/failed-state.sqlite$suffix"
-     fi
-   done
-   sudo cp -p -- "$MARKER" "$RECOVERY_DIR/failed-state.sqlite.maintenance.json"
+   EVIDENCE="$RECOVERY_DIR/files"
+   sudo env DB="$DB" MARKER="$MARKER" BACKUP="$BACKUP" BACKUP_SHA256="$BACKUP_SHA256" \
+     PRIOR="$PRIOR" PRIOR_SHA256="$PRIOR_SHA256" \
+      PROGRAM="$PROGRAM" EVIDENCE="$EVIDENCE" \
+     OWNER="$OWNER" GROUP="$GROUP" PROGRAM_OWNER=root PROGRAM_GROUP=root \
+     sh docs/operations/upgrade-recovery-files.sh quarantine
    ```
 
-   If a move or copy fails, stop and investigate. Never delete sidecars from a
-   running installation or attach sidecars from the failed database to the
-   standalone backup.
+   Set `PROGRAM_OWNER`/`PROGRAM_GROUP` to the installed executable owner/group.
+   If any command fails, keep the service stopped and investigate. Never remove
+   live sidecars or mix generations.
 
-5. **Stage and verify the matched pair offline.** Copy (do not move) the
-   finalized backup into a new staging file on the database's filesystem,
-   verify its hash again, then atomically rename it into place. Install the
-   retained previous executable as a separate staged file and replace the
-   executable only after its identity has been checked. These commands preserve
-   the backup and ensure no failed-generation sidecar remains beside the new DB:
+5. **Stage and verify the matched pair offline.** After confirming the matching
+   backup and prior executable again, run the `restore` action. It installs both
+   via same-filesystem staging and checks the copies, while leaving the marker
+   in place:
 
    ```sh
-   sudo install -o "$OWNER" -g "$GROUP" -m 600 -- "$BACKUP" "$DB.restore-stage"
-   sudo cmp -- "$BACKUP" "$DB.restore-stage"
-   sudo mv -- "$DB.restore-stage" "$DB"
-   sudo install -o root -g root -m 755 -- "$PRIOR" /usr/local/bin/deploy-manager.restore-stage
-   sudo cmp -- "$PRIOR" /usr/local/bin/deploy-manager.restore-stage
-   sudo mv -- /usr/local/bin/deploy-manager.restore-stage /usr/local/bin/deploy-manager
-   sudo chown "$OWNER:$GROUP" "$DB"
-   sudo chmod 600 "$DB"
+   sudo env DB="$DB" MARKER="$MARKER" BACKUP="$BACKUP" BACKUP_SHA256="$BACKUP_SHA256" \
+     PRIOR="$PRIOR" PRIOR_SHA256="$PRIOR_SHA256" \
+      PROGRAM="$PROGRAM" EVIDENCE="$EVIDENCE" \
+     OWNER="$OWNER" GROUP="$GROUP" PROGRAM_OWNER=root PROGRAM_GROUP=root \
+     sh docs/operations/upgrade-recovery-files.sh restore
    ```
 
    If the executable is managed by a package manager, restore the exact package
@@ -153,16 +170,20 @@ with enough free space; do not put it inside the backup directory.
    trusted pre-upgrade evidence, leave the service stopped and marker in place;
    never regenerate or replace it to make startup pass.
 
-7. **Archive the marker only after steps 3–6 succeed.** Its presence is the
-   durable lock; it is not evidence that restoration has completed. Preserve it
-   in the evidence directory and move the live marker out of the way only now:
+7. **Archive the marker only after steps 3–6 succeed.** The restore action left
+   it in place. After checking keys, archive it explicitly with the same script:
 
    ```sh
-   sudo mv -- "$MARKER" "$RECOVERY_DIR/restored-pair.maintenance.json"
+   sudo env DB="$DB" MARKER="$MARKER" BACKUP="$BACKUP" BACKUP_SHA256="$BACKUP_SHA256" \
+     PRIOR="$PRIOR" PRIOR_SHA256="$PRIOR_SHA256" \
+     PROGRAM="$PROGRAM" EVIDENCE="$EVIDENCE" \
+     OWNER="$OWNER" GROUP="$GROUP" PROGRAM_OWNER=root PROGRAM_GROUP=root \
+     sh docs/operations/upgrade-recovery-files.sh archive-marker
    ```
 
-   Do not use a command that clears it before restoring and checking both
-   members. If this operation fails, remain stopped and investigate.
+   This preserves `restored-pair.maintenance.json` beside the failed marker
+   evidence. Do not clear the marker by any other means or before restoring and
+   checking both members. If the script fails, remain stopped and investigate.
 
 8. **Start the restored program and verify the installation.** Make the unit
    available again, start it, and verify normal readiness (not HTTP 503),
@@ -173,6 +194,8 @@ with enough free space; do not put it inside the backup directory.
    publications. Keep the recovery evidence and finalized backup:
 
    ```sh
+   sudo chown "$OWNER:$GROUP" "$DATA"
+   sudo chmod 700 "$DATA"
    sudo systemctl unmask --runtime deploy-manager.service
    sudo systemctl start deploy-manager.service
    curl --fail --silent --show-error http://127.0.0.1:8080/ >/dev/null
@@ -210,11 +233,12 @@ planned whole-installation recovery for those cases.
 
 ## Rehearsal
 
-The repository's isolated operator-recovery rehearsal builds two test-only
-fixture program versions, induces a real child-process interruption during the
-upgrade lifecycle, confirms that an ordinary restart stays locked, and executes
-the same explicit quarantine/stage/verify/marker-archive command sequence above
-against temporary fixture paths. It never targets a maintainer installation.
+The isolated rehearsal builds two distinct test-only fixture executables,
+induces a real child-process migration failure during startup, confirms restart
+stays locked, and runs `upgrade-recovery-files.sh`—the exact file-restoration
+path above—against temporary paths. It checks restored OPAQUE login,
+repository-key signing/decryption, durable job state, publication content and
+directory identity. It never targets a maintainer installation.
 Run it with:
 
 ```sh
