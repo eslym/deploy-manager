@@ -70,14 +70,16 @@ with enough free space; do not put it inside the backup directory.
    operation, and backup location. The marker is
    `/srv/deploy-manager/data/state.sqlite.maintenance.json`. A recoverable
    backup is the `.db` file named by that marker **and** its adjacent `.db.json`
-   manifest with `"status":"complete"`, matching source version and the
-   failing program identity in the marker, and a SHA-256 matching the database
-   file. Verify it read-only with the procedure below. The executable is not
-   included in that backup. Retrieve and verify the exact previous release from
-   your pre-upgrade release inventory; do not mistake the manifest's failing
-   program identity for the rollback executable or substitute an arbitrary older
-   binary. If any member is missing or cannot be verified, stop here and remain
-   locked.
+   manifest with `"status":"complete"`, matching source version, and a SHA-256
+   matching the database file. The manifest records `prior_program` separately
+   from `program`: the latter is the executable that attempted the upgrade;
+   `prior_program` is daemon-recorded source-installation provenance, including
+   the exact prior executable path, build version/revision, artifact SHA-256,
+   canonical database path/filesystem identity, and source schema.
+   Verify it against the independently retained executable before restoration.
+   The executable is not included in the database backup. If prior provenance,
+   the matching artifact, or any backup member is missing or cannot be verified,
+   stop here and remain locked; never infer the prior program from the upgrader.
 
    Set the following shell variables from the inspected installation and
    manifest. Use the exact absolute backup path from the marker; do not guess
@@ -111,13 +113,16 @@ with enough free space; do not put it inside the backup directory.
    trusted equivalent in read-only/immutable mode; if verification is not
    possible, do not restore. Do not modify the finalized backup.
 
-   `program` identifies the executable that attempted the failed upgrade; it is
-   not the prior executable. The exact previous build is identified by your
-   retained pre-upgrade release inventory (record its build/revision and trusted
-   artifact SHA-256 before installing a new version). Match that inventory to
-   the database's `source_version`, and verify `PRIOR_SHA256` against the
-   retained executable. If no trusted identity and exact prior artifact exist,
-   remain stopped.
+   Compare `prior_program.version`, `prior_program.revision` (when present),
+   `prior_program.executable`, and `prior_program.sha256` in the manifest with
+   the retained artifact and trusted release inventory. `source_version` must
+   match the backup schema. `program` and the marker's `program` identify the
+   upgrader only. The application records provenance only after a daemon has
+   verified and prepared the current schema; setup/recovery CLI binaries never
+   overwrite daemon provenance. An existing store without trustworthy
+   source-schema provenance fails closed rather than manufacturing a prior
+   identity. Verify `PRIOR_SHA256` against the retained executable; if there is
+   no trusted identity and exact prior artifact, remain stopped.
 
 4. **Preserve failed state as evidence.** Capture service logs to a named file
    in the recovery directory. Quarantine the failed database and every existing

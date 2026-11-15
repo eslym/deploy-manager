@@ -25,12 +25,13 @@ import (
 )
 
 type backupManifest struct {
-	Status        string `json:"status"`
-	SourceVersion int64  `json:"source_version"`
-	TargetVersion int64  `json:"target_version"`
-	Program       string `json:"program"`
-	Created       string `json:"created"`
-	SHA256        string `json:"sha256"`
+	Status        string            `json:"status"`
+	SourceVersion int64             `json:"source_version"`
+	TargetVersion int64             `json:"target_version"`
+	Program       string            `json:"program"` // upgrader, not rollback program
+	PriorProgram  programProvenance `json:"prior_program"`
+	Created       string            `json:"created"`
+	SHA256        string            `json:"sha256"`
 }
 
 // The caller holds exclusive cross-process storage access throughout this
@@ -65,6 +66,10 @@ func prepareUpgradeBackup(cfg Config, source, target int64, dbURL string) (retEr
 			}
 		}
 	}
+	priorProgram, err := readPriorProgramProvenance(cfg, source)
+	if err != nil {
+		return err
+	}
 	var operationBytes [16]byte
 	if _, err := rand.Read(operationBytes[:]); err != nil {
 		return err
@@ -90,6 +95,11 @@ func prepareUpgradeBackup(cfg Config, source, target int64, dbURL string) (retEr
 		}
 	}()
 	phase := func(name string, db *sql.DB) error {
+		if cfg.upgradeContext != nil {
+			if err := cfg.upgradeContext.Err(); err != nil {
+				return err
+			}
+		}
 		if cfg.storageFault != nil {
 			return cfg.storageFault(name, db)
 		}
@@ -130,7 +140,7 @@ func prepareUpgradeBackup(cfg Config, source, target int64, dbURL string) (retEr
 	if err != nil {
 		return fmt.Errorf("upgrade backup verification failed; verified recovery copy is not guaranteed: %w", err)
 	}
-	manifest := backupManifest{Status: "complete", SourceVersion: source, TargetVersion: target, Program: program, Created: time.Now().UTC().Format(time.RFC3339Nano), SHA256: checksum}
+	manifest := backupManifest{Status: "complete", SourceVersion: source, TargetVersion: target, Program: program, PriorProgram: priorProgram, Created: time.Now().UTC().Format(time.RFC3339Nano), SHA256: checksum}
 	if err := phase("backup-finalize", nil); err != nil {
 		return fmt.Errorf("verified backup could not be durably finalized; recovery copy is not guaranteed: %w", err)
 	}
@@ -525,7 +535,33 @@ func copyExclusive(source, destination string, phase func(string, *sql.DB) error
 	if err != nil {
 		return err
 	}
-	_, copyErr := io.Copy(out, in)
+	buffer := make([]byte, 64<<10)
+	var copyErr error
+	for {
+		n, readErr := io.ReadFull(in, buffer)
+		if n > 0 {
+			written, writeErr := out.Write(buffer[:n])
+			if writeErr != nil {
+				copyErr = writeErr
+				break
+			}
+			if written != n {
+				copyErr = io.ErrShortWrite
+				break
+			}
+			if hookErr := phase("backup-copy-chunk", nil); hookErr != nil {
+				copyErr = hookErr
+				break
+			}
+		}
+		if readErr == io.EOF || readErr == io.ErrUnexpectedEOF {
+			break
+		}
+		if readErr != nil {
+			copyErr = readErr
+			break
+		}
+	}
 	if copyErr == nil {
 		copyErr = phase("backup-copy", nil)
 	}

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"database/sql"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -168,6 +169,116 @@ func freeAddress(t *testing.T) string {
 	return address
 }
 
+func TestServePublishesMaintenanceUntilApplicationStartupCompletes(t *testing.T) {
+	address := freeAddress(t)
+	entered, release := make(chan struct{}), make(chan struct{})
+	finished := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		finished <- serveWithStartup(ctx, address, nil, func(context.Context) (http.Handler, func(), error) {
+			close(entered)
+			<-release
+			return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }), func() {}, nil
+		})
+	}()
+	<-entered
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		response, err := (&http.Client{Timeout: time.Second}).Get("http://" + address + "/webhooks/gitea")
+		if method == http.MethodHead {
+			request, _ := http.NewRequest(method, "http://"+address+"/webhooks/github", nil)
+			response, err = (&http.Client{Timeout: time.Second}).Do(request)
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusServiceUnavailable {
+			t.Fatalf("%s during protected startup = %d, want 503", method, response.StatusCode)
+		}
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		response, err := http.Get("http://" + address + "/")
+		if err == nil {
+			response.Body.Close()
+			if response.StatusCode == http.StatusNoContent {
+				cancel()
+				select {
+				case err := <-finished:
+					if !errors.Is(err, context.Canceled) {
+						t.Fatalf("serve returned %v after cancellation", err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("serve did not stop after cancellation")
+				}
+				return
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("ready handler was not published after startup succeeded")
+}
+
+func TestServeStartupProcessFixture(t *testing.T) {
+	if os.Getenv("DM_SERVE_STARTUP_FIXTURE") != "1" {
+		return
+	}
+	address, release := os.Getenv("DM_SERVE_FIXTURE_ADDRESS"), os.Getenv("DM_SERVE_FIXTURE_RELEASE")
+	err := serveWithStartup(context.Background(), address, nil, func(context.Context) (http.Handler, func(), error) {
+		for {
+			if _, err := os.Stat(release); err == nil {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }), func() {}, nil
+	})
+	if err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+func TestRealProcessServes503DuringProtectedStartupThenSwitchesReady(t *testing.T) {
+	address, release := freeAddress(t), filepath.Join(t.TempDir(), "release-startup")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestServeStartupProcessFixture$")
+	cmd.Env = append(os.Environ(), "DM_SERVE_STARTUP_FIXTURE=1", "DM_SERVE_FIXTURE_ADDRESS="+address, "DM_SERVE_FIXTURE_RELEASE="+release)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill(); _ = cmd.Wait() })
+	client := &http.Client{Timeout: time.Second}
+	request := func(method, path string) int {
+		r, _ := http.NewRequest(method, "http://"+address+path, nil)
+		response, err := client.Do(r)
+		if err != nil {
+			return 0
+		}
+		defer response.Body.Close()
+		return response.StatusCode
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && request(http.MethodGet, "/webhooks/gitea") != http.StatusServiceUnavailable {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := request(http.MethodHead, "/webhooks/github"); got != http.StatusServiceUnavailable {
+		t.Fatalf("HEAD while startup blocked returned %d, want 503", got)
+	}
+	if err := os.WriteFile(release, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if got := request(http.MethodGet, "/"); got == http.StatusNoContent {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("process did not switch to ready handler after initialization succeeded")
+}
+
 func startCommand(t *testing.T, binary, data, address string, flags ...string) *http.Client {
 	t.Helper()
 	args := append([]string{"serve", "--data", data, "--listen", address}, flags...)
@@ -210,7 +321,12 @@ func startCommand(t *testing.T, binary, data, address string, flags ...string) *
 		res, err := client.Get(scheme + "://" + address + "/")
 		if err == nil {
 			res.Body.Close()
-			return client
+			if res.StatusCode != http.StatusServiceUnavailable {
+				return client
+			}
+			if _, markerErr := os.Lstat(filepath.Join(data, "state.sqlite.maintenance.json")); markerErr == nil {
+				return client
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

@@ -200,7 +200,7 @@ func (a *App) fetchProjectForBranchAttempt(ctx context.Context, id string) error
 		}
 		return errors.New("refreshed project cache could not be promoted")
 	}
-	if err := replaceProjectMetadata(p.store, id, refs, time.Now().UTC()); err != nil {
+	if err := replaceProjectMetadata(ctx, p.store, id, refs, time.Now().UTC()); err != nil {
 		if p.rollbackRefresh(id, true) != nil {
 			return errors.New("project cache recovery is required")
 		}
