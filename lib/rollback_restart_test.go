@@ -156,7 +156,7 @@ func TestPermanentRollbackFailuresKeepPauseTargetAndLiveFiles(t *testing.T) {
 			restoreFault := func() {}
 			switch phase {
 			case "fetch":
-				f.failGitFetch.Store(true)
+				f.fetchFailureStatus.Store(int32(http.StatusServiceUnavailable))
 			case "missing-branch":
 				remote, openErr := git.PlainOpen(f.remoteDir)
 				if openErr != nil {

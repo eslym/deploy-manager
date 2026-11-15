@@ -27,7 +27,7 @@ type automationFixture struct {
 	secret                                      []byte
 	provider                                    string
 	gitFetches                                  atomic.Int32
-	failGitFetch                                atomic.Bool
+	fetchFailureStatus                          atomic.Int32
 }
 
 func newAutomationFixture(t *testing.T, providers ...string) *automationFixture {
@@ -47,8 +47,9 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	var endpoint *transport.Endpoint
 	var backend transport.Transport
 	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == http.MethodGet && f.failGitFetch.Load() {
-			http.Error(w, "injected fetch failure", http.StatusServiceUnavailable)
+		if status := int(f.fetchFailureStatus.Load()); status != 0 && r.Method == http.MethodGet {
+			f.gitFetches.Add(1)
+			http.Error(w, "controlled fetch failure Authorization: Bearer private-test-secret", status)
 			return
 		}
 		session, err := backend.NewUploadPackSession(endpoint, nil)
@@ -98,7 +99,7 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	backend = gitserver.NewServer(gitserver.MapLoader{endpoint.String(): repo.Storer})
 	installTrustedSmartHTTPTestClient(t, remote)
 	dir := t.TempDir()
-	f.app, err = New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key")})
+	f.app, err = New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), FetchRetryAttempts: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -140,6 +141,83 @@ func (f *automationFixture) createBranch(t *testing.T, name string) string {
 	response.Body.Close()
 	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, created.ID, created.JobID, "succeeded")
 	return created.ID
+}
+
+func TestBranchDeploymentRetriesTransientFetchesButNotAuthenticationFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int32
+		wantTries int32
+	}{
+		{name: "server unavailable", status: http.StatusServiceUnavailable, wantTries: 2},
+		{name: "authentication rejected", status: http.StatusUnauthorized, wantTries: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAutomationFixture(t)
+			id := f.createBranch(t, "retry-policy")
+			before := f.gitFetches.Load()
+			f.fetchFailureStatus.Store(tc.status)
+			jobID := f.action(t, id, "deploy", `{}`)
+			waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, jobID, "failed")
+			if got := f.gitFetches.Load() - before; got != tc.wantTries {
+				t.Fatalf("transient retry policy made %d fetch attempts, want %d", got, tc.wantTries)
+			}
+			jobs := f.waitJobs(t, id)
+			if len(jobs) == 0 || jobs[0].ID != jobID || strings.Contains(jobs[0].Log, "controlled fetch failure") || strings.Contains(jobs[0].Log, "private-test-secret") {
+				t.Fatalf("failed job details are missing or unsanitized: %+v", jobs)
+			}
+		})
+	}
+}
+
+func TestJobHistoryRetentionExpiresTerminalWorkButPreservesActiveAndCleanupWork(t *testing.T) {
+	f := newAutomationFixture(t)
+	id := f.createBranch(t, "history-retention")
+	retentionNow := time.Now().UTC()
+	f.app.cfg.JobRetention = time.Hour
+	f.app.cfg.Now = func() time.Time { return retentionNow }
+	old := retentionNow.Add(-2 * time.Hour).UnixNano()
+	ids := map[string]string{
+		"expired": strings.Repeat("d", 32),
+		"active":  strings.Repeat("e", 32),
+		"cleanup": strings.Repeat("f", 32),
+	}
+	for key, status := range map[string]string{"expired": "succeeded", "active": "running", "cleanup": "succeeded"} {
+		if _, err := f.app.db.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at) VALUES(?,?,?,1,?,?,?,?)`, ids[key], id, f.initialCommit, status, "Historical outcome", old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.app.db.Exec(`INSERT INTO publication_cleanup(deployment_id,job_id,path_name,dev,ino,not_before,last_error,attempts) VALUES(?,?,?,?,?,?,?,0)`, id, ids["cleanup"], "."+id+".stage-"+ids["cleanup"], 0, 0, retentionNow.Add(time.Hour).UnixNano(), "cleanup pending"); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		request, _ := http.NewRequest(http.MethodGet, f.server.URL+"/api/deployments/"+id+"/jobs", nil)
+		request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
+		response, err := f.server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK {
+			t.Fatalf("job history response = %d: %s", response.StatusCode, responseText(response))
+		}
+		var jobs []deploymentJob
+		err = json.NewDecoder(response.Body).Decode(&jobs)
+		response.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		present := map[string]bool{}
+		for _, job := range jobs {
+			present[job.ID] = true
+		}
+		if !present[ids["expired"]] && present[ids["active"]] && present[ids["cleanup"]] {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatal("history retention did not expire terminal work while preserving active and cleanup-obligated jobs")
 }
 
 func (f *automationFixture) action(t *testing.T, id, action, body string) string {

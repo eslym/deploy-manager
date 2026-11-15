@@ -23,14 +23,12 @@ type transientGitNetworkError struct{}
 
 func (transientGitNetworkError) Error() string { return "temporary Git network failure" }
 
-const branchFetchMaxAttempts = 3
-
 // fetchProjectForBranch refreshes the project's shared bare cache using the
 // same bounded staging and journaled promotion policy as an explicit refresh.
 // Ref metadata is only committed after the refreshed object store is promoted.
 func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
 	var err error
-	for attempt := 1; attempt <= branchFetchMaxAttempts; attempt++ {
+	for attempt := 1; attempt <= a.cfg.FetchRetryAttempts; attempt++ {
 		err = a.fetchProjectForBranchAttempt(ctx, id)
 		if err == nil {
 			return err
@@ -41,7 +39,7 @@ func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
 		if !retryableBranchFetch(err) {
 			return err
 		}
-		if attempt == branchFetchMaxAttempts {
+		if attempt == a.cfg.FetchRetryAttempts {
 			return errBranchFetchRetriesExhausted
 		}
 		delay := time.Duration(attempt) * 100 * time.Millisecond
