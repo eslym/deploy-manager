@@ -3,21 +3,33 @@ package lib
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
+	"github.com/bytemare/opaque"
 	"golang.org/x/sys/unix"
 )
+
+var fixtureProgramVersion = "development-test"
 
 func TestParentTraversalRejectedWithoutStorageSideEffects(t *testing.T) {
 	for _, entrypoint := range []string{"daemon", "command"} {
@@ -168,6 +180,84 @@ func TestStorageCoordinationChild(t *testing.T) {
 			t.Fatal("pending upgrade unexpectedly completed")
 		}
 		return
+	case "upgrade-fail":
+		if fixtureProgramVersion != "fixture-v2" {
+			t.Fatalf("failing-upgrade process has wrong fixture identity %q", fixtureProgramVersion)
+		}
+		cfg.upgradeTargetVersion = 2
+		cfg.migrationFS = fstest.MapFS{
+			"00001_base.sql":            {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+			"00002_fixture_failure.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_partial(value TEXT NOT NULL);\nINSERT INTO missing_fixture_table VALUES('fail');\n-- +goose Down\nDROP TABLE fixture_partial;\n")},
+		}
+		if _, err := New(cfg); err == nil {
+			t.Fatal("fixture upgrade unexpectedly succeeded")
+		} else {
+			fmt.Fprintln(os.Stderr, "fixture-v2 startup failed as expected:", err)
+			os.Exit(1)
+		}
+		return
+	case "locked-restart":
+		daemon, e := OpenDaemon(cfg)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer daemon.Close()
+		if !daemon.Locked() {
+			t.Fatal("restart with retained marker became ready")
+		}
+		fmt.Println("restart remains maintenance-locked")
+		return
+	case "verify-recovered":
+		if fixtureProgramVersion != "fixture-v1" {
+			t.Fatalf("recovery process has wrong prior fixture identity %q", fixtureProgramVersion)
+		}
+		app, e := New(cfg)
+		if e != nil {
+			t.Fatal(e)
+		}
+		defer app.Close()
+		cookie := completeFixtureLogin(t, app, os.Getenv("DM_FIXTURE_PASSWORD"))
+		request := httptest.NewRequest(http.MethodGet, "/api/projects", nil)
+		request.RemoteAddr, request.Host = "127.0.0.1:12345", "manager.example"
+		request.TLS = &tls.ConnectionState{}
+		request.Header.Set("Origin", "https://manager.example")
+		request.AddCookie(cookie)
+		response := httptest.NewRecorder()
+		app.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("prior fixture authenticated API returned %d: %s", response.Code, response.Body.String())
+		}
+		keyID := os.Getenv("DM_FIXTURE_REPOSITORY_KEY")
+		if !app.repositoryKeyCanSign(keyID, []byte("rehearsal-key-signature-check")) {
+			t.Fatal("prior fixture could not decrypt and sign with the restored repository key")
+		}
+		jobID := os.Getenv("DM_FIXTURE_JOB")
+		var durable, generation int
+		var jobCommit, jobStatus string
+		if e := app.db.QueryRow(`SELECT durable,generation,commit_id,status FROM deployment_jobs WHERE id=?`, jobID).Scan(&durable, &generation, &jobCommit, &jobStatus); e != nil || durable != 1 || generation != 1 || jobCommit != strings.Repeat("d", 40) {
+			t.Fatalf("accepted durable job state was not preserved: durable=%d generation=%d commit=%q status=%q err=%v", durable, generation, jobCommit, jobStatus, e)
+		}
+		deploymentID := os.Getenv("DM_FIXTURE_DEPLOYMENT")
+		publication := app.deploymentPath(deploymentID)
+		gotIdentity, e := identity(publication)
+		if e != nil {
+			t.Fatal(e)
+		}
+		wantDev, _ := strconv.ParseUint(os.Getenv("DM_FIXTURE_PUBLICATION_DEV"), 10, 64)
+		wantIno, _ := strconv.ParseUint(os.Getenv("DM_FIXTURE_PUBLICATION_INO"), 10, 64)
+		if gotIdentity.Dev != wantDev || gotIdentity.Ino != wantIno {
+			t.Fatalf("publication directory identity changed: got %d/%d want %d/%d", gotIdentity.Dev, gotIdentity.Ino, wantDev, wantIno)
+		}
+		content, e := os.ReadFile(filepath.Join(publication, "index.html"))
+		if e != nil || string(content) != "prior-publication-witness" {
+			t.Fatalf("published content changed/lost: %q err=%v", content, e)
+		}
+		var recordedDev, recordedIno uint64
+		if e := app.db.QueryRow(`SELECT live_dev,live_ino FROM deployments WHERE id=?`, deploymentID).Scan(&recordedDev, &recordedIno); e != nil || recordedDev != wantDev || recordedIno != wantIno {
+			t.Fatalf("publication identity was not conservatively retained in state: %d/%d err=%v", recordedDev, recordedIno, e)
+		}
+		fmt.Println("ready: prior fixture login, repository key, job, and publication verified")
+		return
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -248,6 +338,279 @@ func startUpgradeCrashChild(t *testing.T, cfg Config, phase string) (*exec.Cmd, 
 		_ = cmd.Wait()
 	})
 	return cmd, stdin, stdout
+}
+
+// TestDocumentedOperatorRecoveryRehearsal drives the real storage upgrade in a
+// child process, lets a real goose migration fail, then runs the documented
+// quarantine/stage/verify/unlock file commands against a temporary installation.
+func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
+	dir := t.TempDir()
+	publicationRoot := filepath.Join(dir, "publications")
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true, DeploymentRoot: publicationRoot, GitTimeout: time.Second}
+	app, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const password = "test-only OPAQUE recovery password"
+	grant, err := app.IssueRegistrationGrant()
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction, record := newRegistrationFlowWithIdentities(t, app, grant, "https://manager.example", password, nil, nil)
+	if status := finishTestRegistration(app, "", transaction, record, "https://manager.example"); status != http.StatusNoContent {
+		t.Fatalf("OPAQUE fixture registration status=%d", status)
+	}
+	key, err := app.createRepositoryKey("recovery witness", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !app.repositoryKeyCanSign(key.ID, []byte("rehearsal-key-signature-check")) {
+		t.Fatal("fixture repository key failed pre-upgrade signing check")
+	}
+	projectID, deploymentID, jobID := strings.Repeat("a", 32), strings.Repeat("b", 32), strings.Repeat("c", 32)
+	now := time.Now().UTC().UnixNano()
+	if _, err := app.db.Exec(`INSERT INTO projects(id,name,remote_url,created_at,last_fetched,warning) VALUES(?,?,?,?,?,'')`, projectID, "recovery-witness", "https://unreachable.invalid/repository.git", now, now); err != nil {
+		t.Fatal(err)
+	}
+	publication := app.deploymentPath(deploymentID)
+	if err := os.MkdirAll(publication, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(publication, "index.html"), []byte("prior-publication-witness"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	publicationIdentity, err := identity(publication)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := strings.Repeat("d", 40)
+	if _, err := app.db.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,generation,live_commit,live_dev,live_ino,status,created_at,updated_at,target_kind,target_name) VALUES(?,?,?, ?,1,?,?,?,'live',?,?,'branch','main')`, deploymentID, projectID, "live-witness", commit, commit, publicationIdentity.Dev, publicationIdentity.Ino, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.db.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable,automatic) VALUES(?,?,?,1,'queued','accepted before upgrade',?,?,1,0)`, jobID, deploymentID, commit, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opaqueBefore, err := os.ReadFile(cfg.OPAQUEKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryBefore, err := os.ReadFile(cfg.DatabasePath + ".repository-master-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Compile genuinely distinct test-only versions: the linker identity is part
+	// of the executable, and each version asserts it before performing its role.
+	v1, v2 := filepath.Join(dir, "fixture-v1"), filepath.Join(dir, "fixture-v2")
+	buildFixtureProgram(t, v1, "fixture-v1")
+	buildFixtureProgram(t, v2, "fixture-v2")
+	v1Hash, err := fileSHA256(v1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2Hash, err := fileSHA256(v2)
+	if err != nil || v1Hash == v2Hash {
+		t.Fatalf("fixture binaries must have distinct build identities: v1=%s v2=%s err=%v", v1Hash, v2Hash, err)
+	}
+	child := exec.Command(v2, "-test.run=^TestStorageCoordinationChild$")
+	child.Env = append(os.Environ(), "DM_COORDINATION_CHILD=upgrade-fail", "DM_COORDINATION_DIR="+dir)
+	if output, err := child.CombinedOutput(); err == nil {
+		t.Fatalf("failing fixture upgrade returned success: %s", output)
+	}
+	marker := cfg.DatabasePath + ".maintenance.json"
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("failed process did not leave marker: %v", err)
+	}
+	entries, err := os.ReadDir(cfg.DatabasePath + ".upgrade-backups")
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("expected finalized backup and manifest, entries=%v err=%v", entries, err)
+	}
+	backup := ""
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".db") {
+			backup = filepath.Join(cfg.DatabasePath+".upgrade-backups", entry.Name())
+		}
+	}
+	if backup == "" {
+		t.Fatal("finalized database backup not found")
+	}
+	manifestBytes, err := os.ReadFile(backup + ".json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest struct {
+		Status        string `json:"status"`
+		Program       string `json:"program"`
+		SourceVersion int64  `json:"source_version"`
+		TargetVersion int64  `json:"target_version"`
+		SHA256        string `json:"sha256"`
+	}
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil || manifest.Status != "complete" || manifest.SourceVersion != 1 || manifest.TargetVersion != 2 || !strings.HasPrefix(manifest.Program, "fixture-v2") {
+		t.Fatalf("verified backup manifest does not identify the failing fixture build: %+v err=%v", manifest, err)
+	}
+	backupBefore, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backupHash, err := fileSHA256(backup)
+	if err != nil || backupHash != manifest.SHA256 {
+		t.Fatalf("finalized backup checksum does not match its manifest: got %s want %s err=%v", backupHash, manifest.SHA256, err)
+	}
+	restart := exec.Command(v2, "-test.run=^TestStorageCoordinationChild$")
+	restart.Env = append(os.Environ(), "DM_COORDINATION_CHILD=locked-restart", "DM_COORDINATION_DIR="+dir)
+	if output, err := restart.CombinedOutput(); err != nil || !strings.Contains(string(output), "restart remains maintenance-locked") {
+		t.Fatalf("real restart escaped maintenance lock: err=%v output=%s", err, output)
+	}
+
+	// Run the same standalone file-phase script operators use. Quarantine,
+	// restore, and marker archival are separate so evidence and external-key
+	// checks happen before unlocking.
+	evidence := filepath.Join(dir, "evidence")
+	script, err := filepath.Abs("../docs/operations/upgrade-recovery-files.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid, gid := strconv.Itoa(os.Getuid()), strconv.Itoa(os.Getgid())
+	baseEnv := append(os.Environ(), "DB="+cfg.DatabasePath, "MARKER="+marker, "BACKUP="+backup, "BACKUP_SHA256="+backupHash, "PRIOR="+v1, "PRIOR_SHA256="+v1Hash, "PROGRAM="+v2, "EVIDENCE="+evidence, "OWNER="+uid, "GROUP="+gid, "PROGRAM_OWNER="+uid, "PROGRAM_GROUP="+gid)
+	cmd := exec.Command("sh", script, "quarantine")
+	cmd.Env = baseEnv
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("documented recovery quarantine action failed: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("quarantine action cleared the maintenance marker: %v", err)
+	}
+	cmd = exec.Command("sh", script, "restore")
+	cmd.Env = baseEnv
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("documented recovery restore action failed: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("restore action cleared the maintenance marker before key checks: %v", err)
+	}
+	if _, err := os.Stat(evidence + "/failed-state.sqlite"); err != nil {
+		t.Fatalf("failed database evidence missing: %v", err)
+	}
+	if _, err := os.Stat(evidence + "/failed-state.sqlite.maintenance.json"); err != nil {
+		t.Fatalf("failed marker evidence missing: %v", err)
+	}
+	if _, err := os.Stat(evidence + "/restored-pair.maintenance.json"); !os.IsNotExist(err) {
+		t.Fatalf("restore action archived marker before external-key verification: %v", err)
+	}
+	restoredProgramHash, err := fileSHA256(v2)
+	if err != nil || restoredProgramHash != v1Hash {
+		t.Fatalf("recovery did not install the exact prior executable: got %s want %s err=%v", restoredProgramHash, v1Hash, err)
+	}
+	backupAfter, err := os.ReadFile(backup)
+	if err != nil || string(backupBefore) != string(backupAfter) {
+		t.Fatalf("recovery commands modified the finalized backup: %v", err)
+	}
+	for path, before := range map[string][]byte{cfg.OPAQUEKeyPath: opaqueBefore, cfg.DatabasePath + ".repository-master-key": repositoryBefore} {
+		after, err := os.ReadFile(path)
+		if err != nil || string(after) != string(before) {
+			t.Fatalf("recovery changed or lost external key %s: %v", path, err)
+		}
+	}
+	archive := exec.Command("sh", script, "archive-marker")
+	archive.Env = baseEnv
+	if output, err := archive.CombinedOutput(); err != nil {
+		t.Fatalf("documented marker-archive action failed: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("marker remains after explicit archive action: %v", err)
+	}
+	if _, err := os.Stat(evidence + "/restored-pair.maintenance.json"); err != nil {
+		t.Fatalf("archived marker missing: %v", err)
+	}
+	// The script replaced v2's installed executable path with v1. Run that
+	// actual restored file as the distinct prior build, not a test helper binary.
+	prior := exec.Command(v2, "-test.run=^TestStorageCoordinationChild$")
+	prior.Env = append(os.Environ(), "DM_COORDINATION_CHILD=verify-recovered", "DM_COORDINATION_DIR="+dir,
+		"DM_FIXTURE_PASSWORD="+password, "DM_FIXTURE_REPOSITORY_KEY="+key.ID, "DM_FIXTURE_JOB="+jobID,
+		"DM_FIXTURE_DEPLOYMENT="+deploymentID, "DM_FIXTURE_PUBLICATION_DEV="+strconv.FormatUint(publicationIdentity.Dev, 10),
+		"DM_FIXTURE_PUBLICATION_INO="+strconv.FormatUint(publicationIdentity.Ino, 10))
+	output, err := prior.CombinedOutput()
+	if err != nil {
+		t.Fatalf("restored prior executable failed the observable checks: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "ready: prior fixture login, repository key, job, and publication verified") {
+		t.Fatalf("restored prior executable did not report all verification checks: %s", output)
+	}
+}
+
+func buildFixtureProgram(t *testing.T, output, version string) {
+	t.Helper()
+	cmd := exec.Command("go", "test", "-c", "-o", output, "-ldflags", "-X=github.com/eslym/deploy-manager/lib.fixtureProgramVersion="+version)
+	if result, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("build %s fixture program: %v\n%s", version, err, result)
+	}
+}
+
+func fileSHA256(path string) (string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(content)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+func completeFixtureLogin(t *testing.T, app *App, password string) *http.Cookie {
+	t.Helper()
+	const origin = "https://manager.example"
+	client, err := opaque.NewClient(opaque.DefaultConfiguration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.ClearState()
+	ke1, err := client.GenerateKE1([]byte(password))
+	if err != nil {
+		t.Fatal(err)
+	}
+	startBody, err := json.Marshal(protocolMessage{Value: base64.RawURLEncoding.EncodeToString(ke1.Serialize())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := registrationRequest(app, http.MethodPost, "/opaque/login/start", startBody, origin)
+	if start.Code != http.StatusOK {
+		t.Fatalf("OPAQUE login start returned %d: %s", start.Code, start.Body.String())
+	}
+	var startResponse struct {
+		Transaction string `json:"transaction"`
+		Value       string `json:"value"`
+	}
+	if err := json.Unmarshal(start.Body.Bytes(), &startResponse); err != nil || startResponse.Transaction == "" {
+		t.Fatalf("invalid OPAQUE login response: %+v (%v)", startResponse, err)
+	}
+	ke2Bytes, err := base64.RawURLEncoding.DecodeString(startResponse.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ke2, err := client.Deserialize.KE2(ke2Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ke3, _, _, err := client.GenerateKE3(ke2, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finishBody, err := json.Marshal(protocolMessage{Transaction: &startResponse.Transaction, Value: base64.RawURLEncoding.EncodeToString(ke3.Serialize())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finish := registrationRequest(app, http.MethodPost, "/opaque/login/finish", finishBody, origin)
+	if finish.Code != http.StatusNoContent {
+		t.Fatalf("OPAQUE login finish returned %d: %s", finish.Code, finish.Body.String())
+	}
+	for _, cookie := range finish.Result().Cookies() {
+		if cookie.Name == sessionCookie {
+			return cookie
+		}
+	}
+	t.Fatal("OPAQUE login did not issue a session cookie")
+	return nil
 }
 
 func TestConcurrentCommandTransactionsRespectGrantLimit(t *testing.T) {
