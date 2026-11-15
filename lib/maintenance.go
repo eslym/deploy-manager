@@ -8,6 +8,16 @@ import (
 	"strings"
 )
 
+type maintenanceMarker struct {
+	Version       int    `json:"version"`
+	SourceVersion int64  `json:"source_version"`
+	TargetVersion int64  `json:"target_version"`
+	Program       string `json:"program"`
+	Operation     string `json:"operation"`
+	Backup        string `json:"backup"`
+	Phase         string `json:"phase"`
+}
+
 // ErrMaintenance means application data must not be accessed. Its diagnostic is
 // deliberately independent of marker contents, paths and filesystem errors.
 var ErrMaintenance = errors.New("installation is maintenance-locked; stop all database users and follow operator recovery before explicitly clearing the marker")

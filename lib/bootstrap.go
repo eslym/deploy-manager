@@ -23,6 +23,7 @@ import (
 
 	"github.com/bytemare/opaque"
 	_ "github.com/mattn/go-sqlite3"
+	"golang.org/x/sys/unix"
 )
 
 // Config controls durable administrator bootstrap. OPAQUEKeyPath must be external to SQLite.
@@ -197,7 +198,30 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(sqlitePath)}).String()
 	if prior {
 		if err := preflightExistingSchema(dbURL); err != nil {
-			return nil, err
+			var pending pendingUpgrade
+			if !errors.As(err, &pending) {
+				return nil, err
+			}
+			if err := access.acquire(unix.LOCK_EX); err != nil {
+				return nil, err
+			}
+			if err := CheckMaintenance(cfg); err != nil {
+				return nil, err
+			}
+			priorNow, err := inspectGuardedStorage(cfg)
+			if err != nil || !priorNow {
+				if err == nil {
+					err = errors.New("database changed during maintenance transition")
+				}
+				return nil, err
+			}
+			if err := preflightExistingSchema(dbURL); err != nil {
+				if !errors.As(err, &pending) {
+					return nil, err
+				}
+				return nil, prepareUpgradeBackup(cfg, pending.source, pending.target, dbURL)
+			}
+			return nil, errors.New("database upgrade state changed during maintenance transition; refusing startup")
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0700); err != nil {
