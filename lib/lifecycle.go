@@ -2,22 +2,26 @@ package lib
 
 import (
 	"bytes"
-	"database/sql"
-	"errors"
+	"context"
 	"net/http"
 	"time"
+
+	"github.com/eslym/deploy-manager/lib/ent"
+	"github.com/eslym/deploy-manager/lib/ent/administrator"
+	"github.com/eslym/deploy-manager/lib/ent/registrationgrant"
 )
 
 // refreshCredentialGenerationLocked synchronizes sessions and pending logins
 // with durable credential replacements made by another App process.
 func (a *App) refreshCredentialGenerationLocked() error {
+	adminRecord, err := a.store.Administrator.Get(context.Background(), 1)
 	var generation int64
-	err := a.db.QueryRow(`SELECT credential_generation FROM administrator WHERE id=1`).Scan(&generation)
-	if errors.Is(err, sql.ErrNoRows) {
-		generation, err = 0, nil
-	}
 	if err != nil {
-		return err
+		if !ent.IsNotFound(err) {
+			return err
+		}
+	} else {
+		generation = adminRecord.CredentialGeneration
 	}
 	if generation != a.credentialGeneration {
 		a.credentialGeneration = generation
@@ -115,7 +119,8 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 		return
 	}
 	old := a.credentialGeneration
-	tx, err := a.db.Begin()
+	ctx := context.Background()
+	tx, err := a.store.Tx(ctx)
 	if err != nil {
 		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
 		return
@@ -128,13 +133,12 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 			http.Error(w, "registration transaction expired or invalid; start again", http.StatusGone)
 			return
 		}
-		res, e := tx.Exec(`DELETE FROM registration_grants WHERE token_hash=? AND purpose='recovery' AND credential_generation=? AND expires_at>=?`, grantHash, old, now)
+		res, e := tx.RegistrationGrant.Delete().Where(registrationgrant.IDEQ(grantHash), registrationgrant.PurposeEQ("recovery"), registrationgrant.CredentialGenerationEQ(old), registrationgrant.ExpiresAtGTE(now)).Exec(ctx)
 		if e != nil {
 			http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
 			return
 		}
-		n, _ := res.RowsAffected()
-		if n != 1 {
+		if res != 1 {
 			http.Error(w, "grant expired, superseded, or already used", http.StatusGone)
 			return
 		}
@@ -145,17 +149,16 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 			return
 		}
 	}
-	res, err := tx.Exec(`UPDATE administrator SET registration_record=?,credential_generation=credential_generation+1 WHERE id=1 AND credential_generation=? AND profile_generation=1`, record, old)
+	res, err := tx.Administrator.Update().Where(administrator.IDEQ(1), administrator.CredentialGenerationEQ(old), administrator.ProfileGenerationEQ(1)).SetRegistrationRecord(record).AddCredentialGeneration(1).Save(ctx)
 	if err != nil {
 		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
 		return
 	}
-	n, err := res.RowsAffected()
-	if err != nil || n != 1 {
+	if res != 1 {
 		http.Error(w, "credential replacement conflicted", http.StatusConflict)
 		return
 	}
-	if _, err = tx.Exec(`DELETE FROM registration_grants`); err != nil {
+	if _, err = tx.RegistrationGrant.Delete().Exec(ctx); err != nil {
 		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
 		return
 	}
