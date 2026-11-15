@@ -55,6 +55,7 @@
 	let projectDeleteConfirmation = $state('');
 	let cacheRecreateConfirmation = $state('');
 	let cacheRecreateTrigger: HTMLButtonElement | undefined = $state();
+	let cacheRecreateTriggerProject = '';
 	let cacheRecreateBusy = $state(false);
 	let cacheRecreateError = $state('');
 	let cacheRecreateNotice = $state('');
@@ -375,7 +376,7 @@
 			storageCleared = true;
 			const refreshedProjects: Project[] = await request('/api/projects');
 			projects = refreshedProjects;
-			closeCacheRecreateConfirmation();
+			if (cacheRecreateConfirmation === project.id) closeCacheRecreateConfirmation(true);
 			if (selected === project.id)
 				cacheRecreateNotice = 'Repository storage cleared. Sizes updated.';
 		} catch (cause) {
@@ -389,15 +390,28 @@
 	async function openCacheRecreateConfirmation(project: Project) {
 		cacheRecreateTrigger =
 			document.activeElement instanceof HTMLButtonElement ? document.activeElement : undefined;
+		cacheRecreateTriggerProject = project.id;
 		cacheRecreateConfirmation = project.id;
 		cacheRecreateError = '';
 		cacheRecreateNotice = '';
 		await tick();
 		document.getElementById('cache-recreate-confirm')?.focus();
 	}
-	function closeCacheRecreateConfirmation() {
+	function closeCacheRecreateConfirmation(restoreFocus = true) {
 		cacheRecreateConfirmation = '';
-		void tick().then(() => document.getElementById('cache-recreate-trigger')?.focus());
+		const trigger = cacheRecreateTrigger;
+		const projectId = cacheRecreateTriggerProject;
+		cacheRecreateTrigger = undefined;
+		cacheRecreateTriggerProject = '';
+		if (restoreFocus)
+			void tick().then(() => {
+				const target = trigger?.isConnected
+					? trigger
+					: document.querySelector<HTMLButtonElement>(
+							`[data-cache-recreate-trigger="${CSS.escape(projectId)}"]`
+						);
+				target?.focus();
+			});
 	}
 	function trapCacheRecreateFocus(event: KeyboardEvent) {
 		if (event.key === 'Escape' && !cacheRecreateBusy) {
@@ -596,7 +610,7 @@
 								aria-pressed={selected === project.id}
 								onclick={() => {
 									selected = project.id;
-									closeCacheRecreateConfirmation();
+									closeCacheRecreateConfirmation(false);
 									cacheRecreateError = '';
 									cacheRecreateNotice = '';
 									search = '';
@@ -677,7 +691,7 @@
 								>
 								<button
 									class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold disabled:opacity-60"
-									onclick={closeCacheRecreateConfirmation}
+									onclick={() => closeCacheRecreateConfirmation()}
 									disabled={cacheRecreateBusy}>Cancel</button
 								>
 							</div>
@@ -685,6 +699,7 @@
 					{:else}
 						<button
 							id="cache-recreate-trigger"
+							data-cache-recreate-trigger={project?.id ?? ''}
 							class="mt-2 min-h-9 rounded-lg border border-amber-500 px-3 text-sm font-semibold text-amber-950 disabled:opacity-60"
 							onclick={() => project && openCacheRecreateConfirmation(project)}
 							disabled={cacheRecreateBusy || !project}>Clear cache…</button
