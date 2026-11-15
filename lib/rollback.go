@@ -198,6 +198,10 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := a.cfg.Now().UnixNano()
+	supersedeMessage := "Superseded by temporary rollback"
+	if in.Permanent {
+		supersedeMessage = "Superseded by permanent rollback"
+	}
 	newGeneration := d.Generation + 1
 	update := tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.GenerationEQ(d.Generation)).AddGeneration(1).SetStatus("queued").SetError("").SetUpdatedAt(now)
 	if in.Permanent {
@@ -219,7 +223,7 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				break
 			}
-			logText := old.Log + "\nSuperseded by temporary rollback"
+			logText := old.Log + "\n" + supersedeMessage
 			if len(logText) > 8192 {
 				logText = logText[:8192]
 			}

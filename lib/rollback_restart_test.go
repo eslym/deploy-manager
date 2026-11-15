@@ -13,6 +13,7 @@ import (
 func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) {
 	f := newAutomationFixture(t)
 	id := f.createBranch(t, "permanent-rollback")
+	other := f.createBranch(t, "permanent-rollback-independent")
 	before, err := identity(f.app.deploymentPath(id))
 	if err != nil {
 		t.Fatal(err)
@@ -31,6 +32,33 @@ func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) 
 	assertAutomationPaused(t, f.server, f.cookie, id, true)
 	if after, err := identity(f.app.deploymentPath(id)); err != nil || after != before {
 		t.Fatalf("failed permanent rollback changed live publication: %v", err)
+	}
+	cfg := f.app.cfg
+	f.server.Close()
+	if err = f.app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.app, err = New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.cookie = installAPITestSession(t, f.app)
+	f.server = httptest.NewTLSServer(f.app.Handler())
+	defer f.server.Close()
+	defer f.app.Close()
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	latest := addSmartFixtureCommit(t, f.remoteDir, "after permanent rollback failure")
+	f.push(t, "after-permanent-rollback-restart", latest)
+	pausedJobs := f.waitJobs(t, id)
+	if pausedJobs[0].Status != "noop" {
+		t.Fatalf("permanently paused deployment published webhook update: %+v", pausedJobs[0])
+	}
+	independentJobs := f.waitJobs(t, other)
+	if independentJobs[0].Status != "succeeded" || independentJobs[0].Commit != latest {
+		t.Fatalf("permanent pause blocked independent deployment: %+v", independentJobs[0])
+	}
+	if after, err := identity(f.app.deploymentPath(id)); err != nil || after != before {
+		t.Fatalf("restart or paused webhook changed failed rollback publication: %v", err)
 	}
 }
 
