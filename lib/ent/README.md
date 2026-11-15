@@ -18,10 +18,14 @@ or migrate schema. Embedded goose SQL remains the only schema executor.
 including the singleton OPAQUE profile and administrator and the existing
 project/deployment/job relationships. Composite-key tables retain their full
 unique indexes in the Ent model; because Ent's entity API requires an ID, the
-first physical key component is used as the generated ID. Do not use generated
-ID-based CRUD against those composite-key tables. Their operational workflows
-remain on the existing SQL transaction paths until a separately reviewed
-adapter can preserve their composite identity without changing v1 storage.
+first physical key component is used as the generated ID. For such tables,
+bulk operations are safe only when their predicate identifies the complete
+physical key, and inserts must explicitly supply the complete key tuple. Do
+not use generated ID-only `Get`, `UpdateOne`, or `DeleteOne` operations: the
+generated ID is not the full identity and can select or modify the wrong row.
+Use the existing raw SQL transaction path when the complete-key operation
+cannot be expressed safely through Ent. This restriction does not apply to
+`ProjectSSHKey`: its `project_id` is its sole physical primary key.
 
 The account workflows use Ent for OPAQUE profile binding, registration grants,
 the singleton administrator, login record lookup, and atomic credential

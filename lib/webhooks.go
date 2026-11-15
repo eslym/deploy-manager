@@ -25,6 +25,7 @@ import (
 	"github.com/eslym/deploy-manager/lib/ent/projectwebhook"
 	"github.com/eslym/deploy-manager/lib/ent/webhookdelivery"
 	"github.com/go-git/go-git/v5/plumbing"
+	sqlite3 "github.com/mattn/go-sqlite3"
 )
 
 const githubWebhookProvider = "github"
@@ -409,7 +410,11 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 	}
 	defer tx.Rollback()
 	if _, err = tx.WebhookDelivery.Create().SetID(projectID).SetProvider(provider).SetDeliveryID(deliveryID).SetEvent(event).SetOutcome("ignored").SetCreatedAt(a.cfg.Now().UnixNano()).Save(context.Background()); err != nil {
-		if entdb.IsConstraintError(err) {
+		var sqliteErr sqlite3.Error
+		// The physical primary key is exactly (project, provider, delivery ID);
+		// only that key conflict proves the receipt was already accepted. Other
+		// constraint errors (notably FK/trigger failures) must not be acked.
+		if errors.As(err, &sqliteErr) && sqliteErr.ExtendedCode == sqlite3.ErrConstraintPrimaryKey {
 			return nil
 		}
 		return err
