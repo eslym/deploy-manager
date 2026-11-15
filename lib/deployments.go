@@ -998,27 +998,24 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if oldErr != nil && !os.IsNotExist(oldErr) {
 		return oldErr
 	}
+	dbCtx := context.Background()
 	// Recheck the saved configuration at the final database/filesystem boundary.
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(dbCtx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var currentCommit string
-	var currentGeneration int64
-	var currentStatus string
-	var paused bool
-	var epoch int64
-	if err = tx.QueryRow(`SELECT commit_id,generation,status,automation_paused,automation_epoch FROM deployments WHERE id=?`, d.ID).Scan(&currentCommit, &currentGeneration, &currentStatus, &paused, &epoch); err != nil {
+	current, err := tx.Deployment.Get(dbCtx, d.ID)
+	if err != nil {
 		return errors.New("deployment was deleted before publication")
 	}
-	if currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && currentCommit != d.Commit) || (d.automatic && (paused || epoch != d.automationEpoch)) {
+	if current.Generation != generation || current.Status == "deleting" || current.Status == "deletion_failed" || (d.TargetKind != "branch" && current.CommitID != d.Commit) || (d.automatic && (current.AutomationPaused != 0 || current.AutomationEpoch != d.automationEpoch)) {
 		return errors.New("publication target changed; job superseded")
 	}
 	if err = fault("before-intent"); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`INSERT INTO publication_intents(deployment_id,job_id,stage_name,had_old,old_dev,old_ino,new_dev,new_ino,phase,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)`, d.ID, jobID, filepath.Base(stage), boolInt(hadOld), oldID.Dev, oldID.Ino, newID.Dev, newID.Ino, "intent", a.cfg.Now().UnixNano()); err != nil {
+	if _, err = tx.PublicationIntent.Create().SetID(d.ID).SetJobID(jobID).SetStageName(filepath.Base(stage)).SetHadOld(boolInt(hadOld)).SetOldDev(int64(oldID.Dev)).SetOldIno(int64(oldID.Ino)).SetNewDev(int64(newID.Dev)).SetNewIno(int64(newID.Ino)).SetPhase("intent").SetCreatedAt(a.cfg.Now().UnixNano()).Save(dbCtx); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1030,20 +1027,32 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	// Hold a SQLite write transaction from the final generation check through
 	// the namespace switch and durable state update. Target edits may supersede
 	// work during preparation, but cannot slip between this check and exchange.
-	boundaryTx, err := a.db.Begin()
+	boundaryTx, err := a.store.Tx(dbCtx)
 	if err != nil {
 		return err
 	}
 	defer boundaryTx.Rollback()
-	guard, err := boundaryTx.Exec(`UPDATE deployments SET updated_at=updated_at WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed') AND (?=0 OR (automation_paused=0 AND automation_epoch=?))`, d.ID, generation, boolInt(d.automatic), d.automationEpoch)
+	boundaryDeployment, err := boundaryTx.Deployment.Get(dbCtx, d.ID)
+	if err != nil {
+		return errors.New("deployment was deleted before publication")
+	}
+	guard := boundaryTx.Deployment.Update().Where(
+		deploymentmodel.IDEQ(d.ID),
+		deploymentmodel.GenerationEQ(generation),
+		deploymentmodel.StatusNotIn("deleting", "deletion_failed"),
+	)
+	if d.automatic {
+		guard.Where(deploymentmodel.AutomationPausedEQ(0), deploymentmodel.AutomationEpochEQ(d.automationEpoch))
+	}
+	changed, err := guard.SetUpdatedAt(boundaryDeployment.UpdatedAt).Save(dbCtx)
 	if err != nil {
 		return err
 	}
-	if changed, _ := guard.RowsAffected(); changed != 1 {
+	if changed != 1 {
 		// No namespace operation has happened. Remove only this job's intent
 		// while holding the same write transaction, so cleanup is safe now and
 		// a subsequent manual publication does not require restart recovery.
-		if _, err = boundaryTx.Exec(`DELETE FROM publication_intents WHERE deployment_id=? AND job_id=?`, d.ID, jobID); err != nil {
+		if _, err = boundaryTx.PublicationIntent.Delete().Where(publicationintent.IDEQ(d.ID), publicationintent.JobIDEQ(jobID)).Exec(dbCtx); err != nil {
 			return err
 		}
 		if err = boundaryTx.Commit(); err != nil {
@@ -1081,28 +1090,32 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if err = fault("before-state"); err != nil {
 		return err
 	}
-	tx = boundaryTx
-	var latest string
-	var latestGen int64
-	var latestStatus string
-	if err = tx.QueryRow(`SELECT commit_id,generation,status FROM deployments WHERE id=?`, d.ID).Scan(&latest, &latestGen, &latestStatus); err != nil || latestGen != generation || latestStatus == "deleting" || latestStatus == "deletion_failed" || (d.TargetKind != "branch" && latest != d.Commit) {
+	latest, err := boundaryTx.Deployment.Get(dbCtx, d.ID)
+	if err != nil || latest.Generation != generation || latest.Status == "deleting" || latest.Status == "deletion_failed" || (d.TargetKind != "branch" && latest.CommitID != d.Commit) {
 		return errors.New("target changed after directory switch; publication requires reconciliation")
 	}
-	if _, err = tx.Exec(`UPDATE deployments SET live_commit=?,live_dev=?,live_ino=?,status='live',error='',updated_at=? WHERE id=? AND generation=?`, d.Commit, newID.Dev, newID.Ino, a.cfg.Now().UnixNano(), d.ID, generation); err != nil {
+	if _, err = boundaryTx.Deployment.Update().Where(deploymentmodel.IDEQ(d.ID), deploymentmodel.GenerationEQ(generation)).SetLiveCommit(d.Commit).SetLiveDev(int64(newID.Dev)).SetLiveIno(int64(newID.Ino)).SetStatus("live").SetError("").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(dbCtx); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(`UPDATE deployment_jobs SET status='succeeded',log=substr(log || char(10) || 'Published successfully',1,8192),updated_at=? WHERE id=?`, a.cfg.Now().UnixNano(), jobID); err != nil {
+	job, err := boundaryTx.DeploymentJob.Get(dbCtx, jobID)
+	if err != nil {
+		return err
+	}
+	if _, err = boundaryTx.DeploymentJob.UpdateOneID(jobID).SetStatus("succeeded").SetLog(appendJobLog(job.Log, "Published successfully")).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(dbCtx); err != nil {
 		return err
 	}
 	if hadOld {
-		if _, err = tx.Exec(`INSERT OR REPLACE INTO publication_cleanup(deployment_id,job_id,path_name,dev,ino,not_before,last_error) VALUES(?,?,?,?,?,?, '')`, d.ID, jobID, filepath.Base(stage), oldID.Dev, oldID.Ino, a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano()); err != nil {
+		if _, err = boundaryTx.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(d.ID), publicationcleanup.JobIDEQ(jobID)).Exec(dbCtx); err != nil {
+			return err
+		}
+		if _, err = boundaryTx.PublicationCleanup.Create().SetID(d.ID).SetJobID(jobID).SetPathName(filepath.Base(stage)).SetDev(int64(oldID.Dev)).SetIno(int64(oldID.Ino)).SetNotBefore(a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano()).SetLastError("").Save(dbCtx); err != nil {
 			return err
 		}
 	}
-	if _, err = tx.Exec(`DELETE FROM publication_intents WHERE deployment_id=?`, d.ID); err != nil {
+	if _, err = boundaryTx.PublicationIntent.Delete().Where(publicationintent.IDEQ(d.ID)).Exec(dbCtx); err != nil {
 		return err
 	}
-	if err = tx.Commit(); err != nil {
+	if err = boundaryTx.Commit(); err != nil {
 		return err
 	}
 	if err = fault("after-state"); err != nil {
@@ -1121,6 +1134,14 @@ func boolInt(v bool) int {
 		return 1
 	}
 	return 0
+}
+
+func appendJobLog(log, message string) string {
+	combined := []rune(log + "\n" + message)
+	if len(combined) > 8192 {
+		combined = combined[:8192]
+	}
+	return string(combined)
 }
 
 func sanitizePublicationError(err error) string {
@@ -1202,10 +1223,6 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 				if !ok {
 					return errors.New("ambiguous publication recovery: old directory identity is not at its recorded staging path")
 				}
-				_, err = a.db.Exec(`INSERT OR REPLACE INTO publication_cleanup(deployment_id,job_id,path_name,dev,ino,not_before,last_error) VALUES(?,?,?,?,?,?, '')`, x.id, x.job, x.stage, x.old.Dev, x.old.Ino, a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano())
-				if err != nil {
-					return err
-				}
 			}
 			job, getErr := a.store.DeploymentJob.Get(context.Background(), x.job)
 			if getErr != nil {
@@ -1216,20 +1233,35 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 				err = errors.New("publication job has no commit")
 				return err
 			}
-			tx, e := a.db.Begin()
+			ctx := context.Background()
+			tx, e := a.store.Tx(ctx)
 			if e != nil {
 				return e
 			}
-			if _, e = tx.Exec(`UPDATE deployments SET live_commit=?,live_dev=?,live_ino=?,status=CASE WHEN status IN ('deleting','deletion_failed') THEN status ELSE 'live' END,error=CASE WHEN status IN ('deleting','deletion_failed') THEN error ELSE '' END,updated_at=? WHERE id=?`, commit, x.new.Dev, x.new.Ino, a.cfg.Now().UnixNano(), x.id); e != nil {
-				tx.Rollback()
+			defer tx.Rollback()
+			deployment, queryErr := tx.Deployment.Get(ctx, x.id)
+			if queryErr != nil {
+				return queryErr
+			}
+			update := tx.Deployment.UpdateOneID(x.id).SetLiveCommit(commit).SetLiveDev(int64(x.new.Dev)).SetLiveIno(int64(x.new.Ino)).SetUpdatedAt(a.cfg.Now().UnixNano())
+			if deployment.Status != "deleting" && deployment.Status != "deletion_failed" {
+				update.SetStatus("live").SetError("")
+			}
+			if _, e = update.Save(ctx); e != nil {
 				return e
 			}
-			if _, e = tx.Exec(`UPDATE deployment_jobs SET log=substr(log || char(10) || 'Filesystem outcome reconciled after restart',1,8192),updated_at=? WHERE id=?`, a.cfg.Now().UnixNano(), x.job); e != nil {
-				tx.Rollback()
+			if _, e = tx.DeploymentJob.UpdateOneID(x.job).SetLog(appendJobLog(job.Log, "Filesystem outcome reconciled after restart")).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); e != nil {
 				return e
 			}
-			if _, e = tx.Exec(`DELETE FROM publication_intents WHERE deployment_id=?`, x.id); e != nil {
-				tx.Rollback()
+			if x.had == 1 {
+				if _, e = tx.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(x.id), publicationcleanup.JobIDEQ(x.job)).Exec(ctx); e != nil {
+					return e
+				}
+				if _, e = tx.PublicationCleanup.Create().SetID(x.id).SetJobID(x.job).SetPathName(x.stage).SetDev(int64(x.old.Dev)).SetIno(int64(x.old.Ino)).SetNotBefore(a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano()).SetLastError("").Save(ctx); e != nil {
+					return e
+				}
+			}
+			if _, e = tx.PublicationIntent.Delete().Where(publicationintent.IDEQ(x.id)).Exec(ctx); e != nil {
 				return e
 			}
 			if e = tx.Commit(); e != nil {
@@ -1250,13 +1282,25 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 			} else if _, e = os.Lstat(stage); !os.IsNotExist(e) {
 				return errors.New("ambiguous publication recovery: staged directory identity changed")
 			}
-			_, err = a.db.Exec(`UPDATE deployments SET status=CASE WHEN status IN ('deleting','deletion_failed') THEN status ELSE 'failed' END,error=CASE WHEN status IN ('deleting','deletion_failed') THEN error ELSE 'publication did not switch before restart' END,updated_at=? WHERE id=?`, a.cfg.Now().UnixNano(), x.id)
-			if err != nil {
-				return err
+			ctx := context.Background()
+			tx, txErr := a.store.Tx(ctx)
+			if txErr != nil {
+				return txErr
 			}
-			_, err = a.db.Exec(`DELETE FROM publication_intents WHERE deployment_id=?`, x.id)
-			if err != nil {
-				return err
+			defer tx.Rollback()
+			deployment, queryErr := tx.Deployment.Get(ctx, x.id)
+			if queryErr == nil && deployment.Status != "deleting" && deployment.Status != "deletion_failed" {
+				if _, txErr = tx.Deployment.UpdateOneID(x.id).SetStatus("failed").SetError("publication did not switch before restart").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); txErr != nil {
+					return txErr
+				}
+			} else if queryErr != nil && !ent.IsNotFound(queryErr) {
+				return queryErr
+			}
+			if _, txErr = tx.PublicationIntent.Delete().Where(publicationintent.IDEQ(x.id)).Exec(ctx); txErr != nil {
+				return txErr
+			}
+			if txErr = tx.Commit(); txErr != nil {
+				return txErr
 			}
 		} else {
 			return errors.New("ambiguous publication recovery: live directory identity matches neither recorded state")
