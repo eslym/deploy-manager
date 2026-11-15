@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -168,6 +169,19 @@ func TestStorageCoordinationChild(t *testing.T) {
 			t.Fatal("pending upgrade unexpectedly completed")
 		}
 		return
+	case "upgrade-fail":
+		cfg.upgradeTargetVersion = 2
+		cfg.migrationFS = fstest.MapFS{
+			"00001_base.sql":            {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+			"00002_fixture_failure.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_partial(value TEXT NOT NULL);\nINSERT INTO missing_fixture_table VALUES('fail');\n-- +goose Down\nDROP TABLE fixture_partial;\n")},
+		}
+		if _, err := New(cfg); err == nil {
+			t.Fatal("fixture upgrade unexpectedly succeeded")
+		} else {
+			fmt.Fprintln(os.Stderr, "fixture-v2 startup failed as expected:", err)
+			os.Exit(1)
+		}
+		return
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -248,6 +262,170 @@ func startUpgradeCrashChild(t *testing.T, cfg Config, phase string) (*exec.Cmd, 
 		_ = cmd.Wait()
 	})
 	return cmd, stdin, stdout
+}
+
+// TestDocumentedOperatorRecoveryRehearsal drives the real storage upgrade in a
+// child process, lets a real goose migration fail, then runs the documented
+// quarantine/stage/verify/unlock file commands against a temporary installation.
+func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	opaqueBefore, err := os.ReadFile(cfg.OPAQUEKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repositoryBefore, err := os.ReadFile(cfg.DatabasePath + ".repository-master-key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two separately named compatible fixture program artifacts model the
+	// retained prior version and the test-only failing-upgrade version. The
+	// latter runs the application's real storage startup/migration code below.
+	v1, v2 := filepath.Join(dir, "fixture-v1"), filepath.Join(dir, "fixture-v2")
+	for _, path := range []string{v1, v2} {
+		if err := copyFile(os.Args[0], path, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(v1+".build", []byte("fixture-compatible-v1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(v2+".build", []byte("fixture-compatible-v2\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	child := exec.Command(v2, "-test.run=^TestStorageCoordinationChild$")
+	child.Env = append(os.Environ(), "DM_COORDINATION_CHILD=upgrade-fail", "DM_COORDINATION_DIR="+dir)
+	if output, err := child.CombinedOutput(); err == nil {
+		t.Fatalf("failing fixture upgrade returned success: %s", output)
+	}
+	marker := cfg.DatabasePath + ".maintenance.json"
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("failed process did not leave marker: %v", err)
+	}
+	entries, err := os.ReadDir(cfg.DatabasePath + ".upgrade-backups")
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("expected finalized backup and manifest, entries=%v err=%v", entries, err)
+	}
+	backup := ""
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".db") {
+			backup = filepath.Join(cfg.DatabasePath+".upgrade-backups", entry.Name())
+		}
+	}
+	if backup == "" {
+		t.Fatal("finalized database backup not found")
+	}
+	backupBefore, err := os.ReadFile(backup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locked, err := OpenDaemon(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !locked.Locked() {
+		t.Fatal("restart with retained marker was not locked")
+	}
+	_ = locked.Close()
+
+	// These are the same explicit commands documented above: preserve the
+	// failed set, stage the verified standalone database, install the prior
+	// executable artifact, and archive the marker last. No recursive deletion.
+	evidence := filepath.Join(dir, "evidence")
+	if err := os.Mkdir(evidence, 0700); err != nil {
+		t.Fatal(err)
+	}
+	commands := `set -eu
+cp -p "$DB" "$EVIDENCE/failed-state.sqlite"
+for suffix in -wal -shm -journal; do
+  if test -e "$DB$suffix"; then mv -- "$DB$suffix" "$EVIDENCE/failed-state.sqlite$suffix"; fi
+done
+cp -p "$MARKER" "$EVIDENCE/failed-state.sqlite.maintenance.json"
+cp -- "$BACKUP" "$DB.restore-stage"
+cmp -- "$BACKUP" "$DB.restore-stage"
+mv -- "$DB.restore-stage" "$DB"
+cp -- "$PRIOR" "$PROGRAM.restore-stage"
+cmp -- "$PRIOR" "$PROGRAM.restore-stage"
+mv -- "$PROGRAM.restore-stage" "$PROGRAM"
+mv -- "$MARKER" "$EVIDENCE/restored-pair.maintenance.json"
+`
+	cmd := exec.Command("sh", "-c", commands)
+	cmd.Env = append(os.Environ(), "DB="+cfg.DatabasePath, "MARKER="+marker, "BACKUP="+backup, "PRIOR="+v1, "PROGRAM="+v2, "EVIDENCE="+evidence)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("documented recovery commands failed: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("marker was not archived after restoring pair: %v", err)
+	}
+	if _, err := os.Stat(evidence + "/failed-state.sqlite"); err != nil {
+		t.Fatalf("failed database evidence missing: %v", err)
+	}
+	if _, err := os.Stat(evidence + "/failed-state.sqlite.maintenance.json"); err != nil {
+		t.Fatalf("failed marker evidence missing: %v", err)
+	}
+	if _, err := os.Stat(evidence + "/restored-pair.maintenance.json"); err != nil {
+		t.Fatalf("archived marker missing: %v", err)
+	}
+	backupAfter, err := os.ReadFile(backup)
+	if err != nil || string(backupBefore) != string(backupAfter) {
+		t.Fatalf("recovery commands modified the finalized backup: %v", err)
+	}
+	for path, before := range map[string][]byte{cfg.OPAQUEKeyPath: opaqueBefore, cfg.DatabasePath + ".repository-master-key": repositoryBefore} {
+		after, err := os.ReadFile(path)
+		if err != nil || string(after) != string(before) {
+			t.Fatalf("recovery changed or lost external key %s: %v", path, err)
+		}
+	}
+	// Run the retained prior executable as a real process against the restored
+	// database; it reaches normal application readiness and exits cleanly.
+	prior := exec.Command(v1, "-test.run=^TestStorageCoordinationChild$")
+	prior.Env = append(os.Environ(), "DM_COORDINATION_CHILD=daemon", "DM_COORDINATION_DIR="+dir)
+	stdin, err := prior.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := prior.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prior.Stderr = os.Stderr
+	if err := prior.Start(); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || line != "ready\n" {
+		_ = stdin.Close()
+		_ = prior.Wait()
+		t.Fatalf("prior executable did not reach readiness: %q %v", line, err)
+	}
+	if err := stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := prior.Wait(); err != nil {
+		t.Fatalf("prior executable failed after recovery: %v", err)
+	}
+}
+
+func copyFile(source, destination string, mode os.FileMode) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	_, copyErr := io.Copy(out, in)
+	closeErr := out.Close()
+	return errors.Join(copyErr, closeErr)
 }
 
 func TestConcurrentCommandTransactionsRespectGrantLimit(t *testing.T) {

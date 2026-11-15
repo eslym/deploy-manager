@@ -55,5 +55,5 @@ CLI commands**, disable automatic daemon restarts, and prevent new command use
 throughout restoration. Routine account recovery only issues a grant; it is not
 database repair. Replacing live database files while a shared user exists is not
 supported. Retain matching external keys and follow the dedicated upgrade
-recovery procedure when available; deleting an OS lock or maintenance marker
-is not database repair.
+recovery procedure in [operator upgrade recovery](operations/upgrade-recovery.md);
+deleting an OS lock or maintenance marker is not database repair.
