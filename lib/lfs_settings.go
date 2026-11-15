@@ -2,7 +2,6 @@ package lib
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent"
 	"github.com/eslym/deploy-manager/lib/ent/projectsshkey"
 )
 
@@ -22,24 +22,23 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var remote string
-	if err := a.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, id).Scan(&remote); err != nil {
+	storedProject, projectErr := a.store.Project.Get(r.Context(), id)
+	if projectErr != nil {
 		http.NotFound(w, r)
 		return
 	}
+	remote := storedProject.RemoteURL
 	if !mutation {
 		settings := lfsProjectSettings{}
-		var encoded string
-		var internal int
-		var encodedInternal string
-		err := a.db.QueryRow(`SELECT endpoint,object_origins,allow_internal,internal_addresses FROM project_lfs_settings WHERE project_id=?`, id).Scan(&settings.Endpoint, &encoded, &internal, &encodedInternal)
+		stored, err := a.store.ProjectLFSSetting.Get(r.Context(), id)
 		if err == nil {
-			if json.Unmarshal([]byte(encoded), &settings.ObjectOrigins) != nil || json.Unmarshal([]byte(encodedInternal), &settings.InternalAddresses) != nil {
+			if json.Unmarshal([]byte(stored.ObjectOrigins), &settings.ObjectOrigins) != nil || json.Unmarshal([]byte(stored.InternalAddresses), &settings.InternalAddresses) != nil {
 				http.Error(w, "LFS settings are unavailable", http.StatusInternalServerError)
 				return
 			}
-			settings.AllowInternal = internal != 0
-		} else if !errors.Is(err, sql.ErrNoRows) {
+			settings.Endpoint = stored.Endpoint
+			settings.AllowInternal = stored.AllowInternal != 0
+		} else if !ent.IsNotFound(err) {
 			http.Error(w, "LFS settings are unavailable", http.StatusInternalServerError)
 			return
 		}
@@ -91,7 +90,14 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	encoded, _ := json.Marshal(origins)
 	encodedInternal, _ := json.Marshal(internalIPs)
-	_, err = a.db.Exec(`INSERT INTO project_lfs_settings(project_id,endpoint,object_origins,allow_internal,internal_addresses,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET endpoint=excluded.endpoint,object_origins=excluded.object_origins,allow_internal=excluded.allow_internal,internal_addresses=excluded.internal_addresses,updated_at=excluded.updated_at`, id, endpoint.String(), string(encoded), boolInt(input.AllowInternal), string(encodedInternal), a.cfg.Now().UTC().UnixNano())
+	stored, lookupErr := a.store.ProjectLFSSetting.Get(r.Context(), id)
+	if lookupErr == nil {
+		_, err = stored.Update().SetEndpoint(endpoint.String()).SetObjectOrigins(string(encoded)).SetAllowInternal(boolInt(input.AllowInternal)).SetInternalAddresses(string(encodedInternal)).SetUpdatedAt(a.cfg.Now().UTC().UnixNano()).Save(r.Context())
+	} else if ent.IsNotFound(lookupErr) {
+		_, err = a.store.ProjectLFSSetting.Create().SetID(id).SetEndpoint(endpoint.String()).SetObjectOrigins(string(encoded)).SetAllowInternal(boolInt(input.AllowInternal)).SetInternalAddresses(string(encodedInternal)).SetUpdatedAt(a.cfg.Now().UTC().UnixNano()).Save(r.Context())
+	} else {
+		err = lookupErr
+	}
 	if err != nil {
 		http.Error(w, "LFS settings could not be saved", http.StatusInternalServerError)
 		return
@@ -112,20 +118,20 @@ func suggestedLFSEndpoint(raw string) string {
 
 func (a *App) projectLFSHydrator(projectID string) (*lfsHydrator, error) {
 	var settings lfsProjectSettings
-	var encoded, encodedInternal string
-	var internal int
-	if err := a.db.QueryRow(`SELECT endpoint,object_origins,allow_internal,internal_addresses FROM project_lfs_settings WHERE project_id=?`, projectID).Scan(&settings.Endpoint, &encoded, &internal, &encodedInternal); errors.Is(err, sql.ErrNoRows) {
+	stored, err := a.store.ProjectLFSSetting.Get(context.Background(), projectID)
+	if ent.IsNotFound(err) {
 		return nil, nil
 	} else if err != nil {
 		return nil, errors.New("selected LFS content has no administrator-approved endpoint")
 	}
-	if err := json.Unmarshal([]byte(encoded), &settings.ObjectOrigins); err != nil {
+	if err := json.Unmarshal([]byte(stored.ObjectOrigins), &settings.ObjectOrigins); err != nil {
 		return nil, errors.New("administrator-approved LFS settings are invalid")
 	}
-	if err := json.Unmarshal([]byte(encodedInternal), &settings.InternalAddresses); err != nil {
+	if err := json.Unmarshal([]byte(stored.InternalAddresses), &settings.InternalAddresses); err != nil {
 		return nil, errors.New("administrator-approved LFS settings are invalid")
 	}
-	settings.AllowInternal = internal != 0
+	settings.Endpoint = stored.Endpoint
+	settings.AllowInternal = stored.AllowInternal != 0
 	hydrator, err := newLFSHydratorWithBudget(projectID, settings, a.projects.root, a.cfg.DeployMaxBytes, a.projects.maxCacheBytes, a.cfg.DeployTimeout, &a.projects.lfsCacheMu)
 	if err != nil {
 		return nil, err
@@ -138,16 +144,16 @@ func (a *App) projectLFSHydrator(projectID string) (*lfsHydrator, error) {
 		if pending != 0 {
 			return errors.New("project deletion is in progress; LFS cache writes are blocked")
 		}
-		var exists int
-		if err := a.db.QueryRow(`SELECT count(*) FROM projects WHERE id=?`, projectID).Scan(&exists); err != nil || exists == 0 {
+		if _, err := a.store.Project.Get(context.Background(), projectID); err != nil {
 			return errors.New("project no longer exists; LFS cache writes are blocked")
 		}
 		return nil
 	}
-	var remote string
-	if err := a.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, projectID).Scan(&remote); err != nil {
+	projectRecord, err := a.store.Project.Get(context.Background(), projectID)
+	if err != nil {
 		return nil, errors.New("project repository configuration is unavailable")
 	}
+	remote := projectRecord.RemoteURL
 	if strings.HasPrefix(remote, "ssh://") {
 		if _, _, _, _, parseErr := safeSSHRemote(remote); parseErr != nil {
 			return nil, errors.New("private SSH LFS requires an assigned repository key")
@@ -160,10 +166,11 @@ func (a *App) projectLFSHydrator(projectID string) (*lfsHydrator, error) {
 		hydrator.sshAuth = func(ctx context.Context) (lfsAuthCredentials, error) {
 			// hydrate holds the SSH-key lifecycle read lock across cache lookup,
 			// authentication, and transfer. No signer is retained across calls.
-			var currentRemote string
-			if a.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, projectID).Scan(&currentRemote) != nil || currentRemote != remote {
+			projectRecord, projectErr := a.store.Project.Get(ctx, projectID)
+			if projectErr != nil || projectRecord.RemoteURL != remote {
 				return lfsAuthCredentials{}, errors.New("private SSH LFS project configuration changed")
 			}
+			currentRemote := projectRecord.RemoteURL
 			assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(projectID)).Only(ctx)
 			if assignmentErr != nil {
 				return lfsAuthCredentials{}, errors.New("private SSH LFS project configuration changed")

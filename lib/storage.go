@@ -84,7 +84,7 @@ func startDaemon(cfg Config) (*App, *storageLock, error) {
 func (s *readyStorage) start() (*App, error) {
 	app := s.app
 	cfg, db := app.cfg, app.db
-	projects, err := newProjectManager(db, cfg.DatabasePath+".projects", cfg.GitTimeout, cfg.GitMaxCacheBytes)
+	projects, err := newProjectManager(db, app.store, cfg.DatabasePath+".projects", cfg.GitTimeout, cfg.GitMaxCacheBytes)
 	if err != nil {
 		_ = app.Close()
 		return nil, err
