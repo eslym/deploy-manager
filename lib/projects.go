@@ -36,23 +36,25 @@ import (
 )
 
 type projectManager struct {
-	db                    *sql.DB
-	store                 *ent.Client
-	root                  string
-	rootIdentity          dirIdentity
-	timeout               time.Duration
-	maxTransferBytes      int64
-	maxCacheBytes         int64
-	maxRefs               int
-	maxAdvertisementBytes int64
-	mu                    sync.Mutex
-	cacheLifecycleMu      sync.RWMutex
-	cacheMu               sync.RWMutex
-	lfsCacheMu            sync.Mutex
-	lfsAuthMu             sync.RWMutex
-	stateMu               sync.RWMutex
-	cacheFS               projectCacheFS
-	blocked               string
+	db                                 *sql.DB
+	store                              *ent.Client
+	root                               string
+	rootIdentity                       dirIdentity
+	timeout                            time.Duration
+	maxTransferBytes                   int64
+	maxCacheBytes                      int64
+	maxRefs                            int
+	maxAdvertisementBytes              int64
+	mu                                 sync.Mutex
+	cacheLifecycleMu                   sync.RWMutex
+	cacheMu                            sync.RWMutex
+	lfsCacheMu                         sync.Mutex
+	lfsAuthMu                          sync.RWMutex
+	stateMu                            sync.RWMutex
+	cacheFS                            projectCacheFS
+	blocked                            string
+	branchFetchBeforeProjectLock       func()
+	cacheRecreationBeforeLifecycleLock func()
 }
 
 const maxGitTreeObjectBytes = 16 << 20
@@ -305,6 +307,9 @@ func (a *App) recreateProjectCache(w http.ResponseWriter, r *http.Request) {
 	p := a.projects
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.cacheRecreationBeforeLifecycleLock != nil {
+		p.cacheRecreationBeforeLifecycleLock()
+	}
 	if err := p.ensureCacheReady(); err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return

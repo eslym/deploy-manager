@@ -1,7 +1,6 @@
 package lib
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -30,7 +29,6 @@ type automationFixture struct {
 	gitFetches                                  atomic.Int32
 	fetchStarted                                chan struct{}
 	fetchRelease                                chan struct{}
-	cacheRecreateReceived                       chan struct{}
 	fetchFailureStatus                          atomic.Int32
 }
 
@@ -121,12 +119,6 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	t.Cleanup(func() { _ = f.app.Close() })
 	f.cookie = installAPITestSession(t, f.app)
 	f.server = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if f.cacheRecreateReceived != nil && strings.HasSuffix(r.URL.Path, "/cache/recreate") {
-			select {
-			case f.cacheRecreateReceived <- struct{}{}:
-			default:
-			}
-		}
 		f.app.Handler().ServeHTTP(w, r)
 	}))
 	f.server.StartTLS()
@@ -153,53 +145,65 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 
 func TestBranchFetchAndCacheRecreationCompleteWithoutUsingPartialCache(t *testing.T) {
 	f := newAutomationFixture(t)
-	f.fetchStarted = make(chan struct{}, 1)
-	f.fetchRelease = make(chan struct{})
-	f.cacheRecreateReceived = make(chan struct{}, 1)
-
-	fetchDone := make(chan error, 1)
-	go func() { fetchDone <- f.app.fetchProjectForBranch(context.Background(), f.projectID) }()
-	select {
-	case <-f.fetchStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("branch fetch never reached the remote repository")
+	deploymentID := f.createBranch(t, "cache-recreation-lock-order")
+	livePath := f.app.deploymentPath(deploymentID)
+	before, err := identity(livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeContents, err := os.ReadFile(filepath.Join(livePath, "README.md"))
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	recreationStarted := make(chan struct{})
+	recreationAtLifecycle := make(chan struct{})
+	allowRecreation := make(chan struct{})
+	f.app.projects.cacheRecreationBeforeLifecycleLock = func() {
+		close(recreationAtLifecycle)
+		<-allowRecreation
+	}
+	fetchAtProjectLock := make(chan struct{}, 1)
+	f.app.projects.branchFetchBeforeProjectLock = func() { fetchAtProjectLock <- struct{}{} }
+	t.Cleanup(func() {
+		select {
+		case <-allowRecreation:
+		default:
+			close(allowRecreation)
+		}
+	})
+
 	type recreationResult struct {
 		response *http.Response
 		err      error
 	}
 	recreationDone := make(chan recreationResult, 1)
 	go func() {
-		close(recreationStarted)
-		request, err := http.NewRequest(http.MethodPost, f.server.URL+"/api/projects/"+f.projectID+"/cache/recreate", strings.NewReader(`{"confirm":true}`))
-		if err != nil {
-			recreationDone <- recreationResult{err: err}
+		request, requestErr := http.NewRequest(http.MethodPost, f.server.URL+"/api/projects/"+f.projectID+"/cache/recreate", strings.NewReader(`{"confirm":true}`))
+		if requestErr != nil {
+			recreationDone <- recreationResult{err: requestErr}
 			return
 		}
 		request.Header.Set("Origin", f.server.URL)
 		request.Header.Set("Content-Type", "application/json")
 		request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
-		response, err := f.server.Client().Do(request)
-		recreationDone <- recreationResult{response: response, err: err}
+		response, requestErr := f.server.Client().Do(request)
+		recreationDone <- recreationResult{response: response, err: requestErr}
 	}()
-	<-recreationStarted
 	select {
-	case <-f.cacheRecreateReceived:
+	case <-recreationAtLifecycle:
 	case <-time.After(5 * time.Second):
-		t.Fatal("cache recreation request never reached the application")
+		t.Fatal("cache recreation never reached the lifecycle boundary")
 	}
-	close(f.fetchRelease)
 
+	jobID := f.action(t, deploymentID, "deploy", `{}`)
 	select {
-	case err := <-fetchDone:
-		if err != nil {
-			t.Fatalf("branch fetch failed before cache recreation: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("branch fetch deadlocked with cache recreation")
+	case <-fetchAtProjectLock:
+	case <-time.After(5 * time.Second):
+		t.Fatal("branch fetch never reached project coordination")
 	}
+	close(allowRecreation)
+
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, deploymentID, jobID, "failed")
 	select {
 	case result := <-recreationDone:
 		if result.err != nil {
@@ -215,6 +219,16 @@ func TestBranchFetchAndCacheRecreationCompleteWithoutUsingPartialCache(t *testin
 
 	if _, err := os.Stat(f.app.projects.repoPath(f.projectID)); !os.IsNotExist(err) {
 		t.Fatalf("cache recreation did not finish after branch fetch: %v", err)
+	}
+	jobs := f.waitJobs(t, deploymentID)
+	if len(jobs) == 0 || jobs[0].ID != jobID || jobs[0].Status != "failed" || !strings.Contains(jobs[0].Log, "current live files were kept") {
+		t.Fatalf("waiting deployment did not preserve and report the live publication: %+v", jobs)
+	}
+	if current, err := identity(livePath); err != nil || current != before {
+		t.Fatalf("cache recreation or waiting fetch changed the live publication: %v", err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(livePath, "README.md")); err != nil || string(contents) != string(beforeContents) {
+		t.Fatalf("live publication content changed: %q: %v", contents, err)
 	}
 }
 

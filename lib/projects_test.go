@@ -14,8 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 func TestProjectHTTPRejectsUnauthenticatedAndUnsupportedURLs(t *testing.T) {
@@ -238,38 +243,6 @@ func TestProjectCacheSizesAndExplicitRecreationOverHTTP(t *testing.T) {
 		t.Fatalf("cache sizes after recreation = %+v, want project retained with empty caches", projects)
 	}
 
-	// The LFS object was verified and cached before recreation. Its server now
-	// advertises the object but cannot serve its bytes; recreation must not
-	// leave stale local data that makes this object appear recoverable.
-	var lfsServerURL string
-	lfsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/objects/batch") {
-			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q}}}]}`, payloadOID, len(payload), lfsServerURL+"/unavailable")
-			return
-		}
-		http.Error(w, "object unavailable", http.StatusNotFound)
-	}))
-	defer lfsServer.Close()
-	lfsServerURL = lfsServer.URL
-	pool := x509.NewCertPool()
-	pool.AddCert(lfsServer.Certificate())
-	oldRoots := lfsTestRootCAs
-	lfsTestRootCAs = pool
-	t.Cleanup(func() { lfsTestRootCAs = oldRoots })
-	hydrator, err := newLFSHydratorWithBudget(projectID, lfsProjectSettings{
-		Endpoint: lfsServer.URL + "/info/lfs", ObjectOrigins: []string{lfsServer.URL},
-		AllowInternal: true, InternalAddresses: map[string][]string{lfsServer.URL: {"127.0.0.1"}},
-	}, app.projects.root, 1<<20, app.projects.maxCacheBytes, 5*time.Second, &app.projects.lfsCacheMu)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := hydrator.hydrate(context.Background(), lfsPointer{OID: payloadOID, Size: int64(len(payload))}); err == nil {
-		t.Fatal("recreated cache unexpectedly restored a payload unavailable from its LFS server")
-	}
-	if validCachedLFS(filepath.Join(app.projects.root, "lfs-cache", projectID, payloadOID), lfsPointer{OID: payloadOID, Size: int64(len(payload))}) {
-		t.Fatal("unavailable LFS payload was left cached after recreation")
-	}
-
 	type concurrentResult struct {
 		status int
 		body   []byte
@@ -309,6 +282,200 @@ func TestProjectCacheSizesAndExplicitRecreationOverHTTP(t *testing.T) {
 	if missingCommit.StatusCode != http.StatusBadRequest || !strings.Contains(string(missingBody), "commit is not available") {
 		t.Fatalf("deployment using a commit removed by recreation got status=%d body=%q", missingCommit.StatusCode, missingBody)
 	}
+}
+
+func TestRecreatedLFSCacheFailureIsVisibleThroughDeploymentApplication(t *testing.T) {
+	f := newAutomationFixture(t)
+	payload := []byte("the live LFS payload")
+	payloadOID := fmt.Sprintf("%x", sha256.Sum256(payload))
+	pointer := fmt.Sprintf("version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n", payloadOID, len(payload))
+
+	remoteRepo, err := git.PlainOpen(f.remoteDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := remoteRepo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = worktree.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("feature/search")}); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(f.remoteDir, ".gitattributes"), []byte("asset.dat filter=lfs\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(f.remoteDir, "asset.dat"), []byte(pointer), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{".gitattributes", "asset.dat"} {
+		if _, err = worktree.Add(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commit, err := worktree.Commit("track LFS payload", &git.CommitOptions{Author: &object.Signature{Name: "fixture", Email: "fixture@example.test", When: time.Now().UTC()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var lfsServerURL string
+	var payloadAvailable atomic.Bool
+	var unavailablePayloadRequested atomic.Bool
+	requests := make(chan string, 8)
+	payloadAvailable.Store(true)
+	lfsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case requests <- r.Method + " " + r.URL.Path:
+		default:
+		}
+		if strings.HasSuffix(r.URL.Path, "/objects/batch") {
+			w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+			_, _ = fmt.Fprintf(w, `{"objects":[{"oid":%q,"size":%d,"actions":{"download":{"href":%q}}}]}`, payloadOID, len(payload), lfsServerURL+"/payload")
+			return
+		}
+		if r.URL.Path == "/payload" && payloadAvailable.Load() {
+			_, _ = w.Write(payload)
+			return
+		}
+		if r.URL.Path == "/payload" {
+			unavailablePayloadRequested.Store(true)
+		}
+		http.NotFound(w, r)
+	}))
+	defer lfsServer.Close()
+	lfsServerURL = lfsServer.URL
+	pool := x509.NewCertPool()
+	pool.AddCert(lfsServer.Certificate())
+	oldRoots := lfsTestRootCAs
+	lfsTestRootCAs = pool
+	t.Cleanup(func() { lfsTestRootCAs = oldRoots })
+	origins, err := json.Marshal([]string{lfsServer.URL})
+	if err != nil {
+		t.Fatal(err)
+	}
+	internal, err := json.Marshal(map[string][]string{lfsServer.URL: {"127.0.0.1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = f.app.db.Exec(`INSERT INTO project_lfs_settings(project_id,endpoint,object_origins,allow_internal,internal_addresses,updated_at) VALUES(?,?,?,?,?,?)`, f.projectID, lfsServer.URL+"/info/lfs", string(origins), 1, string(internal), time.Now().UnixNano()); err != nil {
+		t.Fatal(err)
+	}
+
+	refresh := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/refresh", `{}`)
+	if refresh.StatusCode != http.StatusOK {
+		t.Fatalf("refresh LFS branch: %d %s", refresh.StatusCode, responseText(refresh))
+	}
+	refresh.Body.Close()
+	if got := findProjectRef(projectRefsFromAPI(t, f.server.Client(), f.server.URL, f.cookie, f.projectID), "branch", "feature/search").Commit; got != commit.String() {
+		t.Fatalf("refreshed LFS branch=%s, want %s", got, commit)
+	}
+	gitBackup := filepath.Join(t.TempDir(), "git-cache")
+	if err = copyGitCache(f.app.projects.repoPath(f.projectID), gitBackup, f.app.projects.maxCacheBytes); err != nil {
+		t.Fatal(err)
+	}
+	created := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments", fmt.Sprintf(`{"projectId":%q,"name":"unavailable-lfs-after-cache-recreation","commit":%q}`, f.projectID, f.initialCommit))
+	if created.StatusCode != http.StatusCreated {
+		t.Fatalf("create LFS deployment: %d %s", created.StatusCode, responseText(created))
+	}
+	var deployment struct{ ID, JobID string }
+	if err = json.NewDecoder(created.Body).Decode(&deployment); err != nil {
+		created.Body.Close()
+		t.Fatal(err)
+	}
+	created.Body.Close()
+	deploymentID := deployment.ID
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, deploymentID, deployment.JobID, "succeeded")
+	livePath := f.app.deploymentPath(deploymentID)
+	func() {
+		for {
+			select {
+			case <-requests:
+			default:
+				return
+			}
+		}
+	}()
+	liveBefore, err := identity(livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recreated := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/cache/recreate", `{"confirm":true}`)
+	if recreated.StatusCode != http.StatusNoContent {
+		t.Fatalf("cache recreation: %d %s", recreated.StatusCode, responseText(recreated))
+	}
+	recreated.Body.Close()
+	if size, sizeErr := projectLFSCacheSize(f.app.projects.root, f.projectID); sizeErr != nil || size != 0 {
+		t.Fatalf("LFS cache after protected recreation=%d: %v", size, sizeErr)
+	}
+	payloadAvailable.Store(false)
+	// Keep the known Git objects available while exercising LFS-specific loss;
+	// the real cache-recreation request has already removed both cache trees.
+	if err = copyGitCache(gitBackup, f.app.projects.repoPath(f.projectID), f.app.projects.maxCacheBytes); err != nil {
+		t.Fatalf("restore isolated Git fixture after cache recreation: %v", err)
+	}
+	target := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments/"+deploymentID+"/target", fmt.Sprintf(`{"commit":%q}`, commit.String()))
+	if target.StatusCode != http.StatusAccepted {
+		t.Fatalf("set recovery deployment target: %d %s", target.StatusCode, responseText(target))
+	}
+	var targetJob struct{ JobID string }
+	if err = json.NewDecoder(target.Body).Decode(&targetJob); err != nil {
+		target.Body.Close()
+		t.Fatal(err)
+	}
+	target.Body.Close()
+	jobID := targetJob.JobID
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, deploymentID, jobID, "failed")
+	jobs := f.waitJobs(t, deploymentID)
+	var failed *deploymentJob
+	for i := range jobs {
+		if jobs[i].ID == jobID {
+			failed = &jobs[i]
+			break
+		}
+	}
+	if !unavailablePayloadRequested.Load() {
+		var seen []string
+		for {
+			select {
+			case path := <-requests:
+				seen = append(seen, path)
+			default:
+				t.Fatalf("deployment did not reach the LFS object after cache recreation: requests=%v job=%+v", seen, failed)
+			}
+		}
+	}
+	if failed == nil || failed.Status != "failed" || !strings.Contains(failed.Log, "current live files were kept") {
+		t.Fatalf("missing-LFS deployment result is not visible in job history: %+v", failed)
+	}
+	if after, err := identity(livePath); err != nil || after != liveBefore {
+		t.Fatalf("failed LFS recovery changed the live publication: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(livePath, "asset.dat")); !os.IsNotExist(err) {
+		t.Fatalf("failed LFS deployment unexpectedly changed live asset: %v", err)
+	}
+
+	// The protected job-history endpoint reads durable state, not a worker-local result.
+	cfg := f.app.cfg
+	f.server.Close()
+	if err = f.app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.app, err = New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.cookie = installAPITestSession(t, f.app)
+	f.server = httptest.NewTLSServer(f.app.Handler())
+	jobs = f.waitJobs(t, deploymentID)
+	for _, job := range jobs {
+		if job.ID == jobID {
+			if job.Status != "failed" || !strings.Contains(job.Log, "current live files were kept") {
+				t.Fatalf("persisted missing-LFS failure changed after restart: %+v", job)
+			}
+			return
+		}
+	}
+	t.Fatal("failed LFS deployment was not present in durable job history after restart")
 }
 
 func TestInterruptedProjectCacheRecreationFinishesBeforeRestartServesWork(t *testing.T) {

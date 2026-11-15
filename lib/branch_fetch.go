@@ -84,6 +84,9 @@ func retryableBranchFetch(err error) bool {
 
 func (a *App) fetchProjectForBranchAttempt(ctx context.Context, id string) error {
 	p := a.projects
+	if p.branchFetchBeforeProjectLock != nil {
+		p.branchFetchBeforeProjectLock()
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// Cache recreation takes p.mu before cacheLifecycleMu. Keep this same
