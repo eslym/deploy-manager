@@ -1,8 +1,12 @@
 package lib
 
 import (
+	"context"
 	"log"
 	"net/http"
+
+	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
+	jobmodel "github.com/eslym/deploy-manager/lib/ent/deploymentjob"
 )
 
 func (a *App) finishAutomaticFetch(jobID, id string, generation int64, paused bool) {
@@ -10,22 +14,46 @@ func (a *App) finishAutomaticFetch(jobID, id string, generation int64, paused bo
 	if paused {
 		status, message = "noop", "Automatic deployment paused; repository updates fetched only"
 	}
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(context.Background())
 	if err != nil {
 		log.Printf("cannot begin completion of automatic deployment job %s: %v", jobID, err)
 		return
 	}
 	defer tx.Rollback()
 	now := a.cfg.Now().UnixNano()
-	if _, err = tx.Exec(`UPDATE deployment_jobs SET status=?,log=substr(log || char(10) || ?,1,8192),updated_at=? WHERE id=? AND status='running'`, status, message, now, jobID); err != nil {
+	job, err := tx.DeploymentJob.Get(context.Background(), jobID)
+	if err != nil {
+		return
+	}
+	logText := (job.Log + "\n" + message)
+	if len(logText) > 8192 {
+		logText = logText[:8192]
+	}
+	if _, err = tx.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).SetStatus(status).SetLog(logText).SetUpdatedAt(now).Save(context.Background()); err != nil {
 		log.Printf("cannot complete automatic deployment job %s: %v", jobID, err)
 		return
 	}
 	// A fetch-only delivery must neither claim an unpublished deployment is live
 	// nor erase an error left by a failed manual publication.
-	if _, err = tx.Exec(`UPDATE deployments SET status=CASE WHEN error<>'' THEN 'failed' WHEN live_commit<>'' THEN 'live' ELSE 'idle' END,updated_at=? WHERE id=? AND generation=? AND status NOT IN ('deleting','deletion_failed','recovery_required') AND NOT EXISTS (SELECT 1 FROM deployment_jobs WHERE deployment_id=? AND status IN ('queued','running'))`, now, id, generation, id); err != nil {
-		log.Printf("cannot settle automatic deployment %s: %v", id, err)
+	d, err := tx.Deployment.Get(context.Background(), id)
+	if err != nil {
 		return
+	}
+	active, err := tx.DeploymentJob.Query().Where(jobmodel.DeploymentIDEQ(id), jobmodel.StatusIn("queued", "running")).Exist(context.Background())
+	if err != nil {
+		return
+	}
+	if !active && d.Generation == generation && d.Status != "deleting" && d.Status != "deletion_failed" && d.Status != "recovery_required" {
+		settled := "idle"
+		if d.Error != "" {
+			settled = "failed"
+		} else if d.LiveCommit != "" {
+			settled = "live"
+		}
+		if _, err = tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.GenerationEQ(generation)).SetStatus(settled).SetUpdatedAt(now).Save(context.Background()); err != nil {
+			log.Printf("cannot settle automatic deployment %s: %v", id, err)
+			return
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		log.Printf("cannot commit completion of automatic deployment job %s: %v", jobID, err)
@@ -62,34 +90,41 @@ func (a *App) controlDeploymentAutomation(w http.ResponseWriter, r *http.Request
 			return
 		}
 	}
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(r.Context())
 	if err != nil {
 		http.Error(w, "automatic deployment could not be updated", 500)
 		return
 	}
 	defer tx.Rollback()
-	var kind, status, commit string
-	var generation int64
-	var paused bool
-	if err = tx.QueryRow(`SELECT target_kind,status,commit_id,generation,automation_paused FROM deployments WHERE id=?`, id).Scan(&kind, &status, &commit, &generation, &paused); err != nil {
+	d, err := tx.Deployment.Get(r.Context(), id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if kind != "branch" || status == "deleting" || status == "deletion_failed" {
+	if d.TargetKind != "branch" || d.Status == "deleting" || d.Status == "deletion_failed" {
 		http.Error(w, "automatic deployment is available only for active branch targets", http.StatusConflict)
 		return
 	}
 	now := a.cfg.Now().UnixNano()
 	if pause {
-		_, err = tx.Exec(`UPDATE deployments SET automation_paused=1,automation_epoch=automation_epoch+CASE WHEN automation_paused=0 THEN 1 ELSE 0 END,updated_at=? WHERE id=?`, now, id)
+		changed, updateErr := tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.AutomationPausedEQ(0)).SetAutomationPaused(1).AddAutomationEpoch(1).SetUpdatedAt(now).Save(r.Context())
+		err = updateErr
+		if err == nil && changed == 0 {
+			_, err = tx.Deployment.Update().Where(deploymentmodel.IDEQ(id)).SetUpdatedAt(now).Save(r.Context())
+		}
 	} else {
-		if !paused {
+		if d.AutomationPaused == 0 {
 			http.Error(w, "automatic deployment is already enabled", http.StatusConflict)
 			return
 		}
-		_, err = tx.Exec(`UPDATE deployments SET automation_paused=0,automation_epoch=automation_epoch+1,status='queued',error='',updated_at=? WHERE id=?`, now, id)
+		var changed int
+		changed, err = tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.AutomationPausedEQ(1)).SetAutomationPaused(0).AddAutomationEpoch(1).SetStatus("queued").SetError("").SetUpdatedAt(now).Save(r.Context())
+		if err == nil && changed != 1 {
+			http.Error(w, "automatic deployment is already enabled", http.StatusConflict)
+			return
+		}
 		if err == nil {
-			_, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,generation,status,log,created_at,updated_at,durable) VALUES(?,?,?,?,'queued','Automatic deployment resumed; latest branch tip queued',?,?,1)`, jobID, id, commit, generation, now, now)
+			_, err = tx.DeploymentJob.Create().SetID(jobID).SetDeploymentID(id).SetCommitID(d.CommitID).SetGeneration(d.Generation).SetStatus("queued").SetLog("Automatic deployment resumed; latest branch tip queued").SetCreatedAt(now).SetUpdatedAt(now).SetDurable(1).Save(r.Context())
 		}
 	}
 	if err != nil {

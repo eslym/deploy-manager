@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
+	jobmodel "github.com/eslym/deploy-manager/lib/ent/deploymentjob"
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 )
@@ -25,17 +27,16 @@ func (a *App) rollbackHistory(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	var project, kind, branch string
-	if err := a.db.QueryRow(`SELECT project_id,target_kind,target_name FROM deployments WHERE id=?`, r.PathValue("id")).Scan(&project, &kind, &branch); err != nil {
+	d, err := a.store.Deployment.Get(r.Context(), r.PathValue("id"))
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if kind != "branch" {
+	if d.TargetKind != "branch" {
 		http.Error(w, "rollback requires a branch target", 409)
 		return
 	}
 	page, limit := 1, 20
-	var err error
 	if value := r.URL.Query().Get("page"); value != "" {
 		page, err = strconv.Atoi(value)
 		if err != nil || page < 1 || page > 100000 {
@@ -63,12 +64,12 @@ func (a *App) rollbackHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.DeployTimeout)
 	defer cancel()
-	repo, err := git.PlainOpen(a.projects.repoPath(project))
+	repo, err := git.PlainOpen(a.projects.repoPath(d.ProjectID))
 	if err != nil {
 		http.Error(w, "repository unavailable", 409)
 		return
 	}
-	ref, err := repo.Reference(plumbing.NewRemoteReferenceName("origin", branch), true)
+	ref, err := repo.Reference(plumbing.NewRemoteReferenceName("origin", d.TargetName), true)
 	if err != nil {
 		http.Error(w, "configured branch is missing; refresh the repository", 409)
 		return
@@ -160,7 +161,8 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 4096)
 	var in struct {
-		Commit string `json:"commit"`
+		Commit    string `json:"commit"`
+		Permanent bool   `json:"permanent,omitempty"`
 	}
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
@@ -180,34 +182,66 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "rollback could not be queued", 500)
 		return
 	}
-	tx, err := a.db.Begin()
+	tx, err := a.store.Tx(r.Context())
 	if err != nil {
 		http.Error(w, "rollback could not be queued", 500)
 		return
 	}
 	defer tx.Rollback()
-	var kind, status string
-	var generation int64
-	if err = tx.QueryRow(`SELECT target_kind,status,generation FROM deployments WHERE id=?`, id).Scan(&kind, &status, &generation); err != nil {
+	d, err := tx.Deployment.Get(r.Context(), id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	if kind != "branch" || status == "deleting" || status == "deletion_failed" || status == "recovery_required" {
+	if d.TargetKind != "branch" || d.Status == "deleting" || d.Status == "deletion_failed" || d.Status == "recovery_required" {
 		http.Error(w, "rollback requires an available branch deployment", 409)
 		return
 	}
 	now := a.cfg.Now().UnixNano()
-	if _, err = tx.Exec(`UPDATE deployments SET generation=generation+1,status='queued',error='',updated_at=? WHERE id=?`, now, id); err == nil {
-		_, err = tx.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Superseded by temporary rollback',1,8192),updated_at=? WHERE deployment_id=? AND status IN ('queued','running')`, now, id)
+	supersedeMessage := "Superseded by temporary rollback"
+	if in.Permanent {
+		supersedeMessage = "Superseded by permanent rollback"
+	}
+	newGeneration := d.Generation + 1
+	update := tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.GenerationEQ(d.Generation)).AddGeneration(1).SetStatus("queued").SetError("").SetUpdatedAt(now)
+	if in.Permanent {
+		update.SetAutomationPaused(1)
+		if d.AutomationPaused == 0 {
+			update.AddAutomationEpoch(1)
+		}
+	}
+	var changed int
+	changed, err = update.Save(r.Context())
+	if err == nil && changed != 1 {
+		http.Error(w, "rollback was superseded by a newer deployment change", http.StatusConflict)
+		return
 	}
 	if err == nil {
-		_, err = tx.Exec(`INSERT INTO deployment_jobs(id,deployment_id,commit_id,rollback_commit,generation,status,log,created_at,updated_at,durable) VALUES(?,?,?,?,?,'queued','Temporary rollback queued',?,?,1)`, job, id, in.Commit, in.Commit, generation+1, now, now)
+		jobs, queryErr := tx.DeploymentJob.Query().Where(jobmodel.DeploymentIDEQ(id), jobmodel.StatusIn("queued", "running")).All(r.Context())
+		err = queryErr
+		for _, old := range jobs {
+			if err != nil {
+				break
+			}
+			logText := old.Log + "\n" + supersedeMessage
+			if len(logText) > 8192 {
+				logText = logText[:8192]
+			}
+			_, err = tx.DeploymentJob.Update().Where(jobmodel.IDEQ(old.ID), jobmodel.StatusEQ(old.Status)).SetStatus("superseded").SetLog(logText).SetUpdatedAt(now).Save(r.Context())
+		}
+	}
+	if err == nil {
+		logText := "Temporary rollback queued"
+		if in.Permanent {
+			logText = "Permanent rollback queued; automatic deployment paused"
+		}
+		_, err = tx.DeploymentJob.Create().SetID(job).SetDeploymentID(id).SetCommitID(in.Commit).SetRollbackCommit(in.Commit).SetGeneration(newGeneration).SetStatus("queued").SetLog(logText).SetCreatedAt(now).SetUpdatedAt(now).SetDurable(1).Save(r.Context())
 	}
 	if err != nil || tx.Commit() != nil {
 		http.Error(w, "rollback could not be queued", 500)
 		return
 	}
-	a.cancelDeploymentJobsBefore(id, generation+1)
+	a.cancelDeploymentJobsBefore(id, newGeneration)
 	slot.enqueue(job)
 	writeJSONStatus(w, 202, map[string]string{"jobId": job, "status": "queued"})
 }
