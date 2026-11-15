@@ -702,15 +702,14 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 	if _, claimErr := a.store.DeploymentJob.UpdateOneID(jobID).Where(jobmodel.Status("queued")).SetStatus("running").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); claimErr != nil {
 		return
 	}
-	var liveTarget string
-	var currentGeneration int64
-	var currentStatus string
 	// Another job in this generation may have published while this worker was
 	// waiting for the deployment lock (notably a preceding rollback).
-	if checkErr := a.db.QueryRow(`SELECT commit_id,generation,status,live_commit,live_dev,live_ino FROM deployments WHERE id=?`, d.ID).Scan(&liveTarget, &currentGeneration, &currentStatus, &d.LiveCommit, &d.LiveDev, &d.LiveIno); checkErr != nil || currentGeneration != generation || currentStatus == "deleting" || currentStatus == "deletion_failed" || (d.TargetKind != "branch" && liveTarget != d.Commit) {
-		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before work began',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+	currentAtLock, checkErr := a.store.Deployment.Get(ctx, d.ID)
+	if checkErr != nil || currentAtLock.Generation != generation || currentAtLock.Status == "deleting" || currentAtLock.Status == "deletion_failed" || (d.TargetKind != "branch" && currentAtLock.CommitID != d.Commit) {
+		_ = a.supersedeJob(jobID, "Target changed before work began")
 		return
 	}
+	d.LiveCommit, d.LiveDev, d.LiveIno = currentAtLock.LiveCommit, uint64(currentAtLock.LiveDev), uint64(currentAtLock.LiveIno)
 	if d.TargetKind == "branch" || forceRedeploy {
 		if err := a.fetchProjectForBranch(ctx, d.ProjectID); err != nil {
 			message := "Could not refresh the configured Git target; the current publication was kept"
@@ -743,25 +742,25 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			if kind == "tag" {
 				// Hard re-deploy is the explicit tag-refresh operation. Persist its
 				// new pin after fetch, before export; later failures and restarts keep it.
-				result, updateErr := a.db.Exec(`UPDATE deployments SET commit_id=?,updated_at=? WHERE id=? AND generation=? AND target_kind='tag' AND target_name=?`, d.Commit, a.cfg.Now().UnixNano(), d.ID, generation, d.TargetName)
+				updated, updateErr := a.store.Deployment.Update().Where(deploymentmodel.IDEQ(d.ID), deploymentmodel.GenerationEQ(generation), deploymentmodel.TargetKindEQ("tag"), deploymentmodel.TargetNameEQ(d.TargetName)).SetCommitID(d.Commit).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
 				if updateErr != nil {
 					a.failJob(jobID, d.ID, generation, "The refreshed tag resolution could not be saved; the current publication was kept")
 					return
 				}
-				if affected, _ := result.RowsAffected(); affected != 1 {
-					_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before refreshed tag resolution was saved',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+				if updated != 1 {
+					_ = a.supersedeJob(jobID, "Target changed before refreshed tag resolution was saved")
 					return
 				}
 			}
 		}
-		if _, err := a.db.Exec(`UPDATE deployment_jobs SET commit_id=?,updated_at=? WHERE id=? AND status='running'`, d.Commit, a.cfg.Now().UnixNano(), jobID); err != nil {
+		if _, err := a.store.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).SetCommitID(d.Commit).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); err != nil {
 			a.failJob(jobID, d.ID, generation, "The resolved branch commit could not be recorded; the current publication was kept")
 			return
 		}
 	}
 	currentDeployment, checkErr := a.store.Deployment.Get(ctx, d.ID)
 	if checkErr != nil || currentDeployment.Generation != generation || currentDeployment.Status == "deleting" || currentDeployment.Status == "deletion_failed" || (d.TargetKind != "branch" && currentDeployment.CommitID != d.Commit) {
-		_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+		_ = a.supersedeJob(jobID, "Target changed before publication")
 		return
 	}
 	if d.automatic {
@@ -784,7 +783,7 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			return
 		}
 	}
-	if _, err = a.db.Exec(`UPDATE deployments SET status='publishing',error='' WHERE id=? AND generation=?`, d.ID, generation); err != nil {
+	if _, err = a.store.Deployment.Update().Where(deploymentmodel.IDEQ(d.ID), deploymentmodel.GenerationEQ(generation)).SetStatus("publishing").SetError("").Save(ctx); err != nil {
 		return
 	}
 	select {
@@ -809,7 +808,7 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 			if d.automatic {
 				a.finishAutomaticFetch(jobID, d.ID, generation, false)
 			} else {
-				_, _ = a.db.Exec(`UPDATE deployment_jobs SET status='superseded',log=substr(log || char(10) || 'Target changed before publication',1,8192),updated_at=? WHERE id=? AND status='running'`, a.cfg.Now().UnixNano(), jobID)
+				_ = a.supersedeJob(jobID, "Target changed before publication")
 			}
 			return
 		}
@@ -1154,6 +1153,16 @@ func appendJobLog(log, message string) string {
 		combined = combined[:8192]
 	}
 	return string(combined)
+}
+
+func (a *App) supersedeJob(jobID, message string) error {
+	ctx := context.Background()
+	job, err := a.store.DeploymentJob.Query().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).Only(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = a.store.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).SetStatus("superseded").SetLog(appendJobLog(job.Log, message)).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
+	return err
 }
 
 func sanitizePublicationError(err error) string {
