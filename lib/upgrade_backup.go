@@ -16,7 +16,10 @@ import (
 	"path/filepath"
 	"time"
 
+	entdialect "entgo.io/ent/dialect"
+	entsql "entgo.io/ent/dialect/sql"
 	"github.com/bytemare/opaque"
+	"github.com/eslym/deploy-manager/lib/ent"
 	"github.com/pressly/goose/v3"
 	"golang.org/x/sys/unix"
 )
@@ -164,7 +167,8 @@ func validateExistingKeyBindings(cfg Config, dbURL string) error {
 		return err
 	}
 	defer clear(master)
-	if err := validateRepositoryKeyStore(db, master); err != nil {
+	store := ent.NewClient(ent.Driver(entsql.OpenDB(entdialect.SQLite, db)))
+	if err := validateRepositoryKeyStore(store, db, master); err != nil {
 		return err
 	}
 	configuration := opaque.DefaultConfiguration()

@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/eslym/deploy-manager/lib/ent/projectsshkey"
 )
 
 const lfsApprovalPhrase = "I independently verified these LFS destinations"
@@ -158,10 +160,15 @@ func (a *App) projectLFSHydrator(projectID string) (*lfsHydrator, error) {
 		hydrator.sshAuth = func(ctx context.Context) (lfsAuthCredentials, error) {
 			// hydrate holds the SSH-key lifecycle read lock across cache lookup,
 			// authentication, and transfer. No signer is retained across calls.
-			var currentRemote, keyID string
-			if a.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, projectID).Scan(&currentRemote) != nil || currentRemote != remote || a.db.QueryRow(`SELECT key_id FROM project_ssh_keys WHERE project_id=?`, projectID).Scan(&keyID) != nil {
+			var currentRemote string
+			if a.db.QueryRow(`SELECT remote_url FROM projects WHERE id=?`, projectID).Scan(&currentRemote) != nil || currentRemote != remote {
 				return lfsAuthCredentials{}, errors.New("private SSH LFS project configuration changed")
 			}
+			assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(projectID)).Only(ctx)
+			if assignmentErr != nil {
+				return lfsAuthCredentials{}, errors.New("private SSH LFS project configuration changed")
+			}
+			keyID := assignment.KeyID
 			parsed, host, port, _, parseErr := safeSSHRemote(currentRemote)
 			if parseErr != nil {
 				return lfsAuthCredentials{}, errors.New("private SSH LFS repository URL is invalid")
