@@ -232,6 +232,64 @@ func TestBranchFetchAndCacheRecreationCompleteWithoutUsingPartialCache(t *testin
 	}
 }
 
+func TestSharedRepositoryPublicationsAreBoundedAcrossDeployments(t *testing.T) {
+	f := newAutomationFixture(t)
+	ids := []string{
+		f.createBranch(t, "bounded-one"),
+		f.createBranch(t, "bounded-two"),
+		f.createBranch(t, "bounded-three"),
+	}
+	addSmartFixtureCommit(t, f.remoteDir, "bounded concurrent tip")
+
+	entered := make(chan struct{}, 3)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	var active, maximum atomic.Int32
+	previous := setPublicationFaultPoint(func(point string) error {
+		if point != "after-stage-fsync" {
+			return nil
+		}
+		current := active.Add(1)
+		for observed := maximum.Load(); current > observed && !maximum.CompareAndSwap(observed, current); observed = maximum.Load() {
+		}
+		entered <- struct{}{}
+		<-release
+		active.Add(-1)
+		return nil
+	})
+	defer setPublicationFaultPoint(previous)
+	defer releaseOnce.Do(func() { close(release) })
+
+	jobs := make([]string, len(ids))
+	for i, id := range ids {
+		jobs[i] = f.action(t, id, "deploy", `{}`)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-entered:
+		case <-time.After(10 * time.Second):
+			t.Fatal("shared-repository deployments did not make bounded parallel progress")
+		}
+	}
+	if got := maximum.Load(); got != 2 {
+		t.Fatalf("observed active prepared publications = %d, want configured bound 2", got)
+	}
+	select {
+	case <-entered:
+		t.Fatal("third publication entered while both bounded slots were occupied")
+	case <-time.After(100 * time.Millisecond):
+	}
+	releaseOnce.Do(func() { close(release) })
+	// Restore the hook before jobs finish so any third operation can proceed.
+	setPublicationFaultPoint(previous)
+	for i, id := range ids {
+		waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, jobs[i], "succeeded")
+		if contents, err := os.ReadFile(filepath.Join(f.app.deploymentPath(id), "README.md")); err != nil || string(contents) != "bounded concurrent tip\n" {
+			t.Fatalf("deployment %s publication=%q: %v", id, contents, err)
+		}
+	}
+}
+
 func (f *automationFixture) createBranch(t *testing.T, name string) string {
 	t.Helper()
 	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments", `{"projectId":"`+f.projectID+`","name":"`+name+`","targetKind":"branch","targetName":"feature/search"}`)
