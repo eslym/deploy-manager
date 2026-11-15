@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -62,7 +63,7 @@ func localMaintenanceDiagnostic(cfg Config) string {
 	if backup == "" {
 		backup = "none finalized"
 	}
-	return fmt.Sprintf("maintenance locked: phase=%s source=%d target=%d operation=%s backup=%s", safeDiagnosticToken(marker.Phase), marker.SourceVersion, marker.TargetVersion, safeDiagnosticToken(marker.Operation), backup)
+	return fmt.Sprintf("maintenance locked: phase=%s source=%d target=%d operation=%s backup=%s", safeDiagnosticToken(marker.Phase), marker.SourceVersion, marker.TargetVersion, safeDiagnosticToken(marker.Operation), strconv.Quote(backup))
 }
 
 func safeDiagnosticToken(value string) string {
