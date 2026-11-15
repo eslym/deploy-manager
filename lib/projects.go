@@ -223,13 +223,28 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, x)
 	}
-	for i := range out {
-		assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(out[i].ID)).Only(r.Context())
-		if assignmentErr == nil {
-			out[i].KeyID = assignment.KeyID
-		} else if !ent.IsNotFound(assignmentErr) {
-			http.Error(w, "projects are temporarily unavailable", 500)
-			return
+	if len(out) != 0 {
+		assignedKeyIDs := make(map[string]string)
+		const assignmentBatchSize = 500
+		for start := 0; start < len(out); start += assignmentBatchSize {
+			end := min(start+assignmentBatchSize, len(out))
+			projectIDs := make([]string, end-start)
+			for i := start; i < end; i++ {
+				projectIDs[i-start] = out[i].ID
+			}
+			assignments, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDIn(projectIDs...)).All(r.Context())
+			if assignmentErr != nil {
+				http.Error(w, "projects are temporarily unavailable", 500)
+				return
+			}
+			for _, assignment := range assignments {
+				assignedKeyIDs[assignment.ID] = assignment.KeyID
+			}
+		}
+		for i := range out {
+			if keyID, ok := assignedKeyIDs[out[i].ID]; ok {
+				out[i].KeyID = keyID
+			}
 		}
 	}
 	writeJSON(w, out)

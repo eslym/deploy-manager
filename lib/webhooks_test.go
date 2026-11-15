@@ -90,6 +90,31 @@ func TestGitHubWebhookValidatesRawSignatureAndDeduplicatesIgnoredDelivery(t *tes
 	}
 }
 
+func TestGitHubWebhookDoesNotAcknowledgeNonDuplicateConstraintFailure(t *testing.T) {
+	app, projectID, secret := webhookTestApp(t, 2048)
+	defer app.Close()
+	if _, err := app.db.Exec(`CREATE TRIGGER reject_webhook_delivery BEFORE INSERT ON webhook_deliveries BEGIN SELECT RAISE(ABORT, 'injected integrity failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewTLSServer(app.Handler())
+	defer server.Close()
+	body := []byte(`{"ref":"refs/heads/main","after":"` + strings.Repeat("a", 40) + `","deleted":false}`)
+	status := sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+projectID, "constraint-failure", "push", body, secret)
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("integrity failure status = %d, want 503", status)
+	}
+	var receipts, jobs int
+	if err := app.db.QueryRow(`SELECT count(*) FROM webhook_deliveries`).Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.db.QueryRow(`SELECT count(*) FROM deployment_jobs`).Scan(&jobs); err != nil {
+		t.Fatal(err)
+	}
+	if receipts != 0 || jobs != 0 {
+		t.Fatalf("integrity failure persisted receipts=%d jobs=%d, want neither", receipts, jobs)
+	}
+}
+
 func TestGitHubWebhookRejectsOversizedAndMalformedPushBeforeAcceptance(t *testing.T) {
 	app, projectID, secret := webhookTestApp(t, 1024)
 	server := httptest.NewTLSServer(app.Handler())
