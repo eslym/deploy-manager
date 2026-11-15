@@ -265,7 +265,7 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 		db.Close()
 		return nil, err
 	}
-	if err = prepareRepositoryKeyStore(db, cfg.RepositoryKeyPath, prior); err != nil {
+	if err = prepareRepositoryKeyStore(store, db, cfg.RepositoryKeyPath, prior); err != nil {
 		db.Close()
 		return nil, err
 	}
