@@ -150,6 +150,24 @@ func TestStorageCoordinationChild(t *testing.T) {
 		}
 		closer = f
 		err = unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
+	case "upgrade-crash":
+		phase := os.Getenv("DM_UPGRADE_CRASH_PHASE")
+		cfg.storageFault = func(name string, _ *sql.DB) error {
+			if name == phase {
+				fmt.Println("ready")
+				_, _ = io.Copy(io.Discard, os.Stdin)
+				return errors.New("test process interrupted")
+			}
+			return nil
+		}
+		g, e := NewGrantIssuer(cfg)
+		if g != nil {
+			_ = g.Close()
+		}
+		if e == nil {
+			t.Fatal("pending upgrade unexpectedly completed")
+		}
+		return
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -157,6 +175,79 @@ func TestStorageCoordinationChild(t *testing.T) {
 	defer closer.Close()
 	fmt.Println("ready")
 	_, _ = io.Copy(io.Discard, os.Stdin)
+}
+
+func TestUpgradePreparationCrashWindowsRemainLockedAcrossRestart(t *testing.T) {
+	for _, phase := range []string{"backup-checkpoint", "marker-update"} {
+		t.Run(phase, func(t *testing.T) {
+			cfg := coordinationConfig(t)
+			issuer, err := NewGrantIssuer(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = issuer.Close()
+			db, err := sql.Open("sqlite3", cfg.DatabasePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
+				t.Fatal(err)
+			}
+			_ = db.Close()
+			cmd, stdin, stdout := startUpgradeCrashChild(t, cfg, phase)
+			if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "ready\n" {
+				t.Fatalf("child did not stop at %s: %q %v", phase, line, err)
+			}
+			if err := cmd.Process.Kill(); err != nil {
+				t.Fatal(err)
+			}
+			_ = stdin.Close()
+			_ = cmd.Wait()
+			if _, err := os.Stat(cfg.DatabasePath + ".maintenance.json"); err != nil {
+				t.Fatalf("crash at %s lost maintenance marker: %v", phase, err)
+			}
+			if phase == "marker-update" {
+				entries, err := os.ReadDir(cfg.DatabasePath + ".upgrade-backups")
+				if err != nil || len(entries) != 2 {
+					t.Fatalf("crash after backup finalization did not retain copy and manifest: entries=%v err=%v", entries, err)
+				}
+			}
+			daemon, err := OpenDaemon(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer daemon.Close()
+			if !daemon.Locked() {
+				t.Fatalf("restart after %s escaped maintenance mode", phase)
+			}
+		})
+	}
+}
+
+func startUpgradeCrashChild(t *testing.T, cfg Config, phase string) (*exec.Cmd, io.WriteCloser, io.ReadCloser) {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestStorageCoordinationChild$")
+	cmd.Env = append(os.Environ(), "DM_COORDINATION_CHILD=upgrade-crash", "DM_COORDINATION_DIR="+filepath.Dir(cfg.DatabasePath), "DM_UPGRADE_CRASH_PHASE="+phase)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = stdin.Close()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	})
+	return cmd, stdin, stdout
 }
 
 func TestConcurrentCommandTransactionsRespectGrantLimit(t *testing.T) {

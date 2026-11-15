@@ -16,6 +16,12 @@ var migrationFiles embed.FS
 
 const currentSchemaVersion int64 = 1
 
+type pendingUpgrade struct{ source, target int64 }
+
+func (p pendingUpgrade) Error() string {
+	return fmt.Sprintf("supported schema upgrade pending (%d to %d)", p.source, p.target)
+}
+
 var requiredSchemaTables = []string{
 	"registration_grants", "administrator", "opaque_profile", "repository_key_store", "repository_keys",
 	"projects", "project_refs", "project_refresh_journal", "project_ssh_keys", "project_deletions",
@@ -56,6 +62,11 @@ func initializeSchema(db *sql.DB, fresh bool) error {
 		if historyTable != 1 {
 			return errors.New("existing database has no supported goose migration history; refusing to alter unversioned or partial state; use a new isolated location for explicit rebootstrap")
 		}
+		if pending, err := inspectVersionOneHistory(db); err != nil {
+			return err
+		} else if pending {
+			return pendingUpgrade{0, currentSchemaVersion}
+		}
 		if err := validateVersionOneHistory(db); err != nil {
 			return err
 		}
@@ -75,6 +86,29 @@ func initializeSchema(db *sql.DB, fresh bool) error {
 		}
 	}
 	return validateStoragePragmas(db)
+}
+
+func inspectVersionOneHistory(db *sql.DB) (bool, error) {
+	rows, err := db.Query(`SELECT version_id,is_applied FROM goose_db_version ORDER BY id`)
+	if err != nil {
+		return false, fmt.Errorf("read database migration history: %w", err)
+	}
+	defer rows.Close()
+	var got [][2]int64
+	for rows.Next() {
+		var v, a int64
+		if err := rows.Scan(&v, &a); err != nil {
+			return false, err
+		}
+		got = append(got, [2]int64{v, a})
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(got) == 2 && got[0] == [2]int64{0, 1} && got[1] == [2]int64{currentSchemaVersion, 0} {
+		return true, nil
+	}
+	return false, nil
 }
 
 func validateVersionOneHistory(db *sql.DB) error {
@@ -151,6 +185,11 @@ func preflightExistingSchema(dbURL string) error {
 	}
 	if historyTable != 1 {
 		return errors.New("existing database has no supported goose migration history; refusing to alter unversioned or partial state; use a new isolated location for explicit rebootstrap")
+	}
+	if pending, err := inspectVersionOneHistory(db); err != nil {
+		return err
+	} else if pending {
+		return pendingUpgrade{0, currentSchemaVersion}
 	}
 	if err := validateVersionOneHistory(db); err != nil {
 		return err
