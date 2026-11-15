@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
+	"testing/fstest"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -46,6 +48,377 @@ func TestFreshSchemaIsCompleteAndReopenIsNoOp(t *testing.T) {
 	}
 	if err := initializeSchema(db, false); err != nil {
 		t.Fatalf("current-version reopen: %v", err)
+	}
+}
+
+func TestProtectedUpgradeVerifiesAndDurablyUnlocksBeforeReturning(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	markerPath, err := MaintenancePath(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 1, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
+	if err := durableJSONReplace(markerPath, marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyProtectedUpgrade(cfg, (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String(), markerPath, marker); err != nil {
+		t.Fatalf("protected completion failed: %v", err)
+	}
+	if _, err := os.Lstat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("maintenance marker remains after verified completion: %v", err)
+	}
+	readyIssuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatalf("readiness was not restored after durable unlock: %v", err)
+	}
+	if err := readyIssuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPendingUpgradeCompletesThroughStorageStartupWithFixtureMigration(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true,
+		upgradeTargetVersion: 2,
+		migrationFS: fstest.MapFS{
+			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_upgrade(value TEXT NOT NULL);\nINSERT INTO fixture_upgrade VALUES('completed');\n-- +goose Down\nDROP TABLE fixture_upgrade;\n")},
+		},
+	}
+	first, err := NewGrantIssuer(Config{DatabasePath: cfg.DatabasePath, OPAQUEKeyPath: cfg.OPAQUEKeyPath, InsecureLocalHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(cfg.OPAQUEKeyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockChecked := false
+	cfg.storageFault = func(phase string, _ *sql.DB) error {
+		if phase != "upgrade-migration" {
+			return nil
+		}
+		f, err := os.OpenFile(cfg.DatabasePath+".access.lock", os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_SH|syscall.LOCK_NB)
+		if err == nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			return errors.New("CLI shared access overlapped protected migration")
+		}
+		if err != syscall.EWOULDBLOCK && err != syscall.EAGAIN {
+			return err
+		}
+		lockChecked = true
+		return nil
+	}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatalf("startup did not finish protected upgrade: %v", err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !lockChecked {
+		t.Fatal("protected migration phase was not reached")
+	}
+	if _, err := os.Lstat(cfg.DatabasePath + ".maintenance.json"); !os.IsNotExist(err) {
+		t.Fatalf("successful upgrade left marker: %v", err)
+	}
+	after, err := os.ReadFile(cfg.OPAQUEKeyPath)
+	if err != nil || string(before) != string(after) {
+		t.Fatalf("upgrade changed external OPAQUE key: %v", err)
+	}
+	db, err := sql.Open("sqlite3", cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var value string
+	if err := db.QueryRow(`SELECT value FROM fixture_upgrade`).Scan(&value); err != nil || value != "completed" {
+		t.Fatalf("fixture migration value=%q err=%v", value, err)
+	}
+	backupDir := cfg.DatabasePath + ".upgrade-backups"
+	entries, err := os.ReadDir(backupDir)
+	if err != nil || len(entries) != 2 {
+		t.Fatalf("verified backup was not retained: entries=%d err=%v", len(entries), err)
+	}
+}
+
+func TestProtectedUpgradeCancellationRetainsMarker(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	markerPath, err := MaintenancePath(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 1, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
+	if err := durableJSONReplace(markerPath, marker); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	cfg.upgradeContext = ctx
+	if err := applyProtectedUpgrade(cfg, (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String(), markerPath, marker); err == nil {
+		t.Fatal("cancelled protected upgrade succeeded")
+	}
+	if _, err := os.Stat(markerPath); err != nil {
+		t.Fatalf("cancellation cleared maintenance marker: %v", err)
+	}
+}
+
+func TestPendingUpgradeValidatesExternalKeyBindingBeforeEstablishingMaintenance(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", cfg.DatabasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	masterPath := cfg.DatabasePath + ".repository-master-key"
+	key, err := os.ReadFile(masterPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key[0] ^= 0xff
+	if err := os.WriteFile(masterPath, key, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewGrantIssuer(cfg); err == nil || errors.Is(err, ErrMaintenance) {
+		t.Fatalf("mismatched key binding should fail before entering maintenance: %v", err)
+	}
+	if _, err := os.Lstat(cfg.DatabasePath + ".maintenance.json"); !os.IsNotExist(err) {
+		t.Fatalf("key validation failure wrote maintenance marker: %v", err)
+	}
+	if _, err := os.Stat(cfg.DatabasePath + ".upgrade-backups"); !os.IsNotExist(err) {
+		t.Fatalf("key validation failure created backup directory: %v", err)
+	}
+}
+
+func TestProtectedUpgradeFailuresRemainLockedAndDoNotRunLaterPhases(t *testing.T) {
+	for _, failedPhase := range []string{"upgrade-vacuum", "upgrade-migration", "upgrade-verify", "marker-remove", "marker-remove-sync"} {
+		t.Run(failedPhase, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+			issuer, err := NewGrantIssuer(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := issuer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			markerPath, err := MaintenancePath(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 1, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
+			if err := durableJSONReplace(markerPath, marker); err != nil {
+				t.Fatal(err)
+			}
+			laterPhaseRan := false
+			cfg.storageFault = func(phase string, _ *sql.DB) error {
+				if phase == failedPhase {
+					return errors.New("injected failure")
+				}
+				if failedPhase == "upgrade-vacuum" && phase == "upgrade-migration" {
+					laterPhaseRan = true
+				}
+				return nil
+			}
+			if err := applyProtectedUpgrade(cfg, (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String(), markerPath, marker); err == nil {
+				t.Fatal("injected protected phase failure was ignored")
+			}
+			if failedPhase == "upgrade-vacuum" && laterPhaseRan {
+				t.Fatal("migration ran after VACUUM failure")
+			}
+			if _, err := os.Lstat(markerPath); err != nil {
+				t.Fatalf("failure cleared maintenance marker: %v", err)
+			}
+			if _, err := NewGrantIssuer(cfg); !errors.Is(err, ErrMaintenance) {
+				t.Fatalf("failed upgrade did not remain locked: %v", err)
+			}
+		})
+	}
+}
+
+func TestProtectedUpgradeRunsEmbeddedForwardMigrationAndRetainsPartialProgress(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		migrations fstest.MapFS
+		target     int64
+		wantValue  bool
+	}{
+		{name: "success", target: 2, wantValue: true, migrations: fstest.MapFS{
+			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('migrated');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
+		}},
+		{name: "partial multi migration", target: 3, migrations: fstest.MapFS{
+			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('first committed migration');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
+			"00003_fail.sql":    {Data: []byte("-- +goose Up\nCREATE TABLE rolled_back(value TEXT NOT NULL);\nINSERT INTO missing_table VALUES('failure');\n-- +goose Down\nDROP TABLE rolled_back;\n")},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+			issuer, err := NewGrantIssuer(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := issuer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			cfg.migrationFS = tc.migrations
+			markerPath, err := MaintenancePath(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: tc.target, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
+			if err := durableJSONReplace(markerPath, marker); err != nil {
+				t.Fatal(err)
+			}
+			err = applyProtectedUpgrade(cfg, (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String(), markerPath, marker)
+			db, openErr := sql.Open("sqlite3", cfg.DatabasePath)
+			if openErr != nil {
+				t.Fatal(openErr)
+			}
+			defer db.Close()
+			if tc.wantValue {
+				if err != nil {
+					t.Fatalf("upgrade failed: %v", err)
+				}
+				var value string
+				if err := db.QueryRow(`SELECT value FROM upgrade_witness`).Scan(&value); err != nil || value != "migrated" {
+					t.Fatalf("migration value=%q err=%v", value, err)
+				}
+				if _, err := os.Lstat(markerPath); !os.IsNotExist(err) {
+					t.Fatalf("successful upgrade left marker: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("failing second migration unexpectedly succeeded")
+				}
+				var value string
+				if err := db.QueryRow(`SELECT value FROM upgrade_witness`).Scan(&value); err != nil || value != "first committed migration" {
+					t.Fatalf("earlier migration was not preserved: value=%q err=%v", value, err)
+				}
+				if _, err := os.Stat(markerPath); err != nil {
+					t.Fatalf("partial upgrade cleared marker: %v", err)
+				}
+				var secondApplied int
+				if err := db.QueryRow(`SELECT is_applied FROM goose_db_version WHERE version_id=2`).Scan(&secondApplied); err != nil || secondApplied != 1 {
+					t.Fatalf("first migration history=%d err=%v", secondApplied, err)
+				}
+				var rolledBack int
+				if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='rolled_back'`).Scan(&rolledBack); err != nil || rolledBack != 0 {
+					t.Fatalf("failed transactional migration left DDL behind: count=%d err=%v", rolledBack, err)
+				}
+			}
+		})
+	}
+}
+
+func TestProtectedForeignKeyRebuildUsesSingleConnectionAndRestoresEnforcement(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	cfg := Config{DatabasePath: dbPath, OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	issuer, err := NewGrantIssuer(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := issuer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_foreign_keys=on")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`CREATE TABLE rebuild_parent(id INTEGER PRIMARY KEY, name TEXT NOT NULL); CREATE TABLE rebuild_child(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES rebuild_parent(id) ON DELETE RESTRICT); INSERT INTO rebuild_parent VALUES(1,'parent'); INSERT INTO rebuild_child VALUES(1,1);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.migrationFS = fstest.MapFS{
+		"00001_base.sql": {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+		"00002_rebuild.sql": {Data: []byte(`-- +goose NO TRANSACTION
+-- +goose Up
+PRAGMA foreign_keys=OFF;
+BEGIN;
+CREATE TABLE rebuild_parent_new(id INTEGER PRIMARY KEY, name TEXT NOT NULL, extra TEXT NOT NULL DEFAULT '');
+INSERT INTO rebuild_parent_new(id,name) SELECT id,name FROM rebuild_parent;
+CREATE TABLE rebuild_child_new(id INTEGER PRIMARY KEY, parent_id INTEGER NOT NULL REFERENCES rebuild_parent_new(id) ON DELETE RESTRICT);
+INSERT INTO rebuild_child_new(id,parent_id) SELECT id,parent_id FROM rebuild_child;
+DROP TABLE rebuild_child;
+DROP TABLE rebuild_parent;
+ALTER TABLE rebuild_parent_new RENAME TO rebuild_parent;
+ALTER TABLE rebuild_child_new RENAME TO rebuild_child;
+COMMIT;
+PRAGMA foreign_keys=ON;
+-- +goose Down
+SELECT 1;
+`)},
+	}
+	markerPath, err := MaintenancePath(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 2, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "backup.db"), Phase: "migration"}
+	if err := durableJSONReplace(markerPath, marker); err != nil {
+		t.Fatal(err)
+	}
+	if err := applyProtectedUpgrade(cfg, (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String(), markerPath, marker); err != nil {
+		t.Fatalf("single-connection foreign-key rebuild deadlocked or failed: %v", err)
+	}
+	db, err = sql.Open("sqlite3", dbPath+"?_foreign_keys=on")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	var enabled, children int
+	if err := db.QueryRow(`PRAGMA foreign_keys`).Scan(&enabled); err != nil || enabled != 1 {
+		t.Fatalf("foreign-key enforcement=%d err=%v", enabled, err)
+	}
+	if err := db.QueryRow(`SELECT count(*) FROM rebuild_child`).Scan(&children); err != nil || children != 1 {
+		t.Fatalf("rebuilt child count=%d err=%v", children, err)
+	}
+	if err := validateDatabaseIntegrity(db); err != nil {
+		t.Fatalf("rebuilt schema failed foreign-key validation: %v", err)
 	}
 }
 

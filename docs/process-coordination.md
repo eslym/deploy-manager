@@ -12,8 +12,10 @@ Two permanent owner-only files beside the database coordinate processes:
 - `state.sqlite.daemon.lock`: exclusive daemon lifetime ownership.
 - `state.sqlite.access.lock`: shared database-use access, held until database
   closure. Fresh initialization takes exclusive access before database/key work
-  and switches to shared access only after preparation succeeds. This is also
-  the coordination boundary for future schema maintenance.
+  and switches to shared access only after storage is ready. A pending daemon
+  upgrade holds exclusive access continuously through the durable marker,
+  verified backup, bounded VACUUM, migrations, verification, and durable marker
+  removal. CLI commands cannot access the database during that interval.
 
 Never delete, replace, hard-link, or repurpose these files to bypass contention.
 Locks belong to open OS descriptors, not file contents or a PID. Process death
@@ -40,13 +42,13 @@ also have a one-second busy timeout. A busy error does not authorize deleting
 locks, resetting state, or running another daemon.
 
 Maintenance refusal and exact-version compatibility are separate safeguards:
-OS crash release must never clear a durable maintenance marker. The required
-policy is to refuse commands while marked or when their schema/history does not
-exactly match, without migration, grant issuance, or repair. Marker enforcement
-is delivered separately in #30; exact schema/history validation and replacing
-the existing ad hoc schema preparation are deferred to #31. **This coordination
-change alone does not implement or certify version compatibility.** Do not run
-mixed executable versions against an existing installation.
+OS crash release must never clear a durable maintenance marker. A daemon may
+apply only embedded, supported forward migrations after a verified database-only
+backup. Compatible CLI commands never migrate; they refuse while marked or when
+their schema/history does not exactly match. Any interrupted or failed upgrade
+keeps the marker, verified backup and publication state, and requires deliberate
+operator recovery. Do not run mixed executable versions against an existing
+installation.
 
 For offline database restoration, stop the daemon **and all database-capable
 CLI commands**, disable automatic daemon restarts, and prevent new command use

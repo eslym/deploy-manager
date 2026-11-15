@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -15,6 +16,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/bytemare/opaque"
+	"github.com/pressly/goose/v3"
 	"golang.org/x/sys/unix"
 )
 
@@ -27,8 +30,8 @@ type backupManifest struct {
 	SHA256        string `json:"sha256"`
 }
 
-// prepareUpgradeBackup deliberately leaves the durable marker in place. Upgrade
-// execution is a separate future phase; until then the caller must remain locked.
+// The caller holds exclusive cross-process storage access throughout this
+// backup, migration, verification, and durable-unlock sequence.
 func prepareUpgradeBackup(cfg Config, source, target int64, dbURL string) (retErr error) {
 	markerPath, err := MaintenancePath(cfg)
 	if err != nil {
@@ -44,6 +47,9 @@ func prepareUpgradeBackup(cfg Config, source, target int64, dbURL string) (retEr
 	}
 	if err := validateBackupPaths(cfg, markerPath); err != nil {
 		return err
+	}
+	if err := validateExistingKeyBindings(cfg, dbURL); err != nil {
+		return fmt.Errorf("existing key bindings failed pre-upgrade validation: %w", err)
 	}
 	program, _ := os.Executable()
 	program = filepath.Base(program)
@@ -136,7 +142,189 @@ func prepareUpgradeBackup(cfg Config, source, target int64, dbURL string) (retEr
 	if err := durableJSONReplace(markerPath, marker); err != nil {
 		return fmt.Errorf("verified backup %s exists, but maintenance marker update failed: %w", backupPath, err)
 	}
-	return ErrMaintenance
+	if err := applyProtectedUpgrade(cfg, dbURL, markerPath, marker); err != nil {
+		return errors.Join(ErrMaintenance, err)
+	}
+	return nil
+}
+
+func validateExistingKeyBindings(cfg Config, dbURL string) error {
+	db, err := sql.Open("sqlite3", dbURL+"?mode=ro&_busy_timeout=1000")
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+	masterPath := cfg.RepositoryKeyPath
+	if masterPath == "" {
+		masterPath = cfg.DatabasePath + ".repository-master-key"
+	}
+	master, err := loadRepositoryMasterKey(masterPath, true)
+	if err != nil {
+		return err
+	}
+	defer clear(master)
+	if err := validateRepositoryKeyStore(db, master); err != nil {
+		return err
+	}
+	configuration := opaque.DefaultConfiguration()
+	_, generation, err := loadOPAQUEServerKey(configuration, cfg.OPAQUEKeyPath, true)
+	if err != nil {
+		return err
+	}
+	const profile = "RFC9807-OPAQUE-3DH;ristretto255-SHA512;HKDF-SHA512;HMAC-SHA512;Argon2id-v19-i1-m65536-p4;context-empty;identities-default"
+	var storedProfile, keyGeneration string
+	var profileGeneration int
+	if err := db.QueryRow(`SELECT profile_generation,key_generation,profile FROM opaque_profile WHERE singleton=1`).Scan(&profileGeneration, &keyGeneration, &storedProfile); err != nil {
+		return errors.New("OPAQUE key/profile binding is missing or unavailable")
+	}
+	if profileGeneration != 1 || keyGeneration != generation || storedProfile != profile {
+		return errors.New("OPAQUE key/profile generation mismatch")
+	}
+	var accountGeneration int
+	err = db.QueryRow(`SELECT profile_generation FROM administrator WHERE id=1`).Scan(&accountGeneration)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return errors.New("administrator/profile binding is unavailable")
+	}
+	if err == nil && accountGeneration != profileGeneration {
+		return errors.New("administrator/profile generation mismatch")
+	}
+	return nil
+}
+
+func applyProtectedUpgrade(cfg Config, dbURL, markerPath string, marker maintenanceMarker) error {
+	ctx := cfg.upgradeContext
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	phase := func(name string, db *sql.DB) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if cfg.storageFault != nil {
+			return cfg.storageFault(name, db)
+		}
+		return nil
+	}
+	if err := phase("upgrade-vacuum", nil); err != nil {
+		return fmt.Errorf("upgrade VACUUM cancelled or unavailable; verified backup retained: %w", err)
+	}
+	db, err := sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=1000&_txlock=immediate")
+	if err != nil {
+		return fmt.Errorf("open database for protected upgrade: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+	_, err = db.ExecContext(ctx, `VACUUM`)
+	if err == nil {
+		err = phase("upgrade-after-vacuum", db)
+	}
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	} else {
+		err = errors.Join(err, closeErr)
+	}
+	if err != nil {
+		return fmt.Errorf("upgrade VACUUM failed; verified backup retained: %w", err)
+	}
+	files, err := migrationSource(cfg)
+	if err != nil {
+		return err
+	}
+	db, err = sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=1000&_txlock=immediate")
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(1)
+	provider, err := goose.NewProvider(goose.DialectSQLite3, db, files, goose.WithDisableGlobalRegistry(true))
+	if err != nil {
+		_ = db.Close()
+		return fmt.Errorf("configure protected migrations: %w", err)
+	}
+	if err = phase("upgrade-migration", db); err == nil {
+		_, err = provider.Up(ctx)
+	}
+	providerCloseErr := provider.Close()
+	if err == nil {
+		err = providerCloseErr
+	} else {
+		err = errors.Join(err, providerCloseErr)
+	}
+	if err != nil {
+		return fmt.Errorf("embedded migration failed; verified backup retained: %w", err)
+	}
+	if err = phase("upgrade-verify", nil); err != nil {
+		return fmt.Errorf("post-upgrade verification failed; verified backup retained: %w", err)
+	}
+	db, err = sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=1000")
+	if err != nil {
+		return err
+	}
+	db.SetMaxOpenConns(1)
+	if err = validateMigrationHistory(db, marker.TargetVersion); err == nil {
+		err = validateStoragePragmas(db)
+	}
+	if err == nil {
+		err = validateExistingKeyBindings(cfg, dbURL)
+	}
+	if err == nil {
+		err = phase("upgrade-clean-close", db)
+	}
+	if closeErr := db.Close(); err == nil {
+		err = closeErr
+	} else {
+		err = errors.Join(err, closeErr)
+	}
+	if err != nil {
+		return fmt.Errorf("post-upgrade verification or database close failed; verified backup retained: %w", err)
+	}
+	if err := phase("marker-remove", nil); err != nil {
+		return fmt.Errorf("verified upgrade could not durably remove maintenance marker; backup retained: %w", err)
+	}
+	if err := durableRemoveWithSync(markerPath, func(dir *os.File) error {
+		if err := phase("marker-remove-sync", nil); err != nil {
+			return err
+		}
+		return dir.Sync()
+	}); err != nil {
+		return fmt.Errorf("verified upgrade could not durably remove maintenance marker; backup retained: %w", err)
+	}
+	return nil
+}
+
+func durableRemove(path string) error {
+	return durableRemoveWithSync(path, func(dir *os.File) error { return dir.Sync() })
+}
+
+func durableRemoveWithSync(path string, syncDirectory func(*os.File) error) error {
+	old, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var marker maintenanceMarker
+	if err := json.Unmarshal(old, &marker); err != nil {
+		return errors.New("maintenance marker became unreadable before removal")
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	err = syncDirectory(dir)
+	closeErr := dir.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		// A failed directory sync must not leave this process able to proceed as
+		// ready. Re-establish the fail-closed marker before returning.
+		return errors.Join(err, durableJSONReplace(path, marker))
+	}
+	return nil
 }
 
 func validateBackupPaths(cfg Config, marker string) error {

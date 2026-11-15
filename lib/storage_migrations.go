@@ -31,10 +31,28 @@ var requiredSchemaTables = []string{
 }
 
 func initializeSchema(db *sql.DB, fresh bool) error {
+	return initializeSchemaWithConfig(db, fresh, Config{})
+}
+
+func schemaTargetVersion(cfg Config) int64 {
+	if cfg.upgradeTargetVersion > 0 {
+		return cfg.upgradeTargetVersion
+	}
+	return currentSchemaVersion
+}
+
+func migrationSource(cfg Config) (fs.FS, error) {
+	if cfg.migrationFS != nil {
+		return cfg.migrationFS, nil
+	}
+	return fs.Sub(migrationFiles, "migrations")
+}
+
+func initializeSchemaWithConfig(db *sql.DB, fresh bool, cfg Config) error {
 	if err := validateSQLiteRuntime(db); err != nil {
 		return err
 	}
-	files, err := fs.Sub(migrationFiles, "migrations")
+	files, err := migrationSource(cfg)
 	if err != nil {
 		return err
 	}
@@ -47,6 +65,7 @@ func initializeSchema(db *sql.DB, fresh bool) error {
 	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'`).Scan(&userObjects); err != nil {
 		return fmt.Errorf("inspect database before schema initialization: %w", err)
 	}
+	targetVersion := schemaTargetVersion(cfg)
 	if fresh {
 		if userObjects != 0 {
 			return errors.New("database path contains existing or partial state; refusing initialization; use a new isolated location for explicit rebootstrap")
@@ -62,20 +81,23 @@ func initializeSchema(db *sql.DB, fresh bool) error {
 		if historyTable != 1 {
 			return errors.New("existing database has no supported goose migration history; refusing to alter unversioned or partial state; use a new isolated location for explicit rebootstrap")
 		}
-		if pending, err := inspectVersionOneHistory(db); err != nil {
+		if pending, found, err := inspectPendingMigration(db, targetVersion); err != nil {
 			return err
-		} else if pending {
-			return pendingUpgrade{0, currentSchemaVersion}
-		}
-		if err := validateVersionOneHistory(db); err != nil {
-			return err
+		} else if found {
+			return pending
 		}
 		current, target, err := provider.GetVersions(ctx)
 		if err != nil {
 			return fmt.Errorf("database migration history is missing, malformed, or unsupported; refusing to modify existing state: %w", err)
 		}
-		if current != currentSchemaVersion || target != currentSchemaVersion {
-			return fmt.Errorf("database schema version mismatch (database %d, executable %d); pending upgrades are unavailable and existing state was not modified", current, currentSchemaVersion)
+		if err := validateMigrationState(db, current, targetVersion); err != nil {
+			return err
+		}
+		if current < targetVersion && target == targetVersion {
+			return pendingUpgrade{current, targetVersion}
+		}
+		if current != targetVersion || target != targetVersion {
+			return fmt.Errorf("database schema version mismatch (database %d, executable %d); refusing unsupported state", current, targetVersion)
 		}
 		pending, err := provider.HasPending(ctx)
 		if err != nil || pending {
@@ -112,12 +134,20 @@ func inspectVersionOneHistory(db *sql.DB) (bool, error) {
 }
 
 func validateVersionOneHistory(db *sql.DB) error {
+	return validateMigrationHistory(db, currentSchemaVersion)
+}
+
+func validateMigrationHistory(db *sql.DB, target int64) error {
 	rows, err := db.Query(`SELECT version_id,is_applied FROM goose_db_version ORDER BY id`)
 	if err != nil {
 		return fmt.Errorf("read database migration history: %w", err)
 	}
 	defer rows.Close()
-	want := [][2]int64{{0, 1}, {currentSchemaVersion, 1}}
+	want := make([][2]int64, 0, target+1)
+	want = append(want, [2]int64{0, 1})
+	for version := int64(1); version <= target; version++ {
+		want = append(want, [2]int64{version, 1})
+	}
 	index := 0
 	for rows.Next() {
 		var version, applied int64
@@ -162,7 +192,11 @@ func validateStoragePragmas(db *sql.DB) error {
 	return validateDatabaseIntegrity(db)
 }
 
-func preflightExistingSchema(dbURL string) error {
+func preflightExistingSchema(dbURL string, configs ...Config) error {
+	cfg := Config{}
+	if len(configs) > 0 {
+		cfg = configs[0]
+	}
 	db, err := sql.Open("sqlite3", dbURL+"?mode=ro&_busy_timeout=1000")
 	if err != nil {
 		return err
@@ -186,18 +220,109 @@ func preflightExistingSchema(dbURL string) error {
 	if historyTable != 1 {
 		return errors.New("existing database has no supported goose migration history; refusing to alter unversioned or partial state; use a new isolated location for explicit rebootstrap")
 	}
-	if pending, err := inspectVersionOneHistory(db); err != nil {
+	if pending, found, err := inspectPendingMigration(db, schemaTargetVersion(cfg)); err != nil {
 		return err
-	} else if pending {
-		return pendingUpgrade{0, currentSchemaVersion}
+	} else if found {
+		return pending
 	}
-	if err := validateVersionOneHistory(db); err != nil {
+	files, err := migrationSource(cfg)
+	if err != nil {
 		return err
+	}
+	provider, err := goose.NewProvider(goose.DialectSQLite3, db, files, goose.WithDisableGlobalRegistry(true))
+	if err != nil {
+		return err
+	}
+	defer provider.Close()
+	current, target, err := provider.GetVersions(context.Background())
+	if err != nil {
+		return fmt.Errorf("database migration history is malformed or unsupported: %w", err)
+	}
+	wantTarget := schemaTargetVersion(cfg)
+	if err := validateMigrationState(db, current, wantTarget); err != nil {
+		return err
+	}
+	if current < wantTarget && target == wantTarget {
+		return pendingUpgrade{current, wantTarget}
+	}
+	if current != wantTarget || target != wantTarget {
+		return fmt.Errorf("database schema version mismatch (database %d, executable %d); refusing unsupported state", current, wantTarget)
+	}
+	if pending, err := provider.HasPending(context.Background()); err != nil || pending {
+		if err == nil {
+			err = errors.New("pending migrations are unavailable")
+		}
+		return fmt.Errorf("database migration history is not current; refusing to modify existing state: %w", err)
 	}
 	if err := validateSchemaTables(db); err != nil {
 		return err
 	}
 	return validateDatabaseIntegrity(db)
+}
+
+func inspectPendingMigration(db *sql.DB, target int64) (pendingUpgrade, bool, error) {
+	rows, err := db.Query(`SELECT version_id,is_applied FROM goose_db_version ORDER BY id`)
+	if err != nil {
+		return pendingUpgrade{}, false, fmt.Errorf("read database migration history: %w", err)
+	}
+	defer rows.Close()
+	var got [][2]int64
+	for rows.Next() {
+		var v, a int64
+		if err := rows.Scan(&v, &a); err != nil {
+			return pendingUpgrade{}, false, err
+		}
+		got = append(got, [2]int64{v, a})
+	}
+	if err := rows.Err(); err != nil {
+		return pendingUpgrade{}, false, err
+	}
+	if len(got) == 0 || got[len(got)-1] != [2]int64{target, 0} {
+		return pendingUpgrade{}, false, nil
+	}
+	if err := rows.Close(); err != nil {
+		return pendingUpgrade{}, false, err
+	}
+	if err := validateMigrationState(db, target-1, target); err != nil {
+		return pendingUpgrade{}, false, err
+	}
+	return pendingUpgrade{target - 1, target}, true, nil
+}
+
+func validateMigrationState(db *sql.DB, appliedThrough, expectedTarget int64) error {
+	rows, err := db.Query(`SELECT version_id,is_applied FROM goose_db_version ORDER BY id`)
+	if err != nil {
+		return fmt.Errorf("read database migration history: %w", err)
+	}
+	defer rows.Close()
+	var got [][2]int64
+	for rows.Next() {
+		var v, a int64
+		if err := rows.Scan(&v, &a); err != nil {
+			return err
+		}
+		got = append(got, [2]int64{v, a})
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	want := make([][2]int64, 0, appliedThrough+2)
+	want = append(want, [2]int64{0, 1})
+	for v := int64(1); v <= appliedThrough; v++ {
+		want = append(want, [2]int64{v, 1})
+	}
+	if appliedThrough < expectedTarget && len(got) == len(want)+1 && got[len(got)-1] == [2]int64{appliedThrough + 1, 0} {
+		want = append(want, [2]int64{appliedThrough + 1, 0})
+	}
+	if len(got) != len(want) {
+		return errors.New("database migration history is incomplete or malformed; refusing to modify existing state")
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			return fmt.Errorf("database migration history is unknown or malformed at row %d; refusing to modify existing state", i)
+		}
+	}
+	return nil
 }
 
 func validateSQLiteRuntime(db *sql.DB) error {
