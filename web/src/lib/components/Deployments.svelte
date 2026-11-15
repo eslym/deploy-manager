@@ -16,7 +16,15 @@
 		error?: string;
 		publicationPath: string;
 	};
-	type Job = { id: string; status: string; log: string; commit: string };
+	type Job = {
+		id: string;
+		status: string;
+		log: string;
+		commit: string;
+		force: boolean;
+		createdAt: string;
+		updatedAt: string;
+	};
 	let { projectId }: { projectId: string } = $props();
 	let refs = $state<Ref[]>([]);
 	let refsLoaded = false;
@@ -33,6 +41,18 @@
 	let deleteConfirmation = $state('');
 	let loadVersion = 0;
 	const key = (ref: Ref) => `${ref.kind}:${ref.name}`;
+	const jobStatus = (job: Job) =>
+		job.status === 'failed' && job.log.toLowerCase().includes('interrupted')
+			? 'Interrupted'
+			: ({
+					succeeded: 'Succeeded',
+					noop: 'No changes',
+					failed: 'Failed',
+					superseded: 'Superseded',
+					interrupted: 'Interrupted',
+					queued: 'Queued',
+					running: 'Running'
+				}[job.status] ?? job.status);
 	let filteredRefs = $derived(
 		refs.filter((ref) => ref.name.toLowerCase().includes(refSearch.toLowerCase()))
 	);
@@ -402,15 +422,43 @@
 					{/key}
 				{/if}
 				{#if item.error}<p role="alert" class="mt-2 text-sm text-red-800">{item.error}</p>{/if}
-				{#if jobs[item.id]?.[0]}<details class="mt-3">
-						<summary class="cursor-pointer text-sm font-semibold text-[#214c30]"
-							>Latest deployment: {jobs[item.id][0].status}</summary
-						>
-						<pre
-							class="mt-2 overflow-auto rounded bg-[#f4f7f3] p-3 text-xs whitespace-pre-wrap">{jobs[
-								item.id
-							][0].log}</pre>
-					</details>{/if}
+				<section
+					class="mt-5 border-t border-[#e1e6df] pt-4"
+					aria-label={`Job history for ${item.name}`}
+				>
+					<h4 class="m-0 text-base font-semibold text-[#243528]">Deployment history</h4>
+					{#if jobs[item.id]?.length}
+						<ul class="mt-3 grid gap-3 p-0">
+							{#each jobs[item.id] as job (job.id)}
+								<li class="list-none rounded-lg border border-[#d5ddd4] bg-[#fafbf9] p-3">
+									<details>
+										<summary class="cursor-pointer font-semibold text-[#214c30]">
+											<span
+												class="inline-flex min-h-7 items-center rounded-full border border-[#aeb9ae] px-2 text-xs"
+												>{jobStatus(job)}</span
+											>
+											<span class="ml-2"
+												>{job.force ? 'Hard re-deploy' : 'Deployment'} · {new Date(
+													job.createdAt
+												).toLocaleString()}</span
+											>
+										</summary>
+										<p class="mt-2 text-sm text-[#58645b]">Commit: <code>{job.commit}</code></p>
+										<p class="mt-1 text-xs text-[#58645b]">
+											Updated {new Date(job.updatedAt).toLocaleString()}
+										</p>
+										<h5 class="mt-3 mb-1 text-sm font-semibold text-[#354238]">Job log</h5>
+										<pre
+											class="m-0 max-h-72 overflow-auto rounded bg-[#eef2ec] p-3 text-xs whitespace-pre-wrap">{job.log ||
+												'No log output.'}</pre>
+									</details>
+								</li>
+							{/each}
+						</ul>
+					{:else}
+						<p class="mt-2 text-sm text-[#58645b]">No deployment jobs recorded yet.</p>
+					{/if}
+				</section>
 			</li>
 		{:else}<li class="list-none py-2 text-sm text-[#58645b]">
 				No deployments for this project yet.
