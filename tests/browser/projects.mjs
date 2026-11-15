@@ -256,7 +256,7 @@ try {
     if ((await searched).status() !== 200) throw new Error("rollback history search failed");
     milestone(`select rollback commit: ${title}`);
     await history.getByRole("button", { name: `Roll back to ${commit.slice(0, 12)}`, exact: true }).click();
-    await history.getByText(/The configured branch and automatic deployment remain unchanged/).waitFor();
+    await history.getByRole("radio", { name: /Temporary rollback/ }).waitFor();
     // Cancellation must not publish; the next confirmation uses the full ID.
     await history.getByRole("button", { name: "Cancel", exact: true }).click();
     await history.getByRole("button", { name: `Roll back to ${commit.slice(0, 12)}`, exact: true }).click();
@@ -295,6 +295,40 @@ try {
     const state = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
     if (state.targetKind !== "branch" || state.targetName !== "feature/search" || state.liveCommit !== commit) throw new Error("temporary rollback changed the branch target");
   }
+  milestone("confirm permanent rollback behavior");
+  await history.getByLabel("Search commits").fill("");
+  const fullHistory = page.waitForResponse(response => response.url().includes(`/api/deployments/${deploymentID}/history?`));
+  await history.getByRole("button", { name: "Search", exact: true }).click();
+  if ((await fullHistory).status() !== 200) throw new Error("could not reload rollback history");
+  await history.getByRole("button", { name: `Roll back to ${mainCommit.slice(0, 12)}`, exact: true }).click();
+  await history.getByRole("radio", { name: /Permanent rollback/ }).check();
+  await history.getByText(/The pause remains even if the rollback fails/).waitFor();
+  const permanentResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/rollback`));
+  await history.getByRole("button", { name: "Confirm permanent rollback", exact: true }).click();
+  const permanent = await permanentResponse;
+  const permanentRequest = permanent.request().postDataJSON();
+  if (permanent.status() !== 202 || permanentRequest.commit !== mainCommit || permanentRequest.permanent !== true) {
+    throw new Error("permanent rollback did not send the selected commit and pause choice");
+  }
+  const permanentJob = await withDeadline(permanent.json(), "permanent rollback acceptance response body");
+  await waitFor(async () => {
+    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+    return jobs.find(job => job.id === permanentJob.jobId)?.status === "succeeded";
+  }, "permanent rollback completion");
+  const permanentlyPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
+  if (!permanentlyPaused.automationPaused || permanentlyPaused.targetKind !== "branch" || permanentlyPaused.targetName !== "feature/search" || permanentlyPaused.liveCommit !== mainCommit) {
+    throw new Error("permanent rollback changed its branch target or failed to pause automation");
+  }
+  milestone("resume after permanent rollback");
+  const resumeResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/resume`));
+  await page.getByRole("button", { name: "Resume", exact: true }).click();
+  const permanentResume = await resumeResponse;
+  if (permanentResume.status() !== 202) throw new Error("could not resume after permanent rollback");
+  const resumedJob = await permanentResume.json();
+  await waitFor(async () => {
+    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+    return jobs.find(job => job.id === resumedJob.jobId)?.status === "succeeded";
+  }, "deployment after permanent rollback resume");
   milestone("change branch target and deploy no-op");
   await page.getByRole("button", { name: "Temporary rollback", exact: true }).click();
   await page.getByLabel("Target for Production site").selectOption("branch:main");

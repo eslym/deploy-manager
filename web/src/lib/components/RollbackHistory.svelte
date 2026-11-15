@@ -24,6 +24,7 @@
 	let rollbackError = $state('');
 	let queued = $state('');
 	let selected = $state.raw<Commit | null>(null);
+	let permanent = $state(false);
 	let requestedPage = 1;
 	let requestedSearch = '';
 
@@ -73,7 +74,7 @@
 				method: 'POST',
 				credentials: 'same-origin',
 				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ commit: commit.id })
+				body: JSON.stringify({ commit: commit.id, permanent })
 			});
 			if (!response.ok) {
 				throw new Error(
@@ -95,7 +96,9 @@
 					'Could not confirm the rollback request. Check Latest deployment before retrying.'
 				);
 			}
-			queued = `Rollback to ${commit.shortId} queued. Follow its progress in Latest deployment.`;
+			queued = permanent
+				? `Permanent rollback to ${commit.shortId} queued. The branch is preserved and automatic deployment is paused now, even if the rollback fails. Follow progress in Latest deployment.`
+				: `Rollback to ${commit.shortId} queued. Follow its progress in Latest deployment.`;
 			selected = null;
 		} catch (cause) {
 			rollbackError =
@@ -175,6 +178,7 @@
 								aria-label={`Roll back to ${commit.shortId}`}
 								onclick={() => {
 									selected = commit;
+									permanent = false;
 									rollbackError = '';
 									queued = '';
 								}}
@@ -211,22 +215,46 @@
 			{#if selected}
 				<div
 					class="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3"
-					aria-label="Confirm temporary rollback"
+					aria-label="Choose rollback behavior"
 				>
 					<p class="m-0 text-sm text-[#243528]">
 						Roll back “{deploymentName}” to <code>{selected.shortId}</code> — {selected.subject}?
 					</p>
-					<p class="mt-2 text-sm text-[#354238]">
-						The configured branch and automatic deployment remain unchanged. Deploy may replace this
-						rollback with the latest branch commit; matching webhooks may do so when automatic
-						deployment is enabled.
-					</p>
+					<fieldset class="mt-3 grid gap-2 text-sm text-[#354238]">
+						<legend class="font-semibold">After rollback</legend>
+						<label class="flex items-start gap-2">
+							<input
+								type="radio"
+								name={`${uid}-rollback-type`}
+								bind:group={permanent}
+								value={false}
+								disabled={busy}
+							/>
+							<span
+								><strong>Temporary rollback</strong> — automatic deployments stay on. A later Deploy or
+								push can replace this version.</span
+							>
+						</label>
+						<label class="flex items-start gap-2">
+							<input
+								type="radio"
+								name={`${uid}-rollback-type`}
+								bind:group={permanent}
+								value={true}
+								disabled={busy}
+							/>
+							<span
+								><strong>Permanent rollback</strong> — automatic deployments pause and the selected branch
+								stays. The pause remains even if the rollback fails.</span
+							>
+						</label>
+					</fieldset>
 					<div class="mt-3 flex flex-wrap gap-2">
 						<button
 							type="button"
 							class="min-h-9 rounded-lg bg-[#214c30] px-3 text-sm font-semibold text-white disabled:opacity-60"
 							onclick={rollback}
-							disabled={busy}>Confirm temporary rollback</button
+							disabled={busy}>Confirm {permanent ? 'permanent' : 'temporary'} rollback</button
 						>
 						<button
 							type="button"

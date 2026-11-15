@@ -2,12 +2,15 @@ package lib
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) {
@@ -59,6 +62,79 @@ func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) 
 	}
 	if after, err := identity(f.app.deploymentPath(id)); err != nil || after != before {
 		t.Fatalf("restart or paused webhook changed failed rollback publication: %v", err)
+	}
+}
+
+func TestPermanentRollbackPauseIsVisibleBeforePublicationWork(t *testing.T) {
+	f := newAutomationFixture(t)
+	id := f.createBranch(t, "permanent-rollback-request")
+	before, err := identity(f.app.deploymentPath(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerStarted, releaseWorker := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(releaseWorker) }) }
+	defer unblock()
+	previous := setPublicationFaultPoint(func(point string) error {
+		if point == "before-job-lock" {
+			close(workerStarted)
+			<-releaseWorker
+		}
+		if point == "after-stage-fsync" {
+			return errors.New("injected publication preparation failure")
+		}
+		return nil
+	})
+	defer setPublicationFaultPoint(previous)
+	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments/"+id+"/rollback", `{"commit":"`+f.initialCommit+`","permanent":true}`)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("permanent rollback request: %d %s", response.StatusCode, responseText(response))
+	}
+	var queued struct{ JobID string }
+	if err = json.NewDecoder(response.Body).Decode(&queued); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	select {
+	case <-workerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback worker did not reach the controlled boundary")
+	}
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	unblock()
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, queued.JobID, "failed")
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	request, _ := http.NewRequest(http.MethodGet, f.server.URL+"/api/deployments", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
+	response, err = f.server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deployments []struct {
+		ID    string `json:"id"`
+		Error string `json:"error"`
+	}
+	if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	errorVisible := false
+	for _, deployment := range deployments {
+		if deployment.ID == id {
+			if deployment.Error == "" {
+				t.Fatal("failed permanent rollback did not expose an error in deployment state")
+			}
+			errorVisible = true
+			break
+		}
+	}
+	if !errorVisible {
+		t.Fatal("failed deployment is missing from dashboard state")
+	}
+	if after, err := identity(f.app.deploymentPath(id)); err != nil || after != before {
+		t.Fatalf("failed permanent rollback changed live publication: %v", err)
 	}
 }
 
