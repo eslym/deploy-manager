@@ -42,21 +42,18 @@ type repositoryKey struct {
 
 // prepareRepositoryKeyStore consumes the pre-schema classification. The mere
 // existence of freshly created tables must never authorize key regeneration.
-func prepareRepositoryKeyStore(db *sql.DB, path string, priorStore bool) error {
-	key, err := loadRepositoryMasterKey(path, priorStore)
+func prepareRepositoryKeyStore(db *sql.DB, path string, priorDatabase bool) error {
+	key, err := loadRepositoryMasterKey(path, priorDatabase)
 	if err != nil {
 		return err
 	}
 	defer clear(key)
-	if !priorStore {
+	if !priorDatabase {
 		tx, txErr := db.Begin()
 		if txErr != nil {
 			return errors.New("could not initialize repository key store")
 		}
 		defer tx.Rollback()
-		if txErr = createRepositoryKeySchema(tx); txErr != nil {
-			return errors.New("could not initialize repository key store")
-		}
 		if txErr = initializeRepositoryKeyBinding(tx, key); txErr != nil {
 			return errors.New("could not initialize repository key store")
 		}
@@ -65,20 +62,6 @@ func prepareRepositoryKeyStore(db *sql.DB, path string, priorStore bool) error {
 		}
 	}
 	return validateRepositoryKeyStore(db, key)
-}
-
-// Structural DDL is deliberately independent from the external key/binding.
-// Fresh preparation keeps DDL and binding insertion in one transaction.
-func createRepositoryKeySchema(tx *sql.Tx) error {
-	for _, statement := range []string{
-		`CREATE TABLE repository_key_store(singleton INTEGER PRIMARY KEY CHECK(singleton=1),verifier BLOB NOT NULL)`,
-		`CREATE TABLE repository_keys(id TEXT PRIMARY KEY,name TEXT NOT NULL,algorithm TEXT NOT NULL,bits INTEGER NOT NULL,fingerprint TEXT NOT NULL,public_key TEXT NOT NULL,ciphertext BLOB NOT NULL,created_at INTEGER NOT NULL)`,
-	} {
-		if _, err := tx.Exec(statement); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func repositoryKeyVerifier(key []byte) []byte {
@@ -124,7 +107,7 @@ func validateRepositoryKeyStore(db *sql.DB, key []byte) error {
 	return rows.Err()
 }
 
-func loadRepositoryMasterKey(path string, priorKeyStore bool) ([]byte, error) {
+func loadRepositoryMasterKey(path string, priorDatabase bool) ([]byte, error) {
 	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err == nil {
 		defer f.Close()
@@ -144,8 +127,8 @@ func loadRepositoryMasterKey(path string, priorKeyStore bool) ([]byte, error) {
 	if !os.IsNotExist(err) {
 		return nil, errors.New("repository key master file is unavailable")
 	}
-	if priorKeyStore {
-		return nil, errors.New("repository key master file is missing; refusing to regenerate it")
+	if priorDatabase {
+		return nil, errors.New("repository key master file is missing; refusing to regenerate it; preserve the database and key-file evidence, and use isolated rebootstrap only if this was an interrupted fresh initialization")
 	}
 	b := make([]byte, 32)
 	if _, err = rand.Read(b); err != nil {

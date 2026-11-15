@@ -187,6 +187,19 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 			return nil, err
 		}
 	}
+	// Existing stores are opened read-only first. This prevents a DSN pragma
+	// (notably journal_mode=WAL) from changing unsupported state before exact
+	// migration history has been accepted.
+	sqlitePath, err := filepath.Abs(cfg.DatabasePath)
+	if err != nil {
+		return nil, err
+	}
+	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(sqlitePath)}).String()
+	if prior {
+		if err := preflightExistingSchema(dbURL); err != nil {
+			return nil, err
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0700); err != nil {
 		return nil, err
 	}
@@ -196,55 +209,12 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	if err := os.MkdirAll(filepath.Dir(cfg.RepositoryKeyPath), 0700); err != nil {
 		return nil, err
 	}
-	c := opaque.DefaultConfiguration()
-	material, keyGeneration, err := loadOPAQUEServerKey(c, cfg.OPAQUEKeyPath, prior)
-	if err != nil {
-		return nil, err
-	}
-	protocol, err := opaque.NewServer(c)
-	if err != nil {
-		return nil, err
-	}
-	if err = protocol.SetKeyMaterial(material); err != nil {
-		return nil, err
-	}
-	des, err := c.Deserializer()
-	if err != nil {
-		return nil, err
-	}
-	// Parent traversal was rejected before any filesystem work, and access
-	// coordination validated the database directory without symlink ancestors.
-	// An absolute URL path selects that same file; a relative URL path would be
-	// encoded as a file://authority and rejected by SQLite.
-	sqlitePath, err := filepath.Abs(cfg.DatabasePath)
-	if err != nil {
-		return nil, err
-	}
-	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(sqlitePath)}).String()
 	db, err := sql.Open("sqlite3", dbURL+"?_journal_mode=WAL&_synchronous=FULL&_foreign_keys=on&_busy_timeout=1000&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	for _, q := range []string{
-		`CREATE TABLE IF NOT EXISTS registration_grants(token_hash BLOB PRIMARY KEY,expires_at INTEGER NOT NULL,created_at INTEGER NOT NULL,purpose TEXT NOT NULL DEFAULT 'setup',credential_generation INTEGER NOT NULL DEFAULT 0)`,
-		`CREATE TABLE IF NOT EXISTS administrator(id INTEGER PRIMARY KEY CHECK(id=1),registration_record BLOB NOT NULL,profile_generation INTEGER NOT NULL,credential_generation INTEGER NOT NULL DEFAULT 1,created_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS opaque_profile(singleton INTEGER PRIMARY KEY CHECK(singleton=1),profile_generation INTEGER NOT NULL,key_generation TEXT NOT NULL,profile TEXT NOT NULL)`,
-	} {
-		if _, err = db.Exec(q); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	if err := ensureColumn(db, "registration_grants", "purpose", `TEXT NOT NULL DEFAULT 'setup'`); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := ensureColumn(db, "registration_grants", "credential_generation", `INTEGER NOT NULL DEFAULT 0`); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := ensureColumn(db, "administrator", "credential_generation", `INTEGER NOT NULL DEFAULT 1`); err != nil {
+	if err = initializeSchema(db, !prior); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -252,12 +222,7 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 		db.Close()
 		return nil, err
 	}
-	var priorRepositoryKeyStore int
-	if err = db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name IN ('repository_key_store','repository_keys')`).Scan(&priorRepositoryKeyStore); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err = prepareRepositoryKeyStore(db, cfg.RepositoryKeyPath, priorRepositoryKeyStore != 0); err != nil {
+	if err = prepareRepositoryKeyStore(db, cfg.RepositoryKeyPath, prior); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -280,10 +245,32 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 			}
 		}
 	}
-	const profile = "RFC9807-OPAQUE-3DH;ristretto255-SHA512;HKDF-SHA512;HMAC-SHA512;Argon2id-v19-i1-m65536-p4;context-empty;identities-default"
-	if _, err = db.Exec(`INSERT OR IGNORE INTO opaque_profile(singleton,profile_generation,key_generation,profile) VALUES(1,1,?,?)`, keyGeneration, profile); err != nil {
+	c := opaque.DefaultConfiguration()
+	material, keyGeneration, err := loadOPAQUEServerKey(c, cfg.OPAQUEKeyPath, prior)
+	if err != nil {
 		db.Close()
 		return nil, err
+	}
+	protocol, err := opaque.NewServer(c)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err = protocol.SetKeyMaterial(material); err != nil {
+		db.Close()
+		return nil, err
+	}
+	des, err := c.Deserializer()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	const profile = "RFC9807-OPAQUE-3DH;ristretto255-SHA512;HKDF-SHA512;HMAC-SHA512;Argon2id-v19-i1-m65536-p4;context-empty;identities-default"
+	if !prior {
+		if _, err = db.Exec(`INSERT INTO opaque_profile(singleton,profile_generation,key_generation,profile) VALUES(1,1,?,?)`, keyGeneration, profile); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("could not initialize fresh OPAQUE profile binding; preserve key and database evidence and use isolated rebootstrap if interrupted: %w", err)
+		}
 	}
 	var storedProfile string
 	var profileGeneration int
@@ -339,17 +326,6 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	if err := app.configureDeployments(); err != nil {
 		return nil, err
 	}
-	if err := initProjectSchema(db); err != nil {
-		return nil, err
-	}
-	if err := app.initWebhooks(); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := app.initDeploymentSchema(); err != nil {
-		db.Close()
-		return nil, err
-	}
 	if cfg.storageFault != nil {
 		if err := cfg.storageFault("verify", db); err != nil {
 			return nil, fmt.Errorf("storage verification: %w", err)
@@ -363,30 +339,6 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	app.storageAccess = access
 	accessTransferred = true
 	return &readyStorage{app: app}, nil
-}
-
-func ensureColumn(db *sql.DB, table, column, definition string) error {
-	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notnull, pk int
-		var name, typ string
-		var def any
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
-			return err
-		}
-		if name == column {
-			return rows.Err()
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	_, err = db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + definition)
-	return err
 }
 
 func loadOPAQUEServerKey(c *opaque.Configuration, path string, priorDatabase bool) (*opaque.ServerKeyMaterial, string, error) {
@@ -413,7 +365,7 @@ func loadOPAQUEServerKey(c *opaque.Configuration, path string, priorDatabase boo
 		return nil, "", err
 	}
 	if priorDatabase {
-		return nil, "", errors.New("OPAQUE key file is missing; refusing to regenerate authentication keys")
+		return nil, "", errors.New("OPAQUE key file is missing; refusing to regenerate authentication keys; preserve the database and key-file evidence, and use isolated rebootstrap only if this was an interrupted fresh initialization")
 	}
 	priv, pub := c.KeyGen()
 	material := &opaque.ServerKeyMaterial{PrivateKey: priv, PublicKeyBytes: pub.Encode(), OPRFGlobalSeed: c.GenerateOPRFSeed(), Identity: []byte("deploy-manager-keyfile")}
