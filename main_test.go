@@ -18,11 +18,30 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/eslym/deploy-manager/internal/testbuild"
 	"golang.org/x/sys/unix"
 )
+
+var commandBuild struct {
+	sync.Once
+	directory, binary string
+	err               error
+}
+
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if commandBuild.directory != "" {
+		if err := os.RemoveAll(commandBuild.directory); err != nil {
+			fmt.Fprintln(os.Stderr, "remove CLI test build:", err)
+			code = 1
+		}
+	}
+	os.Exit(code)
+}
 
 func boundedCommand(t *testing.T, binary string, args ...string) *exec.Cmd {
 	t.Helper()
@@ -35,11 +54,27 @@ func boundedCommand(t *testing.T, binary string, args ...string) *exec.Cmd {
 // assets or a frontend runtime. Every subprocess owns isolated installation data.
 func buildCommand(t *testing.T) string {
 	t.Helper()
-	binary := filepath.Join(t.TempDir(), "deploy-manager")
-	if out, err := exec.Command("go", "build", "-o", binary, ".").CombinedOutput(); err != nil {
-		t.Fatalf("build executable: %v\n%s", err, out)
+	// Only installation state is test-specific. All CLI scenarios can share one
+	// immutable executable, including when tests run in parallel or with -count.
+	commandBuild.Do(func() {
+		commandBuild.directory, commandBuild.err = os.MkdirTemp("", "deploy-manager-cli-tests-")
+		if commandBuild.err != nil {
+			return
+		}
+		commandBuild.binary = filepath.Join(commandBuild.directory, "deploy-manager")
+		args := []string{"build"}
+		if testbuild.Race {
+			args = append(args, "-race")
+		}
+		args = append(args, "-o", commandBuild.binary, ".")
+		if out, err := exec.Command("go", args...).CombinedOutput(); err != nil {
+			commandBuild.err = fmt.Errorf("build executable: %w\n%s", err, out)
+		}
+	})
+	if commandBuild.err != nil {
+		t.Fatal(commandBuild.err)
 	}
-	return binary
+	return commandBuild.binary
 }
 
 func TestBuiltExecutableRunsEmbeddedApplicationOutsideSourceTree(t *testing.T) {

@@ -454,7 +454,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("restored branch target content=%q err=%v", content, readErr)
 	}
 	testTemporaryRollback(t, client, appServer.URL, cookie, branchDeployment.ID, featureAtCreate, branchPath)
-	testRollbackGraphAndRaces(t, client, appServer.URL, cookie, created.ID, branchDeployment.ID, featureAtCreate, branchPath, source)
+	testRollbackGraphAndRaces(t, appServer, cookie, created.ID, branchDeployment.ID, featureAtCreate, branchPath, source)
 	publicationPath := filepath.Join(app.cfg.DeploymentRoot, deploymentCreated.ID)
 	deadline := time.Now().Add(5 * time.Second)
 	for {

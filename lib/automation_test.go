@@ -274,19 +274,43 @@ func TestSharedRepositoryPublicationsAreBoundedAcrossDeployments(t *testing.T) {
 	if got := maximum.Load(); got != 2 {
 		t.Fatalf("observed active prepared publications = %d, want configured bound 2", got)
 	}
-	select {
-	case <-entered:
-		t.Fatal("third publication entered while both bounded slots were occupied")
-	case <-time.After(100 * time.Millisecond):
+	// The two publications are held at the switch boundary. Observe the queue
+	// through HTTP rather than sleeping and hoping an extra worker would start.
+	var running, queued int
+	for i, id := range ids {
+		found := false
+		for _, job := range publicDeploymentJobs(t, f.server, f.cookie, id) {
+			if job.ID != jobs[i] {
+				continue
+			}
+			found = true
+			switch job.Status {
+			case "running":
+				running++
+			case "queued":
+				queued++
+			default:
+				t.Fatalf("blocked publication %s reached unexpected status %s", job.ID, job.Status)
+			}
+		}
+		if !found {
+			t.Fatalf("accepted job %s missing from history", jobs[i])
+		}
+	}
+	if running != 2 || queued != 1 {
+		t.Fatalf("held publications: running=%d queued=%d; want 2 running, 1 queued", running, queued)
 	}
 	releaseOnce.Do(func() { close(release) })
-	// Restore the hook before jobs finish so any third operation can proceed.
-	setPublicationFaultPoint(previous)
+	// Keep the hook installed through completion so every publication contributes
+	// to the observed maximum; the released channel no longer blocks later jobs.
 	for i, id := range ids {
 		waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, jobs[i], "succeeded")
 		if contents, err := os.ReadFile(filepath.Join(f.app.deploymentPath(id), "README.md")); err != nil || string(contents) != "bounded concurrent tip\n" {
 			t.Fatalf("deployment %s publication=%q: %v", id, contents, err)
 		}
+	}
+	if got := maximum.Load(); got != 2 {
+		t.Fatalf("maximum concurrent prepared publications = %d, want configured bound 2", got)
 	}
 }
 

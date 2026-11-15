@@ -3,6 +3,7 @@ package lib
 import (
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"sort"
@@ -105,8 +106,9 @@ func testTemporaryRollback(t *testing.T, client *http.Client, origin, cookie, id
 	}
 }
 
-func testRollbackGraphAndRaces(t *testing.T, client *http.Client, origin, cookie, projectID, id, oldCommit, path string, repo *git.Repository) {
+func testRollbackGraphAndRaces(t *testing.T, server *httptest.Server, cookie, projectID, id, oldCommit, path string, repo *git.Repository) {
 	t.Helper()
+	client, origin := server.Client(), server.URL
 	branch := plumbing.NewBranchReferenceName("feature/search")
 	ref, err := repo.Reference(branch, true)
 	if err != nil {
@@ -181,20 +183,36 @@ func testRollbackGraphAndRaces(t *testing.T, client *http.Client, origin, cookie
 	if len(hidden.Commits) != 0 {
 		t.Fatal("first-parent history displayed second-parent candidate")
 	}
+	expectedJobs := make(map[string]bool)
+	for _, existing := range publicDeploymentJobs(t, server, cookie, id) {
+		expectedJobs[existing.ID] = true
+	}
 	job = queue("rollback", side.String())
+	expectedJobs[job] = true
 	waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
-	assertContent("searchable feature\n")
-	// Idle completion must not enqueue an unsolicited catch-up.
-	time.Sleep(150 * time.Millisecond)
 	assertContent("searchable feature\n")
 	if err := os.WriteFile(filepath.Join(path, "README.md"), []byte("damaged live files\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	job = queue("rollback", side.String())
+	expectedJobs[job] = true
 	waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
 	assertContent("searchable feature\n")
 	job = queue("deploy", "")
+	expectedJobs[job] = true
 	waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
+	// Completing the next explicit publication is a progress barrier. Check
+	// durable history, not an arbitrary quiet period: even a superseded catch-up
+	// would leave a job that was never explicitly requested here.
+	actualJobs := publicDeploymentJobs(t, server, cookie, id)
+	if len(actualJobs) != len(expectedJobs) {
+		t.Fatalf("rollback queued unsolicited work: got %d jobs, want %d", len(actualJobs), len(expectedJobs))
+	}
+	for _, actual := range actualJobs {
+		if !expectedJobs[actual.ID] {
+			t.Fatalf("rollback queued unsolicited job %s (%s)", actual.ID, actual.Status)
+		}
+	}
 	// Force push and successfully fetch a new graph while rollback is staged.
 	var once sync.Once
 	previous := setPublicationFaultPoint(func(point string) error {
@@ -364,19 +382,7 @@ func testRollbackGraphAndRaces(t *testing.T, client *http.Client, origin, cookie
 	job = queue("deploy", "")
 	waitForDeploymentJob(t, client, origin, cookie, id, job, "succeeded")
 	assertContent("race branch tip\n")
-	// A valid publication may outlast a tiny HTTP polling window, especially
-	// with the race detector and concurrent Compose worktrees. Keep observing
-	// the actual job instead of treating five seconds as a publication limit.
-	var slow sync.Once
-	previous = setPublicationFaultPoint(func(point string) error {
-		if point == "after-stage-fsync" {
-			slow.Do(func() { time.Sleep(6 * time.Second) })
-		}
-		return nil
-	})
-	defer setPublicationFaultPoint(previous)
 	hardRedeployAndWait(t, client, origin, cookie, id, path, nil)
-	setPublicationFaultPoint(previous)
 	testTemporaryRollbackPreservesPause(t, client, origin, cookie, projectID, id, oldCommit, path)
 }
 

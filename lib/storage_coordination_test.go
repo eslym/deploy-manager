@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/bytemare/opaque"
+	"github.com/eslym/deploy-manager/internal/testbuild"
 	"golang.org/x/sys/unix"
 )
 
@@ -268,8 +269,9 @@ func TestStorageCoordinationChild(t *testing.T) {
 		if e := app.db.QueryRow(`SELECT live_dev,live_ino FROM deployments WHERE id=?`, deploymentID).Scan(&recordedDev, &recordedIno); e != nil || recordedDev != wantDev || recordedIno != wantIno {
 			t.Fatalf("publication identity was not conservatively retained in state: %d/%d err=%v", recordedDev, recordedIno, e)
 		}
-		fmt.Println("ready: prior fixture login, repository key, job, and publication verified")
 		return
+	default:
+		t.Fatalf("unknown storage coordination child mode %q", mode)
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -671,14 +673,16 @@ func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("restored prior executable failed the observable checks: %v\n%s", err, output)
 	}
-	if !strings.Contains(string(output), "ready: prior fixture login, repository key, job, and publication verified") {
-		t.Fatalf("restored prior executable did not report all verification checks: %s", output)
-	}
 }
 
 func buildFixtureProgram(t *testing.T, output, version string) {
 	t.Helper()
-	cmd := exec.Command("go", "test", "-c", "-o", output, "-ldflags", "-X=github.com/eslym/deploy-manager/lib.fixtureProgramVersion="+version)
+	args := []string{"test", "-c"}
+	if testbuild.Race {
+		args = append(args, "-race")
+	}
+	args = append(args, "-o", output, "-ldflags", "-X=github.com/eslym/deploy-manager/lib.fixtureProgramVersion="+version)
+	cmd := exec.Command("go", args...)
 	if result, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build %s fixture program: %v\n%s", version, err, result)
 	}

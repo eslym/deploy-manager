@@ -37,6 +37,13 @@ its system dependencies are supplied by the pinned Playwright image. Run
 `govulncheck ./...` separately after generating frontend assets; it is not
 installed in this environment.
 
+CLI behavior tests build one shared executable per package run; each scenario
+still uses isolated installation data and runs outside the source directory.
+With `go test -race`, this executable and the versioned upgrade/recovery fixture
+executables are also built with `-race`, so child-process behavior is actually
+instrumented. The recovery rehearsal retains two distinct fixture executables
+because it verifies restoring the exact prior artifact, not just a version label.
+
 The source bind mount is read-only. Each run copies source into temporary
 container storage, excluding Git metadata, installed dependencies, and generated
 frontend/binary output. No test state or root-owned build output is written into
