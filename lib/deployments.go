@@ -1676,11 +1676,12 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var projectID string
-	if err := a.db.QueryRow(`SELECT project_id FROM deployments WHERE id=?`, id).Scan(&projectID); err != nil {
+	currentDeployment, err := a.store.Deployment.Get(r.Context(), id)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
+	projectID := currentDeployment.ProjectID
 	if input.TargetKind == "" {
 		input.TargetKind = "commit"
 	}
