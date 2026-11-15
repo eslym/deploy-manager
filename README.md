@@ -291,6 +291,13 @@ dependency/license inventory work
 Review [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before distribution;
 it is not a complete distribution clearance.
 
+The [current notice index](third_party/DEPENDENCIES.md) records pinned versions
+and retained upstream legal files. Builds embed a readable bundle at
+`/third-party-notices.txt`. Refresh and verify it after dependency changes with
+`bun scripts/update-notices.mjs` and `bun scripts/update-notices.mjs --check`
+after installing the pinned Go and Bun dependencies, then rebuild the combined
+binary. This maintenance does not close the unresolved WASM license inventory.
+
 For requirements, terminology, and design rationale, see
 [docs/design.md](docs/design.md), [GLOSSARY.md](GLOSSARY.md), and
 [research notes](docs/research/).

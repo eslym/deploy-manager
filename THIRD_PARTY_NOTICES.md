@@ -1,14 +1,47 @@
 # Third-party notices and distribution caveats
 
-Administrator bootstrap embeds the exact `@serenity-kit/opaque@1.1.0` ESM
-Ristretto browser asset at `lib/assets/opaque.js`. Its SHA-256 is
-`1e8d56383a77948e453085b6d4f52dcb9645f8bfff32395738b63d3a2e2fcb52`; the
-package's MIT license text is retained at `lib/assets/OPAQUE-LICENSE`. The
+## Current codebase (2026-11-16)
+
+The current version/file index is [third_party/DEPENDENCIES.md](third_party/DEPENDENCIES.md).
+It covers all direct and indirect `go.mod` requirements, Go's runtime/toolchain
+notice, and a conservative attribution set for the embedded SPA: Svelte,
+SvelteKit, clsx, devalue, esm-env, Tailwind CSS, Vite helpers, and Serenity OPAQUE.
+Module-root `LICENSE`/`LICENCE`, `NOTICE`, `COPYING`, and `PATENTS` files are
+retained verbatim where supplied. This is not a claim that every module in
+`go.mod` or the entire contents of every frontend package ship in the executable.
+
+The SPA build bundles the pinned `@serenity-kit/opaque@1.1.0` ESM package,
+including its WASM, through Bun/Vite. It no longer serves a standalone
+`lib/assets/opaque.js`; bundling transforms JavaScript, so a historical hash of
+that removed file is not the hash of the shipped chunk. The package's MIT text
+is retained at `lib/assets/OPAQUE-LICENSE` and in the frontend notice directory. The
 published npm tarball's recorded SHA-512 integrity is
 `Y6v/+hRMn0MdMEk5+/ArM0vPIiFfFEbdTZc7oAx+cWyvGODGezAQ/sMjXBVogf7NsS9z9EV0Ve5paZCVULuedw==`. The
 approved Go implementation is `github.com/bytemare/opaque v0.18.0`; the tested
 Go baseline is Go 1.26.11 with `golang.org/x/crypto v0.59.0` and
 `golang.org/x/sys v0.50.0`.
+
+The combined build also embeds a readable notice bundle from
+[`web/static/third-party-notices.txt`](web/static/third-party-notices.txt), served
+at `/third-party-notices.txt`. Include this bundle and the retained legal files
+with source/binary distributions; this convenience endpoint does not itself
+resolve outstanding distribution obligations.
+
+To refresh after a dependency change, install the pinned Go modules and run
+`bun install --frozen-lockfile` in `web/`, then run from the repository root:
+
+```sh
+bun scripts/update-notices.mjs
+bun scripts/update-notices.mjs --check
+```
+
+Use the Go toolchain pinned by `go.mod`; rebuild the frontend and Go binary to
+embed updated notices. The script checks installed frontend versions against
+`web/bun.lock` and preserves historical retained files rather than deleting them.
+It collects module/package-root legal files only, not a recursive legal audit
+or an exact link/bundle SBOM. Additional nested, generated, native, and vendored
+attributions remain part of #26. The frontend attribution set must be reviewed
+when imports or the build change; it is not inferred solely from the lockfile.
 
 This inventory is not a complete license clearance for distribution. The
 historical transitive Rust/WASM dependency graph and corresponding license
@@ -35,6 +68,12 @@ executor. `github.com/go-openapi/inflect v0.19.0` includes an MIT/Expat license
 in its module archive's `LICENCE` file, retained verbatim at
 `third_party/licenses/github.com/go-openapi/inflect@v0.19.0/LICENCE`.
 The repository-wide issue #26 distribution inventory remains separate.
+
+## Retained dependency-family records
+
+The records below describe earlier dependency additions. Use the current index
+above for selected versions and exact notice paths; older version directories
+are retained as historical source notices, not evidence those versions ship.
 
 Public repository support adds `github.com/go-git/go-git/v5 v5.19.3`. The
 source-provided license and notice files for the newly added Go modules are
@@ -94,7 +133,6 @@ the corresponding module/version directories there:
 | `github.com/git-lfs/pktline v0.0.0-20210330133718-06e9096e2825` | `LICENSE.md` |
 | `github.com/git-lfs/wildmatch/v2 v2.0.1` | `LICENSE.md` |
 | `github.com/hashicorp/go-uuid v1.0.2` | `LICENSE` |
-
 | `github.com/jcmturner/aescts/v2 v2.0.0` | `LICENSE` |
 | `github.com/jcmturner/dnsutils/v2 v2.0.0` | `LICENSE` |
 | `github.com/jcmturner/gofork v1.0.0` | `LICENSE` |
