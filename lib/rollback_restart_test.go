@@ -2,13 +2,128 @@ package lib
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
+
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
+
+func TestPermanentRollbackCrashRestartRace(t *testing.T) {
+	root := t.TempDir()
+	marker := filepath.Join(root, "accepted.json")
+	child := exec.Command(os.Args[0], "-test.run=^TestPermanentRollbackCrashRestartRaceChild$")
+	child.Env = append(os.Environ(), "DM_AUTOMATION_FIXTURE_DIR="+root, "DM_ROLLBACK_CRASH_CHILD="+marker)
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if child.ProcessState == nil {
+			_ = child.Process.Kill()
+			_, _ = child.Process.Wait()
+		}
+	})
+	markerBytes := waitForFile(t, marker)
+	var state struct {
+		DeploymentID string `json:"deploymentId"`
+		JobID        string `json:"jobId"`
+		LivePath     string `json:"livePath"`
+		LiveContent  string `json:"liveContent"`
+	}
+	if err := json.Unmarshal(markerBytes, &state); err != nil {
+		t.Fatal(err)
+	}
+	// Kill the application while the accepted rollback worker is still held at
+	// its pre-publication boundary. A graceful close would release the job.
+	if err := child.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = child.Process.Wait()
+	app, err := New(Config{DatabasePath: filepath.Join(root, "state.db"), OPAQUEKeyPath: filepath.Join(root, "opaque.key")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	server := httptest.NewTLSServer(app.Handler())
+	defer server.Close()
+	cookie := installAPITestSession(t, app)
+	assertAutomationPaused(t, server, cookie, state.DeploymentID, true)
+	waitForDeploymentJob(t, server.Client(), server.URL, cookie, state.DeploymentID, state.JobID, "failed")
+	content, err := os.ReadFile(filepath.Join(state.LivePath, "README.md"))
+	if err != nil || string(content) != state.LiveContent {
+		t.Fatalf("crash/recovery changed live publication: content=%q err=%v", content, err)
+	}
+}
+
+func waitForFile(t *testing.T, path string) []byte {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if data, err := os.ReadFile(path); err == nil {
+			return data
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("subprocess did not accept and pause the permanent rollback")
+	return nil
+}
+
+func TestPermanentRollbackCrashRestartRaceChild(t *testing.T) {
+	marker := os.Getenv("DM_ROLLBACK_CRASH_CHILD")
+	if marker == "" {
+		return
+	}
+	f := newAutomationFixture(t)
+	id := f.createBranch(t, "permanent-rollback-process-crash")
+	livePath := f.app.deploymentPath(id)
+	live, err := os.ReadFile(filepath.Join(livePath, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	previous := setPublicationFaultPoint(func(point string) error {
+		if point == "before-job-lock" {
+			close(started)
+			select {}
+		}
+		return nil
+	})
+	defer setPublicationFaultPoint(previous)
+	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments/"+id+"/rollback", `{"commit":"`+f.initialCommit+`","permanent":true}`)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("rollback request status=%d body=%s", response.StatusCode, responseText(response))
+	}
+	var accepted struct {
+		JobID string `json:"jobId"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback worker did not block before publication")
+	}
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	data, err := json.Marshal(map[string]string{"deploymentId": id, "jobId": accepted.JobID, "livePath": livePath, "liveContent": string(live)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {}
+}
 
 func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) {
 	f := newAutomationFixture(t)
@@ -59,6 +174,267 @@ func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) 
 	}
 	if after, err := identity(f.app.deploymentPath(id)); err != nil || after != before {
 		t.Fatalf("restart or paused webhook changed failed rollback publication: %v", err)
+	}
+}
+
+func TestPermanentRollbackPauseIsVisibleBeforePublicationWork(t *testing.T) {
+	f := newAutomationFixture(t)
+	id := f.createBranch(t, "permanent-rollback-request")
+	before, err := identity(f.app.deploymentPath(id))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerStarted, releaseWorker := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(releaseWorker) }) }
+	defer unblock()
+	previous := setPublicationFaultPoint(func(point string) error {
+		if point == "before-job-lock" {
+			close(workerStarted)
+			<-releaseWorker
+		}
+		if point == "after-stage-fsync" {
+			return errors.New("injected publication preparation failure")
+		}
+		return nil
+	})
+	defer setPublicationFaultPoint(previous)
+	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments/"+id+"/rollback", `{"commit":"`+f.initialCommit+`","permanent":true}`)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("permanent rollback request: %d %s", response.StatusCode, responseText(response))
+	}
+	var queued struct{ JobID string }
+	if err = json.NewDecoder(response.Body).Decode(&queued); err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	select {
+	case <-workerStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rollback worker did not reach the controlled boundary")
+	}
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	unblock()
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, queued.JobID, "failed")
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	request, _ := http.NewRequest(http.MethodGet, f.server.URL+"/api/deployments", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
+	response, err = f.server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deployments []struct {
+		ID    string `json:"id"`
+		Error string `json:"error"`
+	}
+	if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	errorVisible := false
+	for _, deployment := range deployments {
+		if deployment.ID == id {
+			if deployment.Error == "" {
+				t.Fatal("failed permanent rollback did not expose an error in deployment state")
+			}
+			errorVisible = true
+			break
+		}
+	}
+	if !errorVisible {
+		t.Fatal("failed deployment is missing from dashboard state")
+	}
+	if after, err := identity(f.app.deploymentPath(id)); err != nil || after != before {
+		t.Fatalf("failed permanent rollback changed live publication: %v", err)
+	}
+}
+
+func TestPermanentRollbackFailuresKeepPauseTargetAndLiveFiles(t *testing.T) {
+	for _, phase := range []string{"fetch", "missing-branch", "missing-content", "ancestry-invalidation", "publication"} {
+		t.Run(phase, func(t *testing.T) {
+			f := newAutomationFixture(t)
+			id := f.createBranch(t, "permanent-rollback-"+phase)
+			path := f.app.deploymentPath(id)
+			before, err := identity(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			selected := f.initialCommit
+			restoreFault := func() {}
+			switch phase {
+			case "fetch":
+				f.fetchFailureStatus.Store(int32(http.StatusServiceUnavailable))
+			case "missing-branch":
+				remote, openErr := git.PlainOpen(f.remoteDir)
+				if openErr != nil {
+					t.Fatal(openErr)
+				}
+				if removeErr := remote.Storer.RemoveReference(plumbing.NewBranchReferenceName("feature/search")); removeErr != nil {
+					t.Fatal(removeErr)
+				}
+				cache, openErr := git.PlainOpen(f.app.projects.repoPath(f.projectID))
+				if openErr != nil {
+					t.Fatal(openErr)
+				}
+				if removeErr := cache.Storer.RemoveReference(plumbing.NewRemoteReferenceName("origin", "feature/search")); removeErr != nil {
+					t.Fatal(removeErr)
+				}
+			case "missing-content":
+				repo, openErr := git.PlainOpen(f.remoteDir)
+				if openErr != nil {
+					t.Fatal(openErr)
+				}
+				branch := plumbing.NewBranchReferenceName("feature/search")
+				tip, refErr := repo.Reference(branch, true)
+				if refErr != nil {
+					t.Fatal(refErr)
+				}
+				existing, commitErr := repo.CommitObject(tip.Hash())
+				if commitErr != nil {
+					t.Fatal(commitErr)
+				}
+				sig := object.Signature{Name: "Rollback fixture", Email: "rollback@example.test", When: time.Now().UTC()}
+				broken := object.Commit{Author: sig, Committer: sig, TreeHash: plumbing.NewHash(strings.Repeat("f", 40)), ParentHashes: []plumbing.Hash{tip.Hash()}, Message: "missing rollback tree"}
+				encoded := repo.Storer.NewEncodedObject()
+				if err = broken.Encode(encoded); err != nil {
+					t.Fatal(err)
+				}
+				selectedHash, setErr := repo.Storer.SetEncodedObject(encoded)
+				if setErr != nil {
+					t.Fatal(setErr)
+				}
+				selected = selectedHash.String()
+				descendant := object.Commit{Author: sig, Committer: sig, TreeHash: existing.TreeHash, ParentHashes: []plumbing.Hash{selectedHash}, Message: "branch tip after missing rollback tree"}
+				encoded = repo.Storer.NewEncodedObject()
+				if err = descendant.Encode(encoded); err != nil {
+					t.Fatal(err)
+				}
+				descendantHash, setErr := repo.Storer.SetEncodedObject(encoded)
+				if setErr != nil {
+					t.Fatal(setErr)
+				}
+				if setErr = repo.Storer.SetReference(plumbing.NewHashReference(branch, descendantHash)); setErr != nil {
+					t.Fatal(setErr)
+				}
+			case "ancestry-invalidation":
+				repo, openErr := git.PlainOpen(f.remoteDir)
+				if openErr != nil {
+					t.Fatal(openErr)
+				}
+				main, refErr := repo.Reference(plumbing.NewBranchReferenceName("main"), true)
+				if refErr != nil {
+					t.Fatal(refErr)
+				}
+				if setErr := repo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("feature/search"), main.Hash())); setErr != nil {
+					t.Fatal(setErr)
+				}
+			case "publication":
+				previous := setPublicationFaultPoint(func(point string) error {
+					if point == "after-stage-fsync" {
+						return errors.New("injected permanent rollback publication failure")
+					}
+					return nil
+				})
+				restoreFault = func() { setPublicationFaultPoint(previous) }
+			}
+			defer restoreFault()
+			job := f.action(t, id, "rollback", `{"commit":"`+selected+`","permanent":true}`)
+			waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, job, "failed")
+			restoreFault()
+			assertAutomationPaused(t, f.server, f.cookie, id, true)
+			var target struct {
+				TargetKind string `json:"targetKind"`
+				TargetName string `json:"targetName"`
+				Error      string `json:"error"`
+			}
+			request, _ := http.NewRequest(http.MethodGet, f.server.URL+"/api/deployments", nil)
+			request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
+			response, err := f.server.Client().Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var deployments []struct {
+				ID         string `json:"id"`
+				TargetKind string `json:"targetKind"`
+				TargetName string `json:"targetName"`
+				Error      string `json:"error"`
+			}
+			if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
+				response.Body.Close()
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			found := false
+			for _, deployment := range deployments {
+				if deployment.ID == id {
+					target.TargetKind, target.TargetName, target.Error = deployment.TargetKind, deployment.TargetName, deployment.Error
+					found = true
+				}
+			}
+			if !found || target.TargetKind != "branch" || target.TargetName != "feature/search" || target.Error == "" {
+				t.Fatalf("permanent rollback failure did not preserve branch target and expose error: %+v", target)
+			}
+			if after, err := identity(path); err != nil || after != before {
+				t.Fatalf("%s failure changed live publication identity: %v", phase, err)
+			}
+			content, err := os.ReadFile(filepath.Join(path, "README.md"))
+			if err != nil || string(content) != "searchable feature\n" {
+				t.Fatalf("%s failure changed live files: %q %v", phase, content, err)
+			}
+		})
+	}
+}
+
+func TestPermanentRollbackIsSupersededByBranchTargetChange(t *testing.T) {
+	f := newAutomationFixture(t)
+	id := f.createBranch(t, "permanent-rollback-target-change")
+	started, release := make(chan struct{}), make(chan struct{})
+	var once, unblock sync.Once
+	defer unblock.Do(func() { close(release) })
+	previous := setPublicationFaultPoint(func(point string) error {
+		if point == "before-job-lock" {
+			once.Do(func() { close(started); <-release })
+		}
+		return nil
+	})
+	defer setPublicationFaultPoint(previous)
+	rollback := f.action(t, id, "rollback", `{"commit":"`+f.initialCommit+`","permanent":true}`)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("permanent rollback did not reach the controlled boundary")
+	}
+	targetChange := f.action(t, id, "target", `{"targetKind":"branch","targetName":"main"}`)
+	unblock.Do(func() { close(release) })
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, rollback, "superseded")
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, targetChange, "succeeded")
+	assertAutomationPaused(t, f.server, f.cookie, id, true)
+	var found bool
+	request, _ := http.NewRequest(http.MethodGet, f.server.URL+"/api/deployments", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
+	response, err := f.server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var deployments []struct {
+		ID, TargetKind, TargetName string
+	}
+	if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
+		response.Body.Close()
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	for _, deployment := range deployments {
+		if deployment.ID == id {
+			found = deployment.TargetKind == "branch" && deployment.TargetName == "main"
+		}
+	}
+	if !found {
+		t.Fatal("permanent rollback or target change altered the requested branch target")
+	}
+	if content, err := os.ReadFile(filepath.Join(f.app.deploymentPath(id), "README.md")); err != nil || string(content) != "main content\n" {
+		t.Fatalf("branch target change did not publish its selected target: %q %v", content, err)
 	}
 }
 
