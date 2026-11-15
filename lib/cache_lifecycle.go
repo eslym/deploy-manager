@@ -5,10 +5,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/eslym/deploy-manager/lib/ent/projectrefreshjournal"
 )
@@ -58,6 +60,135 @@ func (p *projectManager) ensureCacheReady() error {
 	p.stateMu.RUnlock()
 	if blocked != "" {
 		return errors.New(blocked)
+	}
+	return nil
+}
+
+const cacheRecreationMarkerContents = "deploy-manager project cache recreation v1\n"
+
+func (p *projectManager) cacheRecreationPath(id string) string {
+	return filepath.Join(p.root, ".cache-recreate-"+id)
+}
+
+func (p *projectManager) cacheRecreationStagePath(id string) string {
+	return filepath.Join(p.root, ".cache-recreate-stage-"+id)
+}
+
+// markCacheRecreation durably records intent before any cache path is touched.
+func (p *projectManager) markCacheRecreation(id string) error {
+	if !validProjectID(id) {
+		return errors.New("invalid project identifier for cache recreation")
+	}
+	stage := p.cacheRecreationStagePath(id)
+	file, err := os.OpenFile(stage, os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return err
+	}
+	if _, err = io.WriteString(file, cacheRecreationMarkerContents); err == nil {
+		err = file.Sync()
+	}
+	closeErr := file.Close()
+	if err != nil {
+		_ = os.Remove(stage)
+		return err
+	}
+	if closeErr != nil {
+		_ = os.Remove(stage)
+		return closeErr
+	}
+	if err := os.Rename(stage, p.cacheRecreationPath(id)); err != nil {
+		_ = os.Remove(stage)
+		return err
+	}
+	return syncDirectory(p.root)
+}
+
+func (p *projectManager) clearCacheRecreation(id string) error {
+	path := p.cacheRecreationPath(id)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return syncDirectory(p.root)
+}
+
+// reconcileProjectCacheRecreations completes cache removal before accepting work.
+func (p *projectManager) reconcileProjectCacheRecreations() error {
+	entries, err := os.ReadDir(p.root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".cache-recreate-stage-") {
+			id := strings.TrimPrefix(name, ".cache-recreate-stage-")
+			if !validProjectID(id) || !entry.Type().IsRegular() || entry.Type()&os.ModeSymlink != 0 {
+				return errors.New("cache recreation staging marker has an unexpected type")
+			}
+			if err := os.Remove(filepath.Join(p.root, name)); err != nil {
+				return fmt.Errorf("remove abandoned cache recreation marker: %w", err)
+			}
+			continue
+		}
+		if !strings.HasPrefix(name, ".cache-recreate-") {
+			continue
+		}
+		id := strings.TrimPrefix(name, ".cache-recreate-")
+		if !validProjectID(id) {
+			return errors.New("cache recreation marker contains an invalid project identifier")
+		}
+		path := p.cacheRecreationPath(id)
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("cache recreation marker has an unexpected type")
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil || string(contents) != cacheRecreationMarkerContents {
+			return errors.New("cache recreation marker is malformed")
+		}
+		if err := p.clearProjectCaches(id); err != nil {
+			return fmt.Errorf("finish project cache recreation: %w", err)
+		}
+		if err := p.clearCacheRecreation(id); err != nil {
+			return fmt.Errorf("clear project cache recreation marker: %w", err)
+		}
+	}
+	return nil
+}
+
+func (p *projectManager) clearProjectCaches(id string) error {
+	if !validProjectID(id) {
+		return errors.New("invalid project identifier for cache recreation")
+	}
+	lfsRoot := filepath.Join(p.root, "lfs-cache")
+	if info, err := os.Lstat(lfsRoot); err == nil && (!info.IsDir() || info.Mode()&os.ModeSymlink != 0) {
+		return errors.New("LFS cache root is not a real directory; recreation stopped")
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, path := range []string{p.repoPath(id), filepath.Join(lfsRoot, id)} {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("project cache path is not a real directory; recreation stopped")
+		}
+		if err := os.RemoveAll(path); err != nil {
+			return errors.New("project cache could not be removed")
+		}
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			return errors.New("project cache removal could not be confirmed")
+		}
+	}
+	if err := syncDirectory(p.root); err != nil {
+		return fmt.Errorf("sync project cache root: %w", err)
+	}
+	if _, err := os.Lstat(lfsRoot); err == nil {
+		if err := syncDirectory(lfsRoot); err != nil {
+			return fmt.Errorf("sync LFS cache root: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
 	}
 	return nil
 }

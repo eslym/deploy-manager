@@ -29,6 +29,8 @@ const branchFetchMaxAttempts = 3
 // same bounded staging and journaled promotion policy as an explicit refresh.
 // Ref metadata is only committed after the refreshed object store is promoted.
 func (a *App) fetchProjectForBranch(ctx context.Context, id string) error {
+	a.projects.cacheLifecycleMu.RLock()
+	defer a.projects.cacheLifecycleMu.RUnlock()
 	var err error
 	for attempt := 1; attempt <= branchFetchMaxAttempts; attempt++ {
 		err = a.fetchProjectForBranchAttempt(ctx, id)

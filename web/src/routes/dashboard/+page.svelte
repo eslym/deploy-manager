@@ -8,6 +8,8 @@
 		url: string;
 		keyId?: string;
 		lastFetched: string | null;
+		gitCacheBytes: number;
+		lfsCacheBytes: number;
 		warning?: string;
 	};
 	type Ref = { kind: string; name: string; commit: string };
@@ -50,6 +52,10 @@
 	let lfsNotice = $state('');
 	let selected = $state('');
 	let projectDeleteConfirmation = $state('');
+	let cacheRecreateConfirmation = $state(false);
+	let cacheRecreateBusy = $state(false);
+	let cacheRecreateError = $state('');
+	let cacheRecreateNotice = $state('');
 	let visibleRefs = $derived(
 		(refs[selected] ?? []).filter((ref) =>
 			`${ref.kind} ${ref.name}`.toLowerCase().includes(search.toLowerCase())
@@ -346,6 +352,37 @@
 			busy = false;
 		}
 	}
+	function formatBytes(bytes: number) {
+		if (!Number.isFinite(bytes) || bytes <= 0) return '0 bytes';
+		const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
+		const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+		const size = bytes / 1024 ** unit;
+		return `${size.toLocaleString(undefined, { maximumFractionDigits: unit === 0 ? 0 : 1 })} ${units[unit]}`;
+	}
+	async function recreateCache(project: Project) {
+		if (cacheRecreateBusy || !cacheRecreateConfirmation) return;
+		cacheRecreateBusy = true;
+		cacheRecreateError = '';
+		cacheRecreateNotice = '';
+		let storageCleared = false;
+		try {
+			await request(`/api/projects/${project.id}/cache/recreate`, {
+				method: 'POST',
+				body: JSON.stringify({ confirm: true })
+			});
+			storageCleared = true;
+			const refreshedProjects: Project[] = await request('/api/projects');
+			projects = refreshedProjects;
+			cacheRecreateConfirmation = false;
+			cacheRecreateNotice = 'Repository storage cleared. Sizes updated.';
+		} catch (cause) {
+			cacheRecreateError = storageCleared
+				? 'Storage was cleared, but the sizes could not be refreshed. Reload the page to check them.'
+				: 'Could not clear repository storage. Try again.';
+		} finally {
+			cacheRecreateBusy = false;
+		}
+	}
 	onMount(() => {
 		void loadProjects();
 		void loadRepositoryKeys();
@@ -524,11 +561,18 @@
 								aria-pressed={selected === project.id}
 								onclick={() => {
 									selected = project.id;
+									cacheRecreateConfirmation = false;
+									cacheRecreateError = '';
+									cacheRecreateNotice = '';
 									search = '';
 									void loadLfsSettings(project.id);
 								}}
 								><span class="block font-semibold text-[#243528]">{project.name}</span><span
 									class="block truncate text-sm text-[#58645b]">{project.url}</span
+								><span class="mt-1 block text-xs text-[#58645b]"
+									>Git {formatBytes(project.gitCacheBytes ?? 0)} · LFS {formatBytes(
+										project.lfsCacheBytes ?? 0
+									)}</span
 								></button
 							>
 						</li>{/each}
@@ -554,6 +598,53 @@
 					>
 						{project.warning} Your current branches and tags are still shown.
 					</p>{/if}
+				<section
+					class="mt-4 rounded-lg border border-[#e1e6df] bg-[#f8faf7] p-4"
+					aria-labelledby="storage-heading"
+				>
+					<h3 id="storage-heading" class="m-0 font-semibold text-[#243528]">Repository storage</h3>
+					<p class="mt-2 text-sm text-[#58645b]">
+						Git cache: {formatBytes(project?.gitCacheBytes ?? 0)} · LFS cache: {formatBytes(
+							project?.lfsCacheBytes ?? 0
+						)}
+					</p>
+					{#if cacheRecreateError}<p role="alert" class="mt-2 text-sm text-red-800">
+							{cacheRecreateError}
+						</p>{/if}
+					{#if cacheRecreateNotice}<p role="status" class="mt-2 text-sm text-[#214c30]">
+							{cacheRecreateNotice}
+						</p>{/if}
+					{#if cacheRecreateConfirmation}
+						<div
+							class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3"
+							aria-label="Confirm clearing repository storage"
+						>
+							<p class="m-0 text-sm text-amber-950">
+								This can free disk space. It permanently removes commits no longer reachable from a
+								branch or tag, plus Git LFS files the server can no longer provide. You may lose the
+								ability to redeploy or roll back releases that need them.
+							</p>
+							<div class="mt-3 flex flex-wrap gap-2">
+								<button
+									class="min-h-9 rounded-lg bg-amber-900 px-3 text-sm font-semibold text-white disabled:opacity-60"
+									onclick={() => project && recreateCache(project)}
+									disabled={cacheRecreateBusy || !project}>Clear cache</button
+								>
+								<button
+									class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold disabled:opacity-60"
+									onclick={() => (cacheRecreateConfirmation = false)}
+									disabled={cacheRecreateBusy}>Cancel</button
+								>
+							</div>
+						</div>
+					{:else}
+						<button
+							class="mt-2 min-h-9 rounded-lg border border-amber-500 px-3 text-sm font-semibold text-amber-950 disabled:opacity-60"
+							onclick={() => (cacheRecreateConfirmation = true)}
+							disabled={cacheRecreateBusy || !project}>Clear cache…</button
+						>
+					{/if}
+				</section>
 				<div class="mt-4 border-t border-[#e1e6df] pt-4">
 					{#if projectDeleteConfirmation === project?.id}
 						<div

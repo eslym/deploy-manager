@@ -1174,7 +1174,7 @@ func sanitizePublicationError(err error) string {
 	case strings.Contains(s, "private ssh lfs authentication"):
 		return "Private repository LFS authentication failed. Verify the repository key and approved SSH host key, and confirm the server provides git-lfs-authenticate. Pure-SSH LFS transfers are not supported. Existing published files were kept."
 	case strings.Contains(s, "lfs"):
-		return "Git LFS content could not be safely verified or hydrated; the current live files were kept"
+		return "Git LFS content is unavailable or could not be verified; the current live files were kept"
 	case strings.Contains(s, "symbolic link") || strings.Contains(s, "symlink"):
 		return "This commit contains a symbolic link, which cannot be published"
 	case strings.Contains(s, "submodule") || strings.Contains(s, "gitlink"):
@@ -1186,7 +1186,7 @@ func sanitizePublicationError(err error) string {
 	case strings.Contains(s, "byte limit"):
 		return "This commit is larger than the configured publication limit; no files were changed"
 	case strings.Contains(s, "target is not a complete commit"):
-		return "The selected commit is no longer available in the project repository"
+		return "The selected commit is no longer available in the project repository; the current live files were kept"
 	case strings.Contains(s, "timeout"):
 		return "Publication timed out; no files were changed"
 	default:

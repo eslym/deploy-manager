@@ -46,6 +46,7 @@ type projectManager struct {
 	maxRefs               int
 	maxAdvertisementBytes int64
 	mu                    sync.Mutex
+	cacheLifecycleMu      sync.RWMutex
 	cacheMu               sync.RWMutex
 	lfsCacheMu            sync.Mutex
 	lfsAuthMu             sync.RWMutex
@@ -77,12 +78,14 @@ func withGitHTTPPolicy(ctx context.Context, manager *projectManager) context.Con
 var configureTestGitTransport = func() error { return nil }
 
 type project struct {
-	ID          string     `json:"id"`
-	Name        string     `json:"name"`
-	URL         string     `json:"url"`
-	LastFetched *time.Time `json:"lastFetched"`
-	Warning     string     `json:"warning,omitempty"`
-	KeyID       string     `json:"keyId,omitempty"`
+	ID            string     `json:"id"`
+	Name          string     `json:"name"`
+	URL           string     `json:"url"`
+	LastFetched   *time.Time `json:"lastFetched"`
+	Warning       string     `json:"warning,omitempty"`
+	KeyID         string     `json:"keyId,omitempty"`
+	GitCacheBytes int64      `json:"gitCacheBytes"`
+	LFSCacheBytes int64      `json:"lfsCacheBytes"`
 }
 
 type projectRef struct {
@@ -124,6 +127,9 @@ func newProjectManager(db *sql.DB, store *ent.Client, root string, timeout time.
 		return nil, err
 	}
 	manager := &projectManager{db: db, store: store, root: root, rootIdentity: rootIdentity, timeout: timeout, maxCacheBytes: maxCacheBytes, cacheFS: osProjectCacheFS{}}
+	if err := manager.reconcileProjectCacheRecreations(); err != nil {
+		return nil, fmt.Errorf("project cache recreation recovery failed; refusing to start: %w", err)
+	}
 	if err := manager.reconcileCacheFiles(); err != nil {
 		return nil, fmt.Errorf("project cache recovery failed; refusing to start: %w", err)
 	}
@@ -209,6 +215,10 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
+	if err := a.projects.ensureCacheReady(); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
 	projects, err := a.store.Project.Query().Order(ent.Asc(projectent.FieldCreatedAt), ent.Asc(projectent.FieldID)).All(r.Context())
 	if err != nil {
 		http.Error(w, "projects are temporarily unavailable", 500)
@@ -223,6 +233,29 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, x)
 	}
+	a.projects.cacheLifecycleMu.RLock()
+	a.projects.cacheMu.RLock()
+	a.projects.lfsCacheMu.Lock()
+	for i := range out {
+		if !validProjectID(out[i].ID) {
+			continue
+		}
+		var sizeErr error
+		out[i].GitCacheBytes, sizeErr = projectCacheSize(a.projects.repoPath(out[i].ID))
+		if sizeErr == nil {
+			out[i].LFSCacheBytes, sizeErr = projectLFSCacheSize(a.projects.root, out[i].ID)
+		}
+		if sizeErr != nil {
+			a.projects.lfsCacheMu.Unlock()
+			a.projects.cacheMu.RUnlock()
+			a.projects.cacheLifecycleMu.RUnlock()
+			http.Error(w, "project cache sizes are temporarily unavailable", http.StatusServiceUnavailable)
+			return
+		}
+	}
+	a.projects.lfsCacheMu.Unlock()
+	a.projects.cacheMu.RUnlock()
+	a.projects.cacheLifecycleMu.RUnlock()
 	if len(out) != 0 {
 		assignedKeyIDs := make(map[string]string)
 		const assignmentBatchSize = 500
@@ -248,6 +281,88 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, out)
+}
+
+func (a *App) recreateProjectCache(w http.ResponseWriter, r *http.Request) {
+	if !a.projectAuthorized(w, r, true) {
+		return
+	}
+	id := r.PathValue("id")
+	if !validProjectID(id) {
+		http.NotFound(w, r)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1024)
+	var input struct {
+		Confirm bool `json:"confirm"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&input) != nil || !input.Confirm {
+		http.Error(w, "explicit cache recreation confirmation is required", http.StatusBadRequest)
+		return
+	}
+	p := a.projects
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := p.ensureCacheReady(); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	p.cacheLifecycleMu.Lock()
+	defer p.cacheLifecycleMu.Unlock()
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+	p.lfsCacheMu.Lock()
+	defer p.lfsCacheMu.Unlock()
+	if _, err := a.store.Project.Get(r.Context(), id); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := p.markCacheRecreation(id); err != nil {
+		http.Error(w, "cache recreation could not be recorded", http.StatusServiceUnavailable)
+		return
+	}
+	if err := p.clearProjectCaches(id); err != nil {
+		p.setBlocked("project cache recreation is incomplete; restart to finish safely")
+		http.Error(w, "cache recreation is incomplete; restart to finish safely", http.StatusServiceUnavailable)
+		return
+	}
+	if err := p.clearCacheRecreation(id); err != nil {
+		p.setBlocked("project cache recreation is incomplete; restart to finish safely")
+		http.Error(w, "cache recreation is incomplete; restart to finish safely", http.StatusServiceUnavailable)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func projectCacheSize(path string) (int64, error) {
+	info, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return 0, errors.New("project cache path is not a real directory")
+	}
+	return directorySize(path, int64(^uint64(0)>>1))
+}
+
+func projectLFSCacheSize(root, id string) (int64, error) {
+	lfsRoot := filepath.Join(root, "lfs-cache")
+	info, err := os.Lstat(lfsRoot)
+	if os.IsNotExist(err) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return 0, errors.New("LFS cache root is not a real directory")
+	}
+	return projectCacheSize(filepath.Join(lfsRoot, id))
 }
 
 func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
