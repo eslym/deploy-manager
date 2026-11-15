@@ -56,7 +56,8 @@ func (l *storageLock) Close() error {
 // acquireStorageAccess protects the complete check-to-use interval, not just
 // startup checks. Fresh initialization upgrades to exclusive access and checks
 // existence again after acquisition; no database/key work precedes this guard.
-// Future version inspection/maintenance belongs under this same guard (#31).
+// Existing-store upgrade inspection and the entire protected upgrade lifecycle
+// remain under this guard, excluding compatible CLI users until readiness.
 func acquireStorageAccess(cfg Config) (*storageLock, bool, error) {
 	f, err := openCoordinationFile(cfg, ".access.lock")
 	if err != nil {

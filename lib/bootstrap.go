@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
@@ -58,7 +59,12 @@ type Config struct {
 	// storageFault is a per-startup test seam, never configured by the CLI or HTTP.
 	// "access" runs under the access guard before DB/key work, with a nil DB;
 	// "verify" runs after preparation and before storage readiness.
-	storageFault func(string, *sql.DB) error
+	storageFault   func(string, *sql.DB) error
+	upgradeContext context.Context
+	// migrationFS is a deterministic test fixture seam; production migrations
+	// remain the embedded immutable set.
+	migrationFS          fs.FS
+	upgradeTargetVersion int64
 }
 
 type App struct {
@@ -197,7 +203,7 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 	}
 	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(sqlitePath)}).String()
 	if prior {
-		if err := preflightExistingSchema(dbURL); err != nil {
+		if err := preflightExistingSchema(dbURL, cfg); err != nil {
 			var pending pendingUpgrade
 			if !errors.As(err, &pending) {
 				return nil, err
@@ -215,13 +221,17 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 				}
 				return nil, err
 			}
-			if err := preflightExistingSchema(dbURL); err != nil {
-				if !errors.As(err, &pending) {
-					return nil, err
-				}
-				return nil, prepareUpgradeBackup(cfg, pending.source, pending.target, dbURL)
+			err = preflightExistingSchema(dbURL, cfg)
+			if err == nil {
+				return nil, errors.New("database upgrade state changed during maintenance transition; refusing startup")
 			}
-			return nil, errors.New("database upgrade state changed during maintenance transition; refusing startup")
+			if !errors.As(err, &pending) {
+				return nil, err
+			}
+			if err := prepareUpgradeBackup(cfg, pending.source, pending.target, dbURL); err != nil {
+				return nil, err
+			}
+			prior = true
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(cfg.DatabasePath), 0700); err != nil {
@@ -238,7 +248,7 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
-	if err = initializeSchema(db, !prior); err != nil {
+	if err = initializeSchemaWithConfig(db, !prior, cfg); err != nil {
 		db.Close()
 		return nil, err
 	}
