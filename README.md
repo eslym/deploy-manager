@@ -228,6 +228,11 @@ delete them to repair startup. Retain repository/LFS caches if you need rollback
 material that may no longer be available upstream. Explicit cache recreation
 can lose that material.
 
+For a startup migration failure, follow the dedicated [operator upgrade recovery
+procedure](docs/operations/upgrade-recovery.md). It restores the exact prior
+program with its verified database-only upgrade backup and must not be confused
+with deployment rollback or whole-installation recovery.
+
 ## Supported scope
 
 Supports conventional SHA-1 repositories over smart HTTPS or SSH. Private HTTPS
