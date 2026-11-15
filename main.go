@@ -139,7 +139,7 @@ func serve(cfg lib.Config, address, cert, key string) error {
 	}
 	defer daemon.Close()
 	if daemon.Locked() {
-		log.Print(lib.ErrMaintenance)
+		log.Print(daemon.Diagnostic())
 	}
 	// OPTIONS * must reach the daemon handler, including during maintenance,
 	// rather than net/http's default server-wide success response.

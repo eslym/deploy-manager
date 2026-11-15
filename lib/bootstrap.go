@@ -102,7 +102,7 @@ type App struct {
 
 // prepareStorage performs only schema/key preparation and validation. Runtime
 // recovery and all background work belong to readyStorage.start.
-func prepareStorage(cfg Config) (*readyStorage, error) {
+func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 	if err := validateStoragePaths(cfg); err != nil {
 		return nil, err
 	}
@@ -207,6 +207,9 @@ func prepareStorage(cfg Config) (*readyStorage, error) {
 			var pending pendingUpgrade
 			if !errors.As(err, &pending) {
 				return nil, err
+			}
+			if !daemonUpgrade {
+				return nil, errors.New("CLI commands cannot upgrade an existing database; start the daemon to perform protected maintenance")
 			}
 			if err := access.acquire(unix.LOCK_EX); err != nil {
 				return nil, err
