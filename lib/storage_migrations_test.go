@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -301,6 +302,37 @@ func TestProtectedUpgradeFailuresRemainLockedAndDoNotRunLaterPhases(t *testing.T
 				t.Fatalf("failed upgrade did not remain locked: %v", err)
 			}
 		})
+	}
+}
+
+func TestDaemonDiagnosticQuotesUntrustedBackupPath(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key")}
+	backup := filepath.Join(dir, "backup\nforged\r\x1b[31mline")
+	markerPath, err := MaintenancePath(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 2, Program: "fixture", Operation: "op-123", Backup: backup, Phase: "migration"}
+	if err := durableJSONReplace(markerPath, marker); err != nil {
+		t.Fatal(err)
+	}
+	daemon, err := OpenDaemon(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer daemon.Close()
+	diagnostic := daemon.Diagnostic()
+	if strings.Contains(diagnostic, "\n") || strings.Contains(diagnostic, "\r") {
+		t.Fatalf("diagnostic spans multiple log lines: %q", diagnostic)
+	}
+	for _, r := range diagnostic {
+		if r < 0x20 || r == 0x7f {
+			t.Fatalf("diagnostic contains raw control character U+%04X: %q", r, diagnostic)
+		}
+	}
+	if !strings.Contains(diagnostic, "backup="+strconv.Quote(backup)) {
+		t.Fatalf("backup path was not safely quoted in diagnostic: %q", diagnostic)
 	}
 }
 
