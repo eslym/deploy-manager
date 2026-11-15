@@ -62,6 +62,14 @@ async function waitFor(check, label) {
   throw new Error(`${label} did not become ready${appOutput ? `: ${appOutput}` : ""}`);
 }
 
+async function waitForNoopHistory(page, deploymentID, card) {
+  await waitFor(async () => {
+    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+    return jobs[0]?.status === "noop";
+  }, "latest no-op deployment job");
+  await card.getByRole("region", { name: "Job history for Production site" }).getByText("No changes", { exact: true }).waitFor();
+}
+
 async function startApplication(cert, key, gitCA) {
   const env = { ...process.env, DEPLOY_MANAGER_TEST_GIT_CA: gitCA, DEPLOY_MANAGER_TEST_GIT_ORIGIN: fixtureOrigin, DEPLOY_MANAGER_TEST_LFS_CA: gitCA };
   app = spawn(executable, ["serve", "--data", dir, "--listen", appListen, "--tls-cert", cert, "--tls-key", key, "--origin", `https://${appListen}`, "--auth-rate-per-minute", "1000"], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
@@ -373,10 +381,10 @@ try {
     try { return (await readFile(join(publishedPath, "index.html"), "utf8")) === "<!doctype html><title>main</title>\n"; } catch { return false; }
   }, "replacement publication files");
   if ((await stat(publishedPath)).ino === firstDirectoryIdentity) throw new Error("replacement did not switch the live directory");
-  await page.getByRole("button", { name: "Deploy", exact: true }).click();
-  await page.getByRole("region", { name: `Job history for Production site` }).getByText("No changes", { exact: true }).first().waitFor({ timeout: 10000 });
-
   const productionCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "Production site", exact: true }) });
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  await waitForNoopHistory(page, deploymentID, productionCard);
+
   await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
   milestone("pause failure: intercept request");
   const pauseFailureGate = new Promise(resolveGate => { releasePauseFailure = resolveGate; });
@@ -409,7 +417,7 @@ try {
   const manualWhilePaused = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/deploy`));
   await productionCard.getByRole("button", { name: "Deploy", exact: true }).click();
   if ((await manualWhilePaused).status() !== 202) throw new Error("manual Deploy was blocked while paused");
-  await productionCard.getByRole("region", { name: "Job history for Production site" }).getByText("No changes", { exact: true }).first().waitFor();
+  await waitForNoopHistory(page, deploymentID, productionCard);
   const stillPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id).automationPaused, deploymentID);
   if (!stillPaused) throw new Error("manual Deploy cleared automation pause");
   const resumedResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/resume`));

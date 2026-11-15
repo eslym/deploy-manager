@@ -472,7 +472,7 @@ func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	transaction, record := newRegistrationFlowWithIdentities(t, app, grant, "https://manager.example", password, nil, nil)
+	transaction, record := newRegistrationFlow(t, app, grant, "https://manager.example", password)
 	if status := finishTestRegistration(app, "", transaction, record, "https://manager.example"); status != http.StatusNoContent {
 		t.Fatalf("OPAQUE fixture registration status=%d", status)
 	}

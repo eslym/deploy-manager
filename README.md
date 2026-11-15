@@ -211,22 +211,13 @@ create another account. Password replacement revokes existing sessions and
 pending logins without changing repository-key encryption. Server restart also
 invalidates sessions.
 
-For a consistent backup, stop the server and back up the entire data directory,
-any external repository master-key file, and any separately configured
-publication root together. Important default paths include:
-
-- `state.sqlite` and any SQLite WAL/SHM sidecars.
-- `opaque-server.key`: long-term OPAQUE server key, paired with the database's
-  authentication records and profile generation.
-- `repository-key-master.key`: independent encryption key for repository keys
-  and webhook secrets.
-- `state.sqlite.projects`: Git and LFS caches.
-- `state.sqlite.publications`: publication content and recovery/cleanup state.
-
+Follow the [full-installation backup and restore procedure](docs/operations/backup-restore.md).
+It requires a stopped installation and one consistent, identity-preserving
+snapshot of SQLite, matching external keys, caches, and publication/recovery
+state. Ordinary file copying can invalidate publication directory identities.
 Protect backups as secrets. Missing or mismatched key files fail closed; do not
-delete them to repair startup. Retain repository/LFS caches if you need rollback
-material that may no longer be available upstream. Explicit cache recreation
-can lose that material.
+delete them to repair startup. Git/LFS caches are reconstructible only when the
+required objects and payloads remain available upstream.
 
 For a startup migration failure, follow the dedicated [operator upgrade recovery
 procedure](docs/operations/upgrade-recovery.md). It restores the exact prior
