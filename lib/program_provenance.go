@@ -7,13 +7,26 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
+
+type executableFingerprint struct {
+	identity string
+	sha256   string
+}
+
+var runningExecutable struct {
+	sync.Once
+	fingerprint executableFingerprint
+	err         error
+}
 
 // programProvenance is non-secret installation metadata written only by a
 // successfully prepared daemon. CLI grant issuers must never replace it.
@@ -39,11 +52,13 @@ func currentProgramProvenance(cfg Config, schema int64) (programProvenance, erro
 	if err != nil {
 		return programProvenance{}, err
 	}
-	binary, err := os.ReadFile(path)
+	fingerprint, err := cachedRunningExecutableFingerprint()
 	if err != nil {
-		return programProvenance{}, fmt.Errorf("read running program for provenance: %w", err)
+		return programProvenance{}, err
 	}
-	hash := sha256.Sum256(binary)
+	if err := verifyExecutablePath(path, fingerprint.identity); err != nil {
+		return programProvenance{}, err
+	}
 	version, revision := "devel", ""
 	if info, ok := debug.ReadBuildInfo(); ok {
 		if info.Main.Version != "" {
@@ -63,7 +78,63 @@ func currentProgramProvenance(cfg Config, schema int64) (programProvenance, erro
 	if err != nil {
 		return programProvenance{}, err
 	}
-	return programProvenance{Format: 1, Database: database, DatabaseIdentity: identity, Schema: schema, Executable: path, Version: version, Revision: revision, SHA256: hex.EncodeToString(hash[:])}, nil
+	return programProvenance{Format: 1, Database: database, DatabaseIdentity: identity, Schema: schema, Executable: path, Version: version, Revision: revision, SHA256: fingerprint.sha256}, nil
+}
+
+// Linux keeps the running executable inode deny-write while it is mapped. The
+// digest therefore describes the exact running image under normal filesystem
+// semantics. Privileged or nonstandard same-inode mutation is outside that
+// guarantee; device/inode metadata is an identity check, not a content proof.
+func cachedRunningExecutableFingerprint() (executableFingerprint, error) {
+	runningExecutable.Do(func() {
+		f, err := os.Open("/proc/self/exe")
+		if err != nil {
+			runningExecutable.err = fmt.Errorf("open running program for provenance: %w", err)
+			return
+		}
+		defer f.Close()
+		info, err := f.Stat()
+		if err != nil {
+			runningExecutable.err = fmt.Errorf("stat running program for provenance: %w", err)
+			return
+		}
+		if !info.Mode().IsRegular() {
+			runningExecutable.err = errors.New("running program for provenance is not a regular file")
+			return
+		}
+		h := sha256.New()
+		if _, err := io.Copy(h, f); err != nil {
+			runningExecutable.err = fmt.Errorf("hash running program for provenance: %w", err)
+			return
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstat(int(f.Fd()), &stat); err != nil {
+			runningExecutable.err = errors.New("running program identity unavailable")
+			return
+		}
+		runningExecutable.fingerprint = executableFingerprint{
+			identity: fmt.Sprintf("%x:%x", uint64(stat.Dev), uint64(stat.Ino)),
+			sha256:   hex.EncodeToString(h.Sum(nil)),
+		}
+	})
+	return runningExecutable.fingerprint, runningExecutable.err
+}
+
+func verifyExecutablePath(path, runningIdentity string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open configured running program for provenance: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat configured running program for provenance: %w", err)
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(f.Fd()), &stat); err != nil || !info.Mode().IsRegular() || fmt.Sprintf("%x:%x", uint64(stat.Dev), uint64(stat.Ino)) != runningIdentity {
+		return errors.New("configured executable no longer identifies the running program")
+	}
+	return nil
 }
 
 func databaseFileIdentity(path string) (string, error) {
