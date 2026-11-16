@@ -47,4 +47,15 @@
 		>
 	</div>
 </header>
+<nav
+	aria-label="Dashboard"
+	class="border-b border-[#e1e6df] bg-white px-[max(1rem,calc((100%-64rem)/2))] py-3"
+>
+	<div class="flex flex-wrap gap-x-6 gap-y-2 text-sm font-semibold">
+		<a class="text-[#214c30] underline underline-offset-4" href="/dashboard/projects">Projects</a>
+		<a class="text-[#214c30] underline underline-offset-4" href="/dashboard/keys">Repository keys</a
+		>
+		<a class="text-[#214c30] underline underline-offset-4" href="/dashboard/ssh-hosts">SSH hosts</a>
+	</div>
+</nav>
 {@render children()}
