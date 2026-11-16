@@ -182,9 +182,12 @@ try {
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   await page.getByText("v1.0", { exact: true }).waitFor();
 
+  const id = await page.evaluate(async () => (await (await fetch("/api/projects")).json())[0].id);
   milestone("configure LFS");
   await page.getByText("Fixture site", { exact: true }).click();
   await page.getByLabel("LFS server URL").waitFor();
+  const initialLfsSettings = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), id);
+  if (!Array.isArray(initialLfsSettings.settings.objectOrigins) || initialLfsSettings.settings.objectOrigins.length !== 0) throw new Error(`unconfigured LFS settings had an inconsistent shape: ${JSON.stringify(initialLfsSettings)}`);
   await page.getByLabel("LFS server URL").fill(`${fixtureURL}/info/lfs`);
   await page.getByLabel("Object download origins").fill(fixtureOrigin);
   await page.getByLabel("Allow downloads from internal network addresses").check();
@@ -192,8 +195,9 @@ try {
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Save LFS settings" }).click();
   await page.getByText("LFS settings saved.").waitFor();
+  const configuredLfsSettings = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), id);
+  if (JSON.stringify(configuredLfsSettings.settings.objectOrigins) !== JSON.stringify([fixtureOrigin])) throw new Error(`configured LFS destinations were not rendered consistently: ${JSON.stringify(configuredLfsSettings.settings)}`);
 
-  const id = await page.evaluate(async () => (await (await fetch("/api/projects")).json())[0].id);
   const cacheRecreationPath = `/api/projects/${id}/cache/recreate`;
   const unauthenticatedCacheRecreation = await httpsRequestStatus("127.0.0.1", 18440, cacheRecreationPath, "POST", JSON.stringify({ confirm: true }), { Origin: `https://${appListen}`, "Content-Type": "application/json" });
   if (unauthenticatedCacheRecreation !== 401) throw new Error(`unauthenticated cache recreation returned ${unauthenticatedCacheRecreation}`);
@@ -585,6 +589,10 @@ try {
     await route.continue();
   });
   await page.getByText("SSH fixture site", { exact: true }).click();
+  await page.getByLabel("LFS server URL").waitFor();
+  const sshEmptyLfs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), sshProject.id);
+  if (!Array.isArray(sshEmptyLfs.settings.objectOrigins) || sshEmptyLfs.settings.objectOrigins.length !== 0) throw new Error(`ordinary SSH repository LFS settings had an inconsistent shape: ${JSON.stringify(sshEmptyLfs)}`);
+  if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("unconfigured project displayed unexpected LFS destinations");
   await page.getByText("No deployments for this project yet.", { exact: true }).waitFor();
   const oldProjectPollBaseline = oldProjectHistoryPolls;
   await new Promise(resolveWait => setTimeout(resolveWait, 2200));
