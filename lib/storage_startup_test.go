@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -45,6 +47,116 @@ func TestDaemonRecordsProgramProvenanceAndGrantCLILeavesItUntouched(t *testing.T
 	after, err := os.ReadFile(path)
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatalf("compatible CLI overwrote daemon provenance: %v", err)
+	}
+}
+
+func TestDaemonStartupFailsClosedWhenRunningExecutablePathIsRemoved(t *testing.T) {
+	if dir := os.Getenv("DM_PROVENANCE_EXECUTABLE_TEST"); dir != "" {
+		cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key")}
+		initial, err := NewGrantIssuer(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := initial.Close(); err != nil {
+			t.Fatal(err)
+		}
+		prior, err := currentProgramProvenance(cfg, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := durableJSONReplace(provenancePath(cfg), prior); err != nil {
+			t.Fatal(err)
+		}
+		db, err := sql.Open("sqlite3", cfg.DatabasePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		provenanceBefore, err := os.ReadFile(provenancePath(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		path, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		moved := path + ".moved"
+		replacement := path + ".replacement"
+		mode := os.Getenv("DM_PROVENANCE_EXECUTABLE_MODE")
+		if mode == "replaced" {
+			if err := os.WriteFile(replacement, []byte("not the running executable"), 0700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Rename(path, moved); err != nil {
+			t.Fatal(err)
+		}
+		if mode == "replaced" {
+			if err := os.Rename(replacement, path); err != nil {
+				t.Fatal(err)
+			}
+		}
+		defer func() {
+			_ = os.Remove(path)
+			_ = os.Rename(moved, path)
+		}()
+		cfg.upgradeTargetVersion = 2
+		cfg.migrationFS = fstest.MapFS{
+			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE provenance_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE provenance_upgrade_witness;\n")},
+		}
+		app, err := New(cfg)
+		if app != nil {
+			_ = app.Close()
+			t.Fatal("daemon started after its executable pathname was removed")
+		}
+		if err == nil {
+			t.Fatal("daemon startup accepted missing executable pathname")
+		}
+		provenanceAfter, err := os.ReadFile(provenancePath(cfg))
+		if err != nil || !bytes.Equal(provenanceBefore, provenanceAfter) {
+			t.Fatalf("failed daemon changed provenance: %v", err)
+		}
+		return
+	}
+
+	dir := t.TempDir()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childBinary := filepath.Join(dir, "test-binary")
+	source, err := os.Open(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination, err := os.OpenFile(childBinary, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0700)
+	if err != nil {
+		_ = source.Close()
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		t.Fatal(err)
+	}
+	if err := errors.Join(source.Close(), destination.Close()); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []string{"removed", "replaced"} {
+		modeDir := filepath.Join(dir, mode)
+		if err := os.Mkdir(modeDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(childBinary, "-test.run=^TestDaemonStartupFailsClosedWhenRunningExecutablePathIsRemoved$")
+		cmd.Env = append(os.Environ(), "DM_PROVENANCE_EXECUTABLE_TEST="+modeDir, "DM_PROVENANCE_EXECUTABLE_MODE="+mode)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("child daemon fail-closed check (%s): %v\n%s", mode, err, output)
+		}
 	}
 }
 

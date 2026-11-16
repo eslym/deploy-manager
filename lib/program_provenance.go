@@ -113,7 +113,7 @@ func cachedRunningExecutableFingerprint() (executableFingerprint, error) {
 			return
 		}
 		runningExecutable.fingerprint = executableFingerprint{
-			identity: fmt.Sprintf("%x:%x", uint64(stat.Dev), uint64(stat.Ino)),
+			identity: fileIdentity(stat.Dev, stat.Ino),
 			sha256:   hex.EncodeToString(h.Sum(nil)),
 		}
 	})
@@ -131,7 +131,7 @@ func verifyExecutablePath(path, runningIdentity string) error {
 		return fmt.Errorf("stat configured running program for provenance: %w", err)
 	}
 	var stat unix.Stat_t
-	if err := unix.Fstat(int(f.Fd()), &stat); err != nil || !info.Mode().IsRegular() || fmt.Sprintf("%x:%x", uint64(stat.Dev), uint64(stat.Ino)) != runningIdentity {
+	if err := unix.Fstat(int(f.Fd()), &stat); err != nil || !info.Mode().IsRegular() || fileIdentity(stat.Dev, stat.Ino) != runningIdentity {
 		return errors.New("configured executable no longer identifies the running program")
 	}
 	return nil
@@ -142,7 +142,11 @@ func databaseFileIdentity(path string) (string, error) {
 	if err := unix.Stat(path, &stat); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%x:%x", uint64(stat.Dev), uint64(stat.Ino)), nil
+	return fileIdentity(stat.Dev, stat.Ino), nil
+}
+
+func fileIdentity(device, inode uint64) string {
+	return fmt.Sprintf("%x:%x", device, inode)
 }
 
 func readPriorProgramProvenance(cfg Config, source int64) (programProvenance, error) {
