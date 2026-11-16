@@ -417,8 +417,8 @@ try {
   const authenticated = await authPage.evaluate(async () => (await fetch("/api/session")).status);
   if (authenticated !== 200) throw new Error(`authenticated session check returned ${authenticated}`);
   await authPage.goto(`${secureOrigin}/dashboard/projects/nested`, { waitUntil: "domcontentloaded" });
-  await authPage.getByText(/signed in/).waitFor({ timeout: 30000 });
-  await authPage.goto(`${secureOrigin}/dashboard`);
+  await authPage.getByText(/Project not found|This project no longer exists/i).waitFor({ timeout: 30000 });
+  await authPage.goto(`${secureOrigin}/dashboard/projects`);
   await authPage.getByRole("heading", { name: "Repository keys" }).waitFor({ timeout: 30000 });
   await authPage.getByLabel("Key name").fill("generated integration key");
   await authPage.getByRole("button", { name: "Create Ed25519 key" }).click();

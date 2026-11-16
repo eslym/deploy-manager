@@ -70,6 +70,30 @@ async function waitForNoopHistory(page, deploymentID, card) {
   await card.getByRole("region", { name: "Job history for Production site" }).locator("ul > li").first().getByText("No changes", { exact: true }).waitFor();
 }
 
+async function openProject(page, id, name) {
+  await page.getByRole("link", { name: "Projects", exact: true }).click();
+  await page.getByRole("link", { name, exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${id}`);
+}
+
+async function assertProjectLayout(page) {
+  // The original two-column layout placed storage and LFS outside the selected project's column.
+  // Check the actual rendered rectangles, not just CSS class names or a screenshot snapshot.
+  for (const width of [1049, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    const bounds = await page.evaluate(() => {
+      const branches = [...document.querySelectorAll("h2")].find(node => node.textContent === "Branches and tags")?.getBoundingClientRect();
+      const storage = document.getElementById("storage-heading")?.closest("section")?.getBoundingClientRect();
+      const actions = [...document.querySelectorAll("button")].find(node => node.textContent === "Delete project")?.getBoundingClientRect();
+      const lfs = [...document.querySelectorAll("h2")].find(node => node.textContent === "Git LFS destinations")?.closest("section")?.getBoundingClientRect();
+      return { branches: branches && { left: branches.left, right: branches.right }, storage: storage && { left: storage.left, right: storage.right }, actions: actions && { left: actions.left, right: actions.right }, lfs: lfs && { left: lfs.left, right: lfs.right }, scrollWidth: document.documentElement.scrollWidth, width: window.innerWidth };
+    });
+    if (!bounds.branches || !bounds.storage || !bounds.actions || !bounds.lfs) throw new Error(`missing project detail section at ${width}px: ${JSON.stringify(bounds)}`);
+    if ([bounds.storage, bounds.actions, bounds.lfs].some(rect => rect.left < bounds.branches.left - 2 || rect.right > bounds.width) || bounds.scrollWidth > bounds.width) throw new Error(`project detail escaped its column at ${width}px: ${JSON.stringify(bounds)}`);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
+}
+
 async function startApplication(cert, key, gitCA) {
   const env = { ...process.env, DEPLOY_MANAGER_TEST_GIT_CA: gitCA, DEPLOY_MANAGER_TEST_GIT_ORIGIN: fixtureOrigin, DEPLOY_MANAGER_TEST_LFS_CA: gitCA };
   app = spawn(executable, ["serve", "--data", dir, "--listen", appListen, "--tls-cert", cert, "--tls-key", key, "--origin", `https://${appListen}`, "--auth-rate-per-minute", "1000"], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
@@ -143,6 +167,8 @@ try {
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.getByText(/You’re signed in/).waitFor({ timeout: 30000 });
+  await page.getByRole("link", { name: "Projects", exact: true }).click();
+  await page.waitForURL("**/dashboard/projects");
   const sessionCookie = (await context.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session")?.value;
   if (!sessionCookie) throw new Error("authenticated browser session cookie is missing");
   const crossOriginMutation = await httpsRequestStatus("127.0.0.1", 18440, "/api/ssh-hosts/approve", "POST", JSON.stringify({ host: "127.0.0.1", port: 18442, fingerprint: "SHA256:invalid", confirm: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" });
@@ -167,6 +193,10 @@ try {
   await page.getByRole("button", { name: "Add repository" }).click();
   const created = await createResponse;
   if (created.status() !== 201) throw new Error(`project creation returned ${created.status()}: ${await created.text()}\n${appOutput}`);
+  const id = (await created.json()).id;
+  await page.waitForURL(`**/dashboard/projects/${id}`);
+  await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
+  if (!(await page.title()).includes("Fixture site")) throw new Error("project detail lacks its own page title");
   await page.getByRole("heading", { name: "Branches and tags" }).waitFor({ timeout: 30000 });
   await page.getByRole("alert").filter({ hasText: "GitHub webhook settings could not be saved. Try again shortly." }).waitFor();
   const dashboardURLBeforeRetry = page.url();
@@ -179,12 +209,16 @@ try {
   if (page.url() !== dashboardURLBeforeRetry) throw new Error("retrying webhook settings navigated away from the dashboard");
   if ((await page.locator("body").innerText()).includes("RAW_WEBHOOK_ERROR_SENTINEL")) throw new Error("raw webhook error response was shown in the dashboard");
   await page.unroute("**/api/projects/*/github-webhook");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
+  await assertProjectLayout(page);
+  const projectRefresh = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
+  await page.getByRole("button", { name: "Refresh project branches and tags" }).click();
+  if ((await projectRefresh).status() !== 200) throw new Error("project detail refresh failed");
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   await page.getByText("v1.0", { exact: true }).waitFor();
 
-  const id = await page.evaluate(async () => (await (await fetch("/api/projects")).json())[0].id);
   milestone("configure LFS");
-  await page.getByText("Fixture site", { exact: true }).click();
   await page.getByLabel("LFS server URL").waitFor();
   const initialLfsSettings = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), id);
   if (!Array.isArray(initialLfsSettings.settings.objectOrigins) || initialLfsSettings.settings.objectOrigins.length !== 0) throw new Error(`unconfigured LFS settings had an inconsistent shape: ${JSON.stringify(initialLfsSettings)}`);
@@ -199,15 +233,15 @@ try {
   if (JSON.stringify(configuredLfsSettings.settings.objectOrigins) !== JSON.stringify([fixtureOrigin])) throw new Error(`configured LFS destinations were not rendered consistently: ${JSON.stringify(configuredLfsSettings.settings)}`);
 
   milestone("ordinary repository LFS settings and stale response protection");
+  await page.getByRole("link", { name: "Projects", exact: true }).click();
   await page.getByLabel("Project name").fill("Ordinary fixture site");
   await page.getByLabel("Repository URL").fill(`${fixtureOrigin}/ordinary.git`);
   const ordinaryCreateResponse = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Add repository" }).click();
   const ordinaryCreated = await ordinaryCreateResponse;
   if (ordinaryCreated.status() !== 201) throw new Error(`ordinary project creation returned ${ordinaryCreated.status()}: ${await ordinaryCreated.text()}`);
-  await page.getByText("Ordinary fixture site", { exact: true }).waitFor();
-  await page.getByRole("button", { name: /Ordinary fixture site/ }).click();
-  const ordinaryProject = await page.evaluate(async () => (await (await fetch("/api/projects")).json()).find(project => project.name === "Ordinary fixture site"));
+  const ordinaryProject = await ordinaryCreated.json();
+  await page.waitForURL(`**/dashboard/projects/${ordinaryProject.id}`);
   const ordinaryRefs = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/refs`)).json(), ordinaryProject.id);
   if (!ordinaryRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("ordinary fixture repository did not have a main branch");
   await page.getByLabel("LFS server URL").waitFor();
@@ -227,9 +261,9 @@ try {
     }
     await route.continue();
   });
-  await page.getByText("Fixture site", { exact: true }).click();
+  await openProject(page, id, "Fixture site");
   const heldLfsResponse = await lfsResponseIntercepted;
-  await page.getByText("Ordinary fixture site", { exact: true }).click();
+  await openProject(page, ordinaryProject.id, "Ordinary fixture site");
   await page.getByLabel("LFS server URL").waitFor();
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("switching to an ordinary repository showed another project's LFS settings");
   releaseLfsResponse();
@@ -237,7 +271,7 @@ try {
   await page.waitForTimeout(100);
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("a delayed prior-project response overwrote the selected project's LFS form");
   await page.unroute(`**/api/projects/${id}/lfs`);
-  await page.getByText("Fixture site", { exact: true }).click();
+  await openProject(page, id, "Fixture site");
   await page.getByLabel("LFS server URL").waitFor();
   let releaseLfsSave;
   const delayedLfsSave = new Promise(resolveSave => { releaseLfsSave = resolveSave; });
@@ -257,14 +291,14 @@ try {
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Save LFS settings" }).click();
   const heldLfsSave = await lfsSaveIntercepted;
-  await page.getByText("Ordinary fixture site", { exact: true }).click();
+  await openProject(page, ordinaryProject.id, "Ordinary fixture site");
   releaseLfsSave();
   await heldLfsSave.fulfill({ status: 204 });
   await page.waitForTimeout(100);
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("a completed save for another project overwrote the selected project's LFS form");
   if (await page.getByText("LFS settings saved.", { exact: true }).count()) throw new Error("a completed save for another project showed a stale success notice");
   await page.unroute(`**/api/projects/${id}/lfs`);
-  await page.getByText("Fixture site", { exact: true }).click();
+  await openProject(page, id, "Fixture site");
   await page.getByLabel("LFS server URL").waitFor();
 
   const cacheRecreationPath = `/api/projects/${id}/cache/recreate`;
@@ -302,7 +336,7 @@ try {
   if (await sendGitea(firstGiteaSecret, "browser-gitea-old") !== 401) throw new Error("old Gitea secret still authenticated after rotation");
   if (await sendGitea(rotatedGiteaSecret, "browser-gitea-new") !== 204) throw new Error("rotated Gitea secret did not authenticate a push");
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.getByText("Fixture site", { exact: true }).click();
+  await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
   await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).waitFor();
   if ((await page.locator("body").innerText()).includes(rotatedGiteaSecret)) throw new Error("Gitea secret remained after dashboard reload");
   milestone("create branch deployment");
@@ -535,7 +569,7 @@ try {
   if (!paused.ok() || (await paused.json()).automationPaused !== true) throw new Error("Pause did not persist automation state");
   await productionCard.getByText("Automatic deployment paused", { exact: true }).waitFor();
   await page.reload();
-  await page.getByText("Fixture site", { exact: true }).click();
+  await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
   await productionCard.getByText("Automatic deployment paused", { exact: true }).waitFor();
   const manualWhilePaused = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/deploy`));
   await productionCard.getByRole("button", { name: "Deploy", exact: true }).click();
@@ -584,8 +618,9 @@ try {
   }, "dashboard Hard re-deploy to recreate the tag publication");
 
   milestone("refresh success and failure retention");
+  const refreshButton = page.getByRole("button", { name: "Refresh branches and tags", exact: true });
   const refreshResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
-  await page.getByRole("button", { name: "Refresh branches and tags", exact: true }).click();
+  await refreshButton.click();
   const refreshed = await refreshResponse;
   if (refreshed.status() !== 200) throw new Error(`successful refresh returned ${refreshed.status()}`);
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
@@ -627,6 +662,7 @@ try {
   if (failedTimestamp !== timestampAfterReloadFailure) throw new Error("failed refresh changed last successful fetch time");
 
   milestone("create SSH key, approve host, create SSH project");
+  await page.getByRole("link", { name: "Projects", exact: true }).click();
   await page.getByLabel("Key name").fill("SSH browser key");
   await page.getByRole("button", { name: "Create Ed25519 key" }).click();
   await page.getByText("SSH browser key", { exact: true }).waitFor();
@@ -647,8 +683,8 @@ try {
   await page.getByRole("button", { name: "Add repository" }).click();
   const sshCreated = await sshCreateResponse;
   if (sshCreated.status() !== 201) throw new Error(`approved SSH project creation returned ${sshCreated.status()}: ${await sshCreated.text()}`);
-  await page.getByText("SSH fixture site", { exact: true }).waitFor();
-  const sshProject = await page.evaluate(async () => (await (await fetch("/api/projects")).json()).find(project => project.name === "SSH fixture site"));
+  const sshProject = await sshCreated.json();
+  await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
   const sshRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
   milestone("configure private LFS and publish SSH deployment");
@@ -657,7 +693,7 @@ try {
     if (route.request().method() === "GET") oldProjectHistoryPolls++;
     await route.continue();
   });
-  await page.getByText("SSH fixture site", { exact: true }).click();
+  await page.getByRole("heading", { name: "SSH fixture site", exact: true }).waitFor();
   await page.getByLabel("LFS server URL").waitFor();
   const sshEmptyLfs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), sshProject.id);
   if (!Array.isArray(sshEmptyLfs.settings.objectOrigins) || sshEmptyLfs.settings.objectOrigins.length !== 0) throw new Error(`ordinary SSH repository LFS settings had an inconsistent shape: ${JSON.stringify(sshEmptyLfs)}`);
@@ -721,8 +757,15 @@ try {
   if (confirmedProjectDelete.status() !== 204) throw new Error(`confirmed project deletion returned ${confirmedProjectDelete.status()}: ${await confirmedProjectDelete.text()}`);
   if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
   try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }
+  milestone("deleted and missing project routes");
+  await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByText(/Project not found|This project no longer exists/i).waitFor();
+  await page.getByRole("link", { name: "Projects", exact: true }).click();
+  await page.goto(`https://${appListen}/dashboard/projects/missing-project`, { waitUntil: "domcontentloaded" });
+  await page.getByText(/Project not found|This project no longer exists/i).waitFor();
   milestone("review and confirm project cache recreation");
-  await page.getByText("Fixture site", { exact: true }).click();
+  await openProject(page, id, "Fixture site");
   const pinnedDeploymentResponse = await page.evaluate(async ({ id, commit }) => {
     const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: id, name: "Pinned cache check", commit }) });
     return { status: response.status, body: await response.json() };
