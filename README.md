@@ -1,5 +1,12 @@
 # Deploy Manager
 
+> [!IMPORTANT]
+> **AI usage disclosure:** This app is vibe-coded. AI tools have been used
+> extensively to write and modify its code and documentation. Tests and the
+> security features described here are not an independent security audit.
+> Review and assess the code before trusting it with credentials or production
+> infrastructure.
+
 A self-hosted, single-administrator dashboard for publishing static Git content
 to stable directories on a Linux server.
 
