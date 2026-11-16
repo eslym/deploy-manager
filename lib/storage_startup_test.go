@@ -53,30 +53,17 @@ func TestDaemonRecordsProgramProvenanceAndGrantCLILeavesItUntouched(t *testing.T
 func TestDaemonStartupFailsClosedWhenRunningExecutablePathIsRemoved(t *testing.T) {
 	if dir := os.Getenv("DM_PROVENANCE_EXECUTABLE_TEST"); dir != "" {
 		cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key")}
-		initial, err := NewGrantIssuer(cfg)
+		initial, err := New(cfg)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := initial.Close(); err != nil {
 			t.Fatal(err)
 		}
-		prior, err := currentProgramProvenance(cfg, 1)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := durableJSONReplace(provenancePath(cfg), prior); err != nil {
-			t.Fatal(err)
-		}
-		db, err := sql.Open("sqlite3", cfg.DatabasePath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
-			_ = db.Close()
-			t.Fatal(err)
-		}
-		if err := db.Close(); err != nil {
-			t.Fatal(err)
+		cfg.upgradeTargetVersion = 2
+		cfg.migrationFS = fstest.MapFS{
+			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
+			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE provenance_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE provenance_upgrade_witness;\n")},
 		}
 		provenanceBefore, err := os.ReadFile(provenancePath(cfg))
 		if err != nil {
@@ -106,18 +93,13 @@ func TestDaemonStartupFailsClosedWhenRunningExecutablePathIsRemoved(t *testing.T
 			_ = os.Remove(path)
 			_ = os.Rename(moved, path)
 		}()
-		cfg.upgradeTargetVersion = 2
-		cfg.migrationFS = fstest.MapFS{
-			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE provenance_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE provenance_upgrade_witness;\n")},
-		}
 		app, err := New(cfg)
 		if app != nil {
 			_ = app.Close()
 			t.Fatal("daemon started after its executable pathname was removed")
 		}
-		if err == nil {
-			t.Fatal("daemon startup accepted missing executable pathname")
+		if err == nil || (!strings.Contains(err.Error(), "configured running program") && !strings.Contains(err.Error(), "configured executable no longer identifies")) {
+			t.Fatalf("daemon startup did not fail for the invalid executable pathname: %v", err)
 		}
 		provenanceAfter, err := os.ReadFile(provenancePath(cfg))
 		if err != nil || !bytes.Equal(provenanceBefore, provenanceAfter) {

@@ -18,6 +18,7 @@ import (
 )
 
 type executableFingerprint struct {
+	path     string
 	identity string
 	sha256   string
 }
@@ -44,18 +45,11 @@ type programProvenance struct {
 func provenancePath(cfg Config) string { return cfg.DatabasePath + ".program.json" }
 
 func currentProgramProvenance(cfg Config, schema int64) (programProvenance, error) {
-	path, err := os.Executable()
-	if err != nil {
-		return programProvenance{}, err
-	}
-	path, err = filepath.Abs(path)
-	if err != nil {
-		return programProvenance{}, err
-	}
 	fingerprint, err := cachedRunningExecutableFingerprint()
 	if err != nil {
 		return programProvenance{}, err
 	}
+	path := fingerprint.path
 	if err := verifyExecutablePath(path, fingerprint.identity); err != nil {
 		return programProvenance{}, err
 	}
@@ -87,6 +81,16 @@ func currentProgramProvenance(cfg Config, schema int64) (programProvenance, erro
 // guarantee; device/inode metadata is an identity check, not a content proof.
 func cachedRunningExecutableFingerprint() (executableFingerprint, error) {
 	runningExecutable.Do(func() {
+		path, err := os.Executable()
+		if err != nil {
+			runningExecutable.err = fmt.Errorf("resolve running program path for provenance: %w", err)
+			return
+		}
+		path, err = filepath.Abs(path)
+		if err != nil {
+			runningExecutable.err = fmt.Errorf("resolve absolute running program path for provenance: %w", err)
+			return
+		}
 		f, err := os.Open("/proc/self/exe")
 		if err != nil {
 			runningExecutable.err = fmt.Errorf("open running program for provenance: %w", err)
@@ -112,10 +116,16 @@ func cachedRunningExecutableFingerprint() (executableFingerprint, error) {
 			runningExecutable.err = errors.New("running program identity unavailable")
 			return
 		}
-		runningExecutable.fingerprint = executableFingerprint{
+		fingerprint := executableFingerprint{
+			path:     path,
 			identity: fileIdentity(stat.Dev, stat.Ino),
 			sha256:   hex.EncodeToString(h.Sum(nil)),
 		}
+		if err := verifyExecutablePath(path, fingerprint.identity); err != nil {
+			runningExecutable.err = err
+			return
+		}
+		runningExecutable.fingerprint = fingerprint
 	})
 	return runningExecutable.fingerprint, runningExecutable.err
 }
