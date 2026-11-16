@@ -1,12 +1,23 @@
 # syntax=docker/dockerfile:1.7
 
-FROM oven/bun:1.4.4-alpine AS frontend
+ARG BUN_VERSION=1.4.4
+ARG FRONTEND_SOURCE=build
+
+# Frontend assets are architecture-independent; never build them under QEMU.
+FROM --platform=$BUILDPLATFORM oven/bun:${BUN_VERSION}-alpine AS frontend-build
+ARG BUN_VERSION
 WORKDIR /workspace/web
 COPY web/package.json web/bun.lock web/bunfig.toml ./
-RUN --mount=type=cache,id=deploy-manager-bun-1.4.4,target=/root/.bun/install/cache,sharing=locked \
+RUN --mount=type=cache,id=deploy-manager-bun-${BUN_VERSION},target=/root/.bun/install/cache,sharing=locked \
     bun install --frozen-lockfile
 COPY web ./
 RUN bun run build
+
+# CI builds the frontend once on the runner and supplies web/build.
+FROM scratch AS frontend-prebuilt
+COPY web/build /workspace/lib/web
+
+FROM frontend-${FRONTEND_SOURCE} AS frontend
 
 FROM golang:1.26.11-bookworm AS builder
 WORKDIR /workspace

@@ -78,6 +78,19 @@ DM_BUILD_FRONTEND_IN_DOCKER=1 ./scripts/build.sh
 This alternative still requires the Go toolchain and CGO prerequisites on the
 host.
 
+### Container builds
+
+```sh
+docker build -t deploy-manager .
+```
+
+The default Docker build compiles the frontend on the native build platform,
+then embeds it in the target-platform Go executable. For multi-platform CI,
+the workflow builds the frontend once on the runner, moves `lib/web` to
+`web/build`, and passes `--build-arg FRONTEND_SOURCE=prebuilt` to the same
+Dockerfile. Both paths share the Go builder and runtime stages; Vite never
+runs under QEMU.
+
 ## First run
 
 Use the same executable, data directory, and external-key configuration for
