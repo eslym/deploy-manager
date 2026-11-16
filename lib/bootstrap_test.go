@@ -2,7 +2,9 @@ package lib
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -132,6 +134,116 @@ func TestSetupGrantPersistsAndIsSingleUse(t *testing.T) {
 	app.Handler().ServeHTTP(res, req)
 	if res.Code != http.StatusOK {
 		t.Fatalf("unconsumed grant should survive restart: %d", res.Code)
+	}
+}
+
+func TestCanonicalHTTPOriginRequiresOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name, origin string
+		allowHTTP    bool
+		valid        bool
+	}{
+		{"loopback denied by default", "http://localhost:5173", false, false},
+		{"loopback allowed", "http://localhost:5173", true, true},
+		{"IP loopback allowed", "http://127.0.0.1:5173", true, true},
+		{"non-loopback HTTP allowed", "http://example.test", true, true},
+		{"non-loopback HTTP denied by default", "http://example.test", false, false},
+		{"other schemes remain forbidden", "ftp://example.test", true, false},
+		{"HTTPS unaffected", "https://example.test", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			issuer, err := NewGrantIssuer(Config{
+				DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"),
+				CanonicalOrigin: tc.origin, AllowHTTPOrigin: tc.allowHTTP, InsecureLocalHTTP: true,
+			})
+			if (err == nil) != tc.valid {
+				t.Fatalf("origin %q with allowHTTP=%t: err=%v, want valid=%t", tc.origin, tc.allowHTTP, err, tc.valid)
+			}
+			if err == nil {
+				defer issuer.Close()
+				token, err := issuer.IssueRegistrationGrant()
+				if err != nil {
+					t.Fatal(err)
+				}
+				link, err := issuer.RegistrationURL(tc.origin, token)
+				if err != nil || !strings.HasPrefix(link, tc.origin+"/register#") {
+					t.Fatalf("registration link using %s: link=%q err=%v", tc.origin, link, err)
+				}
+			}
+		})
+	}
+}
+
+func TestOptedInHTTPOriginPassesRequestSecurityChecks(t *testing.T) {
+	dir := t.TempDir()
+	app, err := New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), CanonicalOrigin: "http://Manager.Example:80", AllowHTTPOrigin: true, InsecureLocalHTTP: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	for _, tc := range []struct {
+		host, origin string
+		want         bool
+	}{
+		{"manager.example", "http://manager.example", true},
+		{"manager.example", "http://manager.example:80", true},
+		{"attacker.example", "http://manager.example", false},
+		{"manager.example", "https://manager.example", false},
+	} {
+		r := httptest.NewRequest(http.MethodGet, "http://"+tc.host+"/", nil)
+		r.RemoteAddr = "192.0.2.9:1234"
+		r.Host = tc.host
+		r.Header.Set("Origin", tc.origin)
+		if got := app.secure(r) && app.originOK(r); got != tc.want {
+			t.Errorf("host=%q origin=%q got %t want %t", tc.host, tc.origin, got, tc.want)
+		}
+	}
+}
+
+func TestOptedInHTTPSessionCookieAuthenticatesDashboardRequest(t *testing.T) {
+	dir := t.TempDir()
+	app, err := New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), CanonicalOrigin: "http://manager.example", AllowHTTPOrigin: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	token := []byte("01234567890123456789012345678901")
+	digest := sha256.Sum256(token)
+	app.mu.Lock()
+	app.sessions[digest] = sessionState{expires: app.cfg.Now().Add(time.Hour), generation: app.credentialGeneration, authenticatedAt: app.cfg.Now()}
+	app.mu.Unlock()
+	r := httptest.NewRequest(http.MethodGet, "http://manager.example/api/session", nil)
+	r.RemoteAddr = "192.0.2.10:1234"
+	r.AddCookie(&http.Cookie{Name: app.cookieName(), Value: base64.RawURLEncoding.EncodeToString(token)})
+	w := httptest.NewRecorder()
+	app.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("authenticated HTTP session status = %d, want 200: %s", w.Code, w.Body.String())
+	}
+	if got := app.cookieName(); got != insecureSessionCookie {
+		t.Fatalf("HTTP cookie name = %q", got)
+	}
+	projects := httptest.NewRequest(http.MethodGet, "http://manager.example/api/projects", nil)
+	projects.RemoteAddr = "192.0.2.10:1234"
+	projects.AddCookie(&http.Cookie{Name: app.cookieName(), Value: base64.RawURLEncoding.EncodeToString(token)})
+	listed := httptest.NewRecorder()
+	app.Handler().ServeHTTP(listed, projects)
+	if listed.Code != http.StatusOK {
+		t.Fatalf("authenticated HTTP project listing status = %d, want 200: %s", listed.Code, listed.Body.String())
+	}
+	logout := httptest.NewRequest(http.MethodPost, "http://manager.example/api/logout", nil)
+	logout.RemoteAddr = "192.0.2.10:1234"
+	logout.Header.Set("Origin", "http://manager.example")
+	logout.AddCookie(&http.Cookie{Name: app.cookieName(), Value: base64.RawURLEncoding.EncodeToString(token)})
+	loggedOut := httptest.NewRecorder()
+	app.Handler().ServeHTTP(loggedOut, logout)
+	if loggedOut.Code != http.StatusNoContent {
+		t.Fatalf("HTTP logout status = %d, want 204: %s", loggedOut.Code, loggedOut.Body.String())
+	}
+	cookies := loggedOut.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != insecureSessionCookie || cookies[0].Secure || !cookies[0].HttpOnly {
+		t.Fatalf("HTTP session cookie clearing = %+v", cookies)
 	}
 }
 

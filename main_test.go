@@ -32,6 +32,7 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 	fs.String("data", "./data", "")
 	fs.String("listen", "127.0.0.1:8080", "")
 	fs.String("origin", "", "")
+	fs.Bool("allow-http-origin", false, "")
 	fs.String("tls-cert", "", "")
 	fs.String("tls-key", "", "")
 	fs.String("trusted-proxy", "", "")
@@ -53,7 +54,7 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 	lookup := func(key string) (string, bool) {
 		values := map[string]string{
 			"DM_DATA": "/env/data", "DM_LISTEN": "0.0.0.0:9000",
-			"DM_ORIGIN": "https://example.test", "DM_TLS_CERT": "cert.pem", "DM_TLS_KEY": "key.pem",
+			"DM_ORIGIN": "https://example.test", "DM_ALLOW_HTTP_ORIGIN": "true", "DM_TLS_CERT": "cert.pem", "DM_TLS_KEY": "key.pem",
 			"DM_TRUSTED_PROXY":         "172.18.0.0/16,192.0.2.1",
 			"DM_REPOSITORY_KEY_MASTER": "master.key", "DM_LOGIN_TTL": "3m", "DM_SESSION_TTL": "13h",
 			"DM_GIT_TIMEOUT": "4m", "DM_GRANT_TTL": "16m", "DM_RECENT_AUTH_TTL": "6m",
@@ -67,11 +68,12 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 	if err := applyEnvironmentDefaults(fs, lookup); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.Parse([]string{"--listen", "127.0.0.1:7777"}); err != nil {
+	if err := fs.Parse([]string{"--listen", "127.0.0.1:7777", "--allow-http-origin=false"}); err != nil {
 		t.Fatal(err)
 	}
 	want := map[string]string{
 		"data": "/env/data", "listen": "127.0.0.1:7777", "origin": "https://example.test",
+		"allow-http-origin": "false",
 		"tls-cert": "cert.pem", "tls-key": "key.pem", "trusted-proxy": "172.18.0.0/16,192.0.2.1", "repository-key-master": "master.key", "login-ttl": "3m0s",
 		"session-ttl": "13h0m0s", "git-timeout": "4m0s", "grant-ttl": "16m0s", "recent-auth-ttl": "6m0s",
 		"auth-rate-per-minute": "21", "publication-root": "/published", "deploy-max-files": "10001",
@@ -82,6 +84,37 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 		if got := fs.Lookup(name).Value.String(); got != value {
 			t.Errorf("%s = %q, want %q", name, got, value)
 		}
+	}
+}
+
+func TestGrantCommandAllowsHTTPOriginOnlyWhenEnabled(t *testing.T) {
+	binary := buildCommand(t)
+	for _, tc := range []struct {
+		name, origin, env string
+		args              []string
+		valid             bool
+	}{
+		{"default rejects HTTP origin", "http://localhost:5173", "", nil, false},
+		{"environment enables HTTP origin", "http://localhost:5173", "true", nil, true},
+		{"flag enables HTTP origin", "http://localhost:5173", "false", []string{"--allow-http-origin"}, true},
+		{"flag overrides environment", "http://localhost:5173", "true", []string{"--allow-http-origin=false"}, false},
+		{"non-loopback HTTP origin enabled", "http://example.test", "true", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := append([]string{"setup", "--data", t.TempDir()}, tc.args...)
+			cmd := boundedCommand(t, binary, args...)
+			cmd.Env = append(os.Environ(), "DM_ORIGIN="+tc.origin, "DM_ALLOW_HTTP_ORIGIN="+tc.env)
+			if tc.env == "" {
+				cmd.Env = append(os.Environ(), "DM_ORIGIN="+tc.origin)
+			}
+			output, err := cmd.CombinedOutput()
+			if tc.valid && (err != nil || !strings.Contains(string(output), tc.origin+"/register#")) {
+				t.Fatalf("expected setup link using %s: err=%v output=%q", tc.origin, err, output)
+			}
+			if !tc.valid && (err == nil || !strings.Contains(string(output), "canonical origin")) {
+				t.Fatalf("expected HTTP origin rejection: err=%v output=%q", err, output)
+			}
+		})
 	}
 }
 

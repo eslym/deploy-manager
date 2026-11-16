@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/bytemare/opaque"
@@ -14,8 +15,16 @@ import (
 )
 
 const (
-	sessionCookie = "__Host-deploy-manager-session"
+	sessionCookie         = "__Host-deploy-manager-session"
+	insecureSessionCookie = "deploy-manager-session"
 )
+
+func (a *App) cookieName() string {
+	if a.cfg.AllowHTTPOrigin && strings.HasPrefix(strings.ToLower(a.cfg.CanonicalOrigin), "http://") {
+		return insecureSessionCookie
+	}
+	return sessionCookie
+}
 
 type pendingLogin struct {
 	clientMAC  []byte
@@ -32,7 +41,7 @@ type sessionState struct {
 }
 
 func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
-	if !a.https(r) {
+	if !a.authSecure(r) {
 		http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 		return
 	}
@@ -101,7 +110,7 @@ func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) loginFinish(w http.ResponseWriter, r *http.Request) {
-	if !a.https(r) {
+	if !a.authSecure(r) {
 		http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 		return
 	}
@@ -168,13 +177,13 @@ func (a *App) loginFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	a.sessions[digest] = sessionState{expires: expires, generation: pending.generation, authenticatedAt: a.cfg.Now()}
 	a.mu.Unlock()
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: base64.RawURLEncoding.EncodeToString(token), Path: "/", Expires: expires, MaxAge: int(a.cfg.SessionTTL.Seconds()), Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: a.cookieName(), Value: base64.RawURLEncoding.EncodeToString(token), Path: "/", Expires: expires, MaxAge: int(a.cfg.SessionTTL.Seconds()), Secure: a.cookieName() == sessionCookie, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *App) sessionStatus(w http.ResponseWriter, r *http.Request) {
-	if !a.https(r) {
+	if !a.authSecure(r) {
 		http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 		return
 	}
@@ -188,7 +197,7 @@ func (a *App) sessionStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) logout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost || !a.https(r) || !a.originOK(r) || !a.allow(r) {
+	if r.Method != http.MethodPost || !a.authSecure(r) || !a.originOK(r) || !a.allow(r) {
 		http.Error(w, "request rejected", http.StatusForbidden)
 		return
 	}
@@ -197,13 +206,13 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, digest)
 		a.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: a.cookieName(), Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: a.cookieName() == sessionCookie, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *App) session(r *http.Request) ([32]byte, bool) {
-	cookie, err := r.Cookie(sessionCookie)
+	cookie, err := r.Cookie(a.cookieName())
 	if err != nil || len(cookie.Value) > 128 {
 		return [32]byte{}, false
 	}

@@ -25,15 +25,25 @@ Issue a setup link and run the server:
 
 `setup` prints a short-lived, single-use registration URL once. Open it in a
 browser while the server is running. Loopback-only HTTP is available for local
-setup; non-loopback serving can use HTTP only behind an HTTPS-terminating proxy
-with network access restricted to that proxy. Use an HTTPS `--origin` for the
-public application origin. `setup`, `recover`, and `serve` share the
+setup; non-loopback serving uses HTTPS by default, normally behind an
+HTTPS-terminating proxy with network access restricted to that proxy. Use an
+HTTPS `--origin` for the public application origin. `setup`, `recover`, and `serve` share the
 `DM_DATA`, `DM_REPOSITORY_KEY_MASTER`, and `DM_ORIGIN` environment defaults;
 explicit flags take precedence. With no origin configured, a loopback listener
 uses its local HTTP address for the link. Loopback peers are trusted by default
 to set `X-Forwarded-Proto: https`; `--trusted-proxy` adds non-loopback proxy IPs
 or CIDRs to that trust list. The application checks the request Origin. Direct
 HTTPS remains available with `--tls-cert` and `--tls-key`.
+
+For an intentionally insecure deployment or local Vite development,
+`--allow-http-origin` (or `DM_ALLOW_HTTP_ORIGIN=true`) permits an HTTP `--origin`
+and enables browser authentication/dashboard requests on that exact HTTP origin.
+For Vite's default origin, pass `--origin http://localhost:5173
+--allow-http-origin` to both `setup` and `serve`. OPAQUE does not transmit the
+password to the server, but HTTP traffic can be intercepted or modified,
+including grants, OPAQUE exchanges, and session cookies. Use this only on a
+trusted isolated network. The session cookie necessarily lacks `Secure` in this
+mode. HTTPS remains the default and is unchanged when the option is omitted.
 
 The confirmed singleton policy applies only to the main daemon, not local CLI
 utilities. Setup and password-recovery grant issuance must remain usable while

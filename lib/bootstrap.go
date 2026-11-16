@@ -38,6 +38,7 @@ type Config struct {
 	OPAQUEKeyPath         string
 	RepositoryKeyPath     string
 	CanonicalOrigin       string
+	AllowHTTPOrigin       bool
 	TrustedProxies        []netip.Prefix
 	GrantTTL              time.Duration
 	LoginTTL              time.Duration
@@ -132,8 +133,8 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 	}
 	if cfg.CanonicalOrigin != "" {
 		origin, err := url.Parse(cfg.CanonicalOrigin)
-		if err != nil || origin.Scheme != "https" || origin.Host == "" || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
-			return nil, errors.New("canonical origin must be an HTTPS origin without path, query, or credentials")
+		if err != nil || (origin.Scheme != "https" && !(cfg.AllowHTTPOrigin && origin.Scheme == "http")) || origin.Hostname() == "" || origin.User != nil || origin.Opaque != "" || origin.Path != "" || origin.RawQuery != "" || origin.ForceQuery || origin.Fragment != "" {
+			return nil, errors.New("canonical origin must be an HTTPS origin without path, query, or credentials (HTTP requires allow-http-origin)")
 		}
 	}
 	dbPath, keyPath := filepath.Clean(cfg.DatabasePath), filepath.Clean(cfg.OPAQUEKeyPath)
@@ -573,8 +574,8 @@ func (a *App) grantURL(base, token, route string) (string, error) {
 	if u.Hostname() == "" || u.User != nil || u.Fragment != "" {
 		return "", errors.New("registration URL must have a valid host and no user info or fragment")
 	}
-	if u.Scheme != "https" && !(a.cfg.InsecureLocalHTTP && isLoopback(u.Hostname())) {
-		return "", errors.New("registration URL must use HTTPS; HTTP is allowed only for loopback")
+	if u.Scheme != "https" && !(u.Scheme == "http" && (a.cfg.AllowHTTPOrigin || a.cfg.InsecureLocalHTTP && isLoopback(u.Hostname()))) {
+		return "", errors.New("registration URL must use HTTPS; HTTP requires allow-http-origin except on loopback")
 	}
 	u.Path = route
 	u.RawQuery = ""
@@ -638,7 +639,7 @@ func (a *App) Handler() http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/webhooks/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
-		if (r.URL.Path == "/login" || r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/") || r.URL.Path == "/account/password" || strings.HasPrefix(r.URL.Path, "/account/")) && !a.https(r) {
+		if (r.URL.Path == "/login" || r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/") || r.URL.Path == "/account/password" || strings.HasPrefix(r.URL.Path, "/account/")) && !a.authSecure(r) {
 			http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 			return
 		}
@@ -798,7 +799,7 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 func (a *App) secure(r *http.Request) bool {
-	if a.https(r) {
+	if a.authSecure(r) {
 		return true
 	}
 	ip, _, e := net.SplitHostPort(r.RemoteAddr)
@@ -807,6 +808,18 @@ func (a *App) secure(r *http.Request) bool {
 		host = strings.Trim(r.Host, "[]")
 	}
 	return a.cfg.InsecureLocalHTTP && e == nil && isLoopback(ip) && isLoopback(host)
+}
+
+// authSecure permits cleartext only when explicitly configured for this origin.
+func (a *App) authSecure(r *http.Request) bool {
+	if a.https(r) {
+		return true
+	}
+	if !a.cfg.AllowHTTPOrigin || r.TLS != nil || a.cfg.CanonicalOrigin == "" {
+		return false
+	}
+	canonical, err := url.Parse(a.cfg.CanonicalOrigin)
+	return err == nil && canonical.Scheme == "http" && sameOrigin(canonical, requestOrigin(r, "http"))
 }
 
 func (a *App) https(r *http.Request) bool {
@@ -845,7 +858,32 @@ func (a *App) originOK(r *http.Request) bool {
 		}
 		scheme, host = canonical.Scheme, canonical.Host
 	}
-	return e == nil && u.User == nil && u.Path == "" && u.RawQuery == "" && u.Fragment == "" && u.Scheme == scheme && strings.EqualFold(u.Host, host)
+	canonical, parseErr := url.Parse(scheme + "://" + host)
+	return e == nil && parseErr == nil && sameOrigin(u, canonical)
+}
+
+func requestOrigin(r *http.Request, scheme string) *url.URL {
+	u, _ := url.Parse(scheme + "://" + r.Host)
+	return u
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	if a == nil || b == nil || a.User != nil || b.User != nil || a.Opaque != "" || b.Opaque != "" || a.Path != "" || b.Path != "" || a.RawQuery != "" || b.RawQuery != "" || a.ForceQuery || b.ForceQuery || a.Fragment != "" || b.Fragment != "" || a.Hostname() == "" || b.Hostname() == "" || !strings.EqualFold(a.Scheme, b.Scheme) || !strings.EqualFold(a.Hostname(), b.Hostname()) {
+		return false
+	}
+	port := func(u *url.URL) string {
+		if p := u.Port(); p != "" {
+			return p
+		}
+		if strings.EqualFold(u.Scheme, "http") {
+			return "80"
+		}
+		if strings.EqualFold(u.Scheme, "https") {
+			return "443"
+		}
+		return ""
+	}
+	return port(a) == port(b)
 }
 func (a *App) requestScheme(r *http.Request) string {
 	if a.https(r) {

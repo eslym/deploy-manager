@@ -170,7 +170,7 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 	a.sessions = make(map[[32]byte]sessionState)
 	a.logins = make(map[string]pendingLogin)
 	a.registrationTxs = make(map[string]registrationTransaction)
-	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode})
+	http.SetCookie(w, &http.Cookie{Name: a.cookieName(), Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: a.cookieName() == sessionCookie, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -194,7 +194,7 @@ func safeSSHRemote(raw string) (*url.URL, string, int, string, error) {
 func (p *projectManager) repoPath(id string) string { return filepath.Join(p.root, id) }
 
 func (a *App) projectAuthorized(w http.ResponseWriter, r *http.Request, mutation bool) bool {
-	if !a.https(r) {
+	if !a.authSecure(r) {
 		http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 		return false
 	}

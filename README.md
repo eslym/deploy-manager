@@ -49,8 +49,9 @@ and the [current cache-clearing limitation](#caches-and-job-history).
 - A supported local filesystem with atomic directory exchange
   (`renameat2(RENAME_EXCHANGE)`). Publication capability is checked at startup;
   unsupported filesystems fail closed rather than falling back to copying.
-- HTTPS for login, dashboard operations, and webhooks, provided directly or by a
-  trusted local reverse proxy.
+- HTTPS for login, dashboard operations, and webhooks by default, provided
+  directly or by a trusted local reverse proxy. The explicit insecure HTTP-origin
+  opt-in is an exception for isolated/trusted networks; see below.
 - A separate web server if you want to serve the published sites.
 
 **Building from source**
@@ -120,6 +121,15 @@ replace the hostname and certificate paths:
 This assumes external HTTPS traffic for `manager.example.com` reaches port 8443.
 If you access that port directly, include `:8443` in `--origin`.
 
+HTTPS is required by default. An HTTP origin requires `--allow-http-origin` on
+each relevant `setup`, `recover`, and `serve` command; `DM_ALLOW_HTTP_ORIGIN=true`
+is the environment equivalent, with explicit flags taking precedence. This
+opt-in permits HTTP authentication and dashboard requests only on the configured
+HTTP origin, using a session cookie without the `Secure` attribute. Although
+OPAQUE does not send the password to the server, HTTP traffic can be intercepted
+or modified, including grants, OPAQUE exchanges, and sessions. Use it only on a
+trusted isolated network; HTTPS remains the recommended/default mode.
+
 Open the setup URL printed by the first command while the server is running.
 It expires after 15 minutes by default and can be used only once. Registration
 is disabled after the administrator account is created. Then sign in at
@@ -172,7 +182,8 @@ CIDR if it is not loopback. TLS can still be enabled directly by setting both
 `DM_TLS_CERT` and `DM_TLS_KEY` (or passing the corresponding flags). The image
 runs `serve` by default; pass `setup` or `recover` as the container command to
 use those CLI modes with the same mounted data and key paths. All three commands
-honor `DM_DATA`, `DM_REPOSITORY_KEY_MASTER`, and `DM_ORIGIN`, so
+honor `DM_DATA`, `DM_REPOSITORY_KEY_MASTER`, `DM_ORIGIN`, and
+`DM_ALLOW_HTTP_ORIGIN`, so
 the same container environment works for grant issuance and the running daemon.
 For example:
 
@@ -186,8 +197,8 @@ The printed link uses the configured public origin; without `DM_ORIGIN`, a
 loopback listener produces a local HTTP link and non-loopback HTTP remains
 disallowed for public setup links.
 
-Loopback HTTP is allowed for initial local registration, but it is **not** a
-substitute for HTTPS login and authenticated dashboard use.
+Loopback HTTP is available for local setup. Without the explicit insecure
+opt-in, HTTP is **not** allowed for login or authenticated dashboard use.
 
 ## Publish a site
 
@@ -387,15 +398,21 @@ docker compose -f tests/compose.yaml run --build --rm test
 See [tests/README.md](tests/README.md) for the development shell, shared caches,
 and cleanup. The [frontend README](web/README.md) describes the SPA. Vite's
 development server (`bun run dev` in `web/`) proxies backend paths to
-`http://127.0.0.1:8080`; `GO_BACKEND_URL` overrides that destination. Authenticated
-browser development still needs HTTPS and the same Origin/cookie protections
-as production.
+`http://127.0.0.1:8080`; `GO_BACKEND_URL` overrides that destination. To use the
+default `http://localhost:5173` Vite origin for authenticated development, both
+`serve` and `setup` need `--origin http://localhost:5173 --allow-http-origin`.
+This deliberately uses insecure HTTP and a non-Secure session cookie; OPAQUE
+keeps the password out of the request, but HTTP traffic remains interceptable
+and modifiable. Use a trusted isolated network. HTTPS remains the default for
+non-development deployments.
 
 ## Security and distribution
 
 OPAQUE authentication requires first-party JavaScript/WASM. Crypto initialization
-failures do not fall back to posting passwords. HTTPS, secure server-side
-sessions, Origin checks, and rate limits remain required.
+failures do not fall back to posting passwords. HTTPS, Secure server-side
+sessions, Origin checks, and rate limits remain the default security model. The
+explicit HTTP-origin opt-in is an insecure exception: its session cookie cannot
+be Secure, and HTTP can expose or alter OPAQUE exchanges, grants, and sessions.
 
 The pinned cryptographic dependencies have explicitly accepted residual risks;
 tests and vulnerability scans are not an independent cryptographic audit. Read

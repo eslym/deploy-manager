@@ -29,7 +29,8 @@ func main() {
 	flags := flag.NewFlagSet(command, flag.ExitOnError)
 	data := flags.String("data", "./data", "application data directory")
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP(S) listen address")
-	origin := flags.String("origin", "", "canonical HTTPS origin used by the application")
+	origin := flags.String("origin", "", "canonical HTTPS origin used by the application (HTTP requires --allow-http-origin)")
+	allowHTTPOrigin := flags.Bool("allow-http-origin", false, "allow insecure HTTP origin end-to-end (credentials and sessions are unencrypted)")
 	cert := flags.String("tls-cert", "", "optional TLS certificate (requires --tls-key)")
 	key := flags.String("tls-key", "", "TLS private key")
 	trustedProxy := flags.String("trusted-proxy", "", "comma-separated proxy IPs or CIDRs trusted to set X-Forwarded-Proto (loopback trusted by default)")
@@ -65,7 +66,7 @@ func main() {
 	if repositoryMasterPath == "" {
 		repositoryMasterPath = dataPath("repository-key-master.key")
 	}
-	cfg := lib.Config{DatabasePath: dataPath("state.sqlite"), OPAQUEKeyPath: dataPath("opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention, FetchRetryAttempts: *fetchRetryAttempts}
+	cfg := lib.Config{DatabasePath: dataPath("state.sqlite"), OPAQUEKeyPath: dataPath("opaque-server.key"), RepositoryKeyPath: repositoryMasterPath, CanonicalOrigin: *origin, AllowHTTPOrigin: *allowHTTPOrigin, InsecureLocalHTTP: true, GrantTTL: *grantTTL, LoginTTL: *loginTTL, SessionTTL: *sessionTTL, RecentAuthTTL: *recentAuthTTL, AuthRequestsPerMinute: *authRate, GitTimeout: *gitTimeout, DeploymentRoot: *publicationRoot, DeployMaxFiles: *deployMaxFiles, DeployMaxBytes: *deployMaxBytes, DeployTimeout: *deployTimeout, DeployConcurrency: *deployConcurrency, DeployGracePeriod: *deployGrace, JobRetention: *jobRetention, FetchRetryAttempts: *fetchRetryAttempts}
 	switch command {
 	case "setup", "recover":
 		app, err := lib.NewGrantIssuer(cfg)

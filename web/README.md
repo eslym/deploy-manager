@@ -14,7 +14,15 @@ session endpoints; the static shell itself contains no protected data.
 
 Serve login and dashboard pages over HTTPS, either directly with `--tls-cert`
 and `--tls-key` or through a trusted loopback reverse proxy. Configure the
-external HTTPS origin with `--origin https://manager.example`. The default
+external HTTPS origin with `--origin https://manager.example`. The explicit
+`--allow-http-origin`/`DM_ALLOW_HTTP_ORIGIN=true` opt-in supports an HTTP origin
+end-to-end, including login, authenticated requests, and a non-Secure session
+cookie. This is insecure: although OPAQUE does not send the password to the
+server, HTTP traffic can be intercepted or modified, including grants, OPAQUE
+exchanges, and sessions. HTTPS remains the default and recommendation. For local
+Vite development, configure both `setup` and `serve` with `--origin
+http://localhost:5173 --allow-http-origin`, then use `http://localhost:5173` in
+the browser. The default
 session lifetime is 12 hours and can be changed with `--session-ttl`; sessions
 are intentionally invalidated on server restart, while the administrator
 credential remains stored durably.
