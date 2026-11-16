@@ -67,7 +67,7 @@ async function waitForNoopHistory(page, deploymentID, card) {
     const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
     return jobs[0]?.status === "noop";
   }, "latest no-op deployment job");
-  await card.getByRole("region", { name: "Job history for Production site" }).getByText("No changes", { exact: true }).waitFor();
+  await card.getByRole("region", { name: "Job history for Production site" }).locator("ul > li").first().getByText("No changes", { exact: true }).waitFor();
 }
 
 async function startApplication(cert, key, gitCA) {
@@ -293,6 +293,51 @@ try {
   await page.getByText("Live", { exact: true }).waitFor();
   const publishedPath = join(dir, "state.sqlite.publications", deploymentID);
   const firstDirectoryIdentity = (await stat(publishedPath)).ino;
+  milestone("steady deployment history during background refreshes");
+  const realJobHistory = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+  if (!realJobHistory.length) throw new Error("deployment history fixture has no recorded jobs");
+  const historyJob = (status, id) => ({ ...realJobHistory[0], id, status, updatedAt: new Date().toISOString() });
+  const historyResponses = [
+    [historyJob("queued", "history-stable-a"), historyJob("succeeded", "history-stable-b")],
+    [historyJob("running", "history-stable-a"), historyJob("succeeded", "history-stable-b")],
+    [historyJob("succeeded", "history-stable-a"), historyJob("succeeded", "history-stable-b")]
+  ];
+  let historyPollCount = 0;
+  let heldHistoryPolls = 0;
+  const releaseHistoryPolls = [];
+  await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
+    if (route.request().method() !== "GET") return route.continue();
+    const poll = ++historyPollCount;
+    if (poll === 2 || poll === 3) {
+      heldHistoryPolls++;
+      await new Promise(resolveHistory => releaseHistoryPolls.push(resolveHistory));
+    }
+    if (poll === 4) {
+      await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE POLLING FAILURE" });
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(historyResponses[Math.min(poll - 1, 2)]) });
+  });
+  const stableHistory = page.getByRole("region", { name: "Job history for Production site" });
+  await stableHistory.getByText("Queued", { exact: true }).waitFor();
+  if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("initial job history list was not rendered");
+  for (const [poll, status] of [[2, "Queued"], [3, "Running"]]) {
+    await waitFor(() => heldHistoryPolls >= poll - 1, `delayed history refresh ${poll}`);
+    await stableHistory.getByText(status, { exact: true }).waitFor();
+    if (await stableHistory.getByText("Loading history…", { exact: true }).count()) throw new Error("background polling replaced visible deployment history with a loading state");
+    if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("background polling changed the visible history list while a refresh was pending");
+    releaseHistoryPolls[poll - 2]();
+    await stableHistory.getByText(poll === 2 ? "Running" : "Succeeded", { exact: true }).first().waitFor();
+  }
+  await stableHistory.getByRole("alert").filter({ hasText: "Could not load deployment history" }).waitFor();
+  await stableHistory.getByText("Succeeded", { exact: true }).first().waitFor();
+  if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("failed history refresh discarded the previously loaded jobs");
+  if ((await stableHistory.innerText()).includes("SENSITIVE POLLING FAILURE")) throw new Error("history refresh exposed an HTTP response body");
+  await waitFor(() => historyPollCount >= 5, "deployment history recovery poll");
+  await waitFor(async () => !(await stableHistory.getByRole("alert").count()), "deployment history recovery");
+  await stableHistory.getByText("Succeeded", { exact: true }).first().waitFor();
+  if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("successful history recovery did not retain the visible job list");
+  await page.unroute(`**/api/deployments/${deploymentID}/jobs`);
   const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
   const featureCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
   milestone("open rollback history");
@@ -538,11 +583,21 @@ try {
   const sshRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
   milestone("configure private LFS and publish SSH deployment");
+  let oldProjectHistoryPolls = 0;
+  await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
+    if (route.request().method() === "GET") oldProjectHistoryPolls++;
+    await route.continue();
+  });
   await page.getByText("SSH fixture site", { exact: true }).click();
   await page.getByLabel("LFS server URL").waitFor();
   const sshEmptyLfs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), sshProject.id);
   if (!Array.isArray(sshEmptyLfs.settings.objectOrigins) || sshEmptyLfs.settings.objectOrigins.length !== 0) throw new Error(`ordinary SSH repository LFS settings had an inconsistent shape: ${JSON.stringify(sshEmptyLfs)}`);
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("unconfigured project displayed unexpected LFS destinations");
+  await page.getByText("No deployments for this project yet.", { exact: true }).waitFor();
+  const oldProjectPollBaseline = oldProjectHistoryPolls;
+  await new Promise(resolveWait => setTimeout(resolveWait, 2200));
+  if (oldProjectHistoryPolls !== oldProjectPollBaseline) throw new Error("deployment history polling continued after switching projects");
+  await page.unroute(`**/api/deployments/${deploymentID}/jobs`);
   await page.getByLabel("LFS server URL").fill(`${fixtureOrigin}/private-lfs`);
   await page.getByLabel("Object download origins").fill(fixtureOrigin);
   await page.getByLabel("Allow downloads from internal network addresses").check();
@@ -632,6 +687,18 @@ try {
   if (recreatedProject.gitCacheBytes !== 0 || recreatedProject.lfsCacheBytes !== 0) throw new Error(`cache sizes after recreation are not zero: ${JSON.stringify(recreatedProject)}`);
   await cacheSection.getByText("Git cache: 0 bytes · LFS cache: 0 bytes").waitFor();
   if ((await readFile(join(publishedPath, "index.html"), "utf8")) !== liveBeforeCacheRecreation) throw new Error("cache recreation changed live published content");
+  let leavingViewHistoryPolls = 0;
+  await page.route(`**/api/deployments/${pinnedDeploymentResponse.body.id}/jobs`, async route => {
+    if (route.request().method() === "GET") leavingViewHistoryPolls++;
+    await route.continue();
+  });
+  await waitFor(() => leavingViewHistoryPolls > 0, "active deployment history polling before leaving dashboard");
+  await page.goto(`https://${appListen}/account/password`, { waitUntil: "domcontentloaded" });
+  await page.getByLabel("Current password").waitFor();
+  const pollCountAfterLeaving = leavingViewHistoryPolls;
+  await new Promise(resolveWait => setTimeout(resolveWait, 2200));
+  if (leavingViewHistoryPolls !== pollCountAfterLeaving) throw new Error("deployment history polling continued after leaving the dashboard");
+  await page.unroute(`**/api/deployments/${pinnedDeploymentResponse.body.id}/jobs`);
   if (await httpsRequestStatus("127.0.0.1", 18441, "/__fixture/fail", "POST") !== 204) throw new Error("could not make the Git server unavailable for the missing-cache check");
   const deployPinnedAfterCacheClear = await page.evaluate(async id => {
     const response = await fetch(`/api/deployments/${id}/hard-redeploy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });

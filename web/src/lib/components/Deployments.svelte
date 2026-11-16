@@ -28,6 +28,7 @@
 	let { projectId }: { projectId: string } = $props();
 	let refs = $state<Ref[]>([]);
 	let refsLoaded = false;
+	let deploymentsLoaded = $state(false);
 	let lastFetched = $state<string | null>(null);
 	let deployments = $state<Deployment[]>([]);
 	let jobs = $state<Record<string, Job[]>>({});
@@ -78,46 +79,60 @@
 			);
 		return response.status === 204 ? null : response.json();
 	}
-	async function load(id = projectId) {
-		const version = loadVersion;
+	async function load(id = projectId, viewVersion = loadViewVersion) {
+		const version = ++loadVersion;
 		try {
 			const [all, projects, cachedRefs]: [Deployment[], Project[], Ref[]] = await Promise.all([
 				request('/api/deployments'),
 				request('/api/projects'),
 				request(`/api/projects/${id}/refs`)
 			]);
-			if (version !== loadVersion || id !== projectId) return;
+			if (version !== loadVersion || viewVersion !== loadViewVersion || id !== projectId) return;
 			refs = cachedRefs;
 			refsLoaded = true;
 			lastFetched = projects.find((project) => project.id === id)?.lastFetched ?? null;
 			const current = all.filter((item) => item.projectId === id);
 			deployments = current;
+			deploymentsLoaded = true;
+			const currentIds = new Set(current.map((item) => item.id));
+			for (const jobId of Object.keys(jobs)) if (!currentIds.has(jobId)) delete jobs[jobId];
+			for (const jobId of Object.keys(jobHistoryState))
+				if (!currentIds.has(jobId)) delete jobHistoryState[jobId];
 			for (const item of current) {
 				targetSelections[item.id] ??=
 					item.targetKind === 'branch' || item.targetKind === 'tag'
 						? `${item.targetKind}:${item.targetName}`
 						: `commit:${item.commit}`;
 			}
-			for (const item of current) jobHistoryState[item.id] = { status: 'loading' };
 			await Promise.all(
 				current.map(async (item) => {
+					if (!jobs[item.id]) jobHistoryState[item.id] = { status: 'loading' };
 					try {
 						const history: Job[] = await request(`/api/deployments/${item.id}/jobs`);
-						if (version !== loadVersion || id !== projectId) return;
+						if (version !== loadVersion || viewVersion !== loadViewVersion || id !== projectId)
+							return;
 						jobs[item.id] = history;
 						jobHistoryState[item.id] = { status: 'loaded' };
 					} catch (cause) {
-						if (version !== loadVersion || id !== projectId) return;
+						if (version !== loadVersion || viewVersion !== loadViewVersion || id !== projectId)
+							return;
 						jobHistoryState[item.id] = {
 							status: 'error',
-							error: cause instanceof Error ? cause.message : 'Could not load deployment history.'
+							error:
+								cause instanceof Error &&
+								[
+									'The request could not be completed. Try again shortly.',
+									'The request was rejected. Refresh and try again.'
+								].includes(cause.message)
+									? cause.message
+									: 'The history could not be refreshed. Try again shortly.'
 						};
 					}
 				})
 			);
-			if (version !== loadVersion || id !== projectId) return;
+			if (version !== loadVersion || viewVersion !== loadViewVersion || id !== projectId) return;
 		} catch (cause) {
-			if (version === loadVersion && id === projectId) {
+			if (version === loadVersion && viewVersion === loadViewVersion && id === projectId) {
 				const message = cause instanceof Error ? cause.message : 'Could not load deployments.';
 				error = refsLoaded
 					? `${message} Refresh and try again. Your current branches and tags are still shown.`
@@ -125,6 +140,7 @@
 			}
 		}
 	}
+	let loadViewVersion = 0;
 	async function create(event: SubmitEvent) {
 		event.preventDefault();
 		if (busy || !selectedTarget) return;
@@ -234,18 +250,30 @@
 	}
 	$effect(() => {
 		const id = projectId;
-		const version = ++loadVersion;
+		const version = ++loadViewVersion;
+		++loadVersion;
+		refs = [];
+		refsLoaded = false;
+		deploymentsLoaded = false;
+		lastFetched = null;
+		deployments = [];
+		jobs = {};
+		jobHistoryState = {};
+		targetSelections = {};
+		targetSearches = {};
+		deleteConfirmation = '';
 		let active = true;
-		let timeout: number;
+		let timeout: number | undefined;
 		const poll = async () => {
-			if (!active || version !== loadVersion) return;
-			await load(id);
-			if (active && version === loadVersion) timeout = window.setTimeout(poll, 2000);
+			if (!active || version !== loadViewVersion) return;
+			await load(id, version);
+			if (active && version === loadViewVersion) timeout = window.setTimeout(poll, 2000);
 		};
 		void poll();
 		return () => {
 			active = false;
-			window.clearTimeout(timeout);
+			if (version === loadViewVersion) ++loadViewVersion;
+			if (timeout !== undefined) window.clearTimeout(timeout);
 		};
 	});
 </script>
@@ -441,14 +469,15 @@
 					aria-label={`Job history for ${item.name}`}
 				>
 					<h4 class="m-0 text-base font-semibold text-[#243528]">Deployment history</h4>
-					{#if jobHistoryState[item.id]?.status === 'loading'}
+					{#if jobHistoryState[item.id]?.status === 'loading' && !jobs[item.id]}
 						<p class="mt-2 text-sm text-[#58645b]">Loading history…</p>
 					{:else if jobHistoryState[item.id]?.status === 'error'}
 						<p role="alert" class="mt-2 text-sm text-red-800">
-							Could not load deployment history: {jobHistoryState[item.id].error} The app will retry automatically;
-							refresh the page to retry now.
+							Could not load deployment history; refresh failed: {jobHistoryState[item.id].error} The
+							app will retry automatically; refresh the page to retry now.
 						</p>
-					{:else if jobHistoryState[item.id]?.status === 'loaded' && jobs[item.id]?.length}
+					{/if}
+					{#if jobs[item.id]?.length}
 						<ul class="mt-3 grid gap-3 p-0">
 							{#each jobs[item.id] as job (job.id)}
 								<li class="list-none rounded-lg border border-[#d5ddd4] bg-[#fafbf9] p-3">
@@ -482,7 +511,7 @@
 				</section>
 			</li>
 		{:else}<li class="list-none py-2 text-sm text-[#58645b]">
-				No deployments for this project yet.
+				{deploymentsLoaded ? 'No deployments for this project yet.' : 'Loading deployments…'}
 			</li>{/each}
 	</ul>
 </section>
