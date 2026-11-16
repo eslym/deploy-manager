@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -65,6 +66,31 @@ func TestLFSSettingsRequireAuthenticatedIndependentApprovalAndPersist(t *testing
 	app.sessions[digest] = sessionState{expires: time.Now().Add(time.Hour), generation: app.credentialGeneration, authenticatedAt: time.Now()}
 	app.mu.Unlock()
 	client := server.Client()
+	getEmptyReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/projects/"+projectID+"/lfs", nil)
+	getEmptyReq.AddCookie(&http.Cookie{Name: sessionCookie, Value: base64.RawURLEncoding.EncodeToString(token)})
+	emptyResult, err := client.Do(getEmptyReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptyBody, readErr := io.ReadAll(emptyResult.Body)
+	emptyResult.Body.Close()
+	if readErr != nil || emptyResult.StatusCode != http.StatusOK {
+		t.Fatalf("unconfigured settings GET status = %d, read error = %v", emptyResult.StatusCode, readErr)
+	}
+	var emptyShape map[string]json.RawMessage
+	if err := json.Unmarshal(emptyBody, &emptyShape); err != nil {
+		t.Fatalf("decode unconfigured settings response: %v", err)
+	}
+	var emptySettings map[string]json.RawMessage
+	if err := json.Unmarshal(emptyShape["settings"], &emptySettings); err != nil {
+		t.Fatalf("decode unconfigured settings: %v", err)
+	}
+	if got := string(emptySettings["objectOrigins"]); got != "[]" {
+		t.Fatalf("unconfigured objectOrigins JSON = %s, want [] (raw response: %s)", got, emptyBody)
+	}
+	if got := string(emptySettings["endpoint"]); got != `""` {
+		t.Fatalf("unconfigured endpoint JSON = %s, want empty string", got)
+	}
 	post := func(body string) *http.Response {
 		req, _ := http.NewRequest(http.MethodPost, server.URL+"/api/projects/"+projectID+"/lfs", bytes.NewBufferString(body))
 		req.Header.Set("Origin", server.URL)

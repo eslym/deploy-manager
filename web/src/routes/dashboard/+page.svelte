@@ -224,13 +224,17 @@
 		lfsSuggestedEndpoint = '';
 		try {
 			const result: {
-				settings: { endpoint: string; objectOrigins: string[]; allowInternal: boolean };
-				suggestedEndpoint: string;
+				settings?: {
+					endpoint?: string | null;
+					objectOrigins?: string[] | null;
+					allowInternal?: boolean | null;
+				} | null;
+				suggestedEndpoint?: string | null;
 			} = await request(`/api/projects/${id}/lfs`);
-			lfsEndpoint = result.settings.endpoint;
-			lfsOrigins = result.settings.objectOrigins.join('\n');
-			lfsAllowInternal = result.settings.allowInternal;
-			lfsSuggestedEndpoint = result.suggestedEndpoint;
+			lfsEndpoint = result.settings?.endpoint ?? '';
+			lfsOrigins = (result.settings?.objectOrigins ?? []).join('\n');
+			lfsAllowInternal = result.settings?.allowInternal ?? false;
+			lfsSuggestedEndpoint = result.suggestedEndpoint ?? '';
 		} catch (cause) {
 			lfsError = cause instanceof Error ? cause.message : 'Could not load LFS settings.';
 		} finally {

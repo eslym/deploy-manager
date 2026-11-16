@@ -30,7 +30,7 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	remote := storedProject.RemoteURL
 	if !mutation {
-		settings := lfsProjectSettings{}
+		settings := lfsProjectSettings{ObjectOrigins: []string{}}
 		stored, err := a.store.ProjectLFSSetting.Get(r.Context(), id)
 		if err == nil {
 			if json.Unmarshal([]byte(stored.ObjectOrigins), &settings.ObjectOrigins) != nil || json.Unmarshal([]byte(stored.InternalAddresses), &settings.InternalAddresses) != nil {
