@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,7 +66,20 @@ func TestDaemonStartupFailsClosedWhenRunningExecutablePathIsRemoved(t *testing.T
 			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
 			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE provenance_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE provenance_upgrade_witness;\n")},
 		}
+		dbPath, err := filepath.Abs(cfg.DatabasePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
+		var pending pendingUpgrade
+		if err := preflightExistingSchema(dbURL, cfg); !errors.As(err, &pending) || pending.source != 1 || pending.target != 2 {
+			t.Fatalf("test fixture is not a valid pending 1-to-2 daemon upgrade: pending=%+v err=%v", pending, err)
+		}
 		provenanceBefore, err := os.ReadFile(provenancePath(cfg))
+		if err != nil {
+			t.Fatal(err)
+		}
+		databaseBefore, err := os.ReadFile(cfg.DatabasePath)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -104,6 +118,15 @@ func TestDaemonStartupFailsClosedWhenRunningExecutablePathIsRemoved(t *testing.T
 		provenanceAfter, err := os.ReadFile(provenancePath(cfg))
 		if err != nil || !bytes.Equal(provenanceBefore, provenanceAfter) {
 			t.Fatalf("failed daemon changed provenance: %v", err)
+		}
+		databaseAfter, err := os.ReadFile(cfg.DatabasePath)
+		if err != nil || !bytes.Equal(databaseBefore, databaseAfter) {
+			t.Fatalf("invalid executable pathname changed database before maintenance: %v", err)
+		}
+		for _, path := range []string{cfg.DatabasePath + ".maintenance.json", cfg.DatabasePath + ".upgrade-backups"} {
+			if _, err := os.Lstat(path); !os.IsNotExist(err) {
+				t.Fatalf("invalid executable pathname created upgrade artifact %s: %v", path, err)
+			}
 		}
 		return
 	}

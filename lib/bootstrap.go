@@ -125,6 +125,11 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 	if err := CheckMaintenance(cfg); err != nil {
 		return nil, err
 	}
+	if daemonUpgrade {
+		if err := preflightRunningExecutablePath(); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.DatabasePath == "" || cfg.OPAQUEKeyPath == "" {
 		return nil, errors.New("database and external OPAQUE key paths are required")
 	}
@@ -231,6 +236,9 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 				return nil, err
 			}
 			if err := CheckMaintenance(cfg); err != nil {
+				return nil, err
+			}
+			if err := preflightRunningExecutablePath(); err != nil {
 				return nil, err
 			}
 			priorNow, err := inspectGuardedStorage(cfg)

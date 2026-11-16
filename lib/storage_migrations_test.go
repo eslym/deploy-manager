@@ -782,7 +782,7 @@ func TestRealProcessCrashDuringPartialBackupCopyStaysLocked(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	databaseIdentity, err := databaseFileIdentity(cfg.DatabasePath)
+	databaseIdentity, err := filesystemPathIdentity(cfg.DatabasePath)
 	if err != nil {
 		t.Fatal(err)
 	}

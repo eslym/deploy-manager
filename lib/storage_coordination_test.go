@@ -536,7 +536,7 @@ func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	databaseIdentity, err := databaseFileIdentity(cfg.DatabasePath)
+	databaseIdentity, err := filesystemPathIdentity(cfg.DatabasePath)
 	if err != nil {
 		t.Fatal(err)
 	}

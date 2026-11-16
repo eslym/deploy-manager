@@ -68,7 +68,7 @@ func currentProgramProvenance(cfg Config, schema int64) (programProvenance, erro
 	if err != nil {
 		return programProvenance{}, err
 	}
-	identity, err := databaseFileIdentity(database)
+	identity, err := filesystemPathIdentity(database)
 	if err != nil {
 		return programProvenance{}, err
 	}
@@ -130,6 +130,14 @@ func cachedRunningExecutableFingerprint() (executableFingerprint, error) {
 	return runningExecutable.fingerprint, runningExecutable.err
 }
 
+func preflightRunningExecutablePath() error {
+	fingerprint, err := cachedRunningExecutableFingerprint()
+	if err != nil {
+		return err
+	}
+	return verifyExecutablePath(fingerprint.path, fingerprint.identity)
+}
+
 func verifyExecutablePath(path, runningIdentity string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -147,7 +155,7 @@ func verifyExecutablePath(path, runningIdentity string) error {
 	return nil
 }
 
-func databaseFileIdentity(path string) (string, error) {
+func filesystemPathIdentity(path string) (string, error) {
 	var stat unix.Stat_t
 	if err := unix.Stat(path, &stat); err != nil {
 		return "", err
@@ -183,7 +191,7 @@ func readPriorProgramProvenance(cfg Config, source int64) (programProvenance, er
 	if err != nil {
 		return programProvenance{}, err
 	}
-	identity, err := databaseFileIdentity(database)
+	identity, err := filesystemPathIdentity(database)
 	if err != nil {
 		return programProvenance{}, err
 	}

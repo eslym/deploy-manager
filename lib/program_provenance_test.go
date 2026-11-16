@@ -52,7 +52,7 @@ func TestExecutablePathMustStillNameRunningInode(t *testing.T) {
 	if err := os.WriteFile(path, []byte("running"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	identity, err := databaseFileIdentity(path)
+	identity, err := filesystemPathIdentity(path)
 	if err != nil {
 		t.Fatal(err)
 	}
