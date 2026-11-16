@@ -546,7 +546,7 @@ try {
 
   server.kill("SIGTERM");
   await once(server, "exit");
-  server = spawn(executable, ["serve", "--data", dir, "--listen", secureListen, "--tls-cert", cert, "--tls-key", key, "--origin", secureOrigin, "--recent-auth-ttl", "1s", "--auth-rate-per-minute", "100"], { cwd: dir, stdio: ["ignore", "pipe", "pipe"] });
+  server = spawn(executable, ["serve", "--listen", secureListen, "--tls-cert", cert, "--tls-key", key, "--recent-auth-ttl", "1s", "--auth-rate-per-minute", "100"], { cwd: dir, env: { ...process.env, DM_DATA: dir, DM_ORIGIN: secureOrigin }, stdio: ["ignore", "pipe", "pipe"] });
   server.stdout.on("data", chunk => { serverOutput += chunk.toString(); });
   server.stderr.on("data", chunk => { serverOutput += chunk.toString(); });
   await new Promise((resolve, reject) => {
@@ -565,13 +565,13 @@ try {
   if (interruptedStatus !== 401) throw new Error(`pre-restart login handshake survived restart: ${interruptedStatus}`);
   await pendingContext.close();
 
-  const expiredRecoveryCommand = spawnSync(executable, ["recover", "--data", dir, "--listen", secureListen, "--url", secureOrigin, "--grant-ttl", "1s"], { cwd: dir, encoding: "utf8" });
+  const expiredRecoveryCommand = spawnSync(executable, ["recover", "--listen", secureListen, "--grant-ttl", "1s"], { cwd: dir, env: { ...process.env, DM_DATA: dir, DM_ORIGIN: secureOrigin }, encoding: "utf8" });
   if (expiredRecoveryCommand.status !== 0) throw new Error(expiredRecoveryCommand.stderr || "short recovery CLI failed");
   const expiredGrant = new URL(expiredRecoveryCommand.stdout.trim()).hash.slice(1);
   await new Promise(resolve => setTimeout(resolve, 1100));
   const expiredRecoveryStatus = await httpsPostStatus("127.0.0.1", Number(secureListen.split(":")[1]), "/opaque/register/start", secureOrigin, { grant: expiredGrant, value: "AA" });
   if (expiredRecoveryStatus !== 410) throw new Error(`expired recovery grant returned ${expiredRecoveryStatus}, expected 410`);
-  const recoveryCommand = spawnSync(executable, ["recover", "--data", dir, "--listen", secureListen, "--url", secureOrigin], { cwd: dir, encoding: "utf8" });
+  const recoveryCommand = spawnSync(executable, ["recover", "--listen", secureListen], { cwd: dir, env: { ...process.env, DM_DATA: dir, DM_ORIGIN: secureOrigin }, encoding: "utf8" });
   if (recoveryCommand.status !== 0) throw new Error(recoveryCommand.stderr || "recovery CLI failed");
   const recoveryLink = recoveryCommand.stdout.trim();
   const recoveryURL = new URL(recoveryLink);

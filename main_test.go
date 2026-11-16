@@ -31,7 +31,6 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.String("data", "./data", "")
 	fs.String("listen", "127.0.0.1:8080", "")
-	fs.String("url", "", "")
 	fs.String("origin", "", "")
 	fs.String("tls-cert", "", "")
 	fs.String("tls-key", "", "")
@@ -53,9 +52,9 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 	fs.Int("fetch-retry-attempts", 3, "")
 	lookup := func(key string) (string, bool) {
 		values := map[string]string{
-			"DM_DATA": "/env/data", "DM_LISTEN": "0.0.0.0:9000", "DM_URL": "https://example.test",
+			"DM_DATA": "/env/data", "DM_LISTEN": "0.0.0.0:9000",
 			"DM_ORIGIN": "https://example.test", "DM_TLS_CERT": "cert.pem", "DM_TLS_KEY": "key.pem",
-			"DM_TRUSTED_PROXY": "172.18.0.0/16,192.0.2.1",
+			"DM_TRUSTED_PROXY":         "172.18.0.0/16,192.0.2.1",
 			"DM_REPOSITORY_KEY_MASTER": "master.key", "DM_LOGIN_TTL": "3m", "DM_SESSION_TTL": "13h",
 			"DM_GIT_TIMEOUT": "4m", "DM_GRANT_TTL": "16m", "DM_RECENT_AUTH_TTL": "6m",
 			"DM_AUTH_RATE_PER_MINUTE": "21", "DM_PUBLICATION_ROOT": "/published", "DM_DEPLOY_MAX_FILES": "10001",
@@ -72,7 +71,7 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string]string{
-		"data": "/env/data", "listen": "127.0.0.1:7777", "url": "https://example.test", "origin": "https://example.test",
+		"data": "/env/data", "listen": "127.0.0.1:7777", "origin": "https://example.test",
 		"tls-cert": "cert.pem", "tls-key": "key.pem", "trusted-proxy": "172.18.0.0/16,192.0.2.1", "repository-key-master": "master.key", "login-ttl": "3m0s",
 		"session-ttl": "13h0m0s", "git-timeout": "4m0s", "grant-ttl": "16m0s", "recent-auth-ttl": "6m0s",
 		"auth-rate-per-minute": "21", "publication-root": "/published", "deploy-max-files": "10001",
@@ -152,7 +151,7 @@ func TestBuiltExecutableRunsEmbeddedApplicationOutsideSourceTree(t *testing.T) {
 	binary := buildCommand(t)
 	installation := t.TempDir()
 	workDir := t.TempDir()
-	setup := boundedCommand(t, binary, "setup", "--data", installation, "--url", "https://manager.example")
+	setup := boundedCommand(t, binary, "setup", "--data", installation, "--origin", "https://manager.example")
 	setup.Dir = workDir
 	if output, err := setup.CombinedOutput(); err != nil || !strings.Contains(string(output), "https://manager.example/register#") {
 		t.Fatalf("embedded executable setup failed outside source tree: %v\n%s", err, output)
@@ -205,6 +204,79 @@ func TestBuiltExecutableRunsEmbeddedApplicationOutsideSourceTree(t *testing.T) {
 	}
 }
 
+func TestGrantCommandsShareInstallationEnvironmentAndFlagPrecedence(t *testing.T) {
+	binary := buildCommand(t)
+	base := t.TempDir()
+	data := filepath.Join(base, "configured-data")
+	key := filepath.Join(base, "configured-master.key")
+	cmd := boundedCommand(t, binary, "setup")
+	cmd.Env = append(os.Environ(), "DM_DATA="+data, "DM_REPOSITORY_KEY_MASTER="+key, "DM_ORIGIN=https://public.example")
+	output, err := cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "https://public.example/register#") {
+		t.Fatalf("setup did not use shared environment: err=%v output=%q", err, output)
+	}
+	if _, err := os.Stat(key); err != nil {
+		t.Fatalf("setup did not use DM_REPOSITORY_KEY_MASTER: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(data, "state.sqlite")); err != nil {
+		t.Fatalf("setup did not use DM_DATA: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(data, "configured-data", "state.sqlite")); !os.IsNotExist(err) {
+		t.Fatalf("setup created nested installation: %v", err)
+	}
+
+	address := freeAddress(t)
+	serve := exec.Command(binary, "serve", "--listen", address)
+	serve.Env = append(os.Environ(), "DM_DATA="+data, "DM_REPOSITORY_KEY_MASTER="+key, "DM_ORIGIN=https://public.example")
+	var diagnostics bytes.Buffer
+	serve.Stdout, serve.Stderr = &diagnostics, &diagnostics
+	if err := serve.Start(); err != nil {
+		t.Fatal(err)
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- serve.Wait() }()
+	t.Cleanup(func() {
+		_ = serve.Process.Kill()
+		<-serveDone
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		conn, dialErr := net.DialTimeout("tcp", address, 50*time.Millisecond)
+		if dialErr == nil {
+			_ = conn.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("serve did not start with shared environment: %v (%s)", dialErr, diagnostics.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cmd = boundedCommand(t, binary, "setup")
+	cmd.Env = append(os.Environ(), "DM_DATA="+data, "DM_REPOSITORY_KEY_MASTER="+key, "DM_ORIGIN=https://public.example")
+	if output, err := cmd.CombinedOutput(); err != nil || !strings.Contains(string(output), "https://public.example/register#") {
+		t.Fatalf("setup alongside shared-configured daemon failed: err=%v output=%q", err, output)
+	}
+
+	overrideData := filepath.Join(base, "explicit-data")
+	cmd = boundedCommand(t, binary, "setup", "--data", overrideData, "--repository-key-master", filepath.Join(base, "explicit.key"), "--origin", "https://explicit.example")
+	cmd.Env = append(os.Environ(), "DM_DATA="+data, "DM_REPOSITORY_KEY_MASTER="+key, "DM_ORIGIN=https://public.example")
+	output, err = cmd.CombinedOutput()
+	if err != nil || !strings.Contains(string(output), "https://explicit.example/register#") {
+		t.Fatalf("explicit flags did not override environment: err=%v output=%q", err, output)
+	}
+	if _, err := os.Stat(filepath.Join(overrideData, "state.sqlite")); err != nil {
+		t.Fatalf("explicit --data was not used: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(base, "explicit.key")); err != nil {
+		t.Fatalf("explicit --repository-key-master was not used: %v", err)
+	}
+	legacy := boundedCommand(t, binary, "setup", "--url", "https://legacy.example")
+	legacy.Env = append(os.Environ(), "DM_DATA="+filepath.Join(base, "legacy-data"))
+	if output, err := legacy.CombinedOutput(); err == nil || !strings.Contains(string(output), "flag provided but not defined: -url") {
+		t.Fatalf("legacy --url was accepted: err=%v output=%q", err, output)
+	}
+}
+
 func TestBuiltExecutableRefusesOlderAndNewerCLIStorageWithoutMutation(t *testing.T) {
 	binary := buildCommand(t)
 	for _, tc := range []struct {
@@ -215,7 +287,7 @@ func TestBuiltExecutableRefusesOlderAndNewerCLIStorageWithoutMutation(t *testing
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := t.TempDir()
-			setup := boundedCommand(t, binary, "setup", "--data", data, "--url", "https://manager.example")
+			setup := boundedCommand(t, binary, "setup", "--data", data, "--origin", "https://manager.example")
 			if output, err := setup.CombinedOutput(); err != nil {
 				t.Fatalf("initialize fixture installation: %v\n%s", err, output)
 			}
@@ -240,7 +312,7 @@ func TestBuiltExecutableRefusesOlderAndNewerCLIStorageWithoutMutation(t *testing
 				}
 			}
 			for _, command := range []string{"setup", "recover"} {
-				cmd := boundedCommand(t, binary, command, "--data", data, "--url", "https://manager.example")
+				cmd := boundedCommand(t, binary, command, "--data", data, "--origin", "https://manager.example")
 				cmd.Dir = t.TempDir()
 				var stdout, stderr bytes.Buffer
 				cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -602,7 +674,7 @@ func TestLockedDaemonRetainsSingletonOwnership(t *testing.T) {
 func TestCLIRechecksMarkerAfterWaitingForStorageAccess(t *testing.T) {
 	binary := buildCommand(t)
 	data := t.TempDir()
-	if out, err := boundedCommand(t, binary, "setup", "--data", data, "--url", "https://example.test").CombinedOutput(); err != nil {
+	if out, err := boundedCommand(t, binary, "setup", "--data", data, "--origin", "https://example.test").CombinedOutput(); err != nil {
 		t.Fatalf("initialize installation: %v %s", err, out)
 	}
 	// Act as a maintenance owner. The CLI must pass its marker preflight and
@@ -633,7 +705,7 @@ func TestCLIRechecksMarkerAfterWaitingForStorageAccess(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	cmd := boundedCommand(t, binary, "setup", "--data", data, "--url", "https://example.test")
+	cmd := boundedCommand(t, binary, "setup", "--data", data, "--origin", "https://example.test")
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Start(); err != nil {
@@ -711,7 +783,7 @@ func TestLockedRestartsAndCLILeaveInstallationUntouched(t *testing.T) {
 	for _, marker := range []string{"valid", "malformed", "unreadable", "directory", "dangling-symlink", "fifo"} {
 		t.Run(marker, func(t *testing.T) {
 			data := t.TempDir()
-			cmd := boundedCommand(t, binary, "setup", "--data", data, "--url", "https://example.test")
+			cmd := boundedCommand(t, binary, "setup", "--data", data, "--origin", "https://example.test")
 			if out, err := cmd.CombinedOutput(); err != nil {
 				t.Fatalf("initialize real installation: %v\n%s", err, out)
 			}
@@ -797,7 +869,7 @@ func TestLockedRestartsAndCLILeaveInstallationUntouched(t *testing.T) {
 					}
 				})
 				for _, command := range []string{"setup", "recover"} {
-					cmd := boundedCommand(t, binary, command, "--data", data, "--listen", freeAddress(t), "--url", "https://example.test")
+					cmd := boundedCommand(t, binary, command, "--data", data, "--listen", freeAddress(t), "--origin", "https://example.test")
 					cmd.Dir = t.TempDir()
 					var stdout, stderr bytes.Buffer
 					cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -924,7 +996,7 @@ func TestReservedMaintenancePathCannotBecomeApplicationState(t *testing.T) {
 				t.Run(command+flag+suffix, func(t *testing.T) {
 					data := t.TempDir()
 					marker := filepath.Join(data, "state.sqlite.maintenance.json")
-					out, err := boundedCommand(t, binary, command, "--data", data, flag, marker+suffix, "--url", "https://example.test").CombinedOutput()
+					out, err := boundedCommand(t, binary, command, "--data", data, flag, marker+suffix, "--origin", "https://example.test").CombinedOutput()
 					if err == nil || !strings.Contains(string(out), "maintenance-locked") {
 						t.Fatalf("reserved marker alias accepted: err=%v out=%q", err, out)
 					}
@@ -958,7 +1030,7 @@ func TestCommandRejectsTraversalWithoutRetargetingInstallation(t *testing.T) {
 			data := trusted + "/link/../installation"
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			out, err := exec.CommandContext(ctx, binary, command, "--data", data, "--listen", freeAddress(t), "--url", "https://example.test").CombinedOutput()
+			out, err := exec.CommandContext(ctx, binary, command, "--data", data, "--listen", freeAddress(t), "--origin", "https://example.test").CombinedOutput()
 			if err == nil || ctx.Err() != nil || !strings.Contains(string(out), "path components") {
 				t.Fatalf("%s accepted or cleaned traversal: err=%v context=%v out=%q", command, err, ctx.Err(), out)
 			}

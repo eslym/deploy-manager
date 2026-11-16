@@ -24,7 +24,7 @@ install -d -m 700 /srv/deploy-manager-rebootstrap-20261115/data
 install -d -m 700 /srv/deploy-manager-rebootstrap-20261115/sites
 /usr/local/bin/deploy-manager setup \
   --data /srv/deploy-manager-rebootstrap-20261115/data \
-  --url https://deploy.example.net
+  --origin https://deploy.example.net
 /usr/local/bin/deploy-manager serve \
   --data /srv/deploy-manager-rebootstrap-20261115/data \
   --publication-root /srv/deploy-manager-rebootstrap-20261115/sites \

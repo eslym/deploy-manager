@@ -26,11 +26,14 @@ Issue a setup link and run the server:
 `setup` prints a short-lived, single-use registration URL once. Open it in a
 browser while the server is running. Loopback-only HTTP is available for local
 setup; non-loopback serving can use HTTP only behind an HTTPS-terminating proxy
-with network access restricted to that proxy. Pass an HTTPS setup URL with
-`--url`. Loopback peers are trusted by default to set `X-Forwarded-Proto: https`;
-`--trusted-proxy` adds non-loopback proxy IPs or CIDRs to that trust list. The
-application checks the request Origin. Direct HTTPS remains available with
-`--tls-cert` and `--tls-key`.
+with network access restricted to that proxy. Use an HTTPS `--origin` for the
+public application origin. `setup`, `recover`, and `serve` share the
+`DM_DATA`, `DM_REPOSITORY_KEY_MASTER`, and `DM_ORIGIN` environment defaults;
+explicit flags take precedence. With no origin configured, a loopback listener
+uses its local HTTP address for the link. Loopback peers are trusted by default
+to set `X-Forwarded-Proto: https`; `--trusted-proxy` adds non-loopback proxy IPs
+or CIDRs to that trust list. The application checks the request Origin. Direct
+HTTPS remains available with `--tls-cert` and `--tls-key`.
 
 The confirmed singleton policy applies only to the main daemon, not local CLI
 utilities. Setup and password-recovery grant issuance must remain usable while

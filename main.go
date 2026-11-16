@@ -29,7 +29,6 @@ func main() {
 	flags := flag.NewFlagSet(command, flag.ExitOnError)
 	data := flags.String("data", "./data", "application data directory")
 	listen := flags.String("listen", "127.0.0.1:8080", "HTTP(S) listen address")
-	base := flags.String("url", "", "externally reachable HTTPS base URL for setup link")
 	origin := flags.String("origin", "", "canonical HTTPS origin used by the application")
 	cert := flags.String("tls-cert", "", "optional TLS certificate (requires --tls-key)")
 	key := flags.String("tls-key", "", "TLS private key")
@@ -49,7 +48,7 @@ func main() {
 	deployGrace := flags.Duration("deploy-grace-period", 60*time.Second, "minimum time before replaced files are cleaned up")
 	jobRetention := flags.Duration("job-retention", 30*24*time.Hour, "how long publication job details and logs are retained")
 	fetchRetryAttempts := flags.Int("fetch-retry-attempts", 3, "maximum attempts for transient Git fetch failures (1-5)")
-	if command == "serve" {
+	if command == "setup" || command == "recover" || command == "serve" {
 		if err := applyEnvironmentDefaults(flags, os.LookupEnv); err != nil {
 			log.Fatal(err)
 		}
@@ -83,7 +82,7 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		url := *base
+		url := *origin
 		if url == "" {
 			host, _, e := net.SplitHostPort(*listen)
 			if e != nil {

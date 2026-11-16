@@ -107,7 +107,7 @@ replace the hostname and certificate paths:
 ```sh
 ./deploy-manager setup \
   --data ./data \
-  --url https://manager.example.com
+  --origin https://manager.example.com
 
 ./deploy-manager serve \
   --data ./data \
@@ -118,7 +118,7 @@ replace the hostname and certificate paths:
 ```
 
 This assumes external HTTPS traffic for `manager.example.com` reaches port 8443.
-If you access that port directly, include `:8443` in both `--url` and `--origin`.
+If you access that port directly, include `:8443` in `--origin`.
 
 Open the setup URL printed by the first command while the server is running.
 It expires after 15 minutes by default and can be used only once. Registration
@@ -169,10 +169,22 @@ The Docker image listens on HTTP port 8080 by default, with no certificate or
 key configured. Put it behind an HTTPS-terminating proxy, set `DM_ORIGIN` to
 the public HTTPS origin, and set `DM_TRUSTED_PROXY` to the proxy's source IP or
 CIDR if it is not loopback. TLS can still be enabled directly by setting both
-`DM_TLS_CERT` and `DM_TLS_KEY` (or passing the corresponding flags). Generate
-setup/recovery links with an explicit public HTTPS `--url`. The image runs
-`serve` by default; pass `setup` or `recover` as the container command to use
-those CLI modes with the same mounted data and key paths.
+`DM_TLS_CERT` and `DM_TLS_KEY` (or passing the corresponding flags). The image
+runs `serve` by default; pass `setup` or `recover` as the container command to
+use those CLI modes with the same mounted data and key paths. All three commands
+honor `DM_DATA`, `DM_REPOSITORY_KEY_MASTER`, and `DM_ORIGIN`, so
+the same container environment works for grant issuance and the running daemon.
+For example:
+
+```sh
+docker run --rm -v deploy-manager-data:/data \
+  -e DM_ORIGIN=https://manager.example.com \
+  deploy-manager:latest setup
+```
+
+The printed link uses the configured public origin; without `DM_ORIGIN`, a
+loopback listener produces a local HTTP link and non-loopback HTTP remains
+disallowed for public setup links.
 
 Loopback HTTP is allowed for initial local registration, but it is **not** a
 substitute for HTTPS login and authenticated dashboard use.
@@ -299,7 +311,7 @@ or the maintenance marker to force startup. See the
 To replace a forgotten administrator password:
 
 ```sh
-./deploy-manager recover --data ./data --url https://manager.example.com
+./deploy-manager recover --data ./data --origin https://manager.example.com
 ```
 
 Open the printed single-use link and complete browser registration of the new

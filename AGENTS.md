@@ -9,7 +9,7 @@
 ## Development and checks
 
 - Frontend instructions live in `web/AGENTS.md`. From `web/`, run `bun install --frozen-lockfile`, then `bun run check`, `bun run lint`, and `bun run build`; `lint` is Prettier.
-- For local full-stack debugging, run `go run . serve --listen 127.0.0.1:8080 --origin http://localhost:5173 --data ./data` at the root and `bun run dev` from `web/`. Vite proxies `/api`, `/opaque`, and `/webhooks`; `GO_BACKEND_URL` overrides its default `http://127.0.0.1:8080`. Use `http://localhost:5173` consistently for browser origin and setup links (`go run . setup --listen 127.0.0.1:8080 --url http://localhost:5173`).
+- For local full-stack debugging, run `go run . serve --listen 127.0.0.1:8080 --data ./data` at the root and `bun run dev` from `web/`. Vite proxies `/api`, `/opaque`, and `/webhooks`; `GO_BACKEND_URL` overrides its default `http://127.0.0.1:8080`. Canonical `--origin`/`DM_ORIGIN` is HTTPS-only; leave it unset for loopback development. To issue a local setup link, run `go run . setup --listen 127.0.0.1:8080 --data ./data`; it uses the safe loopback HTTP default.
 - Run Go tests from the root with `go test ./...` after frontend assets exist; run `govulncheck ./...` after the same build prerequisite. `scripts/build.sh` builds the frontend and executable together.
 - Compose provides the pinned Bun/Go/Playwright development shell and browser test runner. Use `docker compose -f tests/compose.yaml run --build --rm test bash` for the shell or omit `bash` to run the full suite. The checkout is mounted read-only at `/source`; copy it into `/workspace` before commands that generate files. See `tests/README.md` for cache sharing and cleanup.
 
