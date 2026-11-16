@@ -198,6 +198,75 @@ try {
   const configuredLfsSettings = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), id);
   if (JSON.stringify(configuredLfsSettings.settings.objectOrigins) !== JSON.stringify([fixtureOrigin])) throw new Error(`configured LFS destinations were not rendered consistently: ${JSON.stringify(configuredLfsSettings.settings)}`);
 
+  milestone("ordinary repository LFS settings and stale response protection");
+  await page.getByLabel("Project name").fill("Ordinary fixture site");
+  await page.getByLabel("Repository URL").fill(`${fixtureOrigin}/ordinary.git`);
+  const ordinaryCreateResponse = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "POST");
+  await page.getByRole("button", { name: "Add repository" }).click();
+  const ordinaryCreated = await ordinaryCreateResponse;
+  if (ordinaryCreated.status() !== 201) throw new Error(`ordinary project creation returned ${ordinaryCreated.status()}: ${await ordinaryCreated.text()}`);
+  await page.getByText("Ordinary fixture site", { exact: true }).waitFor();
+  await page.getByRole("button", { name: /Ordinary fixture site/ }).click();
+  const ordinaryProject = await page.evaluate(async () => (await (await fetch("/api/projects")).json()).find(project => project.name === "Ordinary fixture site"));
+  const ordinaryRefs = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/refs`)).json(), ordinaryProject.id);
+  if (!ordinaryRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("ordinary fixture repository did not have a main branch");
+  await page.getByLabel("LFS server URL").waitFor();
+  const ordinarySettings = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/lfs`)).json(), ordinaryProject.id);
+  if (!Array.isArray(ordinarySettings.settings.objectOrigins) || ordinarySettings.settings.objectOrigins.length !== 0) throw new Error(`ordinary repository LFS settings had an inconsistent shape: ${JSON.stringify(ordinarySettings)}`);
+  if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("ordinary repository displayed unexpected LFS destinations");
+
+  let releaseLfsResponse;
+  const delayedLfsResponse = new Promise(resolveResponse => { releaseLfsResponse = resolveResponse; });
+  let interceptedLfsResponse;
+  const lfsResponseIntercepted = new Promise(resolveIntercepted => { interceptedLfsResponse = resolveIntercepted; });
+  await page.route(`**/api/projects/${id}/lfs`, async route => {
+    if (route.request().method() === "GET") {
+      interceptedLfsResponse(route);
+      await delayedLfsResponse;
+      return;
+    }
+    await route.continue();
+  });
+  await page.getByText("Fixture site", { exact: true }).click();
+  const heldLfsResponse = await lfsResponseIntercepted;
+  await page.getByText("Ordinary fixture site", { exact: true }).click();
+  await page.getByLabel("LFS server URL").waitFor();
+  if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("switching to an ordinary repository showed another project's LFS settings");
+  releaseLfsResponse();
+  await heldLfsResponse.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ settings: { endpoint: "https://stale.example/lfs", objectOrigins: ["https://stale.example"] }, suggestedEndpoint: "https://stale.example/lfs" }) });
+  await page.waitForTimeout(100);
+  if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("a delayed prior-project response overwrote the selected project's LFS form");
+  await page.unroute(`**/api/projects/${id}/lfs`);
+  await page.getByText("Fixture site", { exact: true }).click();
+  await page.getByLabel("LFS server URL").waitFor();
+  let releaseLfsSave;
+  const delayedLfsSave = new Promise(resolveSave => { releaseLfsSave = resolveSave; });
+  let interceptedLfsSave;
+  const lfsSaveIntercepted = new Promise(resolveIntercepted => { interceptedLfsSave = resolveIntercepted; });
+  await page.route(`**/api/projects/${id}/lfs`, async route => {
+    if (route.request().method() === "POST") {
+      interceptedLfsSave(route);
+      await delayedLfsSave;
+      return;
+    }
+    await route.continue();
+  });
+  await page.getByLabel("LFS server URL").fill(`${fixtureOrigin}/info/lfs`);
+  await page.getByLabel("Object download origins").fill(fixtureOrigin);
+  await page.getByLabel("I independently verified the internal destinations and intend to allow them.").check();
+  page.once("dialog", dialog => dialog.accept());
+  await page.getByRole("button", { name: "Save LFS settings" }).click();
+  const heldLfsSave = await lfsSaveIntercepted;
+  await page.getByText("Ordinary fixture site", { exact: true }).click();
+  releaseLfsSave();
+  await heldLfsSave.fulfill({ status: 204 });
+  await page.waitForTimeout(100);
+  if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("a completed save for another project overwrote the selected project's LFS form");
+  if (await page.getByText("LFS settings saved.", { exact: true }).count()) throw new Error("a completed save for another project showed a stale success notice");
+  await page.unroute(`**/api/projects/${id}/lfs`);
+  await page.getByText("Fixture site", { exact: true }).click();
+  await page.getByLabel("LFS server URL").waitFor();
+
   const cacheRecreationPath = `/api/projects/${id}/cache/recreate`;
   const unauthenticatedCacheRecreation = await httpsRequestStatus("127.0.0.1", 18440, cacheRecreationPath, "POST", JSON.stringify({ confirm: true }), { Origin: `https://${appListen}`, "Content-Type": "application/json" });
   if (unauthenticatedCacheRecreation !== 401) throw new Error(`unauthenticated cache recreation returned ${unauthenticatedCacheRecreation}`);

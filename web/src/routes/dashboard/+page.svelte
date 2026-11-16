@@ -52,6 +52,8 @@
 	let lfsError = $state('');
 	let lfsNotice = $state('');
 	let selected = $state('');
+	let lfsSelectionVersion = 0;
+	let lfsLoadVersion = 0;
 	let projectDeleteConfirmation = $state('');
 	let cacheRecreateConfirmation = $state('');
 	let cacheRecreateTrigger: HTMLButtonElement | undefined = $state();
@@ -215,6 +217,11 @@
 		refs[id] = await request(`/api/projects/${id}/refs`);
 	}
 	async function loadLfsSettings(id: string) {
+		const selectionVersion = lfsSelectionVersion;
+		const loadVersion = ++lfsLoadVersion;
+		const isCurrent = () =>
+			selectionVersion === lfsSelectionVersion && selected === id && loadVersion === lfsLoadVersion;
+		if (selectionVersion !== lfsSelectionVersion || selected !== id) return;
 		lfsLoading = true;
 		lfsError = '';
 		lfsEndpoint = '';
@@ -231,19 +238,24 @@
 				} | null;
 				suggestedEndpoint?: string | null;
 			} = await request(`/api/projects/${id}/lfs`);
-			lfsEndpoint = result.settings?.endpoint ?? '';
-			lfsOrigins = (result.settings?.objectOrigins ?? []).join('\n');
-			lfsAllowInternal = result.settings?.allowInternal ?? false;
-			lfsSuggestedEndpoint = result.suggestedEndpoint ?? '';
+			if (isCurrent()) {
+				lfsEndpoint = result.settings?.endpoint ?? '';
+				lfsOrigins = (result.settings?.objectOrigins ?? []).join('\n');
+				lfsAllowInternal = result.settings?.allowInternal ?? false;
+				lfsSuggestedEndpoint = result.suggestedEndpoint ?? '';
+			}
 		} catch (cause) {
-			lfsError = cause instanceof Error ? cause.message : 'Could not load LFS settings.';
+			if (isCurrent())
+				lfsError = cause instanceof Error ? cause.message : 'Could not load LFS settings.';
 		} finally {
-			lfsLoading = false;
+			if (isCurrent()) lfsLoading = false;
 		}
 	}
 	async function saveLfsSettings(event: SubmitEvent) {
 		event.preventDefault();
 		if (lfsBusy || !selected) return;
+		const projectId = selected;
+		const selectionVersion = lfsSelectionVersion;
 		if (
 			!window.confirm(
 				'Save these LFS destinations? Only continue if you independently verified them.'
@@ -254,7 +266,7 @@
 		lfsError = '';
 		lfsNotice = '';
 		try {
-			await request(`/api/projects/${selected}/lfs`, {
+			await request(`/api/projects/${projectId}/lfs`, {
 				method: 'POST',
 				body: JSON.stringify({
 					endpoint: lfsEndpoint,
@@ -267,12 +279,16 @@
 					...(lfsAllowInternal ? { internalConfirmation: lfsConfirmation } : {})
 				})
 			});
-			await loadLfsSettings(selected);
-			lfsNotice = 'LFS settings saved.';
+			if (selectionVersion === lfsSelectionVersion && selected === projectId) {
+				await loadLfsSettings(projectId);
+				if (selectionVersion === lfsSelectionVersion && selected === projectId)
+					lfsNotice = 'LFS settings saved.';
+			}
 		} catch (cause) {
-			lfsError = cause instanceof Error ? cause.message : 'Could not save LFS settings.';
+			if (selectionVersion === lfsSelectionVersion && selected === projectId)
+				lfsError = cause instanceof Error ? cause.message : 'Could not save LFS settings.';
 		} finally {
-			lfsBusy = false;
+			if (selectionVersion === lfsSelectionVersion && selected === projectId) lfsBusy = false;
 		}
 	}
 	async function createProject(event: SubmitEvent) {
@@ -614,6 +630,8 @@
 								aria-pressed={selected === project.id}
 								onclick={() => {
 									selected = project.id;
+									lfsSelectionVersion += 1;
+									lfsBusy = false;
 									closeCacheRecreateConfirmation(false);
 									cacheRecreateError = '';
 									cacheRecreateNotice = '';

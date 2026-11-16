@@ -95,11 +95,33 @@ func serve(address, cert, key, data string) error {
 	if err := worktree.Checkout(&git.CheckoutOptions{Branch: plumbing.NewBranchReferenceName("main")}); err != nil {
 		return err
 	}
+	ordinaryPath := filepath.Join(data, "ordinary.git")
+	ordinaryRepo, err := git.PlainInitWithOptions(ordinaryPath, &git.PlainInitOptions{InitOptions: git.InitOptions{DefaultBranch: plumbing.NewBranchReferenceName("main")}})
+	if err != nil {
+		return err
+	}
+	ordinaryWorktree, err := ordinaryRepo.Worktree()
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(ordinaryPath, "index.html"), []byte("ordinary fixture site\n"), 0600); err != nil {
+		return err
+	}
+	if _, err := ordinaryWorktree.Add("index.html"); err != nil {
+		return err
+	}
+	if _, err := ordinaryWorktree.Commit("ordinary repository", &git.CommitOptions{Author: &object.Signature{Name: "Fixture", Email: "fixture@example.test", When: time.Now().UTC()}}); err != nil {
+		return err
+	}
 	endpoint, err := transport.NewEndpoint("https://" + address + "/repo.git")
 	if err != nil {
 		return err
 	}
-	backend := gitserver.NewServer(gitserver.MapLoader{endpoint.String(): repo.Storer})
+	ordinaryEndpoint, err := transport.NewEndpoint("https://" + address + "/ordinary.git")
+	if err != nil {
+		return err
+	}
+	backend := gitserver.NewServer(gitserver.MapLoader{endpoint.String(): repo.Storer, ordinaryEndpoint.String(): ordinaryRepo.Storer})
 	var fail atomic.Bool
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /__fixture/fail", func(w http.ResponseWriter, _ *http.Request) { fail.Store(true); w.WriteHeader(http.StatusNoContent) })
@@ -173,14 +195,18 @@ func serve(address, cert, key, data string) error {
 			http.Error(w, "controlled fixture failure", http.StatusServiceUnavailable)
 			return
 		}
-		session, err := backend.NewUploadPackSession(endpoint, nil)
+		repositoryEndpoint := endpoint
+		if strings.HasPrefix(r.URL.Path, "/ordinary.git/") {
+			repositoryEndpoint = ordinaryEndpoint
+		}
+		session, err := backend.NewUploadPackSession(repositoryEndpoint, nil)
 		if err != nil {
 			http.Error(w, "upload-pack unavailable", 500)
 			return
 		}
 		defer session.Close()
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/repo.git/info/refs" && r.URL.Query().Get("service") == "git-upload-pack":
+		case r.Method == http.MethodGet && (r.URL.Path == "/repo.git/info/refs" || r.URL.Path == "/ordinary.git/info/refs") && r.URL.Query().Get("service") == "git-upload-pack":
 			advertisement, err := session.AdvertisedReferencesContext(r.Context())
 			if err != nil {
 				http.Error(w, "advertisement failed", 500)
@@ -191,7 +217,7 @@ func serve(address, cert, key, data string) error {
 			if err := advertisement.Encode(w); err != nil {
 				return
 			}
-		case r.Method == http.MethodPost && r.URL.Path == "/repo.git/git-upload-pack":
+		case r.Method == http.MethodPost && (r.URL.Path == "/repo.git/git-upload-pack" || r.URL.Path == "/ordinary.git/git-upload-pack"):
 			if _, err := session.AdvertisedReferencesContext(r.Context()); err != nil {
 				http.Error(w, "advertisement failed", 500)
 				return
