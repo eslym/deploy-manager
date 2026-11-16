@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
-import { createHmac } from "node:crypto";
+import { createHmac, generateKeyPairSync } from "node:crypto";
 import { chmod, copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { join, resolve } from "node:path";
@@ -71,7 +71,7 @@ async function waitForNoopHistory(page, deploymentID, card) {
 }
 
 async function openProject(page, id, name) {
-  await page.getByRole("link", { name: "Projects", exact: true }).click();
+  await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
   await page.getByRole("link", { name, exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${id}`);
 }
@@ -167,7 +167,7 @@ try {
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
   await page.getByText(/You’re signed in/).waitFor({ timeout: 30000 });
-  await page.getByRole("link", { name: "Projects", exact: true }).click();
+  await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
   await page.waitForURL("**/dashboard/projects");
   const sessionCookie = (await context.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session")?.value;
   if (!sessionCookie) throw new Error("authenticated browser session cookie is missing");
@@ -233,7 +233,7 @@ try {
   if (JSON.stringify(configuredLfsSettings.settings.objectOrigins) !== JSON.stringify([fixtureOrigin])) throw new Error(`configured LFS destinations were not rendered consistently: ${JSON.stringify(configuredLfsSettings.settings)}`);
 
   milestone("ordinary repository LFS settings and stale response protection");
-  await page.getByRole("link", { name: "Projects", exact: true }).click();
+  await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
   await page.getByLabel("Project name").fill("Ordinary fixture site");
   await page.getByLabel("Repository URL").fill(`${fixtureOrigin}/ordinary.git`);
   const ordinaryCreateResponse = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "POST");
@@ -693,11 +693,31 @@ try {
   if (failedTimestamp !== timestampAfterReloadFailure) throw new Error("failed refresh changed last successful fetch time");
 
   milestone("create SSH key, approve host, create SSH project");
-  await page.getByRole("link", { name: "Projects", exact: true }).click();
+  await page.getByRole("link", { name: "Repository keys", exact: true }).click();
+  await page.waitForURL("**/dashboard/keys");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Repository keys" }).waitFor();
+  if (await page.getByRole("heading", { name: "Add a repository" }).count()) throw new Error("key management remains on the project list");
   await page.getByLabel("Key name").fill("SSH browser key");
   await page.getByRole("button", { name: "Create Ed25519 key" }).click();
   await page.getByText("SSH browser key", { exact: true }).waitFor();
+  const generatedKey = page.locator("li").filter({ hasText: "SSH browser key" });
+  if (!(await generatedKey.locator("code").innerText()).startsWith("ssh-ed25519 ") || !(await generatedKey.getByText(/SHA256:/).count())) throw new Error("public key or fingerprint is missing from the key page");
   const sshKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).find(key => key.name === "SSH browser key").id);
+  const importedPrivateKey = generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+  await page.getByLabel("Name for imported key").fill("Imported browser key");
+  await page.getByLabel("Private key").fill(importedPrivateKey);
+  await page.getByRole("button", { name: "Import private key" }).click();
+  await page.getByText("Imported browser key", { exact: true }).waitFor();
+  if (await page.getByLabel("Private key").inputValue()) throw new Error("private key input was not cleared after import");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByText("Imported browser key", { exact: true }).waitFor();
+  if ((await page.locator("body").innerText()).includes(importedPrivateKey) || (await page.content()).includes(importedPrivateKey)) throw new Error("private key material was displayed after import");
+  const importedKey = page.locator("li").filter({ hasText: "Imported browser key" });
+  await importedKey.getByRole("button", { name: "Remove key" }).click();
+  await page.getByText("Imported browser key", { exact: true }).waitFor({ state: "detached" });
+  await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
+  await page.waitForURL("**/dashboard/projects");
   await page.getByLabel("Project name").fill("SSH fixture site");
   await page.getByLabel("Repository URL").fill("ssh://git@127.0.0.1:18442/repo.git");
   await page.getByLabel("SSH key").selectOption(sshKeyId);
@@ -705,11 +725,24 @@ try {
   await page.getByRole("button", { name: "Add repository" }).click();
   const blockedCreate = await blockedCreateResponse;
   if (blockedCreate.status() !== 409) throw new Error(`unknown SSH host was not blocked (${blockedCreate.status()})`);
-  const hostTrust = page.locator("section").filter({ has: page.getByRole("heading", { name: "SSH host keys" }) });
+  await page.getByRole("link", { name: "SSH hosts", exact: true }).click();
+  await page.waitForURL("**/dashboard/ssh-hosts");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  const hostTrust = page.getByRole("main").filter({ has: page.getByRole("heading", { name: "SSH host keys" }) });
+  await hostTrust.getByText(/SHA256:/).waitFor();
+  if (!(await hostTrust.getByText(/Verify this fingerprint independently before approving it/).count())) throw new Error("host approval lacks independent verification warning");
+  if (!(await hostTrust.getByText(/127\.0\.0\.1:18442/).count())) throw new Error("host warning lost host and port");
+  page.once("dialog", dialog => dialog.dismiss());
+  await page.getByRole("button", { name: "Approve verified host key" }).click();
   await hostTrust.getByText(/SHA256:/).waitFor();
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Approve verified host key" }).click();
   await hostTrust.getByText("No SSH host warnings.").waitFor();
+  await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
+  await page.waitForURL("**/dashboard/projects");
+  await page.getByLabel("Project name").fill("SSH fixture site");
+  await page.getByLabel("Repository URL").fill("ssh://git@127.0.0.1:18442/repo.git");
+  await page.getByLabel("SSH key").selectOption(sshKeyId);
   const sshCreateResponse = page.waitForResponse(response => response.url().endsWith("/api/projects") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Add repository" }).click();
   const sshCreated = await sshCreateResponse;
@@ -718,6 +751,23 @@ try {
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
   const sshRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
+  await page.getByRole("link", { name: "Repository keys", exact: true }).click();
+  await page.waitForURL("**/dashboard/keys");
+  const assignedKey = page.locator("li").filter({ hasText: "SSH browser key" });
+  await assignedKey.getByRole("button", { name: "Remove key" }).click();
+  await page.getByText("This key is assigned to a project.").waitFor();
+  await page.getByLabel("Key name").fill("Replacement SSH key");
+  await page.getByRole("button", { name: "Create Ed25519 key" }).click();
+  await page.getByText("Replacement SSH key", { exact: true }).waitFor();
+  const replacementKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).find(key => key.name === "Replacement SSH key").id);
+  await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "SSH fixture site", exact: true }).waitFor();
+  await page.getByLabel("SSH key").selectOption(replacementKeyId);
+  await page.getByRole("button", { name: "Change SSH key" }).click();
+  await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id)?.keyId, sshProject.id)) === replacementKeyId, "project key assignment");
+  await page.getByLabel("SSH key").selectOption(sshKeyId);
+  await page.getByRole("button", { name: "Change SSH key" }).click();
+  await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id)?.keyId, sshProject.id)) === sshKeyId, "restored project key assignment");
   milestone("configure private LFS and publish SSH deployment");
   let oldProjectHistoryPolls = 0;
   await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
@@ -799,7 +849,7 @@ try {
   await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByText(/Project not found|This project no longer exists/i).waitFor();
-  await page.getByRole("link", { name: "Projects", exact: true }).click();
+  await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
   await page.goto(`https://${appListen}/dashboard/projects/missing-project`, { waitUntil: "domcontentloaded" });
   await page.getByText(/Project not found|This project no longer exists/i).waitFor();
   milestone("review and confirm project cache recreation");

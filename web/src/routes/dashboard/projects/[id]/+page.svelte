@@ -453,7 +453,9 @@
 					role="alert"
 					class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3 text-amber-900"
 				>
-					{project.warning} Your current branches and tags are still shown.
+					{project.warning} Your current branches and tags are still shown. For SSH issues,
+					<a class="font-semibold underline" href="/dashboard/ssh-hosts">review SSH host warnings</a
+					> and verify the fingerprint independently before approval.
 				</p>{/if}
 			<section
 				class="mt-4 rounded-lg border border-[#e1e6df] bg-[#f8faf7] p-4"
@@ -545,6 +547,14 @@
 				{/if}
 			</div>
 			{#if project?.url.startsWith('ssh://')}
+				<p class="mt-4 text-sm text-[#58645b]">
+					Need another key? <a class="font-semibold text-[#214c30] underline" href="/dashboard/keys"
+						>Manage repository keys</a
+					>.
+					<a class="font-semibold text-[#214c30] underline" href="/dashboard/ssh-hosts"
+						>Review SSH host warnings</a
+					> if the host is unrecognized.
+				</p>
 				<label class="mt-4 grid gap-1 text-sm font-medium text-[#354238]"
 					>SSH key
 					<select
