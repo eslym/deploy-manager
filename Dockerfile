@@ -2,7 +2,7 @@
 
 FROM oven/bun:1.4.4-alpine AS frontend
 WORKDIR /workspace/web
-COPY web/package.json web/bun.lock ./
+COPY web/package.json web/bun.lock web/bunfig.toml ./
 RUN --mount=type=cache,id=deploy-manager-bun-1.4.4,target=/root/.bun/install/cache,sharing=locked \
     bun install --frozen-lockfile
 COPY web ./

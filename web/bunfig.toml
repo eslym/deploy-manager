@@ -2,6 +2,9 @@
 # Allow CPU-compatibility fixes without disabling the age gate for other packages.
 minimumReleaseAgeExcludes = [
   "rolldown",
+  "@rolldown/binding-darwin-arm64",
+  "@rolldown/binding-darwin-x64",
+  "@rolldown/binding-linux-arm64-musl",
   "@rolldown/binding-linux-x64-gnu",
   "@rolldown/binding-linux-x64-musl",
 ]
