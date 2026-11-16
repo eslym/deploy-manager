@@ -79,17 +79,17 @@ async function openProject(page, id, name) {
 async function assertProjectLayout(page) {
   // The original two-column layout placed storage and LFS outside the selected project's column.
   // Check the actual rendered rectangles, not just CSS class names or a screenshot snapshot.
-  for (const width of [1049, 390]) {
+  for (const width of [1440, 1049, 390]) {
     await page.setViewportSize({ width, height: 900 });
     const bounds = await page.evaluate(() => {
-      const branches = [...document.querySelectorAll("h2")].find(node => node.textContent === "Branches and tags")?.getBoundingClientRect();
+      const detail = [...document.querySelectorAll("h2")].find(node => node.textContent === "Branches and tags")?.closest("section")?.getBoundingClientRect();
       const storage = document.getElementById("storage-heading")?.closest("section")?.getBoundingClientRect();
       const actions = [...document.querySelectorAll("button")].find(node => node.textContent === "Delete project")?.getBoundingClientRect();
       const lfs = [...document.querySelectorAll("h2")].find(node => node.textContent === "Git LFS destinations")?.closest("section")?.getBoundingClientRect();
-      return { branches: branches && { left: branches.left, right: branches.right }, storage: storage && { left: storage.left, right: storage.right }, actions: actions && { left: actions.left, right: actions.right }, lfs: lfs && { left: lfs.left, right: lfs.right }, scrollWidth: document.documentElement.scrollWidth, width: window.innerWidth };
+      return { detail: detail && { left: detail.left, right: detail.right }, storage: storage && { left: storage.left, right: storage.right }, actions: actions && { left: actions.left, right: actions.right }, lfs: lfs && { left: lfs.left, right: lfs.right }, hasProjectList: [...document.querySelectorAll("h2")].some(node => node.textContent === "Your projects"), scrollWidth: document.documentElement.scrollWidth, width: window.innerWidth };
     });
-    if (!bounds.branches || !bounds.storage || !bounds.actions || !bounds.lfs) throw new Error(`missing project detail section at ${width}px: ${JSON.stringify(bounds)}`);
-    if ([bounds.storage, bounds.actions, bounds.lfs].some(rect => rect.left < bounds.branches.left - 2 || rect.right > bounds.width) || bounds.scrollWidth > bounds.width) throw new Error(`project detail escaped its column at ${width}px: ${JSON.stringify(bounds)}`);
+    if (!bounds.detail || !bounds.storage || !bounds.actions || !bounds.lfs) throw new Error(`missing project detail section at ${width}px: ${JSON.stringify(bounds)}`);
+    if (bounds.hasProjectList || [bounds.storage, bounds.actions, bounds.lfs].some(rect => rect.left < bounds.detail.left - 2 || rect.right > bounds.detail.right + 2) || bounds.scrollWidth > bounds.width) throw new Error(`project detail escaped its dedicated page at ${width}px: ${JSON.stringify(bounds)}`);
   }
   await page.setViewportSize({ width: 1280, height: 900 });
 }
@@ -808,10 +808,38 @@ try {
     if (privateJobLog.includes(secret) || appOutput.includes(secret)) throw new Error(`private LFS secret reached an application or job log (${secret})`);
   }
   const sshPublishedPath = join(dir, "state.sqlite.publications", sshDeployment.body.id);
+  milestone("deployment refs error recovers without hiding other errors");
+  let failedDeploymentRefs = false;
+  await page.route(`**/api/projects/${sshProject.id}/refs`, async route => {
+    if (!failedDeploymentRefs && route.request().frame().url().includes(`/deployments/${sshDeployment.body.id}`)) {
+      failedDeploymentRefs = true;
+      await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE_REFS_FAILURE" });
+    } else {
+      await route.continue();
+    }
+  });
   await page.getByRole("link", { name: "SSH published site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}/deployments/${sshDeployment.body.id}`);
   const commitCard = page.getByRole("main");
   await commitCard.waitFor();
+  await commitCard.getByRole("alert").filter({ hasText: "The request could not be completed. Try again shortly." }).waitFor();
+  await commitCard.getByRole("alert").waitFor({ state: "detached", timeout: 10000 });
+  if (!failedDeploymentRefs || (await commitCard.innerText()).includes("SENSITIVE_REFS_FAILURE")) throw new Error("deployment refs failure did not recover safely");
+  await page.unroute(`**/api/projects/${sshProject.id}/refs`);
+  await commitCard.getByText(`Target commit: ${sshCommit}`, { exact: true }).waitFor();
+  await commitCard.getByText(`Live commit: ${sshCommit}`, { exact: true }).waitFor();
+  let failedDeployAction = false;
+  await page.route(`**/api/deployments/${sshDeployment.body.id}/deploy`, async route => {
+    failedDeployAction = true;
+    await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE_DEPLOY_FAILURE" });
+  });
+  await commitCard.getByRole("button", { name: "Deploy", exact: true }).click();
+  await commitCard.getByRole("alert").filter({ hasText: "The request could not be completed. Try again shortly." }).waitFor();
+  const successfulRefsAfterAction = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/refs`) && response.ok());
+  await successfulRefsAfterAction;
+  await page.waitForTimeout(150);
+  if (!failedDeployAction || !(await commitCard.getByRole("alert").count())) throw new Error("successful refs fetch hid an unrelated deploy error");
+  await page.unroute(`**/api/deployments/${sshDeployment.body.id}/deploy`);
   if (await commitCard.getByRole("button", { name: /^(Pause|Resume)$/ }).count()) throw new Error("commit deployment showed branch-only automation controls");
   milestone("deployment and project deletion confirmation");
   await page.getByRole("button", { name: "Delete", exact: true }).click();

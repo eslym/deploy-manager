@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import { formatBytes } from '#lib/format-bytes.js';
 	import { tick } from 'svelte';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
@@ -29,30 +31,25 @@
 		init?: RequestInit,
 		options?: { sshCreate?: boolean; sshRefresh?: boolean; deletion?: boolean }
 	) {
-		const response = await fetch(path, {
-			...init,
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json', ...init?.headers }
-		});
-		if (!response.ok) {
+		return dashboardRequest(path, init, async (response) => {
 			const status = Number.isInteger(response.status) ? ` (HTTP ${response.status})` : '';
 			const responseText = await response.text();
 			if (options?.deletion && response.status === 409)
-				throw new Error(`Remove the project's deployments before deleting it.${status}`);
+				return new Error(`Remove the project's deployments before deleting it.${status}`);
 			if (options?.deletion && response.status === 503)
-				throw new Error(
+				return new Error(
 					`Project deletion is pending. Remaining cache files are protected while cleanup retries.${status}`
 				);
 			if (options?.sshCreate && response.status === 409) {
-				throw new Error(
+				return new Error(
 					'Host key not approved. Verify the fingerprint in SSH host warnings independently before approving it.'
 				);
 			}
 			if (options?.sshRefresh && response.status === 502) {
-				throw new Error('SSH connection failed. Check the repository key and SSH host warnings.');
+				return new Error('SSH connection failed. Check the repository key and SSH host warnings.');
 			}
 			if (response.status === 409)
-				throw new Error(
+				return new Error(
 					'This change is out of date or the key is assigned. Refresh the page, then choose a key that is not assigned to another project.' +
 						status
 				);
@@ -71,11 +68,10 @@
 										? 'The server could not complete the request. Try again shortly.'
 										: 'The request could not be completed. Check your input and try again.';
 			const safeBackendText = responseText.trim().slice(0, 400);
-			throw new Error(
+			return new Error(
 				`${(options?.sshCreate || options?.sshRefresh) && safeBackendText ? safeBackendText : message}${status}`
 			);
-		}
-		return response.status === 204 ? null : response.json();
+		});
 	}
 	let projects = $state<Project[]>([]);
 	let repositoryKeys = $state<RepositoryKey[]>([]);
@@ -107,6 +103,7 @@
 	let cacheRecreateError = $state('');
 	let cacheRecreateNotice = $state('');
 	let selected = $derived(page.params.id ?? '');
+	let project = $derived(projects.find((item) => item.id === selected));
 	let loading = $state(true);
 	let missing = $state(false);
 	let visibleRefs = $derived(
@@ -148,9 +145,6 @@
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not assign the key.';
 		}
-	}
-	async function loadRefs(id: string) {
-		refs[id] = await request(`/api/projects/${id}/refs`);
 	}
 	async function loadLfsSettings(id: string) {
 		const selectionVersion = lfsSelectionVersion;
@@ -283,13 +277,6 @@
 			busy = false;
 		}
 	}
-	function formatBytes(bytes: number) {
-		if (!Number.isFinite(bytes) || bytes <= 0) return '0 bytes';
-		const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
-		const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-		const size = bytes / 1024 ** unit;
-		return `${size.toLocaleString(undefined, { maximumFractionDigits: unit === 0 ? 0 : 1 })} ${units[unit]}`;
-	}
 	async function recreateCache(project: Project) {
 		if (cacheRecreateBusy || cacheRecreateConfirmation !== project.id) return;
 		cacheRecreateBusy = true;
@@ -404,10 +391,7 @@
 	});
 </script>
 
-<svelte:head
-	><title>{projects.find((item) => item.id === selected)?.name ?? 'Project'} · Deploy Manager</title
-	></svelte:head
->
+<svelte:head><title>{project?.name ?? 'Project'} · Deploy Manager</title></svelte:head>
 <main class="mx-auto w-[min(100%-2rem,64rem)] min-w-0 py-10">
 	<a
 		class="text-sm font-semibold text-[#214c30] underline underline-offset-4"
@@ -418,12 +402,12 @@
 	{:else if missing}
 		<h1 class="mt-5 text-3xl font-semibold text-[#243528]">Project not found</h1>
 		<p class="mt-3 text-[#58645b]">This project may have been deleted.</p>
-	{:else if projects.find((item) => item.id === selected)}
+	{:else if project}
 		<h1 class="mt-5 text-3xl font-semibold tracking-[-0.03em] text-[#243528]">
-			{projects.find((item) => item.id === selected)?.name}
+			{project.name}
 		</h1>
 		<p class="mt-2 break-all text-[#58645b]">
-			{projects.find((item) => item.id === selected)?.url}
+			{project.url}
 		</p>
 	{:else}
 		<h1 class="mt-5 text-3xl font-semibold text-[#243528]">Project unavailable</h1>
@@ -434,8 +418,7 @@
 		>
 			{error}
 		</p>{/if}
-	{#if !loading && !missing && projects.find((item) => item.id === selected)}
-		{@const project = projects.find((item) => item.id === selected)}
+	{#if !loading && !missing && project}
 		<section class="mt-8 min-w-0">
 			<div class="flex flex-wrap items-center justify-between gap-3">
 				<h2 class="m-0 text-xl font-semibold text-[#243528]">Branches and tags</h2>

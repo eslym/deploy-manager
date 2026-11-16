@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { dashboardRequest } from '#lib/dashboard-request.js';
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
@@ -35,18 +36,13 @@
 	let selectedTarget = $derived(refs.find((ref) => key(ref) === selectedRef));
 
 	async function request(path: string, init?: RequestInit) {
-		const response = await fetch(path, {
-			...init,
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json', ...init?.headers }
-		});
-		if (!response.ok)
-			throw new Error(
+		return dashboardRequest(path, init, (response) => {
+			return new Error(
 				response.status >= 500
 					? 'The request could not be completed. Try again shortly.'
 					: 'The request was rejected. Refresh and try again.'
 			);
-		return response.status === 204 ? null : response.json();
+		});
 	}
 
 	async function load(id = projectId, currentView = viewVersion) {
