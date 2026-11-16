@@ -650,7 +650,9 @@
 			{/if}
 		</section>
 		<div class="min-w-0">
-			<Deployments projectId={selected} />
+			{#key selected}
+				<Deployments projectId={selected} />
+			{/key}
 		</div>
 		<div class="min-w-0">
 			{#key selected}
