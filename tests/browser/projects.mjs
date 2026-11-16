@@ -356,13 +356,23 @@ try {
   let finishJobHistory;
   releaseJobHistory = new Promise(resolveRelease => { finishJobHistory = resolveRelease; });
   await page.getByLabel("Deployment name").fill("Production site");
+  try { await page.locator('option[value="branch:feature/search"]').waitFor({ state: "attached" }); } catch {
+    const options = await page.locator("form select").first().innerHTML();
+    const cached = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/refs`)).json(), id);
+    throw new Error(`deployment targets missing feature branch: ${options}; cached refs: ${JSON.stringify(cached)}`);
+  }
   await page.locator("form").locator("select").selectOption("branch:feature/search");
   const deploymentResponse = page.waitForResponse(response => response.url().endsWith("/api/deployments") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Create deployment" }).click();
   const deploymentCreated = await deploymentResponse;
   if (deploymentCreated.status() !== 201) throw new Error(`deployment creation returned ${deploymentCreated.status()}: ${await deploymentCreated.text()}`);
-  await page.getByText("Production site", { exact: true }).waitFor();
-  const deploymentID = await page.evaluate(async () => (await (await fetch("/api/deployments")).json())[0].id);
+  const deploymentID = (await deploymentCreated.json()).id;
+  await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
+  await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
+  await page.getByText(join(dir, "state.sqlite.publications", deploymentID), { exact: true }).waitFor();
+  if (await httpsRequestStatus("127.0.0.1", 18440, "/api/deployments", "GET") !== 401) throw new Error("deployment list was accessible without a session");
+  if (await httpsRequestStatus("127.0.0.1", 18440, `/api/deployments/${deploymentID}/jobs`, "GET") !== 401) throw new Error("deployment history was accessible without a session");
+  if (await httpsRequestStatus("127.0.0.1", 18440, `/api/deployments/${deploymentID}/deploy`, "POST", "{}", { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" }) !== 403) throw new Error("cross-origin deployment action was accepted");
   const delayedHistoryRoute = await jobHistoryRequest;
   const productionHistory = page.getByRole("region", { name: "Job history for Production site" });
   await productionHistory.getByText("Loading history…", { exact: true }).waitFor();
@@ -394,6 +404,22 @@ try {
     throw new Error(`${error.message}; state: ${JSON.stringify(state)}`);
   }
   await page.getByText("Live", { exact: true }).waitFor();
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
+  await page.getByRole("link", { name: "Fixture site", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${id}`);
+  await page.getByRole("link", { name: "Production site", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
+  await page.goto(`https://${appListen}/dashboard/projects/${id}/deployments/missing-deployment`, { waitUntil: "domcontentloaded" });
+  await page.getByText(/Deployment not found/i).waitFor();
+  await page.goto(`https://${appListen}/dashboard/projects/${ordinaryProject.id}/deployments/${deploymentID}`, { waitUntil: "domcontentloaded" });
+  await page.getByText(/Deployment not found/i).waitFor();
+  if (await page.getByRole("button", { name: "Deploy", exact: true }).count()) throw new Error("another project's deployment exposed its actions");
+  await page.goto(`https://${appListen}/dashboard/projects/${id}/deployments/${deploymentID}`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
+  await page.getByRole("link", { name: "Fixture site", exact: true }).click();
+  await page.getByRole("link", { name: "Production site", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
   const publishedPath = join(dir, "state.sqlite.publications", deploymentID);
   const firstDirectoryIdentity = (await stat(publishedPath)).ino;
   milestone("steady deployment history during background refreshes");
@@ -538,7 +564,7 @@ try {
     try { return (await readFile(join(publishedPath, "index.html"), "utf8")) === "<!doctype html><title>main</title>\n"; } catch { return false; }
   }, "replacement publication files");
   if ((await stat(publishedPath)).ino === firstDirectoryIdentity) throw new Error("replacement did not switch the live directory");
-  const productionCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "Production site", exact: true }) });
+  const productionCard = page.getByRole("main");
   await page.getByRole("button", { name: "Deploy", exact: true }).click();
   await waitForNoopHistory(page, deploymentID, productionCard);
 
@@ -569,7 +595,7 @@ try {
   if (!paused.ok() || (await paused.json()).automationPaused !== true) throw new Error("Pause did not persist automation state");
   await productionCard.getByText("Automatic deployment paused", { exact: true }).waitFor();
   await page.reload();
-  await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
+  await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
   await productionCard.getByText("Automatic deployment paused", { exact: true }).waitFor();
   const manualWhilePaused = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/deploy`));
   await productionCard.getByRole("button", { name: "Deploy", exact: true }).click();
@@ -584,6 +610,8 @@ try {
   if (resumed.status() !== 202 || resumeBody.automationPaused !== false || !resumeBody.jobId || resumeBody.status !== "queued") throw new Error("Resume did not enable automation and queue deployment");
   await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
 
+  await page.getByRole("link", { name: "Fixture site", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${id}`);
   const initialTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
   const search = page.getByLabel("Search branches and tags");
   await search.fill("feature/search");
@@ -602,11 +630,12 @@ try {
   const tagCreated = await tagDeploymentResponse;
   if (tagCreated.status() !== 201) throw new Error(`tag deployment creation returned ${tagCreated.status()}: ${await tagCreated.text()}`);
   const tagDeployment = await tagCreated.json();
+  await page.waitForURL(`**/dashboard/projects/${id}/deployments/${tagDeployment.id}`);
   const tagPath = join(dir, "state.sqlite.publications", tagDeployment.id);
   await waitFor(async () => {
     try { return (await readFile(join(tagPath, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n"; } catch { return false; }
   }, "tag-target publication from the dashboard");
-  const tagCard = page.locator("li").filter({ hasText: "Tag release" });
+  const tagCard = page.getByRole("main");
   if (await tagCard.getByRole("button", { name: /^(Pause|Resume)$/ }).count()) throw new Error("tag deployment showed branch-only automation controls");
   const tagIdentity = (await stat(tagPath)).ino;
   const hardRedeployResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${tagDeployment.id}/hard-redeploy`));
@@ -617,6 +646,8 @@ try {
     return jobs[0]?.status === "succeeded" && (await stat(tagPath)).ino !== tagIdentity;
   }, "dashboard Hard re-deploy to recreate the tag publication");
 
+  await page.getByRole("link", { name: "Fixture site", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${id}`);
   milestone("refresh success and failure retention");
   const refreshButton = page.getByRole("button", { name: "Refresh branches and tags", exact: true });
   const refreshResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
@@ -777,7 +808,9 @@ try {
     if (privateJobLog.includes(secret) || appOutput.includes(secret)) throw new Error(`private LFS secret reached an application or job log (${secret})`);
   }
   const sshPublishedPath = join(dir, "state.sqlite.publications", sshDeployment.body.id);
-  const commitCard = page.locator("li").filter({ has: page.getByRole("heading", { name: "SSH published site", exact: true }) });
+  await page.getByRole("link", { name: "SSH published site", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${sshProject.id}/deployments/${sshDeployment.body.id}`);
+  const commitCard = page.getByRole("main");
   await commitCard.waitFor();
   if (await commitCard.getByRole("button", { name: /^(Pause|Resume)$/ }).count()) throw new Error("commit deployment showed branch-only automation controls");
   milestone("deployment and project deletion confirmation");
@@ -785,16 +818,21 @@ try {
   await page.getByText(/Delete “SSH published site” and remove its published files/).waitFor();
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
   if ((await readFile(join(sshPublishedPath, "index.html"), "utf8")) !== "SSH fixture site\n") throw new Error("cancelling deployment deletion changed its publication");
+  await page.getByRole("link", { name: "SSH fixture site", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
   await page.getByRole("button", { name: "Delete project" }).click();
   await page.getByText(/Projects with deployments cannot be deleted/).waitFor();
   const blockedProjectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/delete`));
   await page.getByRole("button", { name: "Confirm delete" }).click();
   if ((await blockedProjectDelete).status() !== 409) throw new Error("project deletion was not blocked while a deployment existed");
   if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id))) throw new Error("blocked project deletion removed the project");
+  await page.getByRole("link", { name: "SSH published site", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${sshProject.id}/deployments/${sshDeployment.body.id}`);
   await page.getByRole("button", { name: "Delete", exact: true }).click();
   const deploymentDelete = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${sshDeployment.body.id}/delete`));
   await page.getByRole("button", { name: "Confirm delete" }).click();
   if ((await deploymentDelete).status() !== 204) throw new Error("confirmed deployment deletion did not finish");
+  await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
   await waitFor(async () => { try { await stat(sshPublishedPath); return false; } catch { return true; } }, "deleted publication files");
   await page.getByRole("button", { name: "Delete project" }).click();
   await page.getByText(/Projects with deployments cannot be deleted/).waitFor();
@@ -849,6 +887,8 @@ try {
   if (recreatedProject.gitCacheBytes !== 0 || recreatedProject.lfsCacheBytes !== 0) throw new Error(`cache sizes after recreation are not zero: ${JSON.stringify(recreatedProject)}`);
   await cacheSection.getByText("Git cache: 0 bytes · LFS cache: 0 bytes").waitFor();
   if ((await readFile(join(publishedPath, "index.html"), "utf8")) !== liveBeforeCacheRecreation) throw new Error("cache recreation changed live published content");
+  await page.getByRole("link", { name: "Pinned cache check", exact: true }).click();
+  await page.waitForURL(`**/dashboard/projects/${id}/deployments/${pinnedDeploymentResponse.body.id}`);
   let leavingViewHistoryPolls = 0;
   await page.route(`**/api/deployments/${pinnedDeploymentResponse.body.id}/jobs`, async route => {
     if (route.request().method() === "GET") leavingViewHistoryPolls++;
