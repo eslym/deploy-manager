@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { dashboardRequest } from '#lib/dashboard-request.js';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onDestroy } from 'svelte';
@@ -40,6 +41,7 @@
 	let targetSelection = $state('');
 	let targetSearch = $state('');
 	let error = $state('');
+	let refsError = $state('');
 	let loading = $state(true);
 	let missing = $state(false);
 	let busy = $state(false);
@@ -64,22 +66,17 @@
 				}[job.status] ?? job.status);
 
 	async function request(path: string, init?: RequestInit) {
-		const response = await fetch(path, {
-			...init,
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json', ...init?.headers }
-		});
-		if (!response.ok && path.endsWith('/delete') && response.status === 503)
-			throw new Error(
-				'Deletion is pending. The published files are protected while cleanup retries; try again later.'
-			);
-		if (!response.ok)
-			throw new Error(
+		return dashboardRequest(path, init, (response) => {
+			if (path.endsWith('/delete') && response.status === 503)
+				return new Error(
+					'Deletion is pending. The published files are protected while cleanup retries; try again later.'
+				);
+			return new Error(
 				response.status >= 500
 					? 'The request could not be completed. Try again shortly.'
 					: 'The request was rejected. Refresh and try again.'
 			);
-		return response.status === 204 ? null : response.json();
+		});
 	}
 
 	async function load(id = projectId, deployment = deploymentId, currentView = viewVersion) {
@@ -126,12 +123,13 @@
 			if (refsResult.status === 'fulfilled') {
 				refs = refsResult.value;
 				refsLoaded = true;
+				refsError = '';
 			} else {
 				const message =
 					refsResult.reason instanceof Error
 						? refsResult.reason.message
 						: 'Could not load targets.';
-				error = refsLoaded
+				refsError = refsLoaded
 					? `${message} Refresh and try again. Your current branches and tags are still shown.`
 					: message;
 			}
@@ -154,12 +152,13 @@
 		if (busy || !project || !item) return;
 		busy = true;
 		error = '';
+		refsError = '';
 		try {
 			await request(`/api/projects/${projectId}/refresh`, { method: 'POST', body: '{}' });
 			await load();
 		} catch (cause) {
 			const message = cause instanceof Error ? cause.message : 'Could not refresh targets.';
-			error = refsLoaded
+			refsError = refsLoaded
 				? `${message} Refresh and try again. Your current branches and tags are still shown.`
 				: message;
 		} finally {
@@ -251,6 +250,7 @@
 		missing = false;
 		loading = true;
 		error = '';
+		refsError = '';
 		targetSelection = '';
 		targetSearch = '';
 		deleteConfirmation = false;
@@ -291,6 +291,12 @@
 			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
 		>
 			{error}
+		</p>{/if}
+	{#if refsError}<p
+			role="alert"
+			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{refsError}
 		</p>{/if}
 	{#if item && project && !missing}
 		<section
@@ -376,11 +382,13 @@
 					</div>
 				</div>
 			{/if}
-			<p class="mt-2 text-sm text-[#58645b]">
-				{item.liveCommit ? `Live commit: ${item.liveCommit}` : ''}
+			{#if item.liveCommit}<p class="mt-2 text-sm text-[#58645b]">
+					Live commit: {item.liveCommit}
+				</p>{/if}
+			<p class="mt-1 text-sm text-[#58645b]">
 				{#if item.targetKind === 'branch' || item.targetKind === 'tag'}
-					{item.liveCommit ? ' · ' : ''}Target {item.targetKind}: {item.targetName}
-				{:else if !item.liveCommit}
+					Target {item.targetKind}: {item.targetName}
+				{:else}
 					Target commit: {item.commit}
 				{/if}
 			</p>

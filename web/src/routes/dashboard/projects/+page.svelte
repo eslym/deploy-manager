@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import { formatBytes } from '#lib/format-bytes.js';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	type Project = {
@@ -25,30 +27,25 @@
 		init?: RequestInit,
 		options?: { sshCreate?: boolean; sshRefresh?: boolean; deletion?: boolean }
 	) {
-		const response = await fetch(path, {
-			...init,
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json', ...init?.headers }
-		});
-		if (!response.ok) {
+		return dashboardRequest(path, init, async (response) => {
 			const status = Number.isInteger(response.status) ? ` (HTTP ${response.status})` : '';
 			const responseText = await response.text();
 			if (options?.deletion && response.status === 409)
-				throw new Error(`Remove the project's deployments before deleting it.${status}`);
+				return new Error(`Remove the project's deployments before deleting it.${status}`);
 			if (options?.deletion && response.status === 503)
-				throw new Error(
+				return new Error(
 					`Project deletion is pending. Remaining cache files are protected while cleanup retries.${status}`
 				);
 			if (options?.sshCreate && response.status === 409) {
-				throw new Error(
+				return new Error(
 					'Host key not approved. Verify the fingerprint in SSH host warnings independently before approving it.'
 				);
 			}
 			if (options?.sshRefresh && response.status === 502) {
-				throw new Error('SSH connection failed. Check the repository key and SSH host warnings.');
+				return new Error('SSH connection failed. Check the repository key and SSH host warnings.');
 			}
 			if (response.status === 409)
-				throw new Error(
+				return new Error(
 					'This change is out of date or the key is assigned. Refresh the page, then choose a key that is not assigned to another project.' +
 						status
 				);
@@ -67,11 +64,10 @@
 										? 'The server could not complete the request. Try again shortly.'
 										: 'The request could not be completed. Check your input and try again.';
 			const safeBackendText = responseText.trim().slice(0, 400);
-			throw new Error(
+			return new Error(
 				`${(options?.sshCreate || options?.sshRefresh) && safeBackendText ? safeBackendText : message}${status}`
 			);
-		}
-		return response.status === 204 ? null : response.json();
+		});
 	}
 	let projects = $state<Project[]>([]);
 	let repositoryKeys = $state<RepositoryKey[]>([]);
@@ -114,13 +110,6 @@
 		} finally {
 			busy = false;
 		}
-	}
-	function formatBytes(bytes: number) {
-		if (!Number.isFinite(bytes) || bytes <= 0) return '0 bytes';
-		const units = ['bytes', 'KB', 'MB', 'GB', 'TB'];
-		const unit = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
-		const size = bytes / 1024 ** unit;
-		return `${size.toLocaleString(undefined, { maximumFractionDigits: unit === 0 ? 0 : 1 })} ${units[unit]}`;
 	}
 	onMount(() => {
 		void loadProjects();

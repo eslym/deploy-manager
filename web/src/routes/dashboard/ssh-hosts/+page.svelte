@@ -1,19 +1,14 @@
 <script lang="ts">
+	import { dashboardRequest } from '#lib/dashboard-request.js';
 	import { onMount } from 'svelte';
 	async function request(path: string, init?: RequestInit) {
-		const response = await fetch(path, {
-			...init,
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json', ...init?.headers }
-		});
-		if (!response.ok) {
+		return dashboardRequest(path, init, (response) => {
 			const status = ` (HTTP ${response.status})`;
 			if (response.status === 401 || response.status === 403)
-				throw new Error(`Your session may have expired. Sign in again.${status}`);
-			if (response.status === 409) throw new Error(`This change could not be completed.${status}`);
-			throw new Error(`The request could not be completed. Try again shortly.${status}`);
-		}
-		return response.status === 204 ? null : response.json();
+				return new Error(`Your session may have expired. Sign in again.${status}`);
+			if (response.status === 409) return new Error(`This change could not be completed.${status}`);
+			return new Error(`The request could not be completed. Try again shortly.${status}`);
+		});
 	}
 	let sshHosts = $state<
 		{ host: string; port: number; fingerprint: string; warning?: string; trusted: boolean }[]
