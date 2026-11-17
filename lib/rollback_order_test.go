@@ -43,13 +43,14 @@ func TestLaterWebhookCannotOvertakeAcceptedRollback(t *testing.T) {
 		}
 		unblock.Do(func() { close(release) })
 		waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, rollback, "succeeded")
+		publication := f.app.deploymentPath(id)
 		// Closing waits for the original worker too: it must not run rollback a
 		// second time after the later webhook has completed.
 		f.server.Close()
 		if err := f.app.Close(); err != nil {
 			t.Fatal(err)
 		}
-		content, err := os.ReadFile(filepath.Join(f.app.deploymentPath(id), "README.md"))
+		content, err := os.ReadFile(filepath.Join(publication, "README.md"))
 		if err != nil || string(content) != "latest branch tip\n" {
 			t.Fatalf("later accepted webhook lost to rollback: %q %v", content, err)
 		}

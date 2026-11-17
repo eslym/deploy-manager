@@ -1,5 +1,15 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import {
+		isReservedPublicationFolder,
+		isValidPublicationFolder,
+		publicationFolderPattern,
+		publicationFolderPreview
+	} from '#lib/publication-folder.js';
+	import {
+		PublicationStatusUnavailableError,
+		publicationStatusUnavailable
+	} from '#lib/publication-status.js';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onDestroy } from 'svelte';
@@ -41,11 +51,20 @@
 	let targetSelection = $state('');
 	let targetSearch = $state('');
 	let error = $state('');
+	let publicationStatusError = $state('');
 	let refsError = $state('');
 	let loading = $state(true);
 	let missing = $state(false);
 	let busy = $state(false);
 	let deleteConfirmation = $state(false);
+	let publicationRoot = $state('');
+	let moveOpen = $state(false);
+	let movePath = $state('');
+	let moveConfirmation = $state<{ oldPath: string; newPath: string } | null>(null);
+	let moveRootError = $state('');
+	let reservedMovePath = $derived(isReservedPublicationFolder(movePath));
+	let validMovePath = $derived(isValidPublicationFolder(movePath));
+	let movePreview = $derived(publicationFolderPreview(publicationRoot, movePath));
 	let loadVersion = 0;
 	let viewVersion = 0;
 	const key = (ref: Ref) => `${ref.kind}:${ref.name}`;
@@ -67,6 +86,12 @@
 
 	async function request(path: string, init?: RequestInit) {
 		return dashboardRequest(path, init, (response) => {
+			if (path === '/api/deployments' && response.status === 503)
+				return publicationStatusUnavailable(response);
+			if (path.endsWith('/move') && response.status === 409)
+				return new Error(
+					'The publication may have changed or the destination is unavailable. Refresh and review the move before trying again.'
+				);
 			if (path.endsWith('/delete') && response.status === 503)
 				return new Error(
 					'Deletion is pending. The published files are protected while cleanup retries; try again later.'
@@ -92,6 +117,7 @@
 				request('/api/projects')
 			]);
 			if (!current()) return;
+			publicationStatusError = '';
 			const foundProject = projects.find((candidate) => candidate.id === id);
 			const found = all.find(
 				(candidate) => candidate.id === deployment && candidate.projectId === id
@@ -106,6 +132,8 @@
 			}
 			project = foundProject;
 			const previousTarget = item && `${item.targetKind}:${item.targetName}`;
+			if (item?.publicationPath && item.publicationPath !== found.publicationPath)
+				moveConfirmation = null;
 			item = found;
 			if (!targetSelection || previousTarget !== `${found.targetKind}:${found.targetName}`)
 				targetSelection =
@@ -115,9 +143,10 @@
 			loading = false;
 			missing = false;
 			// Only fetch deployment-scoped data after the project/deployment association is verified.
-			const [refsResult, jobsResult] = await Promise.allSettled([
+			const [refsResult, jobsResult, rootResult] = await Promise.allSettled([
 				request(`/api/projects/${id}/refs`) as Promise<Ref[]>,
-				request(`/api/deployments/${deployment}/jobs`) as Promise<Job[]>
+				request(`/api/deployments/${deployment}/jobs`) as Promise<Job[]>,
+				request('/api/deployments/root') as Promise<{ publicationRoot: string }>
 			]);
 			if (!current()) return;
 			if (refsResult.status === 'fulfilled') {
@@ -141,10 +170,28 @@
 				historyStatus = 'error';
 				historyError = 'The history could not be refreshed. Try again shortly.';
 			}
+			if (rootResult.status === 'fulfilled') {
+				publicationRoot = rootResult.value.publicationRoot;
+				moveRootError = '';
+			} else {
+				publicationRoot = '';
+				moveRootError =
+					'Could not load the publication root. Refresh the page to move this deployment.';
+			}
 		} catch (cause) {
 			if (!current()) return;
 			loading = false;
-			error = cause instanceof Error ? cause.message : 'Could not load deployment.';
+			if (cause instanceof PublicationStatusUnavailableError) {
+				item = null;
+				jobs = null;
+				publicationRoot = '';
+				moveConfirmation = null;
+				moveOpen = false;
+				publicationStatusError = cause.message;
+				error = '';
+			} else {
+				error = cause instanceof Error ? cause.message : 'Could not load deployment.';
+			}
 		}
 	}
 
@@ -234,6 +281,41 @@
 		}
 	}
 
+	async function moveDeployment(id: string) {
+		const confirmation = moveConfirmation;
+		if (
+			busy ||
+			!item ||
+			!project ||
+			!confirmation ||
+			!validMovePath ||
+			confirmation.oldPath !== item.publicationPath ||
+			confirmation.newPath !== movePreview
+		)
+			return;
+		busy = true;
+		error = '';
+		try {
+			await request(`/api/deployments/${id}/move`, {
+				method: 'POST',
+				body: JSON.stringify({
+					publicationPath: movePath,
+					expectedPublicationPath: confirmation.oldPath,
+					confirm: true
+				})
+			});
+			moveConfirmation = null;
+			movePath = '';
+			moveOpen = false;
+			await load();
+		} catch (cause) {
+			moveConfirmation = null;
+			error = cause instanceof Error ? cause.message : 'Could not move the deployment.';
+		} finally {
+			busy = false;
+		}
+	}
+
 	let timeout: number | undefined;
 	afterNavigate(() => {
 		const id = projectId;
@@ -250,10 +332,16 @@
 		missing = false;
 		loading = true;
 		error = '';
+		publicationStatusError = '';
 		refsError = '';
 		targetSelection = '';
 		targetSearch = '';
 		deleteConfirmation = false;
+		movePath = '';
+		moveOpen = false;
+		moveConfirmation = null;
+		publicationRoot = '';
+		moveRootError = '';
 		const poll = async () => {
 			if (version !== viewVersion) return;
 			await load(id, deployment, version);
@@ -292,6 +380,12 @@
 		>
 			{error}
 		</p>{/if}
+	{#if publicationStatusError}<p
+			role="alert"
+			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{publicationStatusError}
+		</p>{/if}
 	{#if refsError}<p
 			role="alert"
 			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
@@ -307,6 +401,84 @@
 			<p class="mt-2 text-sm text-[#58645b]">
 				Publication path: <code class="break-all">{item.publicationPath}</code>
 			</p>
+			<div class="mt-4 border-t border-[#e1e6df] pt-4">
+				<button
+					class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold text-[#214c30] disabled:opacity-60"
+					onclick={() => {
+						moveOpen = !moveOpen;
+						moveConfirmation = null;
+					}}
+					disabled={busy}>Move publication</button
+				>
+				{#if moveOpen}
+					{#if moveRootError}<p role="alert" class="mt-2 text-sm text-red-800">
+							{moveRootError}
+						</p>{/if}
+					<label
+						class="mt-3 grid gap-1 text-sm font-medium text-[#354238]"
+						for="move-publication-path"
+					>
+						Publication folder (within the publication root)
+						<input
+							id="move-publication-path"
+							class="min-h-10 rounded-lg border border-[#aeb9ae] px-3"
+							bind:value={movePath}
+							oninput={() => (moveConfirmation = null)}
+							disabled={busy || !publicationRoot}
+							maxlength="100"
+							pattern={publicationFolderPattern}
+						/>
+					</label>
+					<p class="mt-1 text-xs text-[#58645b]">
+						One folder name, with no slashes. Use letters, numbers, dots, hyphens or underscores;
+						start with a letter or number.
+					</p>
+					{#if reservedMovePath}
+						<p class="mt-1 text-xs text-red-800">This folder name is reserved. Choose another.</p>
+					{/if}
+					{#if movePreview && movePreview !== item.publicationPath}
+						<button
+							class="mt-3 min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold text-[#214c30] disabled:opacity-60"
+							onclick={() =>
+								item &&
+								(moveConfirmation = { oldPath: item.publicationPath, newPath: movePreview })}
+							disabled={busy}>Review move</button
+						>
+					{/if}
+					{#if moveConfirmation && moveConfirmation.oldPath === item.publicationPath && moveConfirmation.newPath === movePreview}
+						<div
+							class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3"
+							role="dialog"
+							aria-label="Confirm publication move"
+							aria-modal="false"
+						>
+							<p class="text-sm font-semibold text-[#354238]">Move published files?</p>
+							<p class="mt-2 text-sm text-[#354238]">
+								From: <code class="break-all">{moveConfirmation.oldPath}</code>
+							</p>
+							<p class="mt-1 text-sm text-[#354238]">
+								To: <code class="break-all">{moveConfirmation.newPath}</code>
+							</p>
+							<p class="mt-2 text-sm font-semibold text-amber-900">
+								Update your external web server’s document root to the new path. Until then, the
+								site may not be served.
+							</p>
+							<div class="mt-3 flex flex-wrap gap-2">
+								<button
+									class="min-h-9 rounded-lg bg-[#214c30] px-3 text-sm font-semibold text-white disabled:opacity-60"
+									onclick={() => item && moveDeployment(item.id)}
+									disabled={busy}>Confirm move</button
+								>
+								<button
+									class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold disabled:opacity-60"
+									onclick={() => (moveConfirmation = null)}
+									disabled={busy}>Cancel</button
+								>
+							</div>
+						</div>
+					{/if}
+				{/if}
+			</div>
 			<div class="mt-3 flex flex-wrap items-center justify-between gap-3">
 				<p class="text-sm text-[#58645b]">
 					{project.lastFetched

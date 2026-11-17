@@ -14,7 +14,7 @@ import (
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const currentSchemaVersion int64 = 1
+const currentSchemaVersion int64 = 3
 
 type pendingUpgrade struct{ source, target int64 }
 
@@ -127,7 +127,7 @@ func inspectVersionOneHistory(db *sql.DB) (bool, error) {
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	if len(got) == 2 && got[0] == [2]int64{0, 1} && got[1] == [2]int64{currentSchemaVersion, 0} {
+	if len(got) == 2 && got[0] == [2]int64{0, 1} && got[1] == [2]int64{1, 0} {
 		return true, nil
 	}
 	return false, nil
@@ -344,6 +344,21 @@ func validateSchemaTables(db *sql.DB) error {
 		}
 		if count != 1 {
 			return fmt.Errorf("required schema table %q is missing; refusing startup", name)
+		}
+	}
+	// v1/v2 stores are inspected before their protected forward migration.
+	// A move journal is mandatory only after the reviewed v3 migration.
+	var version int64
+	if err := db.QueryRow(`SELECT max(version_id) FROM goose_db_version WHERE is_applied=1`).Scan(&version); err != nil {
+		return err
+	}
+	if version >= 3 {
+		var count int
+		if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='publication_moves'`).Scan(&count); err != nil {
+			return err
+		}
+		if count != 1 {
+			return errors.New("required schema table publication_moves is missing; refusing startup")
 		}
 	}
 	return nil

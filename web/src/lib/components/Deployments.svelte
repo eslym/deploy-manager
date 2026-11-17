@@ -1,5 +1,15 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import {
+		isReservedPublicationFolder,
+		isValidPublicationFolder,
+		publicationFolderPattern,
+		publicationFolderPreview
+	} from '#lib/publication-folder.js';
+	import {
+		PublicationStatusUnavailableError,
+		publicationStatusUnavailable
+	} from '#lib/publication-status.js';
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
@@ -9,6 +19,7 @@
 		id: string;
 		projectId: string;
 		name: string;
+		publicationPath: string;
 		targetKind: string;
 		targetName: string;
 		commit: string;
@@ -23,6 +34,8 @@
 	let lastFetched = $state<string | null>(null);
 	let deployments = $state.raw<Deployment[]>([]);
 	let name = $state('');
+	let publicationPath = $state('');
+	let publicationRoot = $state('');
 	let selectedRef = $state('');
 	let refSearch = $state('');
 	let error = $state('');
@@ -34,9 +47,14 @@
 		refs.filter((ref) => ref.name.toLowerCase().includes(refSearch.toLowerCase()))
 	);
 	let selectedTarget = $derived(refs.find((ref) => key(ref) === selectedRef));
+	let reservedPublicationPath = $derived(isReservedPublicationFolder(publicationPath));
+	let validPublicationPath = $derived(isValidPublicationFolder(publicationPath));
+	let publicationPreview = $derived(publicationFolderPreview(publicationRoot, publicationPath));
 
 	async function request(path: string, init?: RequestInit) {
 		return dashboardRequest(path, init, (response) => {
+			if (path === '/api/deployments' && response.status === 503)
+				return publicationStatusUnavailable(response);
 			return new Error(
 				response.status >= 500
 					? 'The request could not be completed. Try again shortly.'
@@ -48,20 +66,32 @@
 	async function load(id = projectId, currentView = viewVersion) {
 		const version = ++loadVersion;
 		try {
-			const [all, projects, cachedRefs]: [Deployment[], Project[], Ref[]] = await Promise.all([
+			const [all, projects, cachedRefs, root]: [
+				Deployment[],
+				Project[],
+				Ref[],
+				{ publicationRoot: string }
+			] = await Promise.all([
 				request('/api/deployments'),
 				request('/api/projects'),
-				request(`/api/projects/${id}/refs`)
+				request(`/api/projects/${id}/refs`),
+				request('/api/deployments/root')
 			]);
 			if (version !== loadVersion || currentView !== viewVersion || id !== projectId) return;
 			refs = cachedRefs;
 			refsLoaded = true;
 			lastFetched = projects.find((project) => project.id === id)?.lastFetched ?? null;
+			publicationRoot = root.publicationRoot;
 			deployments = all.filter((item) => item.projectId === id);
 			deploymentsLoaded = true;
 			error = '';
 		} catch (cause) {
 			if (version !== loadVersion || currentView !== viewVersion || id !== projectId) return;
+			if (cause instanceof PublicationStatusUnavailableError) {
+				deployments = [];
+				deploymentsLoaded = false;
+				publicationRoot = '';
+			}
 			const message = cause instanceof Error ? cause.message : 'Could not load deployments.';
 			error = refsLoaded
 				? `${message} Refresh and try again. Your current branches and tags are still shown.`
@@ -71,7 +101,7 @@
 
 	async function create(event: SubmitEvent) {
 		event.preventDefault();
-		if (busy || !selectedTarget) return;
+		if (busy || !selectedTarget || !validPublicationPath || !publicationRoot) return;
 		busy = true;
 		error = '';
 		try {
@@ -82,7 +112,8 @@
 					targetName: selectedTarget.name,
 					commit: selectedTarget.commit,
 					projectId,
-					name
+					name,
+					publicationPath
 				})
 			});
 			if (!result?.id) throw new Error('Could not confirm the new deployment. Refresh the page.');
@@ -185,9 +216,35 @@
 					>{/each}
 			</select>
 		</label>
+		<label class="grid gap-1 text-sm font-medium text-[#354238]"
+			>Publication folder
+			<input
+				class="min-h-11 rounded-lg border border-[#aeb9ae] px-3"
+				bind:value={publicationPath}
+				aria-describedby="publication-folder-hint"
+				pattern={publicationFolderPattern}
+				maxlength="100"
+				required
+			/>
+			<span id="publication-folder-hint" class="text-xs font-normal text-[#58645b]"
+				>One folder name, with no slashes. Use letters, numbers, dots, hyphens or underscores; start
+				with a letter or number.</span
+			>
+			{#if reservedPublicationPath}
+				<span class="text-xs font-normal text-red-800"
+					>This folder name is reserved. Choose another.</span
+				>
+			{/if}
+		</label>
+		{#if publicationPreview}
+			<p class="min-w-0 self-center text-sm text-[#58645b]">
+				Full path: <code class="break-all">{publicationPreview}</code>
+			</p>
+		{/if}
 		<button
 			class="min-h-11 w-fit rounded-lg bg-[#214c30] px-5 font-semibold text-white disabled:opacity-60"
-			disabled={busy || !selectedTarget}>Create deployment</button
+			disabled={busy || !selectedTarget || !validPublicationPath || !publicationRoot}
+			>Create deployment</button
 		>
 	</form>
 	<ul class="mt-5 grid gap-3 p-0">
@@ -199,6 +256,9 @@
 						href={`/dashboard/projects/${projectId}/deployments/${item.id}`}>{item.name}</a
 					>
 				</h3>
+				<p class="mt-1 text-sm text-[#58645b]">
+					Publication path: <code class="break-all">{item.publicationPath}</code>
+				</p>
 				<p class="mt-1 text-sm text-[#58645b]">
 					{item.status === 'live' ? 'Live' : item.status} · Target {item.targetKind}: {item.targetKind ===
 					'commit'

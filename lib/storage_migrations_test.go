@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,6 +25,36 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/sys/unix"
 )
+
+// Keep the historical migrations in synthetic upgrade tests so an applied v2
+// database is never accidentally treated as a v1 database.
+func testUpgradeMigrations(t *testing.T, extras fstest.MapFS) fstest.MapFS {
+	t.Helper()
+	files := fstest.MapFS{}
+	for _, name := range []string{"00001_initial.sql", "00002_publication_name.sql", "00003_publication_moves.sql"} {
+		data, err := fs.ReadFile(migrationFiles, "migrations/"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files[name] = &fstest.MapFile{Data: data}
+	}
+	for name, file := range extras {
+		files[name] = file
+	}
+	return files
+}
+
+// A real v1 installation is required when exercising the old v0-to-v1
+// interrupted-upgrade history; unapplying v1 on a v2 store corrupts history.
+func testVersionOneConfig(t *testing.T, cfg Config) Config {
+	t.Helper()
+	files := testUpgradeMigrations(t, nil)
+	delete(files, "00002_publication_name.sql")
+	delete(files, "00003_publication_moves.sql")
+	cfg.migrationFS = files
+	cfg.upgradeTargetVersion = 1
+	return cfg
+}
 
 func TestFreshSchemaIsCompleteAndReopenIsNoOp(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "fresh.db")
@@ -71,7 +102,7 @@ func TestProtectedUpgradeVerifiesAndDurablyUnlocksBeforeReturning(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 1, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
+	marker := maintenanceMarker{Version: 1, SourceVersion: currentSchemaVersion, TargetVersion: currentSchemaVersion, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
 	if err := durableJSONReplace(markerPath, marker); err != nil {
 		t.Fatal(err)
 	}
@@ -94,12 +125,11 @@ func TestPendingUpgradeCompletesThroughStorageStartupWithFixtureMigration(t *tes
 	dir := t.TempDir()
 	cfg := Config{
 		DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true,
-		upgradeTargetVersion: 2,
-		migrationFS: fstest.MapFS{
-			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_upgrade(value TEXT NOT NULL);\nINSERT INTO fixture_upgrade VALUES('completed');\n-- +goose Down\nDROP TABLE fixture_upgrade;\n")},
-		},
+		upgradeTargetVersion: currentSchemaVersion + 1,
 	}
+	cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
+		"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_upgrade(value TEXT NOT NULL);\nINSERT INTO fixture_upgrade VALUES('completed');\n-- +goose Down\nDROP TABLE fixture_upgrade;\n")},
+	})
 	first, err := NewGrantIssuer(Config{DatabasePath: cfg.DatabasePath, OPAQUEKeyPath: cfg.OPAQUEKeyPath, InsecureLocalHTTP: true})
 	if err != nil {
 		t.Fatal(err)
@@ -107,7 +137,7 @@ func TestPendingUpgradeCompletesThroughStorageStartupWithFixtureMigration(t *tes
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-	writeTestProgramProvenance(t, cfg, 1)
+	writeTestProgramProvenance(t, cfg, currentSchemaVersion)
 	before, err := os.ReadFile(cfg.OPAQUEKeyPath)
 	if err != nil {
 		t.Fatal(err)
@@ -180,7 +210,7 @@ func TestProtectedUpgradeCancellationRetainsMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 1, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
+	marker := maintenanceMarker{Version: 1, SourceVersion: currentSchemaVersion, TargetVersion: currentSchemaVersion, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
 	if err := durableJSONReplace(markerPath, marker); err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +239,7 @@ func TestPendingUpgradeValidatesExternalKeyBindingBeforeEstablishingMaintenance(
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
+	if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=?`, currentSchemaVersion); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -256,7 +286,7 @@ func TestProtectedUpgradeFailuresRemainLockedAndDoNotRunLaterPhases(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 1, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
+			marker := maintenanceMarker{Version: 1, SourceVersion: currentSchemaVersion, TargetVersion: currentSchemaVersion, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
 			if err := durableJSONReplace(markerPath, marker); err != nil {
 				t.Fatal(err)
 			}
@@ -295,7 +325,7 @@ func TestProtectedUpgradeFailuresRemainLockedAndDoNotRunLaterPhases(t *testing.T
 				t.Fatal(err)
 			}
 			defer daemon.Close()
-			if diagnostic := daemon.Diagnostic(); !strings.Contains(diagnostic, "source=1 target=1") || !strings.Contains(diagnostic, "operation=fixture") || !strings.Contains(diagnostic, "backup=") || !strings.Contains(diagnostic, "phase=") {
+			if diagnostic := daemon.Diagnostic(); !strings.Contains(diagnostic, fmt.Sprintf("source=%d target=%d", currentSchemaVersion, currentSchemaVersion)) || !strings.Contains(diagnostic, "operation=fixture") || !strings.Contains(diagnostic, "backup=") || !strings.Contains(diagnostic, "phase=") {
 				t.Fatalf("operator diagnostic lacks recovery context: %q", diagnostic)
 			}
 			recorder := httptest.NewRecorder()
@@ -318,7 +348,7 @@ func TestDaemonDiagnosticQuotesUntrustedBackupPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 2, Program: "fixture", Operation: "op-123", Backup: backup, Phase: "migration"}
+	marker := maintenanceMarker{Version: 1, SourceVersion: currentSchemaVersion, TargetVersion: currentSchemaVersion + 1, Program: "fixture", Operation: "op-123", Backup: backup, Phase: "migration"}
 	if err := durableJSONReplace(markerPath, marker); err != nil {
 		t.Fatal(err)
 	}
@@ -348,14 +378,12 @@ func TestProtectedUpgradeRunsEmbeddedForwardMigrationAndRetainsPartialProgress(t
 		target     int64
 		wantValue  bool
 	}{
-		{name: "success", target: 2, wantValue: true, migrations: fstest.MapFS{
-			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('migrated');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
+		{name: "success", target: currentSchemaVersion + 1, wantValue: true, migrations: fstest.MapFS{
+			"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('migrated');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
 		}},
-		{name: "partial multi migration", target: 3, migrations: fstest.MapFS{
-			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('first committed migration');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
-			"00003_fail.sql":    {Data: []byte("-- +goose Up\nCREATE TABLE rolled_back(value TEXT NOT NULL);\nINSERT INTO missing_table VALUES('failure');\n-- +goose Down\nDROP TABLE rolled_back;\n")},
+		{name: "partial multi migration", target: currentSchemaVersion + 2, migrations: fstest.MapFS{
+			"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('first committed migration');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
+			"00005_fail.sql":    {Data: []byte("-- +goose Up\nCREATE TABLE rolled_back(value TEXT NOT NULL);\nINSERT INTO missing_table VALUES('failure');\n-- +goose Down\nDROP TABLE rolled_back;\n")},
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -368,12 +396,12 @@ func TestProtectedUpgradeRunsEmbeddedForwardMigrationAndRetainsPartialProgress(t
 			if err := issuer.Close(); err != nil {
 				t.Fatal(err)
 			}
-			cfg.migrationFS = tc.migrations
+			cfg.migrationFS = testUpgradeMigrations(t, tc.migrations)
 			markerPath, err := MaintenancePath(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
-			marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: tc.target, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
+			marker := maintenanceMarker{Version: 1, SourceVersion: currentSchemaVersion, TargetVersion: tc.target, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "verified-backup.db"), Phase: "migration"}
 			if err := durableJSONReplace(markerPath, marker); err != nil {
 				t.Fatal(err)
 			}
@@ -406,7 +434,7 @@ func TestProtectedUpgradeRunsEmbeddedForwardMigrationAndRetainsPartialProgress(t
 					t.Fatalf("partial upgrade cleared marker: %v", err)
 				}
 				var secondApplied int
-				if err := db.QueryRow(`SELECT is_applied FROM goose_db_version WHERE version_id=2`).Scan(&secondApplied); err != nil || secondApplied != 1 {
+				if err := db.QueryRow(`SELECT is_applied FROM goose_db_version WHERE version_id=?`, currentSchemaVersion+1).Scan(&secondApplied); err != nil || secondApplied != 1 {
 					t.Fatalf("first migration history=%d err=%v", secondApplied, err)
 				}
 				var rolledBack int
@@ -440,9 +468,8 @@ func TestProtectedForeignKeyRebuildUsesSingleConnectionAndRestoresEnforcement(t 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	cfg.migrationFS = fstest.MapFS{
-		"00001_base.sql": {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-		"00002_rebuild.sql": {Data: []byte(`-- +goose NO TRANSACTION
+	cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
+		"00004_rebuild.sql": {Data: []byte(`-- +goose NO TRANSACTION
 -- +goose Up
 PRAGMA foreign_keys=OFF;
 BEGIN;
@@ -459,12 +486,12 @@ PRAGMA foreign_keys=ON;
 -- +goose Down
 SELECT 1;
 `)},
-	}
+	})
 	markerPath, err := MaintenancePath(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	marker := maintenanceMarker{Version: 1, SourceVersion: 1, TargetVersion: 2, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "backup.db"), Phase: "migration"}
+	marker := maintenanceMarker{Version: 1, SourceVersion: currentSchemaVersion, TargetVersion: currentSchemaVersion + 1, Program: "fixture", Operation: "fixture", Backup: filepath.Join(dir, "backup.db"), Phase: "migration"}
 	if err := durableJSONReplace(markerPath, marker); err != nil {
 		t.Fatal(err)
 	}
@@ -506,6 +533,7 @@ func TestPendingUpgradeFinalizesIndependentVerifiedDatabaseBackupAndStaysLocked(
 		t.Fatal(err)
 	}
 	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), DeploymentRoot: publication, InsecureLocalHTTP: true}
+	cfg = testVersionOneConfig(t, cfg)
 	issuer, err := NewGrantIssuer(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -526,10 +554,18 @@ func TestPendingUpgradeFinalizesIndependentVerifiedDatabaseBackupAndStaysLocked(
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(`CREATE TABLE backup_wal_witness(value TEXT NOT NULL); INSERT INTO backup_wal_witness VALUES('committed-in-wal'); UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE backup_wal_witness(value TEXT NOT NULL); INSERT INTO backup_wal_witness VALUES('committed-in-wal')`); err != nil {
 		t.Fatal(err)
 	}
-	writeTestProgramProvenance(t, cfg, 0)
+	writeTestProgramProvenance(t, cfg, 1)
+	cfg.migrationFS = nil
+	cfg.upgradeTargetVersion = 0
+	cfg.storageFault = func(phase string, _ *sql.DB) error {
+		if phase == "upgrade-verify" {
+			return errors.New("injected verification failure")
+		}
+		return nil
+	}
 	var marker maintenanceMarker
 	if _, err := New(cfg); !errors.Is(err, ErrMaintenance) {
 		t.Fatalf("pending upgrade result=%v, want locked", err)
@@ -544,7 +580,7 @@ func TestPendingUpgradeFinalizesIndependentVerifiedDatabaseBackupAndStaysLocked(
 	if err := json.Unmarshal(markerData, &marker); err != nil {
 		t.Fatal(err)
 	}
-	if marker.SourceVersion != 0 || marker.TargetVersion != 1 || marker.Operation == "" || marker.Program == "" || marker.Phase != "verification" {
+	if marker.SourceVersion != 1 || marker.TargetVersion != currentSchemaVersion || marker.Operation == "" || marker.Program == "" || marker.Phase != "verification" {
 		t.Fatalf("incomplete maintenance marker: %+v", marker)
 	}
 	backupInfo, err := os.Lstat(marker.Backup)
@@ -588,7 +624,7 @@ func TestPendingUpgradeFinalizesIndependentVerifiedDatabaseBackupAndStaysLocked(
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.Status != "complete" || manifest.SourceVersion != 0 || manifest.TargetVersion != 1 || len(manifest.SHA256) != 64 {
+	if manifest.Status != "complete" || manifest.SourceVersion != 1 || manifest.TargetVersion != currentSchemaVersion || len(manifest.SHA256) != 64 {
 		t.Fatalf("invalid backup manifest: %+v", manifest)
 	}
 	backupBytes, err := os.ReadFile(marker.Backup)
@@ -643,6 +679,7 @@ func TestPendingUpgradeFinalizesIndependentVerifiedDatabaseBackupAndStaysLocked(
 func TestPendingUpgradeFailureKeepsDurableMarkerWithoutCompletedBackup(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	cfg = testVersionOneConfig(t, cfg)
 	issuer, err := NewGrantIssuer(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -652,11 +689,10 @@ func TestPendingUpgradeFailureKeepsDurableMarkerWithoutCompletedBackup(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
-		t.Fatal(err)
-	}
 	_ = db.Close()
-	writeTestProgramProvenance(t, cfg, 0)
+	writeTestProgramProvenance(t, cfg, 1)
+	cfg.migrationFS = nil
+	cfg.upgradeTargetVersion = 0
 	cfg.storageFault = func(phase string, _ *sql.DB) error {
 		if phase == "backup-checkpoint" {
 			return errors.New("injected")
@@ -685,6 +721,7 @@ func TestUpgradePreparationFaultsNeverUnlockAndOnlyFinalizedBackupsAreComplete(t
 		t.Run(phase, func(t *testing.T) {
 			dir := t.TempDir()
 			cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+			cfg = testVersionOneConfig(t, cfg)
 			issuer, err := NewGrantIssuer(cfg)
 			if err != nil {
 				t.Fatal(err)
@@ -694,11 +731,8 @@ func TestUpgradePreparationFaultsNeverUnlockAndOnlyFinalizedBackupsAreComplete(t
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
-				t.Fatal(err)
-			}
 			_ = db.Close()
-			provenance, err := currentProgramProvenance(cfg, 0)
+			provenance, err := currentProgramProvenance(cfg, 1)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -711,7 +745,7 @@ func TestUpgradePreparationFaultsNeverUnlockAndOnlyFinalizedBackupsAreComplete(t
 				}
 				return nil
 			}
-			if err := prepareUpgradeBackup(cfg, 0, 1, (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String()); !errors.Is(err, ErrMaintenance) {
+			if err := prepareUpgradeBackup(cfg, 1, currentSchemaVersion, (&url.URL{Scheme: "file", Path: filepath.ToSlash(cfg.DatabasePath)}).String()); !errors.Is(err, ErrMaintenance) {
 				t.Fatalf("fault did not keep installation locked: %v", err)
 			}
 			if _, err := os.Stat(cfg.DatabasePath + ".maintenance.json"); err != nil {
@@ -755,7 +789,7 @@ func TestBackupCopyCrashChild(t *testing.T) {
 		return nil
 	}
 	dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(database)}).String()
-	if err := prepareUpgradeBackup(cfg, 0, 1, dbURL); err != nil {
+	if err := prepareUpgradeBackup(cfg, 1, currentSchemaVersion, dbURL); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(3)
 	}
@@ -765,6 +799,7 @@ func TestBackupCopyCrashChild(t *testing.T) {
 func TestRealProcessCrashDuringPartialBackupCopyStaysLocked(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key"), InsecureLocalHTTP: true}
+	cfg = testVersionOneConfig(t, cfg)
 	issuer, err := NewGrantIssuer(cfg)
 	if err != nil {
 		t.Fatal(err)
@@ -776,7 +811,7 @@ func TestRealProcessCrashDuringPartialBackupCopyStaysLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE TABLE copy_witness(payload BLOB NOT NULL); INSERT INTO copy_witness VALUES(zeroblob(2097152)); UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE copy_witness(payload BLOB NOT NULL); INSERT INTO copy_witness VALUES(zeroblob(2097152))`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -786,7 +821,7 @@ func TestRealProcessCrashDuringPartialBackupCopyStaysLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	provenance := programProvenance{Format: 1, Database: cfg.DatabasePath, DatabaseIdentity: databaseIdentity, Schema: 0, Executable: "/test/prior", Version: "fixture-v1", SHA256: strings.Repeat("a", 64)}
+	provenance := programProvenance{Format: 1, Database: cfg.DatabasePath, DatabaseIdentity: databaseIdentity, Schema: 1, Executable: "/test/prior", Version: "fixture-v1", SHA256: strings.Repeat("a", 64)}
 	if err := durableJSONReplace(provenancePath(cfg), provenance); err != nil {
 		t.Fatal(err)
 	}
@@ -974,8 +1009,8 @@ func TestGrantIssuerRefusesOlderAndNewerSchemaWithoutGrantMutation(t *testing.T)
 		name   string
 		update string
 	}{
-		{name: "older", update: `UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`},
-		{name: "newer", update: `INSERT INTO goose_db_version(version_id,is_applied) VALUES(2,1)`},
+		{name: "older", update: fmt.Sprintf(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=%d`, currentSchemaVersion)},
+		{name: "newer", update: fmt.Sprintf(`INSERT INTO goose_db_version(version_id,is_applied) VALUES(%d,1)`, currentSchemaVersion+1)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()

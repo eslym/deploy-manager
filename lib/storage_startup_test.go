@@ -35,7 +35,7 @@ func TestDaemonRecordsProgramProvenanceAndGrantCLILeavesItUntouched(t *testing.T
 		t.Fatal(err)
 	}
 	hash, err := fileSHA256(recorded.Executable)
-	if err != nil || hash != recorded.SHA256 || recorded.Schema != 1 || recorded.Database != cfg.DatabasePath {
+	if err != nil || hash != recorded.SHA256 || recorded.Schema != currentSchemaVersion || recorded.Database != cfg.DatabasePath {
 		t.Fatalf("recorded daemon provenance is not bound to this executable/install/schema: %+v err=%v", recorded, err)
 	}
 	issuer, err := NewGrantIssuer(cfg)
@@ -61,19 +61,18 @@ func TestDaemonStartupFailsClosedWhenRunningExecutablePathIsRemoved(t *testing.T
 		if err := initial.Close(); err != nil {
 			t.Fatal(err)
 		}
-		cfg.upgradeTargetVersion = 2
-		cfg.migrationFS = fstest.MapFS{
-			"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-			"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE provenance_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE provenance_upgrade_witness;\n")},
-		}
+		cfg.upgradeTargetVersion = currentSchemaVersion + 1
+		cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
+			"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE provenance_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE provenance_upgrade_witness;\n")},
+		})
 		dbPath, err := filepath.Abs(cfg.DatabasePath)
 		if err != nil {
 			t.Fatal(err)
 		}
 		dbURL := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
 		var pending pendingUpgrade
-		if err := preflightExistingSchema(dbURL, cfg); !errors.As(err, &pending) || pending.source != 1 || pending.target != 2 {
-			t.Fatalf("test fixture is not a valid pending 1-to-2 daemon upgrade: pending=%+v err=%v", pending, err)
+		if err := preflightExistingSchema(dbURL, cfg); !errors.As(err, &pending) || pending.source != currentSchemaVersion || pending.target != currentSchemaVersion+1 {
+			t.Fatalf("test fixture is not a valid pending daemon upgrade: pending=%+v err=%v", pending, err)
 		}
 		provenanceBefore, err := os.ReadFile(provenancePath(cfg))
 		if err != nil {
@@ -212,21 +211,10 @@ func TestGrantIssuerRefusesPendingUpgradeWithoutChangingStorage(t *testing.T) {
 	if err := issuer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite3", cfg.DatabasePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	cfg.upgradeTargetVersion = 2
-	cfg.migrationFS = fstest.MapFS{
-		"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-		"00002_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE cli_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE cli_upgrade_witness;\n")},
-	}
+	cfg.upgradeTargetVersion = currentSchemaVersion + 1
+	cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
+		"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE cli_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE cli_upgrade_witness;\n")},
+	})
 	databaseBefore, err := os.ReadFile(cfg.DatabasePath)
 	if err != nil {
 		t.Fatal(err)

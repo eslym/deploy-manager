@@ -39,6 +39,12 @@ func (_c *DeploymentCreate) SetCommitID(v string) *DeploymentCreate {
 	return _c
 }
 
+// SetPublicationName sets the "publication_name" field.
+func (_c *DeploymentCreate) SetPublicationName(v string) *DeploymentCreate {
+	_c.mutation.SetPublicationName(v)
+	return _c
+}
+
 // SetGeneration sets the "generation" field.
 func (_c *DeploymentCreate) SetGeneration(v int64) *DeploymentCreate {
 	_c.mutation.SetGeneration(v)
@@ -305,6 +311,9 @@ func (_c *DeploymentCreate) check() error {
 	if _, ok := _c.mutation.CommitID(); !ok {
 		return &ValidationError{Name: "commit_id", err: errors.New(`ent: missing required field "Deployment.commit_id"`)}
 	}
+	if _, ok := _c.mutation.PublicationName(); !ok {
+		return &ValidationError{Name: "publication_name", err: errors.New(`ent: missing required field "Deployment.publication_name"`)}
+	}
 	if _, ok := _c.mutation.Generation(); !ok {
 		return &ValidationError{Name: "generation", err: errors.New(`ent: missing required field "Deployment.generation"`)}
 	}
@@ -386,6 +395,10 @@ func (_c *DeploymentCreate) createSpec() (*Deployment, *sqlgraph.CreateSpec) {
 	if value, ok := _c.mutation.CommitID(); ok {
 		_spec.SetField(deployment.FieldCommitID, field.TypeString, value)
 		_node.CommitID = value
+	}
+	if value, ok := _c.mutation.PublicationName(); ok {
+		_spec.SetField(deployment.FieldPublicationName, field.TypeString, value)
+		_node.PublicationName = value
 	}
 	if value, ok := _c.mutation.Generation(); ok {
 		_spec.SetField(deployment.FieldGeneration, field.TypeInt64, value)

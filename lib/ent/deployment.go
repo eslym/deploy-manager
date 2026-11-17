@@ -23,6 +23,8 @@ type Deployment struct {
 	Name string `json:"name,omitempty"`
 	// CommitID holds the value of the "commit_id" field.
 	CommitID string `json:"commit_id,omitempty"`
+	// PublicationName holds the value of the "publication_name" field.
+	PublicationName string `json:"publication_name,omitempty"`
 	// Generation holds the value of the "generation" field.
 	Generation int64 `json:"generation,omitempty"`
 	// LiveCommit holds the value of the "live_commit" field.
@@ -91,7 +93,7 @@ func (*Deployment) scanValues(columns []string) ([]any, error) {
 		switch columns[i] {
 		case deployment.FieldGeneration, deployment.FieldLiveDev, deployment.FieldLiveIno, deployment.FieldCreatedAt, deployment.FieldUpdatedAt, deployment.FieldAutomationPaused, deployment.FieldAutomationEpoch:
 			values[i] = new(sql.NullInt64)
-		case deployment.FieldID, deployment.FieldProjectID, deployment.FieldName, deployment.FieldCommitID, deployment.FieldLiveCommit, deployment.FieldStatus, deployment.FieldError, deployment.FieldTargetKind, deployment.FieldTargetName:
+		case deployment.FieldID, deployment.FieldProjectID, deployment.FieldName, deployment.FieldCommitID, deployment.FieldPublicationName, deployment.FieldLiveCommit, deployment.FieldStatus, deployment.FieldError, deployment.FieldTargetKind, deployment.FieldTargetName:
 			values[i] = new(sql.NullString)
 		default:
 			values[i] = new(sql.UnknownType)
@@ -131,6 +133,12 @@ func (_m *Deployment) assignValues(columns []string, values []any) error {
 				return fmt.Errorf("unexpected type %T for field commit_id", values[i])
 			} else if value.Valid {
 				_m.CommitID = value.String
+			}
+		case deployment.FieldPublicationName:
+			if value, ok := values[i].(*sql.NullString); !ok {
+				return fmt.Errorf("unexpected type %T for field publication_name", values[i])
+			} else if value.Valid {
+				_m.PublicationName = value.String
 			}
 		case deployment.FieldGeneration:
 			if value, ok := values[i].(*sql.NullInt64); !ok {
@@ -258,6 +266,9 @@ func (_m *Deployment) String() string {
 	builder.WriteString(", ")
 	builder.WriteString("commit_id=")
 	builder.WriteString(_m.CommitID)
+	builder.WriteString(", ")
+	builder.WriteString("publication_name=")
+	builder.WriteString(_m.PublicationName)
 	builder.WriteString(", ")
 	builder.WriteString("generation=")
 	builder.WriteString(fmt.Sprintf("%v", _m.Generation))

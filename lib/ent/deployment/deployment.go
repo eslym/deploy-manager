@@ -18,6 +18,8 @@ const (
 	FieldName = "name"
 	// FieldCommitID holds the string denoting the commit_id field in the database.
 	FieldCommitID = "commit_id"
+	// FieldPublicationName holds the string denoting the publication_name field in the database.
+	FieldPublicationName = "publication_name"
 	// FieldGeneration holds the string denoting the generation field in the database.
 	FieldGeneration = "generation"
 	// FieldLiveCommit holds the string denoting the live_commit field in the database.
@@ -70,6 +72,7 @@ var Columns = []string{
 	FieldProjectID,
 	FieldName,
 	FieldCommitID,
+	FieldPublicationName,
 	FieldGeneration,
 	FieldLiveCommit,
 	FieldLiveDev,
@@ -138,6 +141,11 @@ func ByName(opts ...sql.OrderTermOption) OrderOption {
 // ByCommitID orders the results by the commit_id field.
 func ByCommitID(opts ...sql.OrderTermOption) OrderOption {
 	return sql.OrderByField(FieldCommitID, opts...).ToFunc()
+}
+
+// ByPublicationName orders the results by the publication_name field.
+func ByPublicationName(opts ...sql.OrderTermOption) OrderOption {
+	return sql.OrderByField(FieldPublicationName, opts...).ToFunc()
 }
 
 // ByGeneration orders the results by the generation field.

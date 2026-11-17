@@ -208,7 +208,11 @@ opt-in, HTTP is **not** allowed for login or authenticated dashboard use.
 2. For unknown or changed SSH host keys, independently verify the displayed
    fingerprint before approving it. Trust is scoped to hostname and port.
 3. Select a cached branch or tag, or a full commit ID, and create a deployment.
-   Creating a deployment or changing its target queues publication automatically.
+   Choose a publication folder directly beneath `--publication-root`; the dashboard
+   previews its absolute path before creation. Use a unique name beginning with a
+   letter or number, followed by letters, numbers, dots, hyphens, or underscores
+   (at most 100 characters). Nested paths are not supported. Creating a deployment
+   or changing its target queues publication automatically.
 4. If the repository uses LFS, approve its LFS server and object-download origins.
    Internal destinations require explicit approval. Missing or invalid payloads
    fail publication without replacing the live content.
@@ -298,6 +302,9 @@ Keep the publication root manager-owned. Live publication paths must be real
 directories, not symlinks; staging and live content must be on the same mount.
 Do not manually rename or remove publication/recovery state while the manager
 is running.
+Deployments created before publication folders were selectable retain their
+existing ID-named directories without relocation. Their displayed path remains
+the document root to configure in your web server.
 
 ### Startup and upgrades
 

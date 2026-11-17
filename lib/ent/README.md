@@ -14,7 +14,7 @@ keys, busy timeout, immediate transactions, and one connection). It does not
 open another pool. The generated client is never asked to create, reconcile,
 or migrate schema. Embedded goose SQL remains the only schema executor.
 
-`schema/` maps the tables and stored fields from the immutable goose v1 SQL,
+`schema/` maps the tables and stored fields from the immutable goose SQL migrations,
 including the singleton OPAQUE profile and administrator and the existing
 project/deployment/job relationships. Composite-key tables retain their full
 unique indexes in the Ent model; because Ent's entity API requires an ID, the
