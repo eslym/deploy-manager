@@ -292,21 +292,8 @@ func (a *App) validateLivePublicationIdentities() error {
 		if r.status == "deleting" || r.status == "deletion_failed" {
 			continue
 		}
-		path := a.deploymentPath(r.id)
-		if r.commit == "" {
-			if _, err := os.Lstat(path); os.IsNotExist(err) {
-				continue
-			} else if err != nil {
-				return err
-			}
-			return errors.New("publication exists without a recorded live commit; refusing to guess its identity")
-		}
-		actual, err := identity(path)
-		if err != nil {
+		if _, _, err := a.publicationPaths(r.id).checkLive(r.commit, r.identity); err != nil {
 			return fmt.Errorf("live publication identity cannot be verified: %w", err)
-		}
-		if actual != r.identity {
-			return errors.New("live publication identity changed; refusing to publish or clean up")
 		}
 	}
 	return nil
@@ -329,6 +316,10 @@ func (a *App) removeOrphanStages() error {
 		if !pattern.MatchString(name) {
 			return errors.New("unrecognized publication staging path; refusing startup cleanup")
 		}
+		owner := a.publicationPaths(name[1:33])
+		if _, err := owner.recordedStage(name, name[40:]); err != nil {
+			return err
+		}
 		intent, err := a.store.PublicationIntent.Query().Where(publicationintent.StageNameEQ(name)).Exist(context.Background())
 		if err != nil {
 			return err
@@ -344,7 +335,7 @@ func (a *App) removeOrphanStages() error {
 		if intent || cleanup || removal {
 			continue
 		}
-		path := filepath.Join(a.cfg.DeploymentRoot, name)
+		path := owner.stage(name[40:])
 		if _, err := identity(path); err != nil {
 			return fmt.Errorf("inspect orphan publication stage: %w", err)
 		}
@@ -505,9 +496,9 @@ func syncTree(root string) error {
 	return nil
 }
 
-func (a *App) deploymentPath(id string) string { return filepath.Join(a.cfg.DeploymentRoot, id) }
+func (a *App) deploymentPath(id string) string { return a.publicationPaths(id).live() }
 func (a *App) stagePath(id, job string) string {
-	return filepath.Join(a.cfg.DeploymentRoot, "."+id+".stage-"+job)
+	return a.publicationPaths(id).stage(job)
 }
 
 // A reservation keeps queue admission separate from each operation's durable
@@ -1017,12 +1008,8 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if err != nil {
 		return err
 	}
-	live := a.deploymentPath(d.ID)
-	oldID, oldErr := identity(live)
-	hadOld := oldErr == nil
-	if oldErr != nil && !os.IsNotExist(oldErr) {
-		return oldErr
-	}
+	paths := a.publicationPaths(d.ID)
+	live := paths.live()
 	dbCtx := context.Background()
 	// Recheck the saved configuration at the final database/filesystem boundary.
 	tx, err := a.store.Tx(dbCtx)
@@ -1037,10 +1024,14 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if current.Generation != generation || current.Status == "deleting" || current.Status == "deletion_failed" || (d.TargetKind != "branch" && current.CommitID != d.Commit) || (d.automatic && (current.AutomationPaused != 0 || current.AutomationEpoch != d.automationEpoch)) {
 		return errors.New("publication target changed; job superseded")
 	}
+	oldID, hadOld, err := paths.checkLive(current.LiveCommit, dirIdentity{Dev: uint64(current.LiveDev), Ino: uint64(current.LiveIno)})
+	if err != nil {
+		return err
+	}
 	if err = fault("before-intent"); err != nil {
 		return err
 	}
-	if _, err = tx.PublicationIntent.Create().SetID(d.ID).SetJobID(jobID).SetStageName(filepath.Base(stage)).SetHadOld(boolInt(hadOld)).SetOldDev(int64(oldID.Dev)).SetOldIno(int64(oldID.Ino)).SetNewDev(int64(newID.Dev)).SetNewIno(int64(newID.Ino)).SetPhase("intent").SetCreatedAt(a.cfg.Now().UnixNano()).Save(dbCtx); err != nil {
+	if _, err = tx.PublicationIntent.Create().SetID(d.ID).SetJobID(jobID).SetStageName(paths.stageName(jobID)).SetHadOld(boolInt(hadOld)).SetOldDev(int64(oldID.Dev)).SetOldIno(int64(oldID.Ino)).SetNewDev(int64(newID.Dev)).SetNewIno(int64(newID.Ino)).SetPhase("intent").SetCreatedAt(a.cfg.Now().UnixNano()).Save(dbCtx); err != nil {
 		return err
 	}
 	if err = tx.Commit(); err != nil {
@@ -1084,6 +1075,12 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 			return err
 		}
 		return errors.New("publication target changed; job superseded")
+	}
+	if _, _, err = paths.checkLive(boundaryDeployment.LiveCommit, dirIdentity{Dev: uint64(boundaryDeployment.LiveDev), Ino: uint64(boundaryDeployment.LiveIno)}); err != nil {
+		return err
+	}
+	if matches, checkErr := sameIdentity(stage, newID); checkErr != nil || !matches {
+		return errors.New("publication stage identity changed before switch; recovery required")
 	}
 	if hadOld {
 		err = unix.Renameat2(unix.AT_FDCWD, stage, unix.AT_FDCWD, live, unix.RENAME_EXCHANGE)
@@ -1133,7 +1130,7 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 		if _, err = boundaryTx.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(d.ID), publicationcleanup.JobIDEQ(jobID)).Exec(dbCtx); err != nil {
 			return err
 		}
-		if _, err = boundaryTx.PublicationCleanup.Create().SetID(d.ID).SetJobID(jobID).SetPathName(filepath.Base(stage)).SetDev(int64(oldID.Dev)).SetIno(int64(oldID.Ino)).SetNotBefore(a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano()).SetLastError("").Save(dbCtx); err != nil {
+		if _, err = boundaryTx.PublicationCleanup.Create().SetID(d.ID).SetJobID(jobID).SetPathName(paths.stageName(jobID)).SetDev(int64(oldID.Dev)).SetIno(int64(oldID.Ino)).SetNotBefore(a.cfg.Now().Add(a.cfg.DeployGracePeriod).UnixNano()).SetLastError("").Save(dbCtx); err != nil {
 			return err
 		}
 	}
@@ -1232,11 +1229,12 @@ func (a *App) reconcilePublicationsFor(onlyDeployment string) error {
 		all = append(all, intent{id: row.ID, job: row.JobID, stage: row.StageName, had: row.HadOld, old: dirIdentity{Dev: uint64(row.OldDev), Ino: uint64(row.OldIno)}, new: dirIdentity{Dev: uint64(row.NewDev), Ino: uint64(row.NewIno)}})
 	}
 	for _, x := range all {
-		if !validProjectID(x.id) || !validProjectID(x.job) || x.stage != "."+x.id+".stage-"+x.job {
-			return errors.New("publication recovery journal contains an unsafe path or identifier")
+		paths := a.publicationPaths(x.id)
+		stage, pathErr := paths.recordedStage(x.stage, x.job)
+		if pathErr != nil {
+			return fmt.Errorf("publication recovery journal: %w", pathErr)
 		}
-		live := a.deploymentPath(x.id)
-		stage := filepath.Join(a.cfg.DeploymentRoot, x.stage)
+		live := paths.live()
 		newLive, le := sameIdentity(live, x.new)
 		if le != nil {
 			return le
@@ -1368,8 +1366,10 @@ func (a *App) cleanupPublications(startup bool) error {
 		all = append(all, cleanup{id: row.ID, job: row.JobID, path: row.PathName, identity: dirIdentity{Dev: uint64(row.Dev), Ino: uint64(row.Ino)}, before: row.NotBefore, attempts: row.Attempts})
 	}
 	for _, c := range all {
-		if !validProjectID(c.id) || !validProjectID(c.job) || c.path != "."+c.id+".stage-"+c.job {
-			return errors.New("publication cleanup record contains an unsafe path or identifier")
+		paths := a.publicationPaths(c.id)
+		path, pathErr := paths.recordedStage(c.path, c.job)
+		if pathErr != nil {
+			return fmt.Errorf("publication cleanup record: %w", pathErr)
 		}
 		if c.before > a.cfg.Now().UnixNano() {
 			continue
@@ -1381,8 +1381,15 @@ func (a *App) cleanupPublications(startup bool) error {
 			}
 			continue
 		}
-		path := filepath.Join(a.cfg.DeploymentRoot, c.path)
-		liveIdentity, liveErr := identity(a.deploymentPath(c.id))
+		live, liveErr := a.store.Deployment.Get(context.Background(), c.id)
+		var liveIdentity dirIdentity
+		if ent.IsNotFound(liveErr) {
+			// Legacy cleanup obligations may outlive the deployment record.
+			// They still cannot remove the directory currently at the live name.
+			liveIdentity, liveErr = identity(paths.live())
+		} else if liveErr == nil {
+			liveIdentity, _, liveErr = paths.checkLive(live.LiveCommit, dirIdentity{Dev: uint64(live.LiveDev), Ino: uint64(live.LiveIno)})
+		}
 		if liveErr != nil {
 			return liveErr
 		}
