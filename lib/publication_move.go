@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 
 	"github.com/eslym/deploy-manager/lib/ent"
 	"golang.org/x/sys/unix"
@@ -45,7 +44,15 @@ func (a *App) reconcileMove(id string) error {
 	if err := a.assertPublicationRoot(); err != nil {
 		return err
 	}
-	source, destination := filepath.Join(a.cfg.DeploymentRoot, m.source), filepath.Join(a.cfg.DeploymentRoot, m.destination)
+	owner := a.publicationPaths(id)
+	source, err := owner.namedPath(m.source)
+	if err != nil {
+		return err
+	}
+	destination, err := owner.namedPath(m.destination)
+	if err != nil {
+		return err
+	}
 	sourceID, sourceErr := identity(source)
 	destinationID, destinationErr := identity(destination)
 	if sourceErr != nil && !os.IsNotExist(sourceErr) {
@@ -134,8 +141,9 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var input struct {
-		PublicationPath string `json:"publicationPath"`
-		Confirm         bool   `json:"confirm"`
+		PublicationPath         string `json:"publicationPath"`
+		ExpectedPublicationPath string `json:"expectedPublicationPath"`
+		Confirm                 bool   `json:"confirm"`
 	}
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	decoder.DisallowUnknownFields()
@@ -172,6 +180,10 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "publication binding is invalid", 503)
 		return
 	}
+	if input.ExpectedPublicationPath != a.publicationPaths(id).live() {
+		http.Error(w, "publication path changed since review; review the current document root before moving", http.StatusConflict)
+		return
+	}
 	if pending, e := a.movePending(id); e != nil || pending {
 		http.Error(w, "a previous move requires reconciliation", 503)
 		return
@@ -181,21 +193,18 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "publication requires reconciliation before moving", 503)
 		return
 	}
-	var reservation int
-	if err = a.db.QueryRow(`SELECT (SELECT count(*) FROM deployments WHERE publication_name=?) + (SELECT count(*) FROM publication_moves WHERE destination_name=?)`, input.PublicationPath, input.PublicationPath).Scan(&reservation); err != nil || reservation != 0 {
-		http.Error(w, "publication destination is reserved", http.StatusConflict)
+	owner := a.publicationPaths(id)
+	destination, err := a.availablePublicationPath(owner, input.PublicationPath)
+	if err != nil {
+		if errors.Is(err, errPublicationOccupied) {
+			http.Error(w, "publication destination is occupied or reserved", 409)
+		} else {
+			http.Error(w, "destination cannot be inspected", 503)
+		}
 		return
 	}
-	destination := filepath.Join(a.cfg.DeploymentRoot, input.PublicationPath)
-	if _, err = os.Lstat(destination); err == nil {
-		http.Error(w, "publication destination is occupied", 409)
-		return
-	} else if !os.IsNotExist(err) {
-		http.Error(w, "destination cannot be inspected", 503)
-		return
-	}
-	source := filepath.Join(a.cfg.DeploymentRoot, current.PublicationName)
-	old, live, err := a.publicationPaths(id).checkLive(current.LiveCommit, dirIdentity{uint64(current.LiveDev), uint64(current.LiveIno)})
+	source := owner.live()
+	old, live, err := owner.checkLive(current.LiveCommit, dirIdentity{uint64(current.LiveDev), uint64(current.LiveIno)})
 	if err != nil {
 		http.Error(w, "live publication cannot be verified", 503)
 		return
@@ -262,6 +271,10 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "move interrupted; reconciliation required", 503)
 		return
 	}
+	if err = fault("before-move-directory-sync"); err != nil {
+		http.Error(w, "move directory sync failed; reconciliation required", 503)
+		return
+	}
 	if err = syncDirectory(a.cfg.DeploymentRoot); err != nil {
 		http.Error(w, "move directory sync failed; reconciliation required", 503)
 		return
@@ -277,6 +290,10 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, verifyErr = os.Lstat(source); !os.IsNotExist(verifyErr) {
 		http.Error(w, "move outcome ambiguous; reconciliation required", 503)
+		return
+	}
+	if err = fault("after-move-verify"); err != nil {
+		http.Error(w, "move verification interrupted; reconciliation required", 503)
 		return
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE deployments SET publication_name=?,updated_at=? WHERE id=? AND publication_name=?`, input.PublicationPath, a.cfg.Now().UnixNano(), id, current.PublicationName); err != nil {

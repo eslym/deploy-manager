@@ -79,11 +79,6 @@ var (
 				Unique:  true,
 				Columns: []*schema.Column{DeploymentsColumns[16], DeploymentsColumns[1]},
 			},
-			{
-				Name:    "deployment_publication_name",
-				Unique:  true,
-				Columns: []*schema.Column{DeploymentsColumns[3]},
-			},
 		},
 	}
 	// DeploymentDeletionsColumns holds the columns for the "deployment_deletions" table.

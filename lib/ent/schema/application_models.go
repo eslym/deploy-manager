@@ -97,7 +97,11 @@ func (Deployment) Fields() []ent.Field {
 	return []ent.Field{field.String("id"), field.String("project_id"), field.String("name"), field.String("commit_id"), field.String("publication_name"), field.Int64("generation").Default(1), field.String("live_commit").Default(""), field.Int64("live_dev").Default(0), field.Int64("live_ino").Default(0), field.String("status").Default("queued"), field.String("error").Default(""), field.Int64("created_at"), field.Int64("updated_at"), field.String("target_kind").Default("commit"), field.String("target_name").Default(""), field.Int("automation_paused").Default(0), field.Int64("automation_epoch").Default(0)}
 }
 func (Deployment) Indexes() []ent.Index {
-	return []ent.Index{index.Fields("project_id", "name").Unique(), index.Fields("publication_name").Unique()}
+	// Migration 00002 owns the partial publication_name<>'' uniqueness index.
+	// Older inserts may omit the name, then the legacy trigger fills it with
+	// the deployment ID. An unconditional Ent index would reject that insert.
+	// Goose is the sole schema executor; do not generate this physical index.
+	return []ent.Index{index.Fields("project_id", "name").Unique()}
 }
 func (Deployment) Edges() []ent.Edge {
 	return []ent.Edge{

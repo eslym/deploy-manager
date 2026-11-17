@@ -1478,6 +1478,11 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
+	var unresolved int
+	if err := a.db.QueryRow(`SELECT count(*) FROM publication_moves`).Scan(&unresolved); err != nil || unresolved != 0 {
+		http.Error(w, "publication move unresolved; document roots unavailable until recovery", http.StatusServiceUnavailable)
+		return
+	}
 	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),(SELECT last_error FROM deployment_deletions x WHERE x.deployment_id=d.id),''),d.created_at,d.updated_at,d.automation_paused,d.publication_name FROM deployments d ORDER BY d.created_at,d.id`)
 	if err != nil {
 		http.Error(w, "deployments are temporarily unavailable", 500)
@@ -1495,7 +1500,8 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 		}
 		d.CreatedAt = time.Unix(0, c).UTC()
 		d.UpdatedAt = time.Unix(0, u).UTC()
-		d.Publication = filepath.Join(a.cfg.DeploymentRoot, publicationName)
+		owner := publicationPaths{root: a.cfg.DeploymentRoot, deploymentID: d.ID, liveName: publicationName}
+		d.Publication = owner.live()
 		out = append(out, d)
 	}
 	if rows.Err() != nil {
@@ -1591,11 +1597,14 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		// Older API clients retain the historical ID-based destination.
 		in.PublicationPath = id
 	}
-	if _, err := os.Lstat(filepath.Join(a.cfg.DeploymentRoot, in.PublicationPath)); err == nil {
-		http.Error(w, "publication destination is already occupied", http.StatusConflict)
-		return
-	} else if !os.IsNotExist(err) {
-		http.Error(w, "publication destination cannot be inspected", http.StatusServiceUnavailable)
+	owner := publicationPaths{root: a.cfg.DeploymentRoot, deploymentID: id, liveName: in.PublicationPath}
+	path, err := a.availablePublicationPath(owner, in.PublicationPath)
+	if err != nil {
+		if errors.Is(err, errPublicationOccupied) {
+			http.Error(w, "publication destination is already occupied", http.StatusConflict)
+		} else {
+			http.Error(w, "publication destination cannot be inspected", http.StatusServiceUnavailable)
+		}
 		return
 	}
 	slot, ok := a.reserveDeploymentSlot()
@@ -1629,7 +1638,7 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slot.enqueue(job)
-	writeJSONStatus(w, 201, map[string]any{"id": id, "jobId": job, "status": "queued", "publicationPath": filepath.Join(a.cfg.DeploymentRoot, in.PublicationPath)})
+	writeJSONStatus(w, 201, map[string]any{"id": id, "jobId": job, "status": "queued", "publicationPath": path})
 }
 
 func (a *App) deploymentJobs(w http.ResponseWriter, r *http.Request) {
