@@ -32,6 +32,7 @@ func exportTrackedTree(ctx context.Context, repo *git.Repository, commit *object
 	if err != nil {
 		return err
 	}
+	prepared := prepareAttributes(attributes)
 	var hydrator *lfsHydrator
 	if len(hydrators) > 0 {
 		hydrator = hydrators[0]
@@ -39,7 +40,6 @@ func exportTrackedTree(ctx context.Context, repo *git.Repository, commit *object
 	var total int64
 	entries := 0
 	seen := map[string]bool{}
-	attributeWork := 0
 	var walk func(*object.Tree, string, int) error
 	walk = func(t *object.Tree, prefix string, depth int) error {
 		if depth > 256 {
@@ -101,7 +101,7 @@ func exportTrackedTree(ctx context.Context, repo *git.Repository, commit *object
 				if blob.Size < 0 || blob.Size > limits.bytes-total {
 					return errors.New("export exceeds configured byte limit")
 				}
-				selected, attrErr := effectiveLFSAttributeWithBudget(attributes, rel, &attributeWork)
+				selected, attrErr := prepared.effective(rel)
 				if attrErr != nil {
 					return attrErr
 				}

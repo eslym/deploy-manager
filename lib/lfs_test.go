@@ -519,22 +519,51 @@ func TestEffectiveLFSAttributesNestedPrecedenceAndMacros(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := effectiveLFSAttribute(tc.files, tc.path)
+			got, err := prepareAttributes(tc.files).effective(tc.path)
 			if err != nil || got != tc.want {
-				t.Fatalf("effectiveLFSAttribute() = %v, %v; want %v", got, err, tc.want)
+				t.Fatalf("prepared attributes effective() = %v, %v; want %v", got, err, tc.want)
 			}
 		})
 	}
 }
 
 func TestEffectiveLFSAttributesRejectsForbiddenNegativePatterns(t *testing.T) {
-	if _, err := effectiveLFSAttribute(map[string]string{".gitattributes": "!private.bin filter=lfs\n"}, "private.bin"); err == nil {
+	if _, err := prepareAttributes(map[string]string{".gitattributes": "!private.bin filter=lfs\n"}).effective("private.bin"); err == nil {
 		t.Fatal("forbidden negative attribute pattern was accepted")
 	}
 }
 
 func TestEffectiveLFSAttributesRejectsMacroCycles(t *testing.T) {
-	if _, err := effectiveLFSAttribute(map[string]string{".gitattributes": "[attr]one two\n[attr]two one\n*.bin one\n"}, "a.bin"); err == nil {
+	if _, err := prepareAttributes(map[string]string{".gitattributes": "[attr]one two\n[attr]two one\n*.bin one\n"}).effective("a.bin"); err == nil {
 		t.Fatal("cyclic macro expansion was accepted")
+	}
+}
+
+func TestPreparedAttributesParseApplicableFilesLazilyAndReuseThem(t *testing.T) {
+	prepared := prepareAttributes(map[string]string{
+		".gitattributes":        "*.bin filter=lfs\n",
+		"nested/.gitattributes": "a.bin -filter\n",
+		"unused/.gitattributes": "this is deliberately malformed \"\n",
+	})
+	if got, err := prepared.effective("plain.txt"); err != nil || got {
+		t.Fatalf("non-matching file selection = %v, %v", got, err)
+	}
+	if _, ok := prepared.parsed["unused/.gitattributes"]; ok {
+		t.Fatal("unrelated tracked attributes were parsed eagerly")
+	}
+	for _, file := range []string{"nested/a.bin", "nested/b.bin"} {
+		if _, err := prepared.effective(file); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(prepared.parsed) != 2 {
+		t.Fatalf("parsed %d files, want the two applicable sources", len(prepared.parsed))
+	}
+}
+
+func TestPreparedAttributesRejectInvalidApplicableRule(t *testing.T) {
+	prepared := prepareAttributes(map[string]string{".gitattributes": "\"unterminated filter=lfs\n"})
+	if _, err := prepared.effective("file.bin"); err == nil {
+		t.Fatal("malformed applicable attributes were accepted")
 	}
 }

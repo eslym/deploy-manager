@@ -19,15 +19,46 @@ type lfsPointer struct {
 	Size int64
 }
 
-// effectiveLFSAttribute applies only committed .gitattributes inputs. Source
-// files are processed from the repository root toward the file, and rules are
-// reduced in order so later rules and deeper files take precedence.
-func effectiveLFSAttribute(files map[string]string, file string) (bool, error) {
-	work := 0
-	return effectiveLFSAttributeWithBudget(files, file, &work)
+type preparedAttributeFile struct {
+	lines []gitattr.Line
+	err   error
 }
 
-func effectiveLFSAttributeWithBudget(files map[string]string, file string, work *int) (bool, error) {
+// preparedAttributes retains source text and parses each applicable tracked
+// attribute file only when first needed during this export.
+type preparedAttributes struct {
+	files     map[string]string
+	parsed    map[string]preparedAttributeFile
+	work      int
+	expansion int
+}
+
+func prepareAttributes(files map[string]string) *preparedAttributes {
+	return &preparedAttributes{files: files, parsed: make(map[string]preparedAttributeFile)}
+}
+
+func (p *preparedAttributes) parse(name, contents string) ([]gitattr.Line, error) {
+	cached, ok := p.parsed[name]
+	if !ok {
+		for _, rawLine := range strings.Split(contents, "\n") {
+			if strings.HasPrefix(strings.TrimSpace(rawLine), "!") {
+				cached.err = errors.New("committed attributes contain a forbidden negative pattern")
+				break
+			}
+		}
+		if cached.err == nil {
+			cached.lines, _, cached.err = gitattr.ParseLines(strings.NewReader(contents))
+			if cached.err != nil {
+				cached.err = errors.New("committed attributes are malformed")
+			}
+		}
+		p.parsed[name] = cached
+	}
+	return cached.lines, cached.err
+}
+
+func (p *preparedAttributes) effective(file string) (bool, error) {
+	files := p.files
 	file = path.Clean(strings.TrimPrefix(file, "/"))
 	if file == "." || strings.HasPrefix(file, "../") {
 		return false, errors.New("invalid tracked path for attribute lookup")
@@ -44,7 +75,6 @@ func effectiveLFSAttributeWithBudget(files map[string]string, file string, work 
 		"binary": {{K: "diff", V: "false"}, {K: "merge", V: "false"}, {K: "text", V: "false"}},
 	}
 	filter := ""
-	steps := 0
 	for _, dir := range levels {
 		name := ".gitattributes"
 		if dir != "" {
@@ -54,15 +84,9 @@ func effectiveLFSAttributeWithBudget(files map[string]string, file string, work 
 		if !ok {
 			continue
 		}
-		for _, rawLine := range strings.Split(contents, "\n") {
-			trimmed := strings.TrimSpace(rawLine)
-			if strings.HasPrefix(trimmed, "!") {
-				return false, errors.New("committed attributes contain a forbidden negative pattern")
-			}
-		}
-		lines, _, err := gitattr.ParseLines(strings.NewReader(contents))
+		lines, err := p.parse(name, contents)
 		if err != nil {
-			return false, errors.New("committed attributes are malformed")
+			return false, err
 		}
 		if dir == "" {
 			for _, line := range lines {
@@ -76,8 +100,8 @@ func effectiveLFSAttributeWithBudget(files map[string]string, file string, work 
 			if !ok {
 				continue
 			}
-			(*work)++
-			if *work > maxLFSAttributeWork {
+			p.work++
+			if p.work > maxLFSAttributeWork {
 				return false, errors.New("committed attribute matching exceeds the work limit")
 			}
 			rel := file
@@ -93,7 +117,7 @@ func effectiveLFSAttributeWithBudget(files map[string]string, file string, work 
 			if !line.Pattern().Match(rel) {
 				continue
 			}
-			attrs, err := expandGitAttributes(line.Attrs(), macros, nil, &steps)
+			attrs, err := expandGitAttributes(line.Attrs(), macros, nil, &p.expansion)
 			if err != nil {
 				return false, err
 			}
@@ -113,12 +137,12 @@ func effectiveLFSAttributeWithBudget(files map[string]string, file string, work 
 }
 
 const maxLFSAttributeWork = 10_000_000
+const maxAttributeExpansions = 10_000
 
 // Git expands set macros recursively, preserving assignment order and the
 // macro's own attribute assignment. Unset and unspecified macro names are
 // ordinary attributes, not invocations. Bound work and reject cyclic graphs.
 func expandGitAttributes(attrs []*gitattr.Attr, macros map[string][]*gitattr.Attr, stack map[string]bool, steps *int) ([]*gitattr.Attr, error) {
-	const maxAttributeExpansions = 10000
 	var out []*gitattr.Attr
 	for _, attr := range attrs {
 		(*steps)++

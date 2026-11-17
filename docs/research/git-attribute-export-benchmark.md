@@ -1,8 +1,7 @@
 # Git-attribute export benchmark (current implementation)
 
 Measured 2026-11-17 on Linux/amd64, Intel Pentium Silver J5005 @ 1.50 GHz,
-Go 1.26.11. This is a baseline of the unmodified export implementation; it
-does not compare a hypothetical prepared-rule implementation.
+Go 1.26.11. This records before/after measurements for the prepared evaluator.
 
 ## Reproduction
 
@@ -24,7 +23,7 @@ so no LFS transfer or network access is involved. Limits are 2,000 files,
 2 MiB and one minute. This intentionally exercises ordinary static content and
 repeated parsing/matching; it is not a synthetic microbenchmark of the parser.
 
-## Observed baseline
+## Observed baseline and prepared implementation
 
 Command above on this host (three measured iterations):
 
@@ -45,15 +44,24 @@ a fresh profile.
 
 ## Assessment
 
-**GO for the narrowly scoped follow-up (#56): lazily parse tracked attribute
-rules once per export, while retaining per-file matching.** The current path
-re-evaluates the same 129-rule input for each of 1,200 files (154,800
-rule-file parses per export) and the representative export consumes roughly
-145 MB of transient allocations. Reuse is justified as a focused reduction in
-repeated work, but this baseline alone cannot quantify its speedup; #56 should
-benchmark the prepared implementation against this benchmark before claiming
-one. Do not broaden the optimization into publication behavior changes.
+**GO: the narrowly scoped prepared evaluator has a worthwhile measured payoff.**
+The old assessment's phrase "154,800 rule-file parses" was inaccurate: there
+is one tracked attribute file containing 129 rules; it was parsed once for
+each of 1,200 file evaluations (1,200 parses, 154,800 rule checks).
 
-No publication code or behavior is changed by this benchmark. In particular,
-LFS selection, fail-closed errors and their timing, resource limits, and
-per-file matching remain untouched.
+The prepared implementation, measured with the same command on this host:
+
+```text
+BenchmarkExportTrackedTree-4  3  378073724 ns/op
+  14567250 B/op  262619 allocs/op
+```
+
+Elapsed time fell from 1.55 s to 0.378 s (about 75.6%), allocated bytes from
+144.6 MB to 14.6 MB (about 89.9%), and allocations from 6.15 million to 263
+thousand (about 95.7%). These are whole-export observations, not parser-only
+attribution, and are evidence rather than thresholds. The measured payoff
+warrants the narrowly scoped per-export prepared state. Do not broaden the
+optimization into publication behavior changes.
+
+LFS selection, fail-closed outcomes and their timing, resource limits, and
+per-file matching remain unchanged.
