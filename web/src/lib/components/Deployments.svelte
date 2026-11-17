@@ -242,7 +242,7 @@
 			</p>
 		{/if}
 		<button
-			class="min-h-11 w-fit self-start rounded-lg bg-[#214c30] px-5 font-semibold text-white disabled:opacity-60"
+			class="min-h-11 w-fit self-start rounded-lg bg-[#214c30] px-5 font-semibold text-white disabled:opacity-60 sm:col-span-2"
 			disabled={busy || !selectedTarget || !validPublicationPath || !publicationRoot}
 			>Create deployment</button
 		>
