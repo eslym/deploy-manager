@@ -27,10 +27,9 @@ type preparedAttributeFile struct {
 // preparedAttributes retains source text and parses each applicable tracked
 // attribute file only when first needed during this export.
 type preparedAttributes struct {
-	files     map[string]string
-	parsed    map[string]preparedAttributeFile
-	work      int
-	expansion int
+	files  map[string]string
+	parsed map[string]preparedAttributeFile
+	work   int
 }
 
 func prepareAttributes(files map[string]string) *preparedAttributes {
@@ -75,6 +74,7 @@ func (p *preparedAttributes) effective(file string) (bool, error) {
 		"binary": {{K: "diff", V: "false"}, {K: "merge", V: "false"}, {K: "text", V: "false"}},
 	}
 	filter := ""
+	expansion := 0
 	for _, dir := range levels {
 		name := ".gitattributes"
 		if dir != "" {
@@ -117,7 +117,7 @@ func (p *preparedAttributes) effective(file string) (bool, error) {
 			if !line.Pattern().Match(rel) {
 				continue
 			}
-			attrs, err := expandGitAttributes(line.Attrs(), macros, nil, &p.expansion)
+			attrs, err := expandGitAttributes(line.Attrs(), macros, nil, &expansion)
 			if err != nil {
 				return false, err
 			}

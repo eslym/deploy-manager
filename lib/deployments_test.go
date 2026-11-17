@@ -476,6 +476,52 @@ func TestExportFailsClosedOnCommitTrackedLFSSelection(t *testing.T) {
 	}
 }
 
+func TestExportAllowsPerFileAttributeExpansionsAcrossFiles(t *testing.T) {
+	repoDir := filepath.Join(t.TempDir(), "repo")
+	repo, err := git.PlainInit(repoDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var attrs strings.Builder
+	for i := 0; i < maxAttributeExpansions/2+1; i++ {
+		fmt.Fprintf(&attrs, "* attr%d\n", i)
+	}
+	files := map[string]string{
+		".gitattributes": attrs.String(),
+		"one.txt":        "one",
+		"two.txt":        "two",
+	}
+	for name, contents := range files {
+		if err := os.WriteFile(filepath.Join(repoDir, name), []byte(contents), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := worktree.Add(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	commitID, err := worktree.Commit("attribute budget fixture", &git.CommitOptions{
+		Author: &object.Signature{Name: "fixture", Email: "fixture@example.test", When: time.Now().UTC()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit, err := repo.CommitObject(commitID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "export")
+	if err := os.Mkdir(out, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := exportTrackedTree(context.Background(), repo, commit, out, exportLimits{files: 10, bytes: 1 << 20, timeout: time.Minute}); err != nil {
+		t.Fatalf("export rejected individually safe attribute expansion: %v", err)
+	}
+}
+
 func TestExportHydratesCommittedLFSPointerIntoActualFile(t *testing.T) {
 	repoDir := filepath.Join(t.TempDir(), "repo")
 	createSmartFixture(t, repoDir)

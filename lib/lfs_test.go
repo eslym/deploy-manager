@@ -567,3 +567,41 @@ func TestPreparedAttributesRejectInvalidApplicableRule(t *testing.T) {
 		t.Fatal("malformed applicable attributes were accepted")
 	}
 }
+
+func TestPreparedAttributesExpansionLimitIsPerFile(t *testing.T) {
+	var rules strings.Builder
+	for i := 0; i < maxAttributeExpansions/2+1; i++ {
+		fmt.Fprintf(&rules, "* attr%d\n", i)
+	}
+	prepared := prepareAttributes(map[string]string{".gitattributes": rules.String()})
+	for _, file := range []string{"one", "two"} {
+		if selected, err := prepared.effective(file); err != nil || selected {
+			t.Fatalf("effective(%q) = %v, %v; want non-LFS without error", file, selected, err)
+		}
+	}
+}
+
+func TestPreparedAttributesRejectsExpansionLimitWithinFile(t *testing.T) {
+	var rules strings.Builder
+	for i := 0; i <= maxAttributeExpansions; i++ {
+		fmt.Fprintf(&rules, "* attr%d\n", i)
+	}
+	if _, err := prepareAttributes(map[string]string{".gitattributes": rules.String()}).effective("one"); err == nil {
+		t.Fatal("per-file attribute expansion limit was not enforced")
+	}
+}
+
+func TestPreparedAttributesKeepsCumulativeRuleWorkLimit(t *testing.T) {
+	const rulesPerFile = maxLFSAttributeWork/2 + 1
+	var rules strings.Builder
+	for i := 0; i < rulesPerFile; i++ {
+		fmt.Fprintf(&rules, "never%d attr\n", i)
+	}
+	prepared := prepareAttributes(map[string]string{".gitattributes": rules.String()})
+	if _, err := prepared.effective("first"); err != nil {
+		t.Fatalf("first file unexpectedly failed: %v", err)
+	}
+	if _, err := prepared.effective("second"); err == nil || !strings.Contains(err.Error(), "work limit") {
+		t.Fatalf("cumulative rule-check limit error = %v", err)
+	}
+}
