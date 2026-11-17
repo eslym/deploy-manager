@@ -1429,6 +1429,7 @@ type DeploymentMutation struct {
 	id                   *string
 	name                 *string
 	commit_id            *string
+	publication_name     *string
 	generation           *int64
 	addgeneration        *int64
 	live_commit          *string
@@ -1669,6 +1670,42 @@ func (m *DeploymentMutation) OldCommitID(ctx context.Context) (v string, err err
 // ResetCommitID resets all changes to the "commit_id" field.
 func (m *DeploymentMutation) ResetCommitID() {
 	m.commit_id = nil
+}
+
+// SetPublicationName sets the "publication_name" field.
+func (m *DeploymentMutation) SetPublicationName(s string) {
+	m.publication_name = &s
+}
+
+// PublicationName returns the value of the "publication_name" field in the mutation.
+func (m *DeploymentMutation) PublicationName() (r string, exists bool) {
+	v := m.publication_name
+	if v == nil {
+		return
+	}
+	return *v, true
+}
+
+// OldPublicationName returns the old "publication_name" field's value of the Deployment entity.
+// If the Deployment object wasn't provided to the builder, the object is fetched from the database.
+// An error is returned if the mutation operation is not UpdateOne, or the database query fails.
+func (m *DeploymentMutation) OldPublicationName(ctx context.Context) (v string, err error) {
+	if !m.op.Is(OpUpdateOne) {
+		return v, errors.New("OldPublicationName is only allowed on UpdateOne operations")
+	}
+	if m.id == nil || m.oldValue == nil {
+		return v, errors.New("OldPublicationName requires an ID field in the mutation")
+	}
+	oldValue, err := m.oldValue(ctx)
+	if err != nil {
+		return v, fmt.Errorf("querying old value for OldPublicationName: %w", err)
+	}
+	return oldValue.PublicationName, nil
+}
+
+// ResetPublicationName resets all changes to the "publication_name" field.
+func (m *DeploymentMutation) ResetPublicationName() {
+	m.publication_name = nil
 }
 
 // SetGeneration sets the "generation" field.
@@ -2358,7 +2395,7 @@ func (m *DeploymentMutation) Type() string {
 // order to get all numeric fields that were incremented/decremented, call
 // AddedFields().
 func (m *DeploymentMutation) Fields() []string {
-	fields := make([]string, 0, 15)
+	fields := make([]string, 0, 16)
 	if m.project != nil {
 		fields = append(fields, deployment.FieldProjectID)
 	}
@@ -2367,6 +2404,9 @@ func (m *DeploymentMutation) Fields() []string {
 	}
 	if m.commit_id != nil {
 		fields = append(fields, deployment.FieldCommitID)
+	}
+	if m.publication_name != nil {
+		fields = append(fields, deployment.FieldPublicationName)
 	}
 	if m.generation != nil {
 		fields = append(fields, deployment.FieldGeneration)
@@ -2418,6 +2458,8 @@ func (m *DeploymentMutation) Field(name string) (ent.Value, bool) {
 		return m.Name()
 	case deployment.FieldCommitID:
 		return m.CommitID()
+	case deployment.FieldPublicationName:
+		return m.PublicationName()
 	case deployment.FieldGeneration:
 		return m.Generation()
 	case deployment.FieldLiveCommit:
@@ -2457,6 +2499,8 @@ func (m *DeploymentMutation) OldField(ctx context.Context, name string) (ent.Val
 		return m.OldName(ctx)
 	case deployment.FieldCommitID:
 		return m.OldCommitID(ctx)
+	case deployment.FieldPublicationName:
+		return m.OldPublicationName(ctx)
 	case deployment.FieldGeneration:
 		return m.OldGeneration(ctx)
 	case deployment.FieldLiveCommit:
@@ -2510,6 +2554,13 @@ func (m *DeploymentMutation) SetField(name string, value ent.Value) error {
 			return fmt.Errorf("unexpected type %T for field %s", value, name)
 		}
 		m.SetCommitID(v)
+		return nil
+	case deployment.FieldPublicationName:
+		v, ok := value.(string)
+		if !ok {
+			return fmt.Errorf("unexpected type %T for field %s", value, name)
+		}
+		m.SetPublicationName(v)
 		return nil
 	case deployment.FieldGeneration:
 		v, ok := value.(int64)
@@ -2739,6 +2790,9 @@ func (m *DeploymentMutation) ResetField(name string) error {
 		return nil
 	case deployment.FieldCommitID:
 		m.ResetCommitID()
+		return nil
+	case deployment.FieldPublicationName:
+		m.ResetPublicationName()
 		return nil
 	case deployment.FieldGeneration:
 		m.ResetGeneration()

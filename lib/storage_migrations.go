@@ -14,7 +14,7 @@ import (
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-const currentSchemaVersion int64 = 1
+const currentSchemaVersion int64 = 2
 
 type pendingUpgrade struct{ source, target int64 }
 
@@ -127,7 +127,7 @@ func inspectVersionOneHistory(db *sql.DB) (bool, error) {
 	if err := rows.Err(); err != nil {
 		return false, err
 	}
-	if len(got) == 2 && got[0] == [2]int64{0, 1} && got[1] == [2]int64{currentSchemaVersion, 0} {
+	if len(got) == 2 && got[0] == [2]int64{0, 1} && got[1] == [2]int64{1, 0} {
 		return true, nil
 	}
 	return false, nil
