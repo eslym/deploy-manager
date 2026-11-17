@@ -122,6 +122,9 @@ func (a *App) finishDeploymentDeletion(id string) error {
 		return a.recordDeletionFailure(id, err)
 	}
 	defer unlock()
+	if pending, err := a.movePending(id); err != nil || pending {
+		return a.recordDeletionFailure(id, errors.New("publication move requires reconciliation before deletion"))
+	}
 	if err = a.reconcileDeploymentIntent(id); err != nil {
 		return a.recordDeletionFailure(id, err)
 	}

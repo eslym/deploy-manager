@@ -215,6 +215,9 @@ func (a *App) recoverDeployments() error {
 	if err := a.requeueInterruptedWebhookJobs(); err != nil {
 		return err
 	}
+	if err := a.reconcileMoves(); err != nil {
+		return err
+	}
 	if err := a.reconcilePublications(); err != nil {
 		return err
 	}
@@ -635,6 +638,12 @@ func (a *App) runDeploymentJob(jobID string) {
 		return
 	}
 	defer unlock()
+	if pending, err := a.movePending(deploymentID); err != nil || pending {
+		// A rename interrupted in this process must not publish to the old
+		// recorded path before its observed outcome has been reconciled.
+		a.failJob(jobID, deploymentID, generation, "A publication move requires restart reconciliation before another deployment")
+		return
+	}
 	// Workers may acquire this lock in a different order than jobs were
 	// accepted. Execute any queued predecessors first, under the same lock,
 	// rather than allowing a later tip publication/no-op to precede rollback.

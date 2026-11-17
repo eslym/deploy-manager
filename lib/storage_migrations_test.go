@@ -31,7 +31,7 @@ import (
 func testUpgradeMigrations(t *testing.T, extras fstest.MapFS) fstest.MapFS {
 	t.Helper()
 	files := fstest.MapFS{}
-	for _, name := range []string{"00001_initial.sql", "00002_publication_name.sql"} {
+	for _, name := range []string{"00001_initial.sql", "00002_publication_name.sql", "00003_publication_moves.sql"} {
 		data, err := fs.ReadFile(migrationFiles, "migrations/"+name)
 		if err != nil {
 			t.Fatal(err)
@@ -50,6 +50,7 @@ func testVersionOneConfig(t *testing.T, cfg Config) Config {
 	t.Helper()
 	files := testUpgradeMigrations(t, nil)
 	delete(files, "00002_publication_name.sql")
+	delete(files, "00003_publication_moves.sql")
 	cfg.migrationFS = files
 	cfg.upgradeTargetVersion = 1
 	return cfg
@@ -127,7 +128,7 @@ func TestPendingUpgradeCompletesThroughStorageStartupWithFixtureMigration(t *tes
 		upgradeTargetVersion: currentSchemaVersion + 1,
 	}
 	cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
-		"00003_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_upgrade(value TEXT NOT NULL);\nINSERT INTO fixture_upgrade VALUES('completed');\n-- +goose Down\nDROP TABLE fixture_upgrade;\n")},
+		"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_upgrade(value TEXT NOT NULL);\nINSERT INTO fixture_upgrade VALUES('completed');\n-- +goose Down\nDROP TABLE fixture_upgrade;\n")},
 	})
 	first, err := NewGrantIssuer(Config{DatabasePath: cfg.DatabasePath, OPAQUEKeyPath: cfg.OPAQUEKeyPath, InsecureLocalHTTP: true})
 	if err != nil {
@@ -378,11 +379,11 @@ func TestProtectedUpgradeRunsEmbeddedForwardMigrationAndRetainsPartialProgress(t
 		wantValue  bool
 	}{
 		{name: "success", target: currentSchemaVersion + 1, wantValue: true, migrations: fstest.MapFS{
-			"00003_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('migrated');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
+			"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('migrated');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
 		}},
 		{name: "partial multi migration", target: currentSchemaVersion + 2, migrations: fstest.MapFS{
-			"00003_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('first committed migration');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
-			"00004_fail.sql":    {Data: []byte("-- +goose Up\nCREATE TABLE rolled_back(value TEXT NOT NULL);\nINSERT INTO missing_table VALUES('failure');\n-- +goose Down\nDROP TABLE rolled_back;\n")},
+			"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE upgrade_witness(value TEXT NOT NULL);\nINSERT INTO upgrade_witness VALUES('first committed migration');\n-- +goose Down\nDROP TABLE upgrade_witness;\n")},
+			"00005_fail.sql":    {Data: []byte("-- +goose Up\nCREATE TABLE rolled_back(value TEXT NOT NULL);\nINSERT INTO missing_table VALUES('failure');\n-- +goose Down\nDROP TABLE rolled_back;\n")},
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -468,7 +469,7 @@ func TestProtectedForeignKeyRebuildUsesSingleConnectionAndRestoresEnforcement(t 
 		t.Fatal(err)
 	}
 	cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
-		"00003_rebuild.sql": {Data: []byte(`-- +goose NO TRANSACTION
+		"00004_rebuild.sql": {Data: []byte(`-- +goose NO TRANSACTION
 -- +goose Up
 PRAGMA foreign_keys=OFF;
 BEGIN;
