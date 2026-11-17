@@ -47,4 +47,16 @@ func TestReviewedPublicationMigrationKeepsLegacyDestinationWithoutRelocation(t *
 	if _, err := db.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,publication_name,created_at,updated_at) VALUES(?,?,'other','',?,1,1)`, strings.Repeat("c", 32), project, id); err == nil {
 		t.Fatal("migration allowed a second deployment to claim the legacy destination")
 	}
+	if _, err := provider.Up(context.Background()); err != nil {
+		t.Fatalf("forward move migration: %v", err)
+	}
+	if err := db.QueryRow(`SELECT publication_name FROM deployments WHERE id=?`, id).Scan(&name); err != nil || name != id {
+		t.Fatalf("move migration relocated legacy destination: %q %v", name, err)
+	}
+	if _, err := db.Exec(`INSERT INTO publication_moves(deployment_id,source_name,destination_name,old_dev,old_ino,created_at) VALUES(?,?, 'new-site',1,2,1)`, id, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,publication_name,created_at,updated_at) VALUES(?,?,'reserved','', 'new-site',1,1)`, strings.Repeat("d", 32), project); err == nil {
+		t.Fatal("migration allowed a create to claim an unresolved move destination")
+	}
 }

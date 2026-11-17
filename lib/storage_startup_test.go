@@ -63,7 +63,7 @@ func TestDaemonStartupFailsClosedWhenRunningExecutablePathIsRemoved(t *testing.T
 		}
 		cfg.upgradeTargetVersion = currentSchemaVersion + 1
 		cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
-			"00003_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE provenance_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE provenance_upgrade_witness;\n")},
+			"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE provenance_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE provenance_upgrade_witness;\n")},
 		})
 		dbPath, err := filepath.Abs(cfg.DatabasePath)
 		if err != nil {
@@ -213,7 +213,7 @@ func TestGrantIssuerRefusesPendingUpgradeWithoutChangingStorage(t *testing.T) {
 	}
 	cfg.upgradeTargetVersion = currentSchemaVersion + 1
 	cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
-		"00003_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE cli_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE cli_upgrade_witness;\n")},
+		"00004_forward.sql": {Data: []byte("-- +goose Up\nCREATE TABLE cli_upgrade_witness(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE cli_upgrade_witness;\n")},
 	})
 	databaseBefore, err := os.ReadFile(cfg.DatabasePath)
 	if err != nil {

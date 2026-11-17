@@ -168,7 +168,7 @@ func TestStorageCoordinationChild(t *testing.T) {
 		if os.Getenv("DM_UPGRADE_CRASH_FIXTURE") == "1" {
 			cfg.upgradeTargetVersion = currentSchemaVersion + 1
 			cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
-				"00003_fixture.sql": {Data: []byte("-- +goose Up\nCREATE TABLE crash_fixture(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE crash_fixture;\n")},
+				"00004_fixture.sql": {Data: []byte("-- +goose Up\nCREATE TABLE crash_fixture(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE crash_fixture;\n")},
 			})
 		}
 		reached := false
@@ -198,7 +198,7 @@ func TestStorageCoordinationChild(t *testing.T) {
 		}
 		cfg.upgradeTargetVersion = currentSchemaVersion + 1
 		cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
-			"00003_fixture_failure.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_partial(value TEXT NOT NULL);\nINSERT INTO missing_fixture_table VALUES('fail');\n-- +goose Down\nDROP TABLE fixture_partial;\n")},
+			"00004_fixture_failure.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_partial(value TEXT NOT NULL);\nINSERT INTO missing_fixture_table VALUES('fail');\n-- +goose Down\nDROP TABLE fixture_partial;\n")},
 		})
 		if _, err := New(cfg); err == nil {
 			t.Fatal("fixture upgrade unexpectedly succeeded")

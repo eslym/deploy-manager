@@ -630,6 +630,7 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/deployments/{id}/resume", a.resumeDeployment)
 	m.HandleFunc("POST /api/deployments/{id}/hard-redeploy", a.hardRedeploy)
 	m.HandleFunc("POST /api/deployments/{id}/delete", a.deleteDeployment)
+	m.HandleFunc("POST /api/deployments/{id}/move", a.moveDeployment)
 	m.HandleFunc("POST /api/deployments/{id}/target", a.updateDeploymentTarget)
 	m.HandleFunc("GET /api/deployments/{id}/jobs", a.deploymentJobs)
 	m.HandleFunc("GET /api/repository-keys", a.listRepositoryKeys)

@@ -1,7 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { createHmac, generateKeyPairSync } from "node:crypto";
-import { chmod, copyFile, mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { request as httpsRequest } from "node:https";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -845,6 +845,62 @@ try {
   await commitCard.getByText(`Target commit: ${sshCommit}`, { exact: true }).waitFor();
   await commitCard.getByText(`Live commit: ${sshCommit}`, { exact: true }).waitFor();
   await commitCard.getByText(`Publication path: ${sshPublishedPath}`, { exact: true }).waitFor();
+  milestone("move legacy publication into a readable folder");
+  const movePath = `/api/deployments/${sshDeployment.body.id}/move`;
+  const movedPath = join(publicationRootResponse.body.publicationRoot, "ssh-readable-site");
+  const occupiedPath = join(publicationRootResponse.body.publicationRoot, "occupied-move-site");
+  const originalIdentity = (await stat(sshPublishedPath)).ino;
+  const originalContent = await readFile(join(sshPublishedPath, "index.html"), "utf8");
+  const originalAsset = await readFile(join(sshPublishedPath, "asset.dat"), "utf8");
+  if (await httpsRequestStatus("127.0.0.1", 18440, movePath, "POST", JSON.stringify({ publicationPath: "ssh-readable-site", confirm: true }), { Origin: `https://${appListen}`, "Content-Type": "application/json" }) !== 401) throw new Error("unauthenticated publication move was accepted");
+  if (await httpsRequestStatus("127.0.0.1", 18440, movePath, "POST", JSON.stringify({ publicationPath: "ssh-readable-site", confirm: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" }) !== 403) throw new Error("cross-origin publication move was accepted");
+  await mkdir(occupiedPath);
+  await writeFile(join(occupiedPath, "keep.txt"), "not owned by deployment\n");
+  const occupiedMove = await page.evaluate(async path => {
+    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicationPath: "occupied-move-site", confirm: true }) });
+    return response.status;
+  }, movePath);
+  if (occupiedMove !== 409) throw new Error(`moving into an occupied folder returned ${occupiedMove}, expected 409`);
+  if ((await readFile(join(occupiedPath, "keep.txt"), "utf8")) !== "not owned by deployment\n" || (await stat(sshPublishedPath)).ino !== originalIdentity) throw new Error("failed move changed the existing publication or occupied destination");
+  await commitCard.getByRole("button", { name: /Move publication/i }).click();
+  await commitCard.getByLabel(/Publication folder/i).fill("ssh-readable-site");
+  const moveReview = commitCard.getByRole("dialog", { name: /move/i });
+  await commitCard.getByRole("button", { name: /Review move/i }).click();
+  await moveReview.waitFor();
+  const warning = await moveReview.innerText();
+  if (!warning.includes(sshPublishedPath) || !warning.includes(movedPath)) throw new Error(`move warning did not identify both old and new paths: ${warning}`);
+  await moveReview.getByRole("button", { name: /Cancel/i }).click();
+  if ((await stat(sshPublishedPath)).ino !== originalIdentity) throw new Error("cancelling publication move changed the live directory");
+  await commitCard.getByRole("button", { name: /Review move/i }).click();
+  const moveResponse = page.waitForResponse(response => response.url().endsWith(movePath) && response.request().method() === "POST");
+  await moveReview.getByRole("button", { name: /Confirm move/i }).click();
+  const moved = await moveResponse;
+  if (moved.status() !== 200 || JSON.stringify(moved.request().postDataJSON()) !== JSON.stringify({ publicationPath: "ssh-readable-site", confirm: true })) throw new Error(`dashboard did not confirm the chosen move (${moved.status()})`);
+  await commitCard.getByText(`Publication path: ${movedPath}`, { exact: true }).waitFor();
+  await waitFor(async () => {
+    try { await stat(sshPublishedPath); return false; } catch (error) { if (error.code !== "ENOENT") throw error; }
+    try { return (await stat(movedPath)).ino === originalIdentity && (await readFile(join(movedPath, "index.html"), "utf8")) === originalContent && (await readFile(join(movedPath, "asset.dat"), "utf8")) === originalAsset; } catch { return false; }
+  }, "moved legacy publication and hydrated content");
+  const movedDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), sshDeployment.body.id);
+  if (movedDeployment?.publicationPath !== movedPath || movedDeployment.liveCommit !== sshCommit) throw new Error(`moved deployment lost its live release: ${JSON.stringify(movedDeployment)}`);
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await commitCard.getByText(`Publication path: ${movedPath}`, { exact: true }).waitFor();
+  const redeployMoved = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${sshDeployment.body.id}/hard-redeploy`));
+  await commitCard.getByRole("button", { name: "Hard re-deploy", exact: true }).click();
+  const redeployAccepted = await redeployMoved;
+  if (redeployAccepted.status() !== 202) throw new Error(`hard re-deploy after move returned ${redeployAccepted.status()}`);
+  const redeployJob = await redeployAccepted.json();
+  await waitFor(async () => {
+    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), sshDeployment.body.id);
+    return jobs.some(job => job.id === redeployJob.jobId && job.status === "succeeded") && (await stat(movedPath)).ino !== originalIdentity;
+  }, "publication recreated at moved destination");
+  if ((await readFile(join(movedPath, "index.html"), "utf8")) !== originalContent || (await readFile(join(movedPath, "asset.dat"), "utf8")) !== originalAsset) throw new Error("deployment after move changed published content");
+  const identityBeforeNoOp = (await stat(movedPath)).ino;
+  const noOpMove = await page.evaluate(async path => {
+    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicationPath: "ssh-readable-site", confirm: true }) });
+    return response.status;
+  }, movePath);
+  if (![200, 204, 409].includes(noOpMove) || (await stat(movedPath)).ino !== identityBeforeNoOp || (await readFile(join(movedPath, "index.html"), "utf8")) !== originalContent) throw new Error(`same-destination move changed the publication (HTTP ${noOpMove})`);
   let failedDeployAction = false;
   await page.route(`**/api/deployments/${sshDeployment.body.id}/deploy`, async route => {
     failedDeployAction = true;
@@ -862,7 +918,7 @@ try {
   await page.getByRole("button", { name: "Delete", exact: true }).click();
   await page.getByText(/Delete “SSH published site” and remove its published files/).waitFor();
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
-  if ((await readFile(join(sshPublishedPath, "index.html"), "utf8")) !== "SSH fixture site\n") throw new Error("cancelling deployment deletion changed its publication");
+  if ((await readFile(join(movedPath, "index.html"), "utf8")) !== "SSH fixture site\n") throw new Error("cancelling deployment deletion changed its publication");
   await page.getByRole("link", { name: "SSH fixture site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
   await page.getByRole("button", { name: "Delete project" }).click();
@@ -878,7 +934,8 @@ try {
   await page.getByRole("button", { name: "Confirm delete" }).click();
   if ((await deploymentDelete).status() !== 204) throw new Error("confirmed deployment deletion did not finish");
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
-  await waitFor(async () => { try { await stat(sshPublishedPath); return false; } catch { return true; } }, "deleted publication files");
+  await waitFor(async () => { try { await stat(movedPath); return false; } catch (error) { if (error.code === "ENOENT") return true; throw error; } }, "deleted moved publication files");
+  if ((await readFile(join(occupiedPath, "keep.txt"), "utf8")) !== "not owned by deployment\n") throw new Error("deleting the moved deployment touched an unrelated occupied folder");
   await page.getByRole("button", { name: "Delete project" }).click();
   await page.getByText(/Projects with deployments cannot be deleted/).waitFor();
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
@@ -994,7 +1051,7 @@ try {
   await waitFor(async () => { try { await stat(publishedPath); return false; } catch (error) { if (error.code === "ENOENT") return true; throw error; } }, "chosen publication folder removal");
   if (await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).some(item => item.id === id), deploymentID)) throw new Error("deleted deployment remained in the list");
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
-  console.log("combined-binary authenticated project workflow passed: readable publication folders and legacy paths, publication and deletion confirmation/cancel, private SSH/LFS publication, cache size/recreation warning and confirmation, restart-safe cache lifecycle, host trust, cross-origin mutation rejection, and cached-ref retention");
+  console.log("combined-binary authenticated project workflow passed: readable publication folders, legacy move and deletion, private SSH/LFS publication, cache size/recreation warning and confirmation, restart-safe cache lifecycle, host trust, cross-origin mutation rejection, and cached-ref retention");
 } catch (error) {
   console.error(`[projects-browser] failed during: ${currentStep}`);
   throw error;
