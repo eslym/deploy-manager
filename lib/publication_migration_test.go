@@ -53,6 +53,17 @@ func TestReviewedPublicationMigrationKeepsLegacyDestinationWithoutRelocation(t *
 	if err := db.QueryRow(`SELECT publication_name FROM deployments WHERE id=?`, id).Scan(&name); err != nil || name != id {
 		t.Fatalf("move migration relocated legacy destination: %q %v", name, err)
 	}
+	var uniqueIndex string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='index' AND name='deployment_publication_name_unique'`).Scan(&uniqueIndex); err != nil || !strings.Contains(uniqueIndex, "WHERE publication_name<>''") {
+		t.Fatalf("publication name index must remain partial under goose: %q %v", uniqueIndex, err)
+	}
+	legacyID := strings.Repeat("e", 32)
+	if _, err := db.Exec(`INSERT INTO deployments(id,project_id,name,commit_id,created_at,updated_at) VALUES(?,?,'older-client','',1,1)`, legacyID, project); err != nil {
+		t.Fatalf("older client insert must pass the partial index and receive ID binding: %v", err)
+	}
+	if err := db.QueryRow(`SELECT publication_name FROM deployments WHERE id=?`, legacyID).Scan(&name); err != nil || name != legacyID {
+		t.Fatalf("older client destination=%q, err=%v", name, err)
+	}
 	if _, err := db.Exec(`INSERT INTO publication_moves(deployment_id,source_name,destination_name,old_dev,old_ino,created_at) VALUES(?,?, 'new-site',1,2,1)`, id, id); err != nil {
 		t.Fatal(err)
 	}

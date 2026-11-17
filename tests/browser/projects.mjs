@@ -848,6 +848,7 @@ try {
   milestone("move legacy publication into a readable folder");
   const movePath = `/api/deployments/${sshDeployment.body.id}/move`;
   const movedPath = join(publicationRootResponse.body.publicationRoot, "ssh-readable-site");
+  const intermediatePath = join(publicationRootResponse.body.publicationRoot, "ssh-intermediate-site");
   const occupiedPath = join(publicationRootResponse.body.publicationRoot, "occupied-move-site");
   const originalIdentity = (await stat(sshPublishedPath)).ino;
   const originalContent = await readFile(join(sshPublishedPath, "index.html"), "utf8");
@@ -856,10 +857,10 @@ try {
   if (await httpsRequestStatus("127.0.0.1", 18440, movePath, "POST", JSON.stringify({ publicationPath: "ssh-readable-site", confirm: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" }) !== 403) throw new Error("cross-origin publication move was accepted");
   await mkdir(occupiedPath);
   await writeFile(join(occupiedPath, "keep.txt"), "not owned by deployment\n");
-  const occupiedMove = await page.evaluate(async path => {
-    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicationPath: "occupied-move-site", confirm: true }) });
+  const occupiedMove = await page.evaluate(async ([path, originalPath]) => {
+    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicationPath: "occupied-move-site", expectedPublicationPath: originalPath, confirm: true }) });
     return response.status;
-  }, movePath);
+  }, [movePath, sshPublishedPath]);
   if (occupiedMove !== 409) throw new Error(`moving into an occupied folder returned ${occupiedMove}, expected 409`);
   if ((await readFile(join(occupiedPath, "keep.txt"), "utf8")) !== "not owned by deployment\n" || (await stat(sshPublishedPath)).ino !== originalIdentity) throw new Error("failed move changed the existing publication or occupied destination");
   await commitCard.getByRole("button", { name: /Move publication/i }).click();
@@ -872,10 +873,26 @@ try {
   await moveReview.getByRole("button", { name: /Cancel/i }).click();
   if ((await stat(sshPublishedPath)).ino !== originalIdentity) throw new Error("cancelling publication move changed the live directory");
   await commitCard.getByRole("button", { name: /Review move/i }).click();
+  // Another administrator moves the site while this confirmation still
+  // displays the old root. The stale confirmation must not move it again.
+  const concurrentMove = await page.evaluate(async ([path, originalPath]) => {
+    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicationPath: "ssh-intermediate-site", expectedPublicationPath: originalPath, confirm: true }) });
+    return response.status;
+  }, [movePath, sshPublishedPath]);
+  if (concurrentMove !== 200) throw new Error(`concurrent move failed (${concurrentMove})`);
+  const staleResponse = page.waitForResponse(response => response.url().endsWith(movePath) && response.request().method() === "POST");
+  await moveReview.getByRole("button", { name: /Confirm move/i }).click();
+  if ((await staleResponse).status() !== 409 || (await stat(intermediatePath)).ino !== originalIdentity) throw new Error("stale confirmation moved the publication again");
+  try { await stat(movedPath); throw new Error("stale confirmation created its proposed destination"); } catch (error) { if (error.code !== "ENOENT") throw error; }
+  await page.reload();
+  await commitCard.getByText(`Publication path: ${intermediatePath}`, { exact: true }).waitFor();
+  await commitCard.getByRole("button", { name: /Move publication/i }).click();
+  await commitCard.getByLabel(/Publication folder/i).fill("ssh-readable-site");
+  await commitCard.getByRole("button", { name: /Review move/i }).click();
   const moveResponse = page.waitForResponse(response => response.url().endsWith(movePath) && response.request().method() === "POST");
   await moveReview.getByRole("button", { name: /Confirm move/i }).click();
   const moved = await moveResponse;
-  if (moved.status() !== 200 || JSON.stringify(moved.request().postDataJSON()) !== JSON.stringify({ publicationPath: "ssh-readable-site", confirm: true })) throw new Error(`dashboard did not confirm the chosen move (${moved.status()})`);
+  if (moved.status() !== 200 || JSON.stringify(moved.request().postDataJSON()) !== JSON.stringify({ publicationPath: "ssh-readable-site", expectedPublicationPath: intermediatePath, confirm: true })) throw new Error(`dashboard did not confirm the chosen move (${moved.status()})`);
   await commitCard.getByText(`Publication path: ${movedPath}`, { exact: true }).waitFor();
   await waitFor(async () => {
     try { await stat(sshPublishedPath); return false; } catch (error) { if (error.code !== "ENOENT") throw error; }
@@ -896,10 +913,10 @@ try {
   }, "publication recreated at moved destination");
   if ((await readFile(join(movedPath, "index.html"), "utf8")) !== originalContent || (await readFile(join(movedPath, "asset.dat"), "utf8")) !== originalAsset) throw new Error("deployment after move changed published content");
   const identityBeforeNoOp = (await stat(movedPath)).ino;
-  const noOpMove = await page.evaluate(async path => {
-    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicationPath: "ssh-readable-site", confirm: true }) });
+  const noOpMove = await page.evaluate(async ([path, currentPath]) => {
+    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicationPath: "ssh-readable-site", expectedPublicationPath: currentPath, confirm: true }) });
     return response.status;
-  }, movePath);
+  }, [movePath, movedPath]);
   if (![200, 204, 409].includes(noOpMove) || (await stat(movedPath)).ino !== identityBeforeNoOp || (await readFile(join(movedPath, "index.html"), "utf8")) !== originalContent) throw new Error(`same-destination move changed the publication (HTTP ${noOpMove})`);
   let failedDeployAction = false;
   await page.route(`**/api/deployments/${sshDeployment.body.id}/deploy`, async route => {

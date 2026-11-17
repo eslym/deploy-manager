@@ -3,6 +3,7 @@ package lib
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,10 +43,44 @@ func validStoredPublicationName(name, id string) bool {
 }
 
 func (p publicationPaths) live() string {
-	if !validProjectID(p.deploymentID) || !validStoredPublicationName(p.liveName, p.deploymentID) {
+	path, err := p.namedPath(p.liveName)
+	if err != nil {
 		return filepath.Join(p.root, ".invalid-publication-binding")
 	}
-	return filepath.Join(p.root, p.liveName)
+	return path
+}
+
+// namedPath is the only root join for a persisted or proposed live name.
+func (p publicationPaths) namedPath(name string) (string, error) {
+	if !validProjectID(p.deploymentID) || !validStoredPublicationName(name, p.deploymentID) {
+		return "", errors.New("invalid publication name")
+	}
+	return filepath.Join(p.root, name), nil
+}
+
+var errPublicationOccupied = errors.New("publication destination is occupied or reserved")
+
+// available checks both durable reservations and filesystem occupancy. The
+// database's unique index and move reservation triggers remain the final
+// cross-process guard after this preflight check.
+func (a *App) availablePublicationPath(p publicationPaths, name string) (string, error) {
+	path, err := p.namedPath(name)
+	if err != nil {
+		return "", err
+	}
+	var reservations int
+	if err = a.db.QueryRow(`SELECT (SELECT count(*) FROM deployments WHERE publication_name=?) + (SELECT count(*) FROM publication_moves WHERE destination_name=?)`, name, name).Scan(&reservations); err != nil {
+		return "", fmt.Errorf("check publication reservations: %w", err)
+	}
+	if reservations != 0 {
+		return "", errPublicationOccupied
+	}
+	if _, err = os.Lstat(path); err == nil {
+		return "", errPublicationOccupied
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("inspect publication destination: %w", err)
+	}
+	return path, nil
 }
 
 func (p publicationPaths) stageName(job string) string {

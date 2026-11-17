@@ -1,5 +1,15 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import {
+		isReservedPublicationFolder,
+		isValidPublicationFolder,
+		publicationFolderPattern,
+		publicationFolderPreview
+	} from '#lib/publication-folder.js';
+	import {
+		PublicationStatusUnavailableError,
+		publicationStatusUnavailable
+	} from '#lib/publication-status.js';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onDestroy } from 'svelte';
@@ -41,6 +51,7 @@
 	let targetSelection = $state('');
 	let targetSearch = $state('');
 	let error = $state('');
+	let publicationStatusError = $state('');
 	let refsError = $state('');
 	let loading = $state(true);
 	let missing = $state(false);
@@ -51,14 +62,9 @@
 	let movePath = $state('');
 	let moveConfirmation = $state<{ oldPath: string; newPath: string } | null>(null);
 	let moveRootError = $state('');
-	let validMovePath = $derived(
-		movePath.length <= 100 &&
-			/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(movePath) &&
-			!/^[0-9a-f]{32}$/.test(movePath)
-	);
-	let movePreview = $derived(
-		publicationRoot && validMovePath ? `${publicationRoot.replace(/\/+$/, '')}/${movePath}` : ''
-	);
+	let reservedMovePath = $derived(isReservedPublicationFolder(movePath));
+	let validMovePath = $derived(isValidPublicationFolder(movePath));
+	let movePreview = $derived(publicationFolderPreview(publicationRoot, movePath));
 	let loadVersion = 0;
 	let viewVersion = 0;
 	const key = (ref: Ref) => `${ref.kind}:${ref.name}`;
@@ -80,6 +86,12 @@
 
 	async function request(path: string, init?: RequestInit) {
 		return dashboardRequest(path, init, (response) => {
+			if (path === '/api/deployments' && response.status === 503)
+				return publicationStatusUnavailable(response);
+			if (path.endsWith('/move') && response.status === 409)
+				return new Error(
+					'The publication may have changed or the destination is unavailable. Refresh and review the move before trying again.'
+				);
 			if (path.endsWith('/delete') && response.status === 503)
 				return new Error(
 					'Deletion is pending. The published files are protected while cleanup retries; try again later.'
@@ -105,6 +117,7 @@
 				request('/api/projects')
 			]);
 			if (!current()) return;
+			publicationStatusError = '';
 			const foundProject = projects.find((candidate) => candidate.id === id);
 			const found = all.find(
 				(candidate) => candidate.id === deployment && candidate.projectId === id
@@ -168,7 +181,17 @@
 		} catch (cause) {
 			if (!current()) return;
 			loading = false;
-			error = cause instanceof Error ? cause.message : 'Could not load deployment.';
+			if (cause instanceof PublicationStatusUnavailableError) {
+				item = null;
+				jobs = null;
+				publicationRoot = '';
+				moveConfirmation = null;
+				moveOpen = false;
+				publicationStatusError = cause.message;
+				error = '';
+			} else {
+				error = cause instanceof Error ? cause.message : 'Could not load deployment.';
+			}
 		}
 	}
 
@@ -275,13 +298,18 @@
 		try {
 			await request(`/api/deployments/${id}/move`, {
 				method: 'POST',
-				body: JSON.stringify({ publicationPath: movePath, confirm: true })
+				body: JSON.stringify({
+					publicationPath: movePath,
+					expectedPublicationPath: confirmation.oldPath,
+					confirm: true
+				})
 			});
 			moveConfirmation = null;
 			movePath = '';
 			moveOpen = false;
 			await load();
 		} catch (cause) {
+			moveConfirmation = null;
 			error = cause instanceof Error ? cause.message : 'Could not move the deployment.';
 		} finally {
 			busy = false;
@@ -304,6 +332,7 @@
 		missing = false;
 		loading = true;
 		error = '';
+		publicationStatusError = '';
 		refsError = '';
 		targetSelection = '';
 		targetSearch = '';
@@ -351,6 +380,12 @@
 		>
 			{error}
 		</p>{/if}
+	{#if publicationStatusError}<p
+			role="alert"
+			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{publicationStatusError}
+		</p>{/if}
 	{#if refsError}<p
 			role="alert"
 			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
@@ -391,12 +426,16 @@
 							oninput={() => (moveConfirmation = null)}
 							disabled={busy || !publicationRoot}
 							maxlength="100"
-							pattern="[A-Za-z0-9][A-Za-z0-9._-]*"
+							pattern={publicationFolderPattern}
 						/>
 					</label>
 					<p class="mt-1 text-xs text-[#58645b]">
-						Use letters, numbers, periods, underscores, or hyphens.
+						One folder name, with no slashes. Use letters, numbers, dots, hyphens or underscores;
+						start with a letter or number.
 					</p>
+					{#if reservedMovePath}
+						<p class="mt-1 text-xs text-red-800">This folder name is reserved. Choose another.</p>
+					{/if}
 					{#if movePreview && movePreview !== item.publicationPath}
 						<button
 							class="mt-3 min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold text-[#214c30] disabled:opacity-60"

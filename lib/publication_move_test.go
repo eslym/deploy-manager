@@ -17,7 +17,7 @@ import (
 // Exercise both sides of the durable rename boundary through the authenticated
 // API; a new daemon must observe the inode rather than replaying the rename.
 func TestPublicationMoveReconcilesInterruptedRename(t *testing.T) {
-	for _, phase := range []string{"before-move-rename", "after-move-rename", "after-move-sync", "before-move-state"} {
+	for _, phase := range []string{"before-move-rename", "after-move-rename", "before-move-directory-sync", "after-move-sync", "after-move-verify", "before-move-state"} {
 		t.Run(phase, func(t *testing.T) {
 			base := t.TempDir()
 			cfg := Config{DatabasePath: filepath.Join(base, "state.sqlite"), OPAQUEKeyPath: filepath.Join(base, "opaque.key")}
@@ -52,12 +52,26 @@ func TestPublicationMoveReconcilesInterruptedRename(t *testing.T) {
 				}
 				return nil
 			})
-			response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+id+"/move", `{"publicationPath":"moved-site","confirm":true}`)
+			response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+id+"/move", `{"publicationPath":"moved-site","expectedPublicationPath":"`+oldPath+`","confirm":true}`)
 			setPublicationFaultPoint(previous)
 			if response.StatusCode != http.StatusServiceUnavailable {
 				t.Fatalf("fault not reached: %d %s", response.StatusCode, responseText(response))
 			}
 			response.Body.Close()
+			// While the move intent is unresolved, the old persisted name is
+			// not necessarily a usable document root (rename may have happened).
+			request, e := http.NewRequest(http.MethodGet, server.URL+"/api/deployments", nil)
+			if e != nil {
+				t.Fatal(e)
+			}
+			request.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+			response, e = server.Client().Do(request)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if response.StatusCode != http.StatusServiceUnavailable || !strings.Contains(responseText(response), "move") {
+				t.Fatalf("unresolved move exposed a document root: HTTP %d", response.StatusCode)
+			}
 			var name string
 			if err = app.db.QueryRow(`SELECT publication_name FROM deployments WHERE id=?`, id).Scan(&name); err != nil || name != id {
 				t.Fatalf("claimed incomplete move: %q %v", name, err)
@@ -123,7 +137,7 @@ func TestPublicationMoveRefusesAmbiguousRestartAndOccupiedDestination(t *testing
 	}
 	server := httptest.NewTLSServer(app.Handler())
 	cookie := installAPITestSession(t, app)
-	response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+id+"/move", `{"publicationPath":"occupied-site","confirm":true}`)
+	response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+id+"/move", `{"publicationPath":"occupied-site","expectedPublicationPath":"`+oldPath+`","confirm":true}`)
 	if response.StatusCode != 409 {
 		t.Fatalf("occupied path accepted: %d %s", response.StatusCode, responseText(response))
 	}
@@ -135,7 +149,7 @@ func TestPublicationMoveRefusesAmbiguousRestartAndOccupiedDestination(t *testing
 	if err := os.Symlink(oldPath, link); err != nil {
 		t.Fatal(err)
 	}
-	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+id+"/move", `{"publicationPath":"symlink-site","confirm":true}`)
+	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+id+"/move", `{"publicationPath":"symlink-site","expectedPublicationPath":"`+oldPath+`","confirm":true}`)
 	if response.StatusCode != 409 {
 		t.Fatalf("symlink destination accepted: %d %s", response.StatusCode, responseText(response))
 	}
@@ -206,7 +220,7 @@ func TestPublicationMoveSerializesWithQueuedDeployment(t *testing.T) {
 	}
 	moveDone := make(chan int, 1)
 	go func() {
-		response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+id+"/move", `{"publicationPath":"moved-site","confirm":true}`)
+		response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+id+"/move", `{"publicationPath":"moved-site","expectedPublicationPath":"`+oldPath+`","confirm":true}`)
 		moveDone <- response.StatusCode
 		response.Body.Close()
 	}()
@@ -277,7 +291,7 @@ func TestMoveLegacyPublicationPreservesReleaseAndFutureDeletion(t *testing.T) {
 		if confirm {
 			flag = "true"
 		}
-		return projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+deployment.ID+"/move", `{"publicationPath":"`+path+`","confirm":`+flag+`}`)
+		return projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+deployment.ID+"/move", `{"publicationPath":"`+path+`","expectedPublicationPath":"`+old+`","confirm":`+flag+`}`)
 	}
 	for _, name := range []string{"../escape", "readable-site"} {
 		response := move(name, false)
@@ -306,6 +320,17 @@ func TestMoveLegacyPublicationPreservesReleaseAndFutureDeletion(t *testing.T) {
 	}
 	if _, err := os.Lstat(old); !os.IsNotExist(err) {
 		t.Fatalf("old location still published: %v", err)
+	}
+	response = move("second-site", true)
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("stale reviewed path moved again: %d %s", response.StatusCode, responseText(response))
+	}
+	response.Body.Close()
+	if got, err := identity(newPath); err != nil || got != oldID {
+		t.Fatalf("stale confirmation changed publication: %v %v", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(app.cfg.DeploymentRoot, "second-site")); !os.IsNotExist(err) {
+		t.Fatalf("stale confirmation created another document root: %v", err)
 	}
 	response = move("readable-site", true)
 	if response.StatusCode != http.StatusConflict {

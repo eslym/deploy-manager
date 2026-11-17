@@ -1,5 +1,15 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import {
+		isReservedPublicationFolder,
+		isValidPublicationFolder,
+		publicationFolderPattern,
+		publicationFolderPreview
+	} from '#lib/publication-folder.js';
+	import {
+		PublicationStatusUnavailableError,
+		publicationStatusUnavailable
+	} from '#lib/publication-status.js';
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
@@ -37,20 +47,14 @@
 		refs.filter((ref) => ref.name.toLowerCase().includes(refSearch.toLowerCase()))
 	);
 	let selectedTarget = $derived(refs.find((ref) => key(ref) === selectedRef));
-	let reservedPublicationPath = $derived(/^[0-9a-f]{32}$/.test(publicationPath));
-	let validPublicationPath = $derived(
-		publicationPath.length <= 100 &&
-			/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(publicationPath) &&
-			!reservedPublicationPath
-	);
-	let publicationPreview = $derived(
-		publicationRoot && validPublicationPath
-			? `${publicationRoot.replace(/\/+$/, '')}/${publicationPath}`
-			: ''
-	);
+	let reservedPublicationPath = $derived(isReservedPublicationFolder(publicationPath));
+	let validPublicationPath = $derived(isValidPublicationFolder(publicationPath));
+	let publicationPreview = $derived(publicationFolderPreview(publicationRoot, publicationPath));
 
 	async function request(path: string, init?: RequestInit) {
 		return dashboardRequest(path, init, (response) => {
+			if (path === '/api/deployments' && response.status === 503)
+				return publicationStatusUnavailable(response);
 			return new Error(
 				response.status >= 500
 					? 'The request could not be completed. Try again shortly.'
@@ -83,6 +87,11 @@
 			error = '';
 		} catch (cause) {
 			if (version !== loadVersion || currentView !== viewVersion || id !== projectId) return;
+			if (cause instanceof PublicationStatusUnavailableError) {
+				deployments = [];
+				deploymentsLoaded = false;
+				publicationRoot = '';
+			}
 			const message = cause instanceof Error ? cause.message : 'Could not load deployments.';
 			error = refsLoaded
 				? `${message} Refresh and try again. Your current branches and tags are still shown.`
@@ -213,7 +222,7 @@
 				class="min-h-11 rounded-lg border border-[#aeb9ae] px-3"
 				bind:value={publicationPath}
 				aria-describedby="publication-folder-hint"
-				pattern="(?!(?:[0-9a-f]{32})$)[A-Za-z0-9][A-Za-z0-9._-]*"
+				pattern={publicationFolderPattern}
 				maxlength="100"
 				required
 			/>
