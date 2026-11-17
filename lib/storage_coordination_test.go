@@ -166,11 +166,10 @@ func TestStorageCoordinationChild(t *testing.T) {
 	case "upgrade-crash":
 		phase := os.Getenv("DM_UPGRADE_CRASH_PHASE")
 		if os.Getenv("DM_UPGRADE_CRASH_FIXTURE") == "1" {
-			cfg.upgradeTargetVersion = 2
-			cfg.migrationFS = fstest.MapFS{
-				"00001_base.sql":    {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-				"00002_fixture.sql": {Data: []byte("-- +goose Up\nCREATE TABLE crash_fixture(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE crash_fixture;\n")},
-			}
+			cfg.upgradeTargetVersion = currentSchemaVersion + 1
+			cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
+				"00003_fixture.sql": {Data: []byte("-- +goose Up\nCREATE TABLE crash_fixture(value TEXT NOT NULL);\n-- +goose Down\nDROP TABLE crash_fixture;\n")},
+			})
 		}
 		reached := false
 		cfg.storageFault = func(name string, _ *sql.DB) error {
@@ -197,11 +196,10 @@ func TestStorageCoordinationChild(t *testing.T) {
 		if fixtureProgramVersion != "fixture-v2" {
 			t.Fatalf("failing-upgrade process has wrong fixture identity %q", fixtureProgramVersion)
 		}
-		cfg.upgradeTargetVersion = 2
-		cfg.migrationFS = fstest.MapFS{
-			"00001_base.sql":            {Data: []byte("-- +goose Up\nSELECT 1;\n-- +goose Down\nSELECT 1;\n")},
-			"00002_fixture_failure.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_partial(value TEXT NOT NULL);\nINSERT INTO missing_fixture_table VALUES('fail');\n-- +goose Down\nDROP TABLE fixture_partial;\n")},
-		}
+		cfg.upgradeTargetVersion = currentSchemaVersion + 1
+		cfg.migrationFS = testUpgradeMigrations(t, fstest.MapFS{
+			"00003_fixture_failure.sql": {Data: []byte("-- +goose Up\nCREATE TABLE fixture_partial(value TEXT NOT NULL);\nINSERT INTO missing_fixture_table VALUES('fail');\n-- +goose Down\nDROP TABLE fixture_partial;\n")},
+		})
 		if _, err := New(cfg); err == nil {
 			t.Fatal("fixture upgrade unexpectedly succeeded")
 		} else {
@@ -285,19 +283,12 @@ func TestUpgradePreparationCrashWindowsRemainLockedAcrossRestart(t *testing.T) {
 	for _, phase := range []string{"backup-checkpoint", "marker-update"} {
 		t.Run(phase, func(t *testing.T) {
 			cfg := coordinationConfig(t)
+			cfg = testVersionOneConfig(t, cfg)
 			issuer, err := NewGrantIssuer(cfg)
 			if err != nil {
 				t.Fatal(err)
 			}
 			_ = issuer.Close()
-			db, err := sql.Open("sqlite3", cfg.DatabasePath)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err := db.Exec(`UPDATE goose_db_version SET is_applied=0 WHERE version_id=1`); err != nil {
-				t.Fatal(err)
-			}
-			_ = db.Close()
 			cmd, stdin, stdout := startUpgradeCrashChild(t, cfg, phase)
 			if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || line != "ready\n" {
 				t.Fatalf("child did not stop at %s: %q %v", phase, line, err)
@@ -540,7 +531,7 @@ func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	priorRecord := programProvenance{Format: 1, Database: cfg.DatabasePath, DatabaseIdentity: databaseIdentity, Schema: 1, Executable: v1Absolute, Version: "fixture-v1", SHA256: v1Hash}
+	priorRecord := programProvenance{Format: 1, Database: cfg.DatabasePath, DatabaseIdentity: databaseIdentity, Schema: currentSchemaVersion, Executable: v1Absolute, Version: "fixture-v1", SHA256: v1Hash}
 	if err := durableJSONReplace(provenancePath(cfg), priorRecord); err != nil {
 		t.Fatal(err)
 	}
@@ -582,7 +573,7 @@ func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
 		TargetVersion int64  `json:"target_version"`
 		SHA256        string `json:"sha256"`
 	}
-	if err := json.Unmarshal(manifestBytes, &manifest); err != nil || manifest.Status != "complete" || manifest.SourceVersion != 1 || manifest.TargetVersion != 2 || !strings.HasPrefix(manifest.Program, "fixture-v2") {
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil || manifest.Status != "complete" || manifest.SourceVersion != currentSchemaVersion || manifest.TargetVersion != currentSchemaVersion+1 || !strings.HasPrefix(manifest.Program, "fixture-v2") {
 		t.Fatalf("verified backup manifest does not identify the failing fixture build: %+v err=%v", manifest, err)
 	}
 	if manifest.PriorProgram.Version != "fixture-v1" || manifest.PriorProgram.SHA256 != v1Hash || manifest.PriorProgram.Executable != v1Absolute {

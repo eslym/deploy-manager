@@ -621,6 +621,7 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/projects/{id}/cache/recreate", a.recreateProjectCache)
 	m.HandleFunc("POST /api/projects/{id}/key", a.assignProjectKey)
 	m.HandleFunc("GET /api/deployments", a.listDeployments)
+	m.HandleFunc("GET /api/deployments/root", a.deploymentRoot)
 	m.HandleFunc("POST /api/deployments", a.createDeployment)
 	m.HandleFunc("POST /api/deployments/{id}/deploy", a.deployNow)
 	m.HandleFunc("GET /api/deployments/{id}/history", a.rollbackHistory)

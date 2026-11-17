@@ -34,43 +34,43 @@ func init() {
 	deploymentFields := schema.Deployment{}.Fields()
 	_ = deploymentFields
 	// deploymentDescGeneration is the schema descriptor for generation field.
-	deploymentDescGeneration := deploymentFields[4].Descriptor()
+	deploymentDescGeneration := deploymentFields[5].Descriptor()
 	// deployment.DefaultGeneration holds the default value on creation for the generation field.
 	deployment.DefaultGeneration = deploymentDescGeneration.Default.(int64)
 	// deploymentDescLiveCommit is the schema descriptor for live_commit field.
-	deploymentDescLiveCommit := deploymentFields[5].Descriptor()
+	deploymentDescLiveCommit := deploymentFields[6].Descriptor()
 	// deployment.DefaultLiveCommit holds the default value on creation for the live_commit field.
 	deployment.DefaultLiveCommit = deploymentDescLiveCommit.Default.(string)
 	// deploymentDescLiveDev is the schema descriptor for live_dev field.
-	deploymentDescLiveDev := deploymentFields[6].Descriptor()
+	deploymentDescLiveDev := deploymentFields[7].Descriptor()
 	// deployment.DefaultLiveDev holds the default value on creation for the live_dev field.
 	deployment.DefaultLiveDev = deploymentDescLiveDev.Default.(int64)
 	// deploymentDescLiveIno is the schema descriptor for live_ino field.
-	deploymentDescLiveIno := deploymentFields[7].Descriptor()
+	deploymentDescLiveIno := deploymentFields[8].Descriptor()
 	// deployment.DefaultLiveIno holds the default value on creation for the live_ino field.
 	deployment.DefaultLiveIno = deploymentDescLiveIno.Default.(int64)
 	// deploymentDescStatus is the schema descriptor for status field.
-	deploymentDescStatus := deploymentFields[8].Descriptor()
+	deploymentDescStatus := deploymentFields[9].Descriptor()
 	// deployment.DefaultStatus holds the default value on creation for the status field.
 	deployment.DefaultStatus = deploymentDescStatus.Default.(string)
 	// deploymentDescError is the schema descriptor for error field.
-	deploymentDescError := deploymentFields[9].Descriptor()
+	deploymentDescError := deploymentFields[10].Descriptor()
 	// deployment.DefaultError holds the default value on creation for the error field.
 	deployment.DefaultError = deploymentDescError.Default.(string)
 	// deploymentDescTargetKind is the schema descriptor for target_kind field.
-	deploymentDescTargetKind := deploymentFields[12].Descriptor()
+	deploymentDescTargetKind := deploymentFields[13].Descriptor()
 	// deployment.DefaultTargetKind holds the default value on creation for the target_kind field.
 	deployment.DefaultTargetKind = deploymentDescTargetKind.Default.(string)
 	// deploymentDescTargetName is the schema descriptor for target_name field.
-	deploymentDescTargetName := deploymentFields[13].Descriptor()
+	deploymentDescTargetName := deploymentFields[14].Descriptor()
 	// deployment.DefaultTargetName holds the default value on creation for the target_name field.
 	deployment.DefaultTargetName = deploymentDescTargetName.Default.(string)
 	// deploymentDescAutomationPaused is the schema descriptor for automation_paused field.
-	deploymentDescAutomationPaused := deploymentFields[14].Descriptor()
+	deploymentDescAutomationPaused := deploymentFields[15].Descriptor()
 	// deployment.DefaultAutomationPaused holds the default value on creation for the automation_paused field.
 	deployment.DefaultAutomationPaused = deploymentDescAutomationPaused.Default.(int)
 	// deploymentDescAutomationEpoch is the schema descriptor for automation_epoch field.
-	deploymentDescAutomationEpoch := deploymentFields[15].Descriptor()
+	deploymentDescAutomationEpoch := deploymentFields[16].Descriptor()
 	// deployment.DefaultAutomationEpoch holds the default value on creation for the automation_epoch field.
 	deployment.DefaultAutomationEpoch = deploymentDescAutomationEpoch.Default.(int64)
 	deploymentdeletionFields := schema.DeploymentDeletion{}.Fields()

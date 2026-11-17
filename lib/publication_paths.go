@@ -1,25 +1,52 @@
 package lib
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
+
+	"github.com/eslym/deploy-manager/lib/ent"
 )
 
 // publicationPaths owns the stable live name and the private names belonging
-// to one deployment. The v1 live name is the deployment ID; it is intentionally
-// not derived from the display name, Git target, job, or current release. A
-// future path-name migration can change this one binding without relocating
-// existing ID-named publications or changing how job stages are identified.
+// to one deployment. Stages remain keyed by deployment ID even for readable
+// live names; the live name is bound to the durable deployment record.
 type publicationPaths struct {
 	root, deploymentID, liveName string
 }
 
 func (a *App) publicationPaths(id string) publicationPaths {
-	return publicationPaths{root: a.cfg.DeploymentRoot, deploymentID: id, liveName: id}
+	p := publicationPaths{root: a.cfg.DeploymentRoot, deploymentID: id}
+	if !validProjectID(id) {
+		return p
+	}
+	row, err := a.store.Deployment.Get(context.Background(), id)
+	if err == nil && validStoredPublicationName(row.PublicationName, id) {
+		p.liveName = row.PublicationName
+	} else if ent.IsNotFound(err) {
+		p.liveName = id
+	}
+	return p
 }
 
-func (p publicationPaths) live() string { return filepath.Join(p.root, p.liveName) }
+var publicationNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$`)
+
+func validPublicationName(name string) bool {
+	return publicationNamePattern.MatchString(name) && !validProjectID(name)
+}
+
+func validStoredPublicationName(name, id string) bool {
+	return name == id && validProjectID(id) || validPublicationName(name)
+}
+
+func (p publicationPaths) live() string {
+	if !validProjectID(p.deploymentID) || !validStoredPublicationName(p.liveName, p.deploymentID) {
+		return filepath.Join(p.root, ".invalid-publication-binding")
+	}
+	return filepath.Join(p.root, p.liveName)
+}
 
 func (p publicationPaths) stageName(job string) string {
 	return "." + p.deploymentID + ".stage-" + job
@@ -35,7 +62,7 @@ func (p publicationPaths) recordedStage(name, job string) (string, error) {
 }
 
 func (p publicationPaths) removal(name string) (string, error) {
-	if !validProjectID(p.deploymentID) {
+	if !validProjectID(p.deploymentID) || !validStoredPublicationName(p.liveName, p.deploymentID) {
 		return "", errors.New("removal journal contains an unsafe path")
 	}
 	if name == p.liveName {
@@ -53,6 +80,9 @@ func (p publicationPaths) removal(name string) (string, error) {
 // checkLive binds an observed real directory to the persisted release. An
 // empty live commit owns an absent path, never an arbitrary existing directory.
 func (p publicationPaths) checkLive(commit string, want dirIdentity) (dirIdentity, bool, error) {
+	if !validProjectID(p.deploymentID) || !validStoredPublicationName(p.liveName, p.deploymentID) {
+		return dirIdentity{}, false, errors.New("publication binding is invalid or unavailable")
+	}
 	actual, err := identity(p.live())
 	if os.IsNotExist(err) {
 		if commit == "" {

@@ -71,6 +71,20 @@ func (_u *DeploymentUpdate) SetNillableCommitID(v *string) *DeploymentUpdate {
 	return _u
 }
 
+// SetPublicationName sets the "publication_name" field.
+func (_u *DeploymentUpdate) SetPublicationName(v string) *DeploymentUpdate {
+	_u.mutation.SetPublicationName(v)
+	return _u
+}
+
+// SetNillablePublicationName sets the "publication_name" field if the given value is not nil.
+func (_u *DeploymentUpdate) SetNillablePublicationName(v *string) *DeploymentUpdate {
+	if v != nil {
+		_u.SetPublicationName(*v)
+	}
+	return _u
+}
+
 // SetGeneration sets the "generation" field.
 func (_u *DeploymentUpdate) SetGeneration(v int64) *DeploymentUpdate {
 	_u.mutation.ResetGeneration()
@@ -393,6 +407,9 @@ func (_u *DeploymentUpdate) sqlSave(ctx context.Context) (_node int, err error) 
 	if value, ok := _u.mutation.CommitID(); ok {
 		_spec.SetField(deployment.FieldCommitID, field.TypeString, value)
 	}
+	if value, ok := _u.mutation.PublicationName(); ok {
+		_spec.SetField(deployment.FieldPublicationName, field.TypeString, value)
+	}
 	if value, ok := _u.mutation.Generation(); ok {
 		_spec.SetField(deployment.FieldGeneration, field.TypeInt64, value)
 	}
@@ -582,6 +599,20 @@ func (_u *DeploymentUpdateOne) SetCommitID(v string) *DeploymentUpdateOne {
 func (_u *DeploymentUpdateOne) SetNillableCommitID(v *string) *DeploymentUpdateOne {
 	if v != nil {
 		_u.SetCommitID(*v)
+	}
+	return _u
+}
+
+// SetPublicationName sets the "publication_name" field.
+func (_u *DeploymentUpdateOne) SetPublicationName(v string) *DeploymentUpdateOne {
+	_u.mutation.SetPublicationName(v)
+	return _u
+}
+
+// SetNillablePublicationName sets the "publication_name" field if the given value is not nil.
+func (_u *DeploymentUpdateOne) SetNillablePublicationName(v *string) *DeploymentUpdateOne {
+	if v != nil {
+		_u.SetPublicationName(*v)
 	}
 	return _u
 }
@@ -937,6 +968,9 @@ func (_u *DeploymentUpdateOne) sqlSave(ctx context.Context) (_node *Deployment, 
 	}
 	if value, ok := _u.mutation.CommitID(); ok {
 		_spec.SetField(deployment.FieldCommitID, field.TypeString, value)
+	}
+	if value, ok := _u.mutation.PublicationName(); ok {
+		_spec.SetField(deployment.FieldPublicationName, field.TypeString, value)
 	}
 	if value, ok := _u.mutation.Generation(); ok {
 		_spec.SetField(deployment.FieldGeneration, field.TypeInt64, value)

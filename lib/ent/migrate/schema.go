@@ -45,6 +45,7 @@ var (
 		{Name: "id", Type: field.TypeString},
 		{Name: "name", Type: field.TypeString},
 		{Name: "commit_id", Type: field.TypeString},
+		{Name: "publication_name", Type: field.TypeString},
 		{Name: "generation", Type: field.TypeInt64, Default: 1},
 		{Name: "live_commit", Type: field.TypeString, Default: ""},
 		{Name: "live_dev", Type: field.TypeInt64, Default: 0},
@@ -67,7 +68,7 @@ var (
 		ForeignKeys: []*schema.ForeignKey{
 			{
 				Symbol:     "deployments_projects_deployments",
-				Columns:    []*schema.Column{DeploymentsColumns[15]},
+				Columns:    []*schema.Column{DeploymentsColumns[16]},
 				RefColumns: []*schema.Column{ProjectsColumns[0]},
 				OnDelete:   schema.NoAction,
 			},
@@ -76,7 +77,12 @@ var (
 			{
 				Name:    "deployment_project_id_name",
 				Unique:  true,
-				Columns: []*schema.Column{DeploymentsColumns[15], DeploymentsColumns[1]},
+				Columns: []*schema.Column{DeploymentsColumns[16], DeploymentsColumns[1]},
+			},
+			{
+				Name:    "deployment_publication_name",
+				Unique:  true,
+				Columns: []*schema.Column{DeploymentsColumns[3]},
 			},
 		},
 	}

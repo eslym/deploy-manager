@@ -78,6 +78,11 @@ func CommitID(v string) predicate.Deployment {
 	return predicate.Deployment(sql.FieldEQ(FieldCommitID, v))
 }
 
+// PublicationName applies equality check predicate on the "publication_name" field. It's identical to PublicationNameEQ.
+func PublicationName(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldEQ(FieldPublicationName, v))
+}
+
 // Generation applies equality check predicate on the "generation" field. It's identical to GenerationEQ.
 func Generation(v int64) predicate.Deployment {
 	return predicate.Deployment(sql.FieldEQ(FieldGeneration, v))
@@ -331,6 +336,71 @@ func CommitIDEqualFold(v string) predicate.Deployment {
 // CommitIDContainsFold applies the ContainsFold predicate on the "commit_id" field.
 func CommitIDContainsFold(v string) predicate.Deployment {
 	return predicate.Deployment(sql.FieldContainsFold(FieldCommitID, v))
+}
+
+// PublicationNameEQ applies the EQ predicate on the "publication_name" field.
+func PublicationNameEQ(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldEQ(FieldPublicationName, v))
+}
+
+// PublicationNameNEQ applies the NEQ predicate on the "publication_name" field.
+func PublicationNameNEQ(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldNEQ(FieldPublicationName, v))
+}
+
+// PublicationNameIn applies the In predicate on the "publication_name" field.
+func PublicationNameIn(vs ...string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldIn(FieldPublicationName, vs...))
+}
+
+// PublicationNameNotIn applies the NotIn predicate on the "publication_name" field.
+func PublicationNameNotIn(vs ...string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldNotIn(FieldPublicationName, vs...))
+}
+
+// PublicationNameGT applies the GT predicate on the "publication_name" field.
+func PublicationNameGT(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldGT(FieldPublicationName, v))
+}
+
+// PublicationNameGTE applies the GTE predicate on the "publication_name" field.
+func PublicationNameGTE(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldGTE(FieldPublicationName, v))
+}
+
+// PublicationNameLT applies the LT predicate on the "publication_name" field.
+func PublicationNameLT(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldLT(FieldPublicationName, v))
+}
+
+// PublicationNameLTE applies the LTE predicate on the "publication_name" field.
+func PublicationNameLTE(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldLTE(FieldPublicationName, v))
+}
+
+// PublicationNameContains applies the Contains predicate on the "publication_name" field.
+func PublicationNameContains(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldContains(FieldPublicationName, v))
+}
+
+// PublicationNameHasPrefix applies the HasPrefix predicate on the "publication_name" field.
+func PublicationNameHasPrefix(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldHasPrefix(FieldPublicationName, v))
+}
+
+// PublicationNameHasSuffix applies the HasSuffix predicate on the "publication_name" field.
+func PublicationNameHasSuffix(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldHasSuffix(FieldPublicationName, v))
+}
+
+// PublicationNameEqualFold applies the EqualFold predicate on the "publication_name" field.
+func PublicationNameEqualFold(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldEqualFold(FieldPublicationName, v))
+}
+
+// PublicationNameContainsFold applies the ContainsFold predicate on the "publication_name" field.
+func PublicationNameContainsFold(v string) predicate.Deployment {
+	return predicate.Deployment(sql.FieldContainsFold(FieldPublicationName, v))
 }
 
 // GenerationEQ applies the EQ predicate on the "generation" field.

@@ -600,12 +600,16 @@ func verifyStandaloneBackup(path string, version int64, phase func(string, *sql.
 	if err := validateDatabaseIntegrity(db); err != nil {
 		return "", err
 	}
-	if pending, err := inspectVersionOneHistory(db); err != nil {
-		return "", err
-	} else if !pending {
-		if err := validateVersionOneHistory(db); err != nil {
+	if version == 1 {
+		if pending, err := inspectVersionOneHistory(db); err != nil {
 			return "", err
+		} else if !pending {
+			if err := validateMigrationHistory(db, version); err != nil {
+				return "", err
+			}
 		}
+	} else if err := validateMigrationHistory(db, version); err != nil {
+		return "", err
 	}
 	var got int64
 	if err := db.QueryRow(`SELECT max(version_id) FROM goose_db_version WHERE is_applied=1`).Scan(&got); err != nil {

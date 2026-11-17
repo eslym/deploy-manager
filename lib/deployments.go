@@ -1469,7 +1469,7 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),(SELECT last_error FROM deployment_deletions x WHERE x.deployment_id=d.id),''),d.created_at,d.updated_at,d.automation_paused FROM deployments d ORDER BY d.created_at,d.id`)
+	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),(SELECT last_error FROM deployment_deletions x WHERE x.deployment_id=d.id),''),d.created_at,d.updated_at,d.automation_paused,d.publication_name FROM deployments d ORDER BY d.created_at,d.id`)
 	if err != nil {
 		http.Error(w, "deployments are temporarily unavailable", 500)
 		return
@@ -1478,14 +1478,15 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	out := []deployment{}
 	for rows.Next() {
 		var d deployment
+		var publicationName string
 		var c, u int64
-		if err = rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &d.LiveCommit, &d.Status, &d.Error, &c, &u, &d.AutomationPaused); err != nil {
+		if err = rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &d.LiveCommit, &d.Status, &d.Error, &c, &u, &d.AutomationPaused, &publicationName); err != nil || !validStoredPublicationName(publicationName, d.ID) {
 			http.Error(w, "deployments are temporarily unavailable", 500)
 			return
 		}
 		d.CreatedAt = time.Unix(0, c).UTC()
 		d.UpdatedAt = time.Unix(0, u).UTC()
-		d.Publication = a.deploymentPath(d.ID)
+		d.Publication = filepath.Join(a.cfg.DeploymentRoot, publicationName)
 		out = append(out, d)
 	}
 	if rows.Err() != nil {
@@ -1493,6 +1494,13 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, out)
+}
+
+func (a *App) deploymentRoot(w http.ResponseWriter, r *http.Request) {
+	if !a.projectAuthorized(w, r, false) {
+		return
+	}
+	writeJSON(w, map[string]string{"publicationRoot": a.cfg.DeploymentRoot})
 }
 
 func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
@@ -1506,16 +1514,25 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 	defer a.projects.mu.Unlock()
 	r.Body = http.MaxBytesReader(w, r.Body, 8192)
 	var in struct {
-		ProjectID  string `json:"projectId"`
-		Name       string `json:"name"`
-		Commit     string `json:"commit"`
-		TargetKind string `json:"targetKind"`
-		TargetName string `json:"targetName"`
+		ProjectID       string `json:"projectId"`
+		Name            string `json:"name"`
+		PublicationPath string `json:"publicationPath"`
+		Commit          string `json:"commit"`
+		TargetKind      string `json:"targetKind"`
+		TargetName      string `json:"targetName"`
 	}
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if dec.Decode(&in) != nil || !validProjectID(in.ProjectID) || strings.TrimSpace(in.Name) == "" || len(in.Name) > 100 {
 		http.Error(w, "enter a deployment name and project", 400)
+		return
+	}
+	if in.PublicationPath != "" && !validPublicationName(in.PublicationPath) {
+		http.Error(w, "choose a single safe folder name under the publication root", http.StatusBadRequest)
+		return
+	}
+	if err := a.assertPublicationRoot(); err != nil {
+		http.Error(w, "publication root is unavailable", http.StatusServiceUnavailable)
 		return
 	}
 	if in.TargetKind == "" {
@@ -1561,6 +1578,17 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "deployment could not be saved", 500)
 		return
 	}
+	if in.PublicationPath == "" {
+		// Older API clients retain the historical ID-based destination.
+		in.PublicationPath = id
+	}
+	if _, err := os.Lstat(filepath.Join(a.cfg.DeploymentRoot, in.PublicationPath)); err == nil {
+		http.Error(w, "publication destination is already occupied", http.StatusConflict)
+		return
+	} else if !os.IsNotExist(err) {
+		http.Error(w, "publication destination cannot be inspected", http.StatusServiceUnavailable)
+		return
+	}
 	slot, ok := a.reserveDeploymentSlot()
 	if !ok {
 		http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
@@ -1579,7 +1607,7 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback()
-	if _, err = tx.Deployment.Create().SetID(id).SetProjectID(in.ProjectID).SetName(strings.TrimSpace(in.Name)).SetCommitID(in.Commit).SetTargetKind(in.TargetKind).SetTargetName(in.TargetName).SetGeneration(1).SetCreatedAt(now.UnixNano()).SetUpdatedAt(now.UnixNano()).Save(r.Context()); err != nil {
+	if _, err = tx.Deployment.Create().SetID(id).SetProjectID(in.ProjectID).SetName(strings.TrimSpace(in.Name)).SetPublicationName(in.PublicationPath).SetCommitID(in.Commit).SetTargetKind(in.TargetKind).SetTargetName(in.TargetName).SetGeneration(1).SetCreatedAt(now.UnixNano()).SetUpdatedAt(now.UnixNano()).Save(r.Context()); err != nil {
 		http.Error(w, "a deployment with this name already exists or could not be saved", 409)
 		return
 	}
@@ -1592,7 +1620,7 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slot.enqueue(job)
-	writeJSONStatus(w, 201, map[string]any{"id": id, "jobId": job, "status": "queued"})
+	writeJSONStatus(w, 201, map[string]any{"id": id, "jobId": job, "status": "queued", "publicationPath": filepath.Join(a.cfg.DeploymentRoot, in.PublicationPath)})
 }
 
 func (a *App) deploymentJobs(w http.ResponseWriter, r *http.Request) {

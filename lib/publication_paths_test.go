@@ -46,7 +46,18 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 	server := httptest.NewTLSServer(app.Handler())
 	defer server.Close()
 	cookie := installAPITestSession(t, app)
-	response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments", `{"projectId":"`+projectID+`","name":"site","commit":"`+firstCommit+`"}`)
+	rootReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/deployments/root", nil)
+	rootReq.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
+	rootRes, err := server.Client().Do(rootReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rootData struct{ PublicationRoot string }
+	if rootRes.StatusCode != http.StatusOK || json.NewDecoder(rootRes.Body).Decode(&rootData) != nil || rootData.PublicationRoot != app.cfg.DeploymentRoot {
+		t.Fatalf("root response: status=%d value=%q", rootRes.StatusCode, rootData.PublicationRoot)
+	}
+	rootRes.Body.Close()
+	response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments", `{"projectId":"`+projectID+`","name":"site","publicationPath":"production-site","commit":"`+firstCommit+`"}`)
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("create status=%d: %s", response.StatusCode, responseText(response))
 	}
@@ -57,7 +68,7 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	path := filepath.Join(app.cfg.DeploymentRoot, created.ID)
+	path := filepath.Join(app.cfg.DeploymentRoot, "production-site")
 	assertPublication := func(jobID, contents string) dirIdentity {
 		t.Helper()
 		waitForDeploymentJob(t, server.Client(), server.URL, cookie, created.ID, jobID, "succeeded")
@@ -85,6 +96,37 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 		return id
 	}
 	firstIdentity := assertPublication(created.JobID, "searchable feature\n")
+	for _, choice := range []struct {
+		name string
+		code int
+	}{
+		{"production-site", http.StatusConflict},
+		{"../escape", http.StatusBadRequest},
+		{"sub/site", http.StatusBadRequest},
+		{".deployment-lock-" + created.ID, http.StatusBadRequest},
+		{strings.Repeat("a", 32), http.StatusBadRequest},
+	} {
+		res := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments", `{"projectId":"`+projectID+`","name":"other","publicationPath":"`+choice.name+`","commit":"`+firstCommit+`"}`)
+		if res.StatusCode != choice.code {
+			t.Fatalf("path %q: status=%d, expected %d: %s", choice.name, res.StatusCode, choice.code, responseText(res))
+		}
+		res.Body.Close()
+		if got, e := identity(path); e != nil || got != firstIdentity {
+			t.Fatalf("invalid request changed publication: %v, %v", got, e)
+		}
+	}
+	link := filepath.Join(app.cfg.DeploymentRoot, "linked-site")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	res := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments", `{"projectId":"`+projectID+`","name":"linked","publicationPath":"linked-site","commit":"`+firstCommit+`"}`)
+	if res.StatusCode != http.StatusConflict {
+		t.Fatalf("symlink destination status=%d: %s", res.StatusCode, responseText(res))
+	}
+	res.Body.Close()
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
 	if _, err = app.db.Exec(`UPDATE deployments SET commit_id=?,generation=2,status='queued' WHERE id=?`, secondCommit, created.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -96,6 +138,39 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 	if secondIdentity == firstIdentity {
 		t.Fatal("replacement did not exchange the live directory")
 	}
+	server.Close()
+	if err := app.Close(); err != nil {
+		t.Fatal(err)
+	}
+	app, err = New(Config{DatabasePath: filepath.Join(base, "state.sqlite"), OPAQUEKeyPath: filepath.Join(base, "opaque.key"), DeployTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("restart did not reconcile readable publication: %v", err)
+	}
+	defer app.Close()
+	server = httptest.NewTLSServer(app.Handler())
+	defer server.Close()
+	cookie = installAPITestSession(t, app)
+	if got, e := identity(path); e != nil || got != secondIdentity {
+		t.Fatalf("restart relocated readable publication: %v, %v", got, e)
+	}
+	// Existing API clients and migrated records retain the ID-named path.
+	legacy := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments", `{"projectId":"`+projectID+`","name":"legacy","commit":"`+firstCommit+`"}`)
+	if legacy.StatusCode != http.StatusCreated {
+		t.Fatalf("legacy create status=%d: %s", legacy.StatusCode, responseText(legacy))
+	}
+	var legacyCreated struct{ ID, JobID, PublicationPath string }
+	if err := json.NewDecoder(legacy.Body).Decode(&legacyCreated); err != nil {
+		t.Fatal(err)
+	}
+	legacy.Body.Close()
+	legacyPath := filepath.Join(app.cfg.DeploymentRoot, legacyCreated.ID)
+	if legacyCreated.PublicationPath != legacyPath {
+		t.Fatalf("legacy destination=%q, want %q", legacyCreated.PublicationPath, legacyPath)
+	}
+	waitForDeploymentJob(t, server.Client(), server.URL, cookie, legacyCreated.ID, legacyCreated.JobID, "succeeded")
+	if data, e := os.ReadFile(filepath.Join(legacyPath, "README.md")); e != nil || string(data) != "searchable feature\n" {
+		t.Fatalf("legacy publication changed: %q %v", data, e)
+	}
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+created.ID+"/delete", `{"confirm":true}`)
 	response.Body.Close()
 	if response.StatusCode != http.StatusNoContent {
@@ -103,6 +178,9 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 	}
 	if _, err = os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("published path survived deletion: %v", err)
+	}
+	if _, err = os.Stat(filepath.Join(legacyPath, "README.md")); err != nil {
+		t.Fatalf("deleting the named destination touched legacy content: %v", err)
 	}
 }
 

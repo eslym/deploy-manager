@@ -356,6 +356,14 @@ try {
   let finishJobHistory;
   releaseJobHistory = new Promise(resolveRelease => { finishJobHistory = resolveRelease; });
   await page.getByLabel("Deployment name").fill("Production site");
+  const publicationRootResponse = await page.evaluate(async () => {
+    const response = await fetch("/api/deployments/root");
+    return { status: response.status, body: await response.json() };
+  });
+  if (publicationRootResponse.status !== 200 || publicationRootResponse.body.publicationRoot !== join(dir, "state.sqlite.publications")) throw new Error(`unexpected publication root: ${JSON.stringify(publicationRootResponse)}`);
+  const publishedPath = join(publicationRootResponse.body.publicationRoot, "production-site");
+  await page.getByLabel("Publication folder").fill("production-site");
+  await page.getByText(`Full path: ${publishedPath}`, { exact: true }).waitFor();
   try { await page.locator('option[value="branch:feature/search"]').waitFor({ state: "attached" }); } catch {
     const options = await page.locator("form select").first().innerHTML();
     const cached = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/refs`)).json(), id);
@@ -366,10 +374,15 @@ try {
   await page.getByRole("button", { name: "Create deployment" }).click();
   const deploymentCreated = await deploymentResponse;
   if (deploymentCreated.status() !== 201) throw new Error(`deployment creation returned ${deploymentCreated.status()}: ${await deploymentCreated.text()}`);
-  const deploymentID = (await deploymentCreated.json()).id;
+  if (deploymentCreated.request().postDataJSON().publicationPath !== "production-site") throw new Error("dashboard did not submit the chosen publication folder");
+  const createdDeployment = await deploymentCreated.json();
+  const deploymentID = createdDeployment.id;
+  if (createdDeployment.publicationPath !== publishedPath) throw new Error(`creation returned a different publication path: ${JSON.stringify(createdDeployment)}`);
   await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
   await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
-  await page.getByText(join(dir, "state.sqlite.publications", deploymentID), { exact: true }).waitFor();
+  await page.getByText(`Publication path: ${publishedPath}`, { exact: true }).waitFor();
+  const listedDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
+  if (listedDeployment?.publicationPath !== publishedPath) throw new Error(`deployment list returned a different publication path: ${JSON.stringify(listedDeployment)}`);
   if (await httpsRequestStatus("127.0.0.1", 18440, "/api/deployments", "GET") !== 401) throw new Error("deployment list was accessible without a session");
   if (await httpsRequestStatus("127.0.0.1", 18440, `/api/deployments/${deploymentID}/jobs`, "GET") !== 401) throw new Error("deployment history was accessible without a session");
   if (await httpsRequestStatus("127.0.0.1", 18440, `/api/deployments/${deploymentID}/deploy`, "POST", "{}", { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" }) !== 403) throw new Error("cross-origin deployment action was accepted");
@@ -395,8 +408,7 @@ try {
   try {
   await waitFor(async () => {
       try {
-        const published = join(dir, "state.sqlite.publications", deploymentID);
-        return (await readFile(join(published, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n" && (await readFile(join(published, "asset.dat"), "utf8")) === "fixture hydrated LFS asset\n";
+        return (await readFile(join(publishedPath, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n" && (await readFile(join(publishedPath, "asset.dat"), "utf8")) === "fixture hydrated LFS asset\n";
       } catch { return false; }
     }, "published deployment files");
   } catch (error) {
@@ -408,6 +420,7 @@ try {
   await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
   await page.getByRole("link", { name: "Fixture site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${id}`);
+  await page.getByText(`Publication path: ${publishedPath}`, { exact: true }).waitFor();
   await page.getByRole("link", { name: "Production site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
   await page.goto(`https://${appListen}/dashboard/projects/${id}/deployments/missing-deployment`, { waitUntil: "domcontentloaded" });
@@ -420,7 +433,6 @@ try {
   await page.getByRole("link", { name: "Fixture site", exact: true }).click();
   await page.getByRole("link", { name: "Production site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
-  const publishedPath = join(dir, "state.sqlite.publications", deploymentID);
   const firstDirectoryIdentity = (await stat(publishedPath)).ino;
   milestone("steady deployment history during background refreshes");
   const realJobHistory = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
@@ -624,6 +636,7 @@ try {
 
   milestone("create tag deployment and hard re-deploy");
   await page.getByLabel("Deployment name").fill("Tag release");
+  await page.getByLabel("Publication folder").fill("tag-release");
   await page.locator("form select").selectOption("tag:v1.0");
   const tagDeploymentResponse = page.waitForResponse(response => response.url().endsWith("/api/deployments") && response.request().method() === "POST");
   await page.getByRole("button", { name: "Create deployment" }).click();
@@ -631,7 +644,8 @@ try {
   if (tagCreated.status() !== 201) throw new Error(`tag deployment creation returned ${tagCreated.status()}: ${await tagCreated.text()}`);
   const tagDeployment = await tagCreated.json();
   await page.waitForURL(`**/dashboard/projects/${id}/deployments/${tagDeployment.id}`);
-  const tagPath = join(dir, "state.sqlite.publications", tagDeployment.id);
+  const tagPath = join(publicationRootResponse.body.publicationRoot, "tag-release");
+  if (tagDeployment.publicationPath !== tagPath) throw new Error(`tag deployment returned a different publication path: ${JSON.stringify(tagDeployment)}`);
   await waitFor(async () => {
     try { return (await readFile(join(tagPath, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n"; } catch { return false; }
   }, "tag-target publication from the dashboard");
@@ -797,17 +811,19 @@ try {
     return { status: response.status, body: await response.json().catch(() => null) };
   }, { projectID: sshProject.id, commit: sshCommit });
   if (sshDeployment.status !== 201) throw new Error(`SSH publication was not accepted (${sshDeployment.status})`);
+  const sshPublishedPath = join(publicationRootResponse.body.publicationRoot, sshDeployment.body.id);
+  if (sshDeployment.body.publicationPath !== sshPublishedPath) throw new Error(`legacy deployment did not retain its ID-based publication path: ${JSON.stringify(sshDeployment)}`);
   await waitFor(async () => {
     try {
-      const published = join(dir, "state.sqlite.publications", sshDeployment.body.id);
-      return (await readFile(join(published, "index.html"), "utf8")) === "SSH fixture site\n" && (await readFile(join(published, "asset.dat"), "utf8")) === "fixture hydrated LFS asset\n";
+      return (await readFile(join(sshPublishedPath, "index.html"), "utf8")) === "SSH fixture site\n" && (await readFile(join(sshPublishedPath, "asset.dat"), "utf8")) === "fixture hydrated LFS asset\n";
     } catch { return false; }
   }, "SSH cached-object publication");
   const privateJobLog = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).text(), sshDeployment.body.id);
   for (const secret of ["ssh-fixture-private-lfs", "private-fixture-secret", "Bearer"]) {
     if (privateJobLog.includes(secret) || appOutput.includes(secret)) throw new Error(`private LFS secret reached an application or job log (${secret})`);
   }
-  const sshPublishedPath = join(dir, "state.sqlite.publications", sshDeployment.body.id);
+  const listedLegacyDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), sshDeployment.body.id);
+  if (listedLegacyDeployment?.publicationPath !== sshPublishedPath) throw new Error(`legacy deployment list path changed: ${JSON.stringify(listedLegacyDeployment)}`);
   milestone("deployment refs error recovers without hiding other errors");
   let failedDeploymentRefs = false;
   await page.route(`**/api/projects/${sshProject.id}/refs`, async route => {
@@ -828,6 +844,7 @@ try {
   await page.unroute(`**/api/projects/${sshProject.id}/refs`);
   await commitCard.getByText(`Target commit: ${sshCommit}`, { exact: true }).waitFor();
   await commitCard.getByText(`Live commit: ${sshCommit}`, { exact: true }).waitFor();
+  await commitCard.getByText(`Publication path: ${sshPublishedPath}`, { exact: true }).waitFor();
   let failedDeployAction = false;
   await page.route(`**/api/deployments/${sshDeployment.body.id}/deploy`, async route => {
     failedDeployAction = true;
@@ -965,8 +982,19 @@ try {
     return { status: response.status, body: await response.text() };
   }, { id, commit: featureCommit });
   if (unavailableOldCommit.status !== 400 || !unavailableOldCommit.body.includes("commit is not available")) throw new Error(`removed commit remained deployable: ${JSON.stringify(unavailableOldCommit)}`);
+  milestone("delete deployment from chosen publication folder");
+  await page.goto(`https://${appListen}/dashboard/projects/${id}/deployments/${deploymentID}`, { waitUntil: "domcontentloaded" });
+  await page.getByText(`Publication path: ${publishedPath}`, { exact: true }).waitFor();
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await page.getByText(/Delete “Production site” and remove its published files/).waitFor();
+  const chosenPathDelete = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/delete`));
+  await page.getByRole("button", { name: "Confirm delete" }).click();
+  if ((await chosenPathDelete).status() !== 204) throw new Error("chosen publication folder deletion did not finish");
+  await page.waitForURL(`**/dashboard/projects/${id}`);
+  await waitFor(async () => { try { await stat(publishedPath); return false; } catch (error) { if (error.code === "ENOENT") return true; throw error; } }, "chosen publication folder removal");
+  if (await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).some(item => item.id === id), deploymentID)) throw new Error("deleted deployment remained in the list");
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
-  console.log("combined-binary authenticated project workflow passed: publication and deletion confirmation/cancel, private SSH/LFS publication, cache size/recreation warning and confirmation, restart-safe cache lifecycle, host trust, cross-origin mutation rejection, and cached-ref retention");
+  console.log("combined-binary authenticated project workflow passed: readable publication folders and legacy paths, publication and deletion confirmation/cancel, private SSH/LFS publication, cache size/recreation warning and confirmation, restart-safe cache lifecycle, host trust, cross-origin mutation rejection, and cached-ref retention");
 } catch (error) {
   console.error(`[projects-browser] failed during: ${currentStep}`);
   throw error;
