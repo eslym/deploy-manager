@@ -207,8 +207,8 @@ func TestBuiltExecutableRunsEmbeddedApplicationOutsideSourceTree(t *testing.T) {
 		t.Fatalf("shipped SQLite %q lacks the required WAL-reset fix: %v", sqliteVersion, err)
 	}
 	var version, applied int64
-	if err := db.QueryRow(`SELECT version_id,is_applied FROM goose_db_version WHERE is_applied=1 ORDER BY version_id DESC LIMIT 1`).Scan(&version, &applied); err != nil || version != 2 || applied != 1 {
-		t.Fatalf("shipped migration history = %d/%d, err=%v; want embedded v2", version, applied, err)
+	if err := db.QueryRow(`SELECT version_id,is_applied FROM goose_db_version WHERE is_applied=1 ORDER BY version_id DESC LIMIT 1`).Scan(&version, &applied); err != nil || version != 3 || applied != 1 {
+		t.Fatalf("shipped migration history = %d/%d, err=%v; want embedded v3", version, applied, err)
 	}
 	if _, err := os.Stat(filepath.Join(installation, "opaque-server.key")); err != nil {
 		t.Fatalf("production executable did not create external OPAQUE key: %v", err)
@@ -315,8 +315,8 @@ func TestBuiltExecutableRefusesOlderAndNewerCLIStorageWithoutMutation(t *testing
 	for _, tc := range []struct {
 		name, update string
 	}{
-		{"older", `UPDATE goose_db_version SET is_applied=0 WHERE version_id=2`},
-		{"newer", `INSERT INTO goose_db_version(version_id,is_applied) VALUES(3,1)`},
+		{"older", `UPDATE goose_db_version SET is_applied=0 WHERE version_id=3`},
+		{"newer", `INSERT INTO goose_db_version(version_id,is_applied) VALUES(4,1)`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			data := t.TempDir()
@@ -349,7 +349,7 @@ func TestBuiltExecutableRefusesOlderAndNewerCLIStorageWithoutMutation(t *testing
 				cmd.Dir = t.TempDir()
 				var stdout, stderr bytes.Buffer
 				cmd.Stdout, cmd.Stderr = &stdout, &stderr
-				if err := cmd.Run(); err == nil || stdout.Len() != 0 || !(strings.Contains(stderr.String(), "schema version mismatch") || strings.Contains(stderr.String(), "cannot upgrade an existing database") || strings.Contains(stderr.String(), "database migration history is incomplete or malformed; refusing to modify existing state")) {
+				if err := cmd.Run(); err == nil || stdout.Len() != 0 || !(strings.Contains(stderr.String(), "schema version mismatch") || strings.Contains(stderr.String(), "cannot upgrade an existing database") || strings.Contains(stderr.String(), "database migration history is incomplete or malformed; refusing to modify existing state") || strings.Contains(stderr.String(), "database migration history is unknown or malformed")) {
 					t.Fatalf("%s accepted unsupported schema: err=%v stdout=%q stderr=%q", command, err, &stdout, &stderr)
 				}
 			}
