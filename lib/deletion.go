@@ -141,9 +141,9 @@ func (a *App) finishDeploymentDeletion(id string) error {
 		pending = append(pending, removal{name: row.PathName, identity: dirIdentity{Dev: uint64(row.Dev), Ino: uint64(row.Ino)}})
 	}
 	for _, x := range pending {
-		path := filepath.Join(a.cfg.DeploymentRoot, x.name)
-		if err = validateRemovalName(id, x.name); err != nil {
-			return a.recordDeletionFailure(id, err)
+		path, pathErr := a.publicationPaths(id).removal(x.name)
+		if pathErr != nil {
+			return a.recordDeletionFailure(id, pathErr)
 		}
 		ok, e := sameIdentity(path, x.identity)
 		if e != nil {
@@ -174,26 +174,17 @@ func (a *App) finishDeploymentDeletion(id string) error {
 	return a.finishDeploymentDeletionRecord(id)
 }
 
-func validateRemovalName(id, name string) error {
-	if name == id {
-		return nil
-	}
-	if !validProjectID(id) || len(name) != 1+len(id)+len(".stage-")+32 || name[:1] != "." || name[1:33] != id || name[33:40] != ".stage-" || !validProjectID(name[40:]) {
-		return errors.New("removal journal contains an unsafe path")
-	}
-	return nil
-}
-
 func (a *App) recordDeploymentRemovalPaths(id string) error {
 	deployment, err := a.store.Deployment.Get(context.Background(), id)
 	if err != nil {
 		return err
 	}
+	paths := a.publicationPaths(id)
 	add := func(name string, want dirIdentity) error {
-		if err := validateRemovalName(id, name); err != nil {
+		path, err := paths.removal(name)
+		if err != nil {
 			return err
 		}
-		path := filepath.Join(a.cfg.DeploymentRoot, name)
 		actual, e := identity(path)
 		if os.IsNotExist(e) {
 			_, _ = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(id), publicationcleanup.PathNameEQ(name)).Exec(context.Background())
@@ -209,10 +200,10 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 		return e
 	}
 	if deployment.LiveCommit != "" {
-		if err := add(id, dirIdentity{uint64(deployment.LiveDev), uint64(deployment.LiveIno)}); err != nil {
+		if err := add(paths.liveName, dirIdentity{uint64(deployment.LiveDev), uint64(deployment.LiveIno)}); err != nil {
 			return err
 		}
-	} else if _, err := os.Lstat(a.deploymentPath(id)); err == nil {
+	} else if _, err := os.Lstat(paths.live()); err == nil {
 		return errors.New("unrecorded live publication; cleanup blocked")
 	} else if !os.IsNotExist(err) {
 		return err
@@ -241,7 +232,7 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 	if err != nil {
 		return err
 	}
-	prefix := "." + id + ".stage-"
+	prefix := paths.stageName("")
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, prefix) {
@@ -258,7 +249,11 @@ func (a *App) recordDeploymentRemovalPaths(id string) error {
 		if !known {
 			return errors.New("stage has no recorded deployment job")
 		}
-		dirID, e := identity(filepath.Join(a.cfg.DeploymentRoot, name))
+		path, e := paths.recordedStage(name, job)
+		if e != nil {
+			return e
+		}
+		dirID, e := identity(path)
 		if e != nil {
 			return e
 		}
