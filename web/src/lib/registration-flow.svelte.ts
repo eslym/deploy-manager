@@ -10,7 +10,8 @@ export class RegistrationError extends Error {}
 export function createRegistrationFlow() {
 	const state = $state({ pending: false, complete: false, error: '' });
 
-	return Object.assign(state, {
+	return {
+		state,
 		async submit(passwordField: HTMLInputElement) {
 			if (state.pending || state.complete) return;
 			const grant = getSetupGrant();
@@ -42,7 +43,7 @@ export function createRegistrationFlow() {
 				state.pending = false;
 			}
 		}
-	});
+	};
 }
 
 export function sanitizeSetupGrantURL(

@@ -18,7 +18,7 @@
 	const flow = createRegistrationFlow();
 	let grantAvailable = $derived(data.hasGrant && setupGrant.ready);
 	let statusMessage = $derived(
-		flow.error ||
+		flow.state.error ||
 			(!data.hasGrant
 				? 'This setup link is incomplete. Ask an administrator to issue a new one.'
 				: grantAvailable
@@ -47,7 +47,7 @@
 		Set a strong password to secure this deployment manager.
 	</p>
 	<p class="my-6 min-h-6 leading-6" role="status" aria-live="polite">{statusMessage}</p>
-	{#if grantAvailable && !flow.complete}
+	{#if grantAvailable && !flow.state.complete}
 		<form class="grid gap-[0.7rem]" onsubmit={submit}>
 			<label class="font-semibold" for="password">Password</label>
 			<input
@@ -58,7 +58,7 @@
 				autocomplete="new-password"
 				minlength="12"
 				required
-				disabled={flow.pending}
+				disabled={flow.state.pending}
 			/>
 			<p class="mt-0 mb-2 text-sm leading-[1.55] text-[#58645b]">
 				Use at least 12 characters. Your password stays in this browser.
@@ -66,7 +66,8 @@
 			<button
 				class="min-h-12 cursor-pointer rounded-lg border-0 bg-[#214c30] font-[inherit] font-semibold text-white focus-visible:outline-3 focus-visible:outline-offset-2 focus-visible:outline-[#82b392] disabled:cursor-wait disabled:opacity-70"
 				type="submit"
-				disabled={flow.pending}>{flow.pending ? 'Creating account…' : 'Create account'}</button
+				disabled={flow.state.pending}
+				>{flow.state.pending ? 'Creating account…' : 'Create account'}</button
 			>
 		</form>
 	{/if}

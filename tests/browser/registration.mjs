@@ -137,13 +137,7 @@ try {
   browser = await chromium.launch({ headless: true, executablePath: browserPath, args: ["--no-sandbox"] });
   const context = await browser.newContext();
   const observedURLs = [];
-  const largeJavaScript = [];
   context.on("request", request => observedURLs.push(request.url()));
-  context.on("response", response => {
-    if (response.headers()["content-type"]?.includes("javascript") && Number(response.headers()["content-length"]) > 300000) {
-      largeJavaScript.push(response.url());
-    }
-  });
 
   const failedInitPage = await context.newPage();
   await failedInitPage.addInitScript(() => Object.defineProperty(globalThis, "WebAssembly", { value: undefined }));
@@ -186,7 +180,15 @@ try {
   const initChunk = failedInitPage.waitForResponse(response => response.headers()["content-type"]?.includes("javascript") && Number(response.headers()["content-length"]) > 300000);
   await failedInitPage.getByRole("button", { name: "Create account" }).click();
   await initChunk;
-  await failedInitPage.getByText(/Check that JavaScript and WebAssembly are enabled/).waitFor({ timeout: 30000 });
+  try {
+    await failedInitPage.getByText(/Check that JavaScript and WebAssembly are enabled/).waitFor({ timeout: 30000 });
+  } catch {
+    throw new Error(`initialization error was not rendered: ${JSON.stringify({
+      status: await failedInitPage.locator('[role="status"]').allTextContents(),
+      pageErrors: initPageErrors.slice(0, 5),
+      postCount: initRequests
+    })}`);
+  }
   if (initRequests !== 0) throw new Error("initialization failure attempted an enrollment request");
   if (await failedInitPage.evaluate(() => globalThis.__cspViolations.length)) throw new Error(`CSP violation occurred during the deliberate WASM-init failure case: ${await failedInitPage.evaluate(() => globalThis.__cspViolations.join(", "))}`);
   await failedInitPage.close();
@@ -198,6 +200,25 @@ try {
   await noGrantPage.getByText(/setup link is incomplete/).waitFor({ timeout: 30000 });
   if (noGrantPosts !== 0) throw new Error("missing grant fell back to an unprotected registration request");
   await noGrantPage.close();
+
+  const expiredSetup = spawnSync(executable, ["setup", "--data", dir, "--listen", listen, "--grant-ttl", "1s"], { cwd: dir, encoding: "utf8" });
+  if (expiredSetup.status !== 0) throw new Error(expiredSetup.stderr || "short-lived setup grant could not be issued");
+  const expiredSetupLink = expiredSetup.stdout.trim();
+  await new Promise(resolve => setTimeout(resolve, 1100));
+  const expiredGrantPage = await context.newPage();
+  let expiredGrantPosts = 0;
+  expiredGrantPage.on("request", request => {
+    if (request.method() === "POST") expiredGrantPosts++;
+  });
+  await navigate(expiredGrantPage, expiredSetupLink);
+  await expiredGrantPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
+  await expiredGrantPage.waitForFunction(() => location.hash === "", null, { timeout: 10000 });
+  await expiredGrantPage.getByLabel("Password").fill(testPassword);
+  await expiredGrantPage.getByRole("button", { name: "Create account" }).click();
+  await expiredGrantPage.getByText(/expired or was already used/).waitFor({ timeout: 30000 });
+  if (expiredGrantPosts !== 1) throw new Error("expired registration grant did not fail through one protected OPAQUE request");
+  if (await expiredGrantPage.getByLabel("Password").inputValue()) throw new Error("expired grant left password in the registration form");
+  await expiredGrantPage.close();
 
   const invalidGrantPage = await context.newPage();
   let invalidGrantPosts = 0;
@@ -239,9 +260,18 @@ try {
   const pageErrors = [];
   const failedScripts = [];
   const failedRequests = [];
+  let pageCryptoLoads = 0;
   page.on("pageerror", error => pageErrors.push(redact(`${error.name}: ${error.message}`, grant)));
   page.on("console", message => {
     if (message.type() === "error") pageErrors.push(redact(message.text(), grant));
+  });
+  page.on("response", response => {
+    if (
+      response.headers()["content-type"]?.includes("javascript") &&
+      Number(response.headers()["content-length"]) > 300000
+    ) {
+      pageCryptoLoads++;
+    }
   });
   await page.addInitScript(() => {
     globalThis.__cspViolations = [];
@@ -299,12 +329,12 @@ try {
   await page.getByRole("link", { name: "Open administrator setup" }).click();
   await page.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
   if (new URL(page.url()).hash) throw new Error("client navigation restored the setup grant in the URL");
-  if (largeJavaScript.length !== 1) throw new Error("OPAQUE WASM bundle was loaded before registration began");
-  const largeBundlesBeforeSubmit = largeJavaScript.length;
+  if (pageCryptoLoads !== 0) throw new Error("OPAQUE WASM bundle was loaded before registration began");
+  const largeBundlesBeforeSubmit = pageCryptoLoads;
   await page.getByLabel("Password").fill(testPassword);
   await page.getByRole("button", { name: "Create account" }).click();
   await page.getByText("Administrator account created. You can close this page.").waitFor({ timeout: 60000 });
-  if (largeJavaScript.length <= largeBundlesBeforeSubmit) throw new Error("OPAQUE bundle was not loaded when registration started");
+  if (pageCryptoLoads <= largeBundlesBeforeSubmit) throw new Error("OPAQUE bundle was not loaded when registration started");
   if (JSON.stringify(finishRaceStatuses) !== JSON.stringify([204, 410])) throw new Error(`grant consumption race was not single-use: ${finishRaceStatuses}`);
   if (observedURLs.some(url => url.includes(grant))) throw new Error("registration grant leaked into a browser request URL");
   const registrationStarts = registrationRequests.filter(request => request.path === "/opaque/register/start");
