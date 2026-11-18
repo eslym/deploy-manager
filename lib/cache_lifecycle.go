@@ -11,9 +11,69 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/eslym/deploy-manager/lib/ent/projectrefreshjournal"
 )
+
+type refreshLifecycleError struct {
+	status  int
+	message string
+}
+
+func (e *refreshLifecycleError) Error() string { return e.message }
+
+// promoteRefresh owns the durable portion of a manual refresh: journal
+// creation, cache promotion, metadata reconciliation, rollback, and cleanup.
+func (p *projectManager) promoteRefresh(ctx context.Context, id, stage string, refs []projectRef, fetchedAt time.Time) (string, error) {
+	backup := p.refreshBackupPath(id)
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+	if _, err := p.cacheFS.Lstat(backup); err == nil {
+		message := "an unresolved previous project cache exists; restart to reconcile before refreshing"
+		p.setBlocked(message)
+		return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+	} else if !os.IsNotExist(err) {
+		return "", &refreshLifecycleError{http.StatusInternalServerError, "could not inspect previous project cache"}
+	}
+	if err := p.markRefreshIntent(id); err != nil {
+		return "", &refreshLifecycleError{http.StatusInternalServerError, "could not record refresh recovery state"}
+	}
+	if err := p.cacheFS.Rename(p.repoPath(id), backup); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, false); rollbackErr != nil {
+			message := "project cache state is ambiguous after promotion failure; project operations are blocked until restart recovery succeeds"
+			p.setBlocked(message)
+			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		return "", &refreshLifecycleError{http.StatusInternalServerError, "refreshed repository could not be safely promoted; previous cache retained"}
+	}
+	if err := p.cacheFS.Rename(stage, p.repoPath(id)); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
+			message := "project cache restoration failed; project operations are blocked until restart recovery succeeds"
+			p.setBlocked(message)
+			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		return "", &refreshLifecycleError{http.StatusInternalServerError, "refreshed repository could not be safely promoted; previous cache restored"}
+	}
+	if err := replaceProjectMetadata(ctx, p.store, id, refs, fetchedAt); err != nil {
+		pending, journalErr := p.refreshIntentExists(id)
+		if journalErr != nil || pending {
+			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
+				message := "refresh commit and cache restoration failed; project operations are blocked until restart recovery succeeds"
+				p.setBlocked(message)
+				return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+			}
+			return "", &refreshLifecycleError{http.StatusInternalServerError, "refresh could not be committed; previous cache and refs restored"}
+		}
+	}
+	if err := p.removeOwnedPath(backup); err != nil {
+		message := "refresh committed but previous cache cleanup failed; restart to reconcile before further project changes"
+		p.setBlocked(message)
+		p.setProjectWarning(ctx, id, message)
+		return message, nil
+	}
+	return "", nil
+}
 
 type projectCacheFS interface {
 	MkdirTemp(string, string) (string, error)

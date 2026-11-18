@@ -652,60 +652,15 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC()
-	backup := p.refreshBackupPath(id)
-	p.cacheMu.Lock()
-	defer p.cacheMu.Unlock()
-	if _, err = p.cacheFS.Lstat(backup); err == nil {
-		message := "an unresolved previous project cache exists; restart to reconcile before refreshing"
-		p.setBlocked(message)
-		http.Error(w, message, http.StatusServiceUnavailable)
-		return
-	} else if !os.IsNotExist(err) {
-		http.Error(w, "could not inspect previous project cache", 500)
-		return
-	}
-	if err = p.markRefreshIntent(id); err != nil {
-		http.Error(w, "could not record refresh recovery state", 500)
-		return
-	}
-	if err = p.cacheFS.Rename(p.repoPath(id), backup); err != nil {
-		if rollbackErr := p.rollbackRefresh(id, false); rollbackErr != nil {
-			message := "project cache state is ambiguous after promotion failure; project operations are blocked until restart recovery succeeds"
-			p.setBlocked(message)
-			http.Error(w, message, http.StatusServiceUnavailable)
-			return
+	cleanupWarning, refreshErr := p.promoteRefresh(r.Context(), id, stage, refs, now)
+	if refreshErr != nil {
+		status := http.StatusInternalServerError
+		var lifecycleErr *refreshLifecycleError
+		if errors.As(refreshErr, &lifecycleErr) {
+			status = lifecycleErr.status
 		}
-		http.Error(w, "refreshed repository could not be safely promoted; previous cache retained", 500)
+		http.Error(w, refreshErr.Error(), status)
 		return
-	}
-	if err = p.cacheFS.Rename(stage, p.repoPath(id)); err != nil {
-		if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
-			message := "project cache restoration failed; project operations are blocked until restart recovery succeeds"
-			p.setBlocked(message)
-			http.Error(w, message, http.StatusServiceUnavailable)
-			return
-		}
-		http.Error(w, "refreshed repository could not be safely promoted; previous cache restored", 500)
-		return
-	}
-	if err = replaceProjectMetadata(r.Context(), p.store, id, refs, now); err != nil {
-		pending, journalErr := p.refreshIntentExists(id)
-		if journalErr != nil || pending {
-			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
-				message := "refresh commit and cache restoration failed; project operations are blocked until restart recovery succeeds"
-				p.setBlocked(message)
-				http.Error(w, message, http.StatusServiceUnavailable)
-				return
-			}
-			http.Error(w, "refresh could not be committed; previous cache and refs restored", 500)
-			return
-		}
-	}
-	cleanupWarning := ""
-	if err := p.removeOwnedPath(backup); err != nil {
-		cleanupWarning = "refresh committed but previous cache cleanup failed; restart to reconcile before further project changes"
-		p.setBlocked(cleanupWarning)
-		p.setProjectWarning(r.Context(), id, cleanupWarning)
 	}
 	writeJSON(w, map[string]any{"lastFetched": now, "warning": cleanupWarning})
 }
