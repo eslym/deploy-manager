@@ -253,9 +253,9 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	cancelledRefreshCtx, cancelRefresh := context.WithCancel(context.Background())
 	pauseManualRefresh.Store(true)
-	cancelledResult := make(chan manualRefreshResult, 1)
+	cancelledResult := make(chan projectCacheRefreshResult, 1)
 	go func() {
-		cancelledResult <- app.projects.manualRefresh(cancelledRefreshCtx, created.ID, remoteURL, nil)
+		cancelledResult <- app.projects.refreshProjectCache(cancelledRefreshCtx, created.ID, remoteURL, nil)
 	}()
 	select {
 	case <-manualRefreshStarted:
@@ -273,6 +273,31 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	if _, err := os.Lstat(app.projects.refreshStagePath(created.ID)); !os.IsNotExist(err) {
 		t.Fatalf("cancelled refresh left a staging directory: %v", err)
+	}
+	// Cancellation at the live-promotion boundary must roll the real cache
+	// filesystem back before refresh metadata can be committed.
+	lastFetchedBeforePromotionCancel := listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched
+	promotionCtx, cancelPromotion := context.WithCancel(context.Background())
+	app.projects.cacheFS = &cancelAfterRenameCacheFS{
+		projectCacheFS: osProjectCacheFS{},
+		target:         app.projects.repoPath(created.ID),
+		cancel:         cancelPromotion,
+	}
+	promotedCancellation := app.projects.refreshProjectCache(promotionCtx, created.ID, remoteURL, nil)
+	app.projects.cacheFS = osProjectCacheFS{}
+	cancelPromotion()
+	if promotedCancellation.message == "" {
+		t.Fatal("refresh unexpectedly succeeded after cancellation at live promotion")
+	}
+	if got, err := digestProjectCache(app.projects.repoPath(created.ID)); err != nil || got != cacheBeforeCancelledRefresh {
+		t.Fatalf("promotion-boundary cancellation changed live cache: digest=%x err=%v", got, err)
+	}
+	if exists, err := app.projects.refreshIntentExists(created.ID); err != nil || exists {
+		t.Fatalf("promotion-boundary cancellation left a journal: exists=%v err=%v", exists, err)
+	}
+	lastFetchedAfterPromotionCancel := listProjectsFromAPI(t, client, appServer.URL, cookie)[0].LastFetched
+	if lastFetchedBeforePromotionCancel == nil || lastFetchedAfterPromotionCancel == nil || !lastFetchedAfterPromotionCancel.Equal(*lastFetchedBeforePromotionCancel) {
+		t.Fatalf("promotion-boundary cancellation committed refresh metadata: before=%v after=%v", lastFetchedBeforePromotionCancel, lastFetchedAfterPromotionCancel)
 	}
 
 	// Exercise the branch-fetch caller through the same real-filesystem cache
@@ -415,7 +440,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if _, err := app.db.Exec(`CREATE TRIGGER reject_refresh_metadata BEFORE DELETE ON project_refs BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END`); err != nil {
 		t.Fatal(err)
 	}
-	metadataFailure := app.projects.manualRefresh(context.Background(), created.ID, remoteURL, nil)
+	metadataFailure := app.projects.refreshProjectCache(context.Background(), created.ID, remoteURL, nil)
 	if metadataFailure.message == "" {
 		t.Fatal("metadata failure was not reported")
 	}
@@ -441,7 +466,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	app.projects.refreshJournalLookup = func(string) (bool, error) {
 		return false, errors.New("injected journal lookup failure")
 	}
-	uncertainRefresh := app.projects.manualRefresh(context.Background(), created.ID, remoteURL, nil)
+	uncertainRefresh := app.projects.refreshProjectCache(context.Background(), created.ID, remoteURL, nil)
 	if uncertainRefresh.status != http.StatusServiceUnavailable {
 		t.Fatalf("uncertain refresh status=%d, want unavailable: %s", uncertainRefresh.status, uncertainRefresh.message)
 	}
@@ -1440,7 +1465,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		projectCacheFS:   osProjectCacheFS{},
 		failRemovePrefix: ".git-backup-refresh-",
 	}
-	pendingCleanup := app.projects.manualRefresh(context.Background(), created.ID, remoteURL, nil)
+	pendingCleanup := app.projects.refreshProjectCache(context.Background(), created.ID, remoteURL, nil)
 	if pendingCleanup.warning == "" || pendingCleanup.fetchedAt.IsZero() {
 		t.Fatalf("post-commit backup cleanup failure was not surfaced: %#v", pendingCleanup)
 	}
@@ -1594,6 +1619,22 @@ type faultProjectCacheFS struct {
 	failRenameCount  int
 	failRemovePrefix string
 	renameAttempts   int
+}
+
+type cancelAfterRenameCacheFS struct {
+	projectCacheFS
+	target string
+	cancel context.CancelFunc
+}
+
+func (f *cancelAfterRenameCacheFS) Rename(oldPath, newPath string) error {
+	if err := f.projectCacheFS.Rename(oldPath, newPath); err != nil {
+		return err
+	}
+	if newPath == f.target {
+		f.cancel()
+	}
+	return nil
 }
 
 func (f *faultProjectCacheFS) Rename(oldPath, newPath string) error {

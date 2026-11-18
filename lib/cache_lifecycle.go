@@ -18,7 +18,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 )
 
-type manualRefreshResult struct {
+type projectCacheRefreshResult struct {
 	fetchedAt time.Time
 	warning   string
 	status    int
@@ -26,11 +26,11 @@ type manualRefreshResult struct {
 	cause     error
 }
 
-// manualRefresh owns every cache phase for an explicit project refresh. Its
+// refreshProjectCache owns every cache phase for a project cache refresh. Its
 // caller is responsible for authorization, serialization, and HTTP rendering.
-func (p *projectManager) manualRefresh(requestCtx context.Context, id, remote string, auth transport.AuthMethod) (result manualRefreshResult) {
-	fail := func(status int, message string) manualRefreshResult {
-		return manualRefreshResult{status: status, message: message}
+func (p *projectManager) refreshProjectCache(requestCtx context.Context, id, remote string, auth transport.AuthMethod) (result projectCacheRefreshResult) {
+	fail := func(status int, message string) projectCacheRefreshResult {
+		return projectCacheRefreshResult{status: status, message: message}
 	}
 	if err := p.checkPersistentCacheBudget(); err != nil {
 		return fail(http.StatusRequestEntityTooLarge, err.Error())
@@ -165,6 +165,14 @@ func (p *projectManager) promoteRefresh(ctx context.Context, id, stage string, r
 			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
 		}
 		return "", &refreshLifecycleError{http.StatusInternalServerError, "refreshed repository could not be safely promoted; previous cache restored"}
+	}
+	if err := ctx.Err(); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
+			message := "cancelled refresh could not restore the previous cache; restart to reconcile before further project changes"
+			p.setBlocked(message)
+			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		return "", err
 	}
 	replaceMetadata := p.refreshMetadata
 	if replaceMetadata == nil {

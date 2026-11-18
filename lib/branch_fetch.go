@@ -122,7 +122,7 @@ func (a *App) fetchProjectForBranchAttempt(ctx context.Context, id string) error
 	} else if _, err := url.ParseRequestURI(remote); err != nil {
 		return errors.New("repository URL is invalid")
 	}
-	result := p.manualRefresh(ctx, id, remote, auth)
+	result := p.refreshProjectCache(ctx, id, remote, auth)
 	if result.message != "" {
 		if result.cause != nil && retryableBranchFetch(result.cause) {
 			var serverErr transientGitHTTPError
