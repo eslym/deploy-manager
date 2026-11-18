@@ -14,6 +14,7 @@
 		"prepare": "svelte-kit sync || echo ''",
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"test:registration-flow": "vitest run src/lib/registration-flow.test.ts",
 		"lint": "prettier --check .",
 		"format": "prettier --write ."
 	},
@@ -30,7 +31,8 @@
 		"svelte-check": "^4.7.8",
 		"tailwindcss": "^4.3.5",
 		"typescript": "^6.0.3",
-		"vite": "^8.3.8"
+		"vite": "^8.3.8",
+		"vitest": "^5.1.0"
 	},
 	"optionalDependencies": {
 		"@rolldown/binding-darwin-arm64": "1.2.19",

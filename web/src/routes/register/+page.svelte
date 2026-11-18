@@ -15,7 +15,7 @@
 	});
 	let grantAvailable = $derived(data.hasGrant && setupGrant.ready);
 	let statusMessage = $derived(
-		flow.state.error ||
+		flow.state.statusMessage ||
 			(!data.hasGrant
 				? 'This setup link is incomplete. Ask an administrator to issue a new one.'
 				: grantAvailable

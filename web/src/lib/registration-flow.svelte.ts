@@ -4,14 +4,21 @@ import {
 	getSetupGrant,
 	markSetupGrantReady
 } from './setup-grant.svelte.js';
+import { rememberSetupGrant } from './setup-grant.svelte.js';
 
 export class RegistrationError extends Error {}
 
 export function createRegistrationFlow() {
-	const state = $state({ pending: false, complete: false, error: '' });
+	const state = $state({ pending: false, complete: false, statusMessage: '' });
 
 	return {
 		state,
+		hasGrant() {
+			return Boolean(getSetupGrant());
+		},
+		intakeGrant(fragment: string) {
+			if (fragment) rememberSetupGrant(fragment);
+		},
 		sanitizeURL(
 			target: URL | undefined,
 			navigate: (url: URL) => Promise<unknown>,
@@ -33,24 +40,26 @@ export function createRegistrationFlow() {
 			if (state.pending || state.complete) return;
 			const grant = getSetupGrant();
 			if (!grant) {
-				state.error = 'This setup link is incomplete. Ask an administrator to issue a new one.';
+				passwordField.value = '';
+				state.statusMessage =
+					'This setup link is incomplete. Ask an administrator to issue a new one.';
 				return;
 			}
 			let password = passwordField.value;
 			passwordField.value = '';
 			if (password.length < 12) {
 				password = '';
-				state.error = 'Use a password with at least 12 characters.';
+				state.statusMessage = 'Use a password with at least 12 characters.';
 				return;
 			}
 			state.pending = true;
-			state.error = 'Creating your account securely…';
+			state.statusMessage = 'Creating your account securely…';
 			try {
 				await registerCredential(password, grant);
 				state.complete = true;
-				state.error = 'Administrator account created. You can close this page.';
+				state.statusMessage = 'Administrator account created. You can close this page.';
 			} catch (cause) {
-				state.error =
+				state.statusMessage =
 					cause instanceof RegistrationError
 						? cause.message
 						: 'Secure registration could not be initialized or completed. Check that JavaScript and WebAssembly are enabled, then reload and try again.';
