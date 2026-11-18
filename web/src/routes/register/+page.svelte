@@ -1,11 +1,10 @@
 <script lang="ts">
 	import { afterNavigate, goto } from '$app/navigation';
-	import { clearSetupGrant, getSetupGrant, setupGrant } from '../../lib/setup-grant.svelte.js';
+	import { setupGrant } from '../../lib/setup-grant.svelte.js';
 	import {
-		registerCredential,
-		RegistrationError,
+		createRegistrationFlow,
 		sanitizeSetupGrantURL
-	} from '../../lib/registration-flow.js';
+	} from '../../lib/registration-flow.svelte.js';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
@@ -16,50 +15,21 @@
 			() => window.location.href
 		);
 	});
+	const flow = createRegistrationFlow();
 	let grantAvailable = $derived(data.hasGrant && setupGrant.ready);
-	let status = $state('');
 	let statusMessage = $derived(
-		status ||
+		flow.error ||
 			(!data.hasGrant
 				? 'This setup link is incomplete. Ask an administrator to issue a new one.'
 				: grantAvailable
 					? 'Choose a password for the administrator account.'
 					: 'Securing your setup link…')
 	);
-	let busy = $state(false);
-	let complete = $state(false);
-
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
-		const grant = getSetupGrant();
-		if (!grant || busy) return;
-
 		const form = event.currentTarget as HTMLFormElement;
 		const passwordField = form.elements.namedItem('password') as HTMLInputElement;
-		let password = passwordField.value;
-		passwordField.value = '';
-		if (password.length < 12) {
-			password = '';
-			status = 'Use a password with at least 12 characters.';
-			return;
-		}
-
-		busy = true;
-		status = 'Creating your account securely…';
-		try {
-			await registerCredential(password, grant);
-			complete = true;
-			status = 'Administrator account created. You can close this page.';
-		} catch (error) {
-			status =
-				error instanceof RegistrationError
-					? error.message
-					: 'Secure registration could not be initialized or completed. Check that JavaScript and WebAssembly are enabled, then reload and try again.';
-		} finally {
-			password = '';
-			passwordField.value = '';
-			busy = false;
-		}
+		await flow.submit(passwordField);
 	}
 </script>
 
@@ -77,7 +47,7 @@
 		Set a strong password to secure this deployment manager.
 	</p>
 	<p class="my-6 min-h-6 leading-6" role="status" aria-live="polite">{statusMessage}</p>
-	{#if grantAvailable && !complete}
+	{#if grantAvailable && !flow.complete}
 		<form class="grid gap-[0.7rem]" onsubmit={submit}>
 			<label class="font-semibold" for="password">Password</label>
 			<input
@@ -88,7 +58,7 @@
 				autocomplete="new-password"
 				minlength="12"
 				required
-				disabled={busy}
+				disabled={flow.pending}
 			/>
 			<p class="mt-0 mb-2 text-sm leading-[1.55] text-[#58645b]">
 				Use at least 12 characters. Your password stays in this browser.
@@ -96,7 +66,7 @@
 			<button
 				class="min-h-12 cursor-pointer rounded-lg border-0 bg-[#214c30] font-[inherit] font-semibold text-white focus-visible:outline-3 focus-visible:outline-offset-2 focus-visible:outline-[#82b392] disabled:cursor-wait disabled:opacity-70"
 				type="submit"
-				disabled={busy}>{busy ? 'Creating account…' : 'Create account'}</button
+				disabled={flow.pending}>{flow.pending ? 'Creating account…' : 'Create account'}</button
 			>
 		</form>
 	{/if}

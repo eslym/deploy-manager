@@ -199,6 +199,21 @@ try {
   if (noGrantPosts !== 0) throw new Error("missing grant fell back to an unprotected registration request");
   await noGrantPage.close();
 
+  const invalidGrantPage = await context.newPage();
+  let invalidGrantPosts = 0;
+  invalidGrantPage.on("request", request => {
+    if (request.method() === "POST") invalidGrantPosts++;
+  });
+  await navigate(invalidGrantPage, `http://${listen}/register#invalid-registration-grant`);
+  await invalidGrantPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
+  await invalidGrantPage.waitForFunction(() => location.hash === "", null, { timeout: 10000 });
+  await invalidGrantPage.getByLabel("Password").fill(testPassword);
+  await invalidGrantPage.getByRole("button", { name: "Create account" }).click();
+  await invalidGrantPage.getByText(/expired or was already used/).waitFor({ timeout: 30000 });
+  if (invalidGrantPosts !== 1) throw new Error("invalid registration grant did not fail through one protected OPAQUE request");
+  if (await invalidGrantPage.getByLabel("Password").inputValue()) throw new Error("invalid grant left password in the registration form");
+  await invalidGrantPage.close();
+
   // A malformed successful response must fail closed through the registration
   // credential flow: do not submit a finish message and clear the password.
   const malformedPage = await context.newPage();
