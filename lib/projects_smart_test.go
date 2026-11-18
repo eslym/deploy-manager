@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/eslym/deploy-manager/lib/ent"
 	git "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/pktline"
@@ -61,6 +62,8 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	var transientFailures atomic.Int32
 	var pauseBranchFetch atomic.Bool
 	branchFetchStarted := make(chan struct{})
+	var pauseManualRefresh atomic.Bool
+	manualRefreshStarted := make(chan struct{})
 	var pauseWebhookFetch atomic.Bool
 	webhookFetchStarted := make(chan struct{})
 	resumeWebhookFetch := make(chan struct{})
@@ -83,6 +86,11 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	var measuredPackBytes atomic.Int64
 	remote := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gitRequests.Add(1)
+		if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") && pauseManualRefresh.CompareAndSwap(true, false) {
+			close(manualRefreshStarted)
+			<-r.Context().Done()
+			return
+		}
 		if pauseWebhookFetch.Load() && r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/info/refs") && pauseWebhookFetch.CompareAndSwap(true, false) {
 			close(webhookFetchStarted)
 			<-resumeWebhookFetch
@@ -237,6 +245,88 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	initialRefs := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
 	requireProjectRefs(t, initialRefs, featureAtCreate)
+	// Cancellation during a real refresh fetch must leave the usable cache and
+	// its metadata intact, and must remove the abandoned staging directory.
+	cacheBeforeCancelledRefresh, err := digestProjectCache(app.projects.repoPath(created.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelledRefreshCtx, cancelRefresh := context.WithCancel(context.Background())
+	pauseManualRefresh.Store(true)
+	cancelledResult := make(chan manualRefreshResult, 1)
+	go func() {
+		cancelledResult <- app.projects.manualRefresh(cancelledRefreshCtx, created.ID, remoteURL, nil)
+	}()
+	select {
+	case <-manualRefreshStarted:
+		cancelRefresh()
+	case <-time.After(5 * time.Second):
+		cancelRefresh()
+		t.Fatal("manual refresh did not reach its cancellable remote request")
+	}
+	cancelledRefresh := <-cancelledResult
+	if cancelledRefresh.message == "" {
+		t.Fatal("cancelled refresh unexpectedly succeeded")
+	}
+	if got, err := digestProjectCache(app.projects.repoPath(created.ID)); err != nil || got != cacheBeforeCancelledRefresh {
+		t.Fatalf("cancelled refresh changed the live cache: digest=%x err=%v", got, err)
+	}
+	if _, err := os.Lstat(app.projects.refreshStagePath(created.ID)); !os.IsNotExist(err) {
+		t.Fatalf("cancelled refresh left a staging directory: %v", err)
+	}
+
+	// A real metadata transaction failure after cache promotion must restore the
+	// old cache and refs rather than publishing the fetched refs alone.
+	cacheBeforeMetadataFailure := cacheBeforeCancelledRefresh
+	if _, err := app.db.Exec(`CREATE TRIGGER reject_refresh_metadata BEFORE DELETE ON project_refs BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	metadataFailure := app.projects.manualRefresh(context.Background(), created.ID, remoteURL, nil)
+	if metadataFailure.message == "" {
+		t.Fatal("metadata failure was not reported")
+	}
+	if _, err := app.db.Exec(`DROP TRIGGER reject_refresh_metadata`); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := digestProjectCache(app.projects.repoPath(created.ID)); err != nil || got != cacheBeforeMetadataFailure {
+		t.Fatalf("metadata failure did not restore the previous cache: digest=%x err=%v", got, err)
+	}
+	if exists, err := app.projects.refreshIntentExists(created.ID); err != nil || exists {
+		t.Fatalf("metadata failure left a refresh journal: exists=%v err=%v", exists, err)
+	}
+	// A commit may have succeeded even when the caller receives an error. If
+	// the durable journal lookup is also unavailable, retain both cache paths
+	// and block until startup reconciliation can prove the outcome.
+	realReplaceMetadata := replaceProjectMetadata
+	app.projects.refreshMetadata = func(ctx context.Context, store *ent.Client, id string, refs []projectRef, fetchedAt time.Time) error {
+		if err := realReplaceMetadata(ctx, store, id, refs, fetchedAt); err != nil {
+			return err
+		}
+		return errors.New("injected lost commit acknowledgement")
+	}
+	app.projects.refreshJournalLookup = func(string) (bool, error) {
+		return false, errors.New("injected journal lookup failure")
+	}
+	uncertainRefresh := app.projects.manualRefresh(context.Background(), created.ID, remoteURL, nil)
+	if uncertainRefresh.status != http.StatusServiceUnavailable {
+		t.Fatalf("uncertain refresh status=%d, want unavailable: %s", uncertainRefresh.status, uncertainRefresh.message)
+	}
+	if _, err := os.Stat(app.projects.repoPath(created.ID)); err != nil {
+		t.Fatalf("uncertain refresh removed promoted cache: %v", err)
+	}
+	if _, err := os.Stat(app.projects.refreshBackupPath(created.ID)); err != nil {
+		t.Fatalf("uncertain refresh removed prior-cache evidence: %v", err)
+	}
+	if err := app.projects.ensureCacheReady(); err == nil {
+		t.Fatal("uncertain refresh did not block subsequent cache work")
+	}
+	app.projects.refreshMetadata = nil
+	app.projects.refreshJournalLookup = nil
+	if err := app.projects.reconcileCacheFiles(); err != nil {
+		t.Fatalf("startup-style reconciliation failed after committed refresh: %v", err)
+	}
+	app.projects.setBlocked("")
+
 	tagDeployment := createAndTestTagDeployment(t, client, appServer.URL, cookie, app, created.ID, initialRefs)
 	deploymentResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments", `{"projectId":"`+created.ID+`","name":"production","commit":"`+featureAtCreate+`"}`)
 	if deploymentResponse.StatusCode != http.StatusCreated {
@@ -1209,6 +1299,32 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, secondDeployment.ID, "README.md"), "second Gitea project tip\n")
 	if content, err := os.ReadFile(filepath.Join(branchPath, "README.md")); err != nil || string(content) != "Gitea latest tip\n" {
 		t.Fatalf("other project affected first publication: %q %v", content, err)
+	}
+	// Failure to remove the old cache occurs only after the cache and refs have
+	// committed. The warning is observable and the backup remains for recovery.
+	app.projects.cacheFS = &faultProjectCacheFS{
+		projectCacheFS:   osProjectCacheFS{},
+		failRemovePrefix: ".git-backup-refresh-",
+	}
+	pendingCleanup := app.projects.manualRefresh(context.Background(), created.ID, remoteURL, nil)
+	if pendingCleanup.warning == "" || pendingCleanup.fetchedAt.IsZero() {
+		t.Fatalf("post-commit backup cleanup failure was not surfaced: %#v", pendingCleanup)
+	}
+	if _, err := os.Stat(app.projects.refreshBackupPath(created.ID)); err != nil {
+		t.Fatalf("previous cache backup was not retained for recovery: %v", err)
+	}
+	if exists, err := app.projects.refreshIntentExists(created.ID); err != nil || exists {
+		t.Fatalf("committed refresh unexpectedly retains journal: exists=%v err=%v", exists, err)
+	}
+	if err := app.projects.ensureCacheReady(); err == nil {
+		t.Fatal("cache operations remained unblocked while old-cache cleanup was pending")
+	}
+	app.projects.cacheFS = osProjectCacheFS{}
+	if err := app.projects.reconcileCacheFiles(); err != nil {
+		t.Fatalf("startup-style reconciliation did not finish pending old-cache cleanup: %v", err)
+	}
+	if _, err := os.Lstat(app.projects.refreshBackupPath(created.ID)); !os.IsNotExist(err) {
+		t.Fatalf("startup-style reconciliation left the previous cache backup: %v", err)
 	}
 }
 

@@ -11,9 +11,163 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/eslym/deploy-manager/lib/ent/projectrefreshjournal"
+	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/transport"
 )
+
+type manualRefreshResult struct {
+	fetchedAt time.Time
+	warning   string
+	status    int
+	message   string
+}
+
+// manualRefresh owns every cache phase for an explicit project refresh. Its
+// caller is responsible for authorization, serialization, and HTTP rendering.
+func (p *projectManager) manualRefresh(requestCtx context.Context, id, remote string, auth transport.AuthMethod) (result manualRefreshResult) {
+	fail := func(status int, message string) manualRefreshResult {
+		return manualRefreshResult{status: status, message: message}
+	}
+	if err := p.checkPersistentCacheBudget(); err != nil {
+		return fail(http.StatusRequestEntityTooLarge, err.Error())
+	}
+	ctx, cancel := context.WithTimeout(requestCtx, p.timeout)
+	defer cancel()
+	ctx = withGitHTTPPolicy(ctx, p)
+	stage := p.refreshStagePath(id)
+	if err := p.cacheFS.Mkdir(stage, 0700); err != nil {
+		return fail(http.StatusInternalServerError, "could not prepare bounded repository staging")
+	}
+	defer func() {
+		if cleanupErr := p.cleanupStage(stage); cleanupErr != nil {
+			result = fail(http.StatusServiceUnavailable, cleanupErr.Error())
+		}
+	}()
+	if err := copyGitCache(p.repoPath(id), stage, p.maxCacheBytes); err != nil {
+		warning := "could not stage the existing repository within the configured cache limit"
+		p.setProjectWarning(requestCtx, id, warning)
+		return fail(http.StatusRequestEntityTooLarge, warning)
+	}
+	repo, err := git.Open(boundedStorage(stage, p.maxCacheBytes), nil)
+	if err == nil {
+		err = repo.FetchContext(ctx, &git.FetchOptions{RemoteName: "origin", Tags: git.AllTags, Force: true, Prune: true, Auth: auth})
+	}
+	if err == git.NoErrAlreadyUpToDate {
+		err = nil
+	}
+	if err != nil {
+		warning := sanitizeGitError(err, remote)
+		p.setProjectWarning(requestCtx, id, warning)
+		status := http.StatusBadGateway
+		if errors.Is(err, errGitCacheLimit) {
+			status = http.StatusRequestEntityTooLarge
+		}
+		return fail(status, warning)
+	}
+	refs, err := projectRefsFromRepository(stage, p.maxRefs)
+	if err != nil {
+		warning := sanitizeGitError(err, remote)
+		p.setProjectWarning(requestCtx, id, warning)
+		return fail(http.StatusBadGateway, warning)
+	}
+	used, sizeErr := directorySize(p.root, 2*p.maxCacheBytes)
+	stageSize, stageErr := directorySize(stage, p.maxCacheBytes)
+	liveSize, liveErr := directorySize(p.repoPath(id), p.maxCacheBytes)
+	if sizeErr != nil || stageErr != nil || liveErr != nil || stageSize > p.maxCacheBytes || used < liveSize || used-liveSize > p.maxCacheBytes {
+		warning := "refreshed repository exceeds the configured persistent cache limit; previous cache retained"
+		p.setProjectWarning(requestCtx, id, warning)
+		return fail(http.StatusRequestEntityTooLarge, warning)
+	}
+	now := time.Now().UTC()
+	warning, err := p.promoteRefresh(requestCtx, id, stage, refs, now)
+	if err != nil {
+		status := http.StatusInternalServerError
+		var lifecycleErr *refreshLifecycleError
+		if errors.As(err, &lifecycleErr) {
+			status = lifecycleErr.status
+		}
+		return fail(status, err.Error())
+	}
+	result.fetchedAt = now
+	result.warning = warning
+	return result
+}
+
+type refreshLifecycleError struct {
+	status  int
+	message string
+}
+
+func (e *refreshLifecycleError) Error() string { return e.message }
+
+// promoteRefresh owns the durable portion of a manual refresh: journal
+// creation, cache promotion, metadata reconciliation, rollback, and cleanup.
+func (p *projectManager) promoteRefresh(ctx context.Context, id, stage string, refs []projectRef, fetchedAt time.Time) (string, error) {
+	backup := p.refreshBackupPath(id)
+	p.cacheMu.Lock()
+	defer p.cacheMu.Unlock()
+	if _, err := p.cacheFS.Lstat(backup); err == nil {
+		message := "an unresolved previous project cache exists; restart to reconcile before refreshing"
+		p.setBlocked(message)
+		return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+	} else if !os.IsNotExist(err) {
+		return "", &refreshLifecycleError{http.StatusInternalServerError, "could not inspect previous project cache"}
+	}
+	if err := p.markRefreshIntent(id); err != nil {
+		return "", &refreshLifecycleError{http.StatusInternalServerError, "could not record refresh recovery state"}
+	}
+	if err := p.cacheFS.Rename(p.repoPath(id), backup); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, false); rollbackErr != nil {
+			message := "project cache state is ambiguous after promotion failure; project operations are blocked until restart recovery succeeds"
+			p.setBlocked(message)
+			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		return "", &refreshLifecycleError{http.StatusInternalServerError, "refreshed repository could not be safely promoted; previous cache retained"}
+	}
+	if err := p.cacheFS.Rename(stage, p.repoPath(id)); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
+			message := "project cache restoration failed; project operations are blocked until restart recovery succeeds"
+			p.setBlocked(message)
+			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		return "", &refreshLifecycleError{http.StatusInternalServerError, "refreshed repository could not be safely promoted; previous cache restored"}
+	}
+	replaceMetadata := p.refreshMetadata
+	if replaceMetadata == nil {
+		replaceMetadata = replaceProjectMetadata
+	}
+	if err := replaceMetadata(ctx, p.store, id, refs, fetchedAt); err != nil {
+		lookup := p.refreshJournalLookup
+		if lookup == nil {
+			lookup = p.refreshIntentExists
+		}
+		pending, journalErr := lookup(id)
+		if journalErr != nil {
+			message := "refresh outcome is uncertain; project operations are blocked until restart recovery succeeds"
+			p.setBlocked(message)
+			p.setProjectWarning(ctx, id, message)
+			return message, &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		if pending {
+			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
+				message := "refresh commit and cache restoration failed; project operations are blocked until restart recovery succeeds"
+				p.setBlocked(message)
+				return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+			}
+			return "", &refreshLifecycleError{http.StatusInternalServerError, "refresh could not be committed; previous cache and refs restored"}
+		}
+	}
+	if err := p.removeOwnedPath(backup); err != nil {
+		message := "refresh committed but previous cache cleanup failed; restart to reconcile before further project changes"
+		p.setBlocked(message)
+		p.setProjectWarning(ctx, id, message)
+		return message, nil
+	}
+	return "", nil
+}
 
 type projectCacheFS interface {
 	MkdirTemp(string, string) (string, error)
