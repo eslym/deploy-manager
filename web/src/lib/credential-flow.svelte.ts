@@ -121,6 +121,7 @@ export async function registerCredential(
 			clientRegistrationState: start.clientRegistrationState,
 			keyStretching: profile
 		});
+		password = '';
 		await send(
 			'/opaque/register/finish',
 			finish.registrationRecord,
