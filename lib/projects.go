@@ -56,6 +56,8 @@ type projectManager struct {
 	refreshJournalLookup               func(string) (bool, error)
 	blocked                            string
 	branchFetchBeforeProjectLock       func()
+	refreshAfterFetch                  func()
+	refreshAfterIntent                 func()
 	cacheRecreationBeforeLifecycleLock func()
 }
 
@@ -597,7 +599,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	refresh := p.manualRefresh(r.Context(), id, remote, sshAuth)
+	refresh := p.refreshProjectCache(r.Context(), id, remote, sshAuth)
 	if refresh.message != "" {
 		http.Error(w, refresh.message, refresh.status)
 		return
