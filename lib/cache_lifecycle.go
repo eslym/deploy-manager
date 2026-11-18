@@ -23,6 +23,7 @@ type manualRefreshResult struct {
 	warning   string
 	status    int
 	message   string
+	cause     error
 }
 
 // manualRefresh owns every cache phase for an explicit project refresh. Its
@@ -65,7 +66,9 @@ func (p *projectManager) manualRefresh(requestCtx context.Context, id, remote st
 		if errors.Is(err, errGitCacheLimit) {
 			status = http.StatusRequestEntityTooLarge
 		}
-		return fail(status, warning)
+		result = fail(status, warning)
+		result.cause = err
+		return result
 	}
 	refs, err := projectRefsFromRepository(stage, p.maxRefs)
 	if err != nil {
