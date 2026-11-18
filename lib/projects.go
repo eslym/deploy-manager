@@ -56,6 +56,8 @@ type projectManager struct {
 	refreshJournalLookup               func(string) (bool, error)
 	blocked                            string
 	branchFetchBeforeProjectLock       func()
+	refreshAfterFetch                  func()
+	refreshAfterIntent                 func()
 	cacheRecreationBeforeLifecycleLock func()
 }
 

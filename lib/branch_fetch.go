@@ -133,5 +133,8 @@ func (a *App) fetchProjectForBranchAttempt(ctx context.Context, id string) error
 		}
 		return errors.New(result.message)
 	}
+	if result.warning != "" {
+		return errors.New(result.warning)
+	}
 	return nil
 }

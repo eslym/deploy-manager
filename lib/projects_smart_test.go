@@ -275,6 +275,140 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("cancelled refresh left a staging directory: %v", err)
 	}
 
+	// Exercise the branch-fetch caller through the same real-filesystem cache
+	// lifecycle: cancellation after a successful fetch and failures at each
+	// durable boundary must not be mistaken for a successful branch refresh.
+	cancelledBranchCtx, cancelBranch := context.WithCancel(context.Background())
+	app.projects.refreshAfterFetch = cancelBranch
+	branchCancellation := app.fetchProjectForBranch(cancelledBranchCtx, created.ID)
+	app.projects.refreshAfterFetch = nil
+	cancelBranch()
+	if !errors.Is(branchCancellation, context.Canceled) {
+		t.Fatalf("branch refresh cancellation after fetch = %v, want context canceled", branchCancellation)
+	}
+	if got, err := digestProjectCache(app.projects.repoPath(created.ID)); err != nil || got != cacheBeforeCancelledRefresh {
+		t.Fatalf("cancelled branch refresh changed live cache: digest=%x err=%v", got, err)
+	}
+	if exists, err := app.projects.refreshIntentExists(created.ID); err != nil || exists {
+		t.Fatalf("cancelled branch refresh left a journal: exists=%v err=%v", exists, err)
+	}
+	if _, err := os.Lstat(app.projects.refreshStagePath(created.ID)); !os.IsNotExist(err) {
+		t.Fatalf("cancelled branch refresh left staging: %v", err)
+	}
+	intentCancelCtx, cancelIntent := context.WithCancel(context.Background())
+	app.projects.refreshAfterIntent = cancelIntent
+	intentCancellation := app.fetchProjectForBranch(intentCancelCtx, created.ID)
+	app.projects.refreshAfterIntent = nil
+	cancelIntent()
+	if !errors.Is(intentCancellation, context.Canceled) {
+		t.Fatalf("branch cancellation after journal creation = %v, want context canceled", intentCancellation)
+	}
+	if got, err := digestProjectCache(app.projects.repoPath(created.ID)); err != nil || got != cacheBeforeCancelledRefresh {
+		t.Fatalf("cancelled branch intent changed live cache: digest=%x err=%v", got, err)
+	}
+	if exists, err := app.projects.refreshIntentExists(created.ID); err != nil || exists {
+		t.Fatalf("cancelled branch intent was not rolled back: exists=%v err=%v", exists, err)
+	}
+
+	app.projects.cacheFS = &faultProjectCacheFS{
+		projectCacheFS:   osProjectCacheFS{},
+		failRenameTarget: app.projects.refreshBackupPath(created.ID),
+		failRenameCount:  1,
+	}
+	promotionFailure := app.fetchProjectForBranch(context.Background(), created.ID)
+	app.projects.cacheFS = osProjectCacheFS{}
+	if promotionFailure == nil {
+		t.Fatal("branch refresh unexpectedly succeeded when promotion failed")
+	}
+	if got, err := digestProjectCache(app.projects.repoPath(created.ID)); err != nil || got != cacheBeforeCancelledRefresh {
+		t.Fatalf("failed branch promotion changed live cache: digest=%x err=%v", got, err)
+	}
+	if exists, err := app.projects.refreshIntentExists(created.ID); err != nil || exists {
+		t.Fatalf("rolled-back branch promotion left journal: exists=%v err=%v", exists, err)
+	}
+
+	app.projects.cacheFS = &faultProjectCacheFS{
+		projectCacheFS:   osProjectCacheFS{},
+		failRenameTarget: app.projects.repoPath(created.ID),
+		failRenameCount:  3, // promotion, immediate restoration, then recovery
+	}
+	branchRollbackFailure := app.fetchProjectForBranch(context.Background(), created.ID)
+	if branchRollbackFailure == nil {
+		t.Fatal("branch refresh reported success after cache restoration failed")
+	}
+	if err := app.projects.ensureCacheReady(); err == nil {
+		t.Fatal("failed branch restoration did not block cache work")
+	}
+	if err := app.projects.reconcileCacheFiles(); err == nil {
+		t.Fatal("branch cache recovery succeeded while filesystem restoration was still failing")
+	}
+	app.projects.cacheFS = osProjectCacheFS{}
+	if err := app.projects.reconcileCacheFiles(); err != nil {
+		t.Fatalf("branch cache recovery did not succeed after fault removal: %v", err)
+	}
+	app.projects.setBlocked("")
+	if got, err := digestProjectCache(app.projects.repoPath(created.ID)); err != nil || got != cacheBeforeCancelledRefresh {
+		t.Fatalf("recovered branch failure did not restore old cache: digest=%x err=%v", got, err)
+	}
+
+	if _, err := app.db.Exec(`CREATE TRIGGER reject_branch_refresh_metadata BEFORE DELETE ON project_refs BEGIN SELECT RAISE(ABORT, 'injected branch metadata failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+	branchMetadataFailure := app.fetchProjectForBranch(context.Background(), created.ID)
+	if _, err := app.db.Exec(`DROP TRIGGER reject_branch_refresh_metadata`); err != nil {
+		t.Fatal(err)
+	}
+	if branchMetadataFailure == nil {
+		t.Fatal("branch metadata failure was not reported")
+	}
+	if got, err := digestProjectCache(app.projects.repoPath(created.ID)); err != nil || got != cacheBeforeCancelledRefresh {
+		t.Fatalf("metadata-failed branch refresh did not restore old cache: digest=%x err=%v", got, err)
+	}
+	if exists, err := app.projects.refreshIntentExists(created.ID); err != nil || exists {
+		t.Fatalf("metadata-failed branch refresh left a journal: exists=%v err=%v", exists, err)
+	}
+
+	branchReplaceMetadata := replaceProjectMetadata
+	app.projects.refreshMetadata = func(ctx context.Context, store *ent.Client, id string, refs []projectRef, fetchedAt time.Time) error {
+		if err := branchReplaceMetadata(ctx, store, id, refs, fetchedAt); err != nil {
+			return err
+		}
+		return errors.New("injected lost branch commit acknowledgement")
+	}
+	app.projects.refreshJournalLookup = func(string) (bool, error) {
+		return false, errors.New("injected branch journal lookup failure")
+	}
+	uncertainBranch := app.fetchProjectForBranch(context.Background(), created.ID)
+	app.projects.refreshMetadata = nil
+	app.projects.refreshJournalLookup = nil
+	if uncertainBranch == nil {
+		t.Fatal("uncertain branch metadata outcome was reported as success")
+	}
+	if err := app.projects.ensureCacheReady(); err == nil {
+		t.Fatal("uncertain branch metadata outcome did not block cache operations")
+	}
+	if _, err := os.Stat(app.projects.refreshBackupPath(created.ID)); err != nil {
+		t.Fatalf("uncertain branch outcome lost previous-cache evidence: %v", err)
+	}
+	if err := app.projects.reconcileCacheFiles(); err != nil {
+		t.Fatalf("branch outcome recovery failed: %v", err)
+	}
+	app.projects.setBlocked("")
+
+	app.projects.cacheFS = &faultProjectCacheFS{projectCacheFS: osProjectCacheFS{}, failRemovePrefix: ".git-backup-refresh-"}
+	branchCleanupFailure := app.fetchProjectForBranch(context.Background(), created.ID)
+	app.projects.cacheFS = osProjectCacheFS{}
+	if branchCleanupFailure == nil {
+		t.Fatal("branch refresh cleanup failure was not reported")
+	}
+	if err := app.projects.ensureCacheReady(); err == nil {
+		t.Fatal("branch refresh cleanup failure did not block cache operations")
+	}
+	if err := app.projects.reconcileCacheFiles(); err != nil {
+		t.Fatalf("branch cleanup recovery failed: %v", err)
+	}
+	app.projects.setBlocked("")
+
 	// A real metadata transaction failure after cache promotion must restore the
 	// old cache and refs rather than publishing the fetched refs alone.
 	cacheBeforeMetadataFailure := cacheBeforeCancelledRefresh

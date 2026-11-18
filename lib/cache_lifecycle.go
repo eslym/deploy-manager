@@ -85,7 +85,10 @@ func (p *projectManager) manualRefresh(requestCtx context.Context, id, remote st
 		return fail(http.StatusRequestEntityTooLarge, warning)
 	}
 	now := time.Now().UTC()
-	warning, err := p.promoteRefresh(requestCtx, id, stage, refs, now)
+	if p.refreshAfterFetch != nil {
+		p.refreshAfterFetch()
+	}
+	warning, err := p.promoteRefresh(ctx, id, stage, refs, now)
 	if err != nil {
 		status := http.StatusInternalServerError
 		var lifecycleErr *refreshLifecycleError
@@ -112,6 +115,9 @@ func (p *projectManager) promoteRefresh(ctx context.Context, id, stage string, r
 	backup := p.refreshBackupPath(id)
 	p.cacheMu.Lock()
 	defer p.cacheMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if _, err := p.cacheFS.Lstat(backup); err == nil {
 		message := "an unresolved previous project cache exists; restart to reconcile before refreshing"
 		p.setBlocked(message)
@@ -119,8 +125,22 @@ func (p *projectManager) promoteRefresh(ctx context.Context, id, stage string, r
 	} else if !os.IsNotExist(err) {
 		return "", &refreshLifecycleError{http.StatusInternalServerError, "could not inspect previous project cache"}
 	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	if err := p.markRefreshIntent(id); err != nil {
 		return "", &refreshLifecycleError{http.StatusInternalServerError, "could not record refresh recovery state"}
+	}
+	if p.refreshAfterIntent != nil {
+		p.refreshAfterIntent()
+	}
+	if err := ctx.Err(); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, false); rollbackErr != nil {
+			message := "cancelled refresh could not be safely rolled back; restart to reconcile before further project changes"
+			p.setBlocked(message)
+			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		return "", err
 	}
 	if err := p.cacheFS.Rename(p.repoPath(id), backup); err != nil {
 		if rollbackErr := p.rollbackRefresh(id, false); rollbackErr != nil {
@@ -129,6 +149,14 @@ func (p *projectManager) promoteRefresh(ctx context.Context, id, stage string, r
 			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
 		}
 		return "", &refreshLifecycleError{http.StatusInternalServerError, "refreshed repository could not be safely promoted; previous cache retained"}
+	}
+	if err := ctx.Err(); err != nil {
+		if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
+			message := "cancelled refresh could not restore the previous cache; restart to reconcile before further project changes"
+			p.setBlocked(message)
+			return "", &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		return "", err
 	}
 	if err := p.cacheFS.Rename(stage, p.repoPath(id)); err != nil {
 		if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
