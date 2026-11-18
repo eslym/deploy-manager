@@ -52,6 +52,8 @@ type projectManager struct {
 	lfsAuthMu                          sync.RWMutex
 	stateMu                            sync.RWMutex
 	cacheFS                            projectCacheFS
+	refreshMetadata                    func(context.Context, *ent.Client, string, []projectRef, time.Time) error
+	refreshJournalLookup               func(string) (bool, error)
 	blocked                            string
 	branchFetchBeforeProjectLock       func()
 	cacheRecreationBeforeLifecycleLock func()

@@ -135,9 +135,23 @@ func (p *projectManager) promoteRefresh(ctx context.Context, id, stage string, r
 		}
 		return "", &refreshLifecycleError{http.StatusInternalServerError, "refreshed repository could not be safely promoted; previous cache restored"}
 	}
-	if err := replaceProjectMetadata(ctx, p.store, id, refs, fetchedAt); err != nil {
-		pending, journalErr := p.refreshIntentExists(id)
-		if journalErr != nil || pending {
+	replaceMetadata := p.refreshMetadata
+	if replaceMetadata == nil {
+		replaceMetadata = replaceProjectMetadata
+	}
+	if err := replaceMetadata(ctx, p.store, id, refs, fetchedAt); err != nil {
+		lookup := p.refreshJournalLookup
+		if lookup == nil {
+			lookup = p.refreshIntentExists
+		}
+		pending, journalErr := lookup(id)
+		if journalErr != nil {
+			message := "refresh outcome is uncertain; project operations are blocked until restart recovery succeeds"
+			p.setBlocked(message)
+			p.setProjectWarning(ctx, id, message)
+			return message, &refreshLifecycleError{http.StatusServiceUnavailable, message}
+		}
+		if pending {
 			if rollbackErr := p.rollbackRefresh(id, true); rollbackErr != nil {
 				message := "refresh commit and cache restoration failed; project operations are blocked until restart recovery succeeds"
 				p.setBlocked(message)
