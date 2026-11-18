@@ -369,6 +369,10 @@ targets. The private HTTP endpoints exist to support the embedded dashboard.
 
 ## Development and tests
 
+The [internal HTTP API reference](docs/internal-api.md) documents the SPA/Go
+contracts, authentication flows, webhook ingestion, and implementation pointers
+for maintainers. These endpoints are not a supported public API.
+
 Frontend commands, from `web/`:
 
 ```sh
