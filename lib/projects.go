@@ -595,74 +595,12 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := p.checkPersistentCacheBudget(); err != nil {
-		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
+	refresh := p.manualRefresh(r.Context(), id, remote, sshAuth)
+	if refresh.message != "" {
+		http.Error(w, refresh.message, refresh.status)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), p.timeout)
-	defer cancel()
-	ctx = withGitHTTPPolicy(ctx, p)
-	stage := p.refreshStagePath(id)
-	if err := p.cacheFS.Mkdir(stage, 0700); err != nil {
-		http.Error(w, "could not prepare bounded repository staging", 500)
-		return
-	}
-	defer func() {
-		if cleanupErr := p.cleanupStage(stage); cleanupErr != nil {
-			buffered.replace(http.StatusServiceUnavailable, cleanupErr.Error())
-		}
-	}()
-	if err := copyGitCache(p.repoPath(id), stage, p.maxCacheBytes); err != nil {
-		warning := "could not stage the existing repository within the configured cache limit"
-		p.setProjectWarning(r.Context(), id, warning)
-		http.Error(w, warning, http.StatusRequestEntityTooLarge)
-		return
-	}
-	repo, err := git.Open(boundedStorage(stage, p.maxCacheBytes), nil)
-	if err == nil {
-		err = repo.FetchContext(ctx, &git.FetchOptions{RemoteName: "origin", Tags: git.AllTags, Force: true, Prune: true, Auth: sshAuth})
-	}
-	if err == git.NoErrAlreadyUpToDate {
-		err = nil
-	}
-	if err != nil {
-		warning := sanitizeGitError(err, remote)
-		p.setProjectWarning(r.Context(), id, warning)
-		status := http.StatusBadGateway
-		if errors.Is(err, errGitCacheLimit) {
-			status = http.StatusRequestEntityTooLarge
-		}
-		http.Error(w, warning, status)
-		return
-	}
-	refs, err := projectRefsFromRepository(stage, p.maxRefs)
-	if err != nil {
-		warning := sanitizeGitError(err, remote)
-		p.setProjectWarning(r.Context(), id, warning)
-		http.Error(w, warning, 502)
-		return
-	}
-	used, sizeErr := directorySize(p.root, 2*p.maxCacheBytes)
-	stageSize, stageErr := directorySize(stage, p.maxCacheBytes)
-	liveSize, liveErr := directorySize(p.repoPath(id), p.maxCacheBytes)
-	if sizeErr != nil || stageErr != nil || liveErr != nil || stageSize > p.maxCacheBytes || used < liveSize || used-liveSize > p.maxCacheBytes {
-		warning := "refreshed repository exceeds the configured persistent cache limit; previous cache retained"
-		p.setProjectWarning(r.Context(), id, warning)
-		http.Error(w, warning, http.StatusRequestEntityTooLarge)
-		return
-	}
-	now := time.Now().UTC()
-	cleanupWarning, refreshErr := p.promoteRefresh(r.Context(), id, stage, refs, now)
-	if refreshErr != nil {
-		status := http.StatusInternalServerError
-		var lifecycleErr *refreshLifecycleError
-		if errors.As(refreshErr, &lifecycleErr) {
-			status = lifecycleErr.status
-		}
-		http.Error(w, refreshErr.Error(), status)
-		return
-	}
-	writeJSON(w, map[string]any{"lastFetched": now, "warning": cleanupWarning})
+	writeJSON(w, map[string]any{"lastFetched": refresh.fetchedAt, "warning": refresh.warning})
 }
 
 func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
