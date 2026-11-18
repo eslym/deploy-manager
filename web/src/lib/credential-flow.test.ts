@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { client } from '@serenity-kit/opaque';
 import { clearSetupGrant, rememberSetupGrant, setupGrant } from './setup-grant.svelte.js';
-import { createRegistrationFlow } from './registration-flow.svelte.js';
+import { createCredentialFlow } from './credential-flow.svelte.js';
 
 vi.mock('@serenity-kit/opaque', () => ({
 	ready: Promise.resolve(),
@@ -21,13 +21,13 @@ afterEach(() => {
 
 describe('registration flow', () => {
 	it('intakes the fragment through the flow-owned interface', () => {
-		createRegistrationFlow().intakeGrant('grant-value');
+		createCredentialFlow('registration').intakeGrant('grant-value');
 		expect(setupGrant.value).toBe('grant-value');
 		expect(setupGrant.ready).toBe(false);
 	});
 
 	it('reports a missing grant without submitting or retaining a password', async () => {
-		const flow = createRegistrationFlow();
+		const flow = createCredentialFlow('registration');
 		const field = { value: 'long-enough-password' } as HTMLInputElement;
 		await flow.submit(field);
 		expect(field.value).toBe('');
@@ -36,7 +36,7 @@ describe('registration flow', () => {
 
 	it('rejects a short password and clears it', async () => {
 		rememberSetupGrant('grant');
-		const flow = createRegistrationFlow();
+		const flow = createCredentialFlow('registration');
 		const field = { value: 'short' } as HTMLInputElement;
 		await flow.submit(field);
 		expect(field.value).toBe('');
@@ -49,7 +49,7 @@ describe('registration flow', () => {
 			'fetch',
 			vi.fn(async () => new Response('', { status: 410 }))
 		);
-		const flow = createRegistrationFlow();
+		const flow = createCredentialFlow('registration');
 		const field = { value: 'a-long-password-value' } as HTMLInputElement;
 		await flow.submit(field);
 		expect(flow.state.pending).toBe(false);
@@ -63,7 +63,7 @@ describe('registration flow', () => {
 			'fetch',
 			vi.fn(async () => new Response('null', { status: 200 }))
 		);
-		const flow = createRegistrationFlow();
+		const flow = createCredentialFlow('registration');
 		const field = { value: 'a-long-password-value' } as HTMLInputElement;
 		await flow.submit(field);
 		expect(flow.state.pending).toBe(false);
@@ -77,7 +77,7 @@ describe('registration flow', () => {
 		vi.mocked(client.startRegistration).mockImplementationOnce(() => {
 			throw new Error('initialization failed');
 		});
-		const flow = createRegistrationFlow();
+		const flow = createCredentialFlow('registration');
 		const field = { value: 'a-long-password-value' } as HTMLInputElement;
 		await flow.submit(field);
 		expect(flow.state.pending).toBe(false);
@@ -105,7 +105,7 @@ describe('registration flow', () => {
 					: new Response(null, { status: 204 });
 			})
 		);
-		const flow = createRegistrationFlow();
+		const flow = createCredentialFlow('registration');
 		const field = { value: 'a-long-password-value' } as HTMLInputElement;
 		const fetchMock = vi.mocked(fetch);
 		await flow.submit(field);

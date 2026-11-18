@@ -6,9 +6,9 @@ import {
 } from './setup-grant.svelte.js';
 import { rememberSetupGrant } from './setup-grant.svelte.js';
 
-export class RegistrationError extends Error {}
+export class CredentialFlowError extends Error {}
 
-export function createRegistrationFlow() {
+export function createCredentialFlow(purpose: 'registration' | 'recovery') {
 	const state = $state({ pending: false, complete: false, statusMessage: '' });
 
 	return {
@@ -24,7 +24,12 @@ export function createRegistrationFlow() {
 			navigate: (url: URL) => Promise<unknown>,
 			currentURL: () => string
 		) {
-			if (!target || target.pathname !== '/register' || !target.hash) return;
+			if (
+				!target ||
+				target.pathname !== (purpose === 'registration' ? '/register' : '/recover') ||
+				!target.hash
+			)
+				return;
 			if (!getSetupGrant() || !beginSetupGrantSanitizing()) return;
 
 			const cleanURL = new URL(target);
@@ -41,8 +46,7 @@ export function createRegistrationFlow() {
 			const grant = getSetupGrant();
 			if (!grant) {
 				passwordField.value = '';
-				state.statusMessage =
-					'This setup link is incomplete. Ask an administrator to issue a new one.';
+				state.statusMessage = `This ${purpose === 'registration' ? 'setup' : 'recovery'} link is incomplete. Ask an administrator to issue a new one.`;
 				return;
 			}
 			let password = passwordField.value;
@@ -53,16 +57,22 @@ export function createRegistrationFlow() {
 				return;
 			}
 			state.pending = true;
-			state.statusMessage = 'Creating your account securely…';
+			state.statusMessage =
+				purpose === 'registration'
+					? 'Creating your account securely…'
+					: 'Replacing the administrator password securely…';
 			try {
-				await registerCredential(password, grant);
+				await registerCredential(password, grant, purpose);
 				state.complete = true;
-				state.statusMessage = 'Administrator account created. You can close this page.';
+				state.statusMessage =
+					purpose === 'registration'
+						? 'Administrator account created. You can close this page.'
+						: 'Administrator password replaced. You can close this page.';
 			} catch (cause) {
 				state.statusMessage =
-					cause instanceof RegistrationError
+					cause instanceof CredentialFlowError
 						? cause.message
-						: 'Secure registration could not be initialized or completed. Check that JavaScript and WebAssembly are enabled, then reload and try again.';
+						: `Secure ${purpose === 'registration' ? 'registration' : 'recovery'} could not be initialized or completed. Check that JavaScript and WebAssembly are enabled, then reload and try again.`;
 			} finally {
 				password = '';
 				passwordField.value = '';
@@ -72,12 +82,16 @@ export function createRegistrationFlow() {
 	};
 }
 
-export async function registerCredential(password: string, grant: string) {
+export async function registerCredential(
+	password: string,
+	grant: string,
+	purpose: 'registration' | 'recovery'
+) {
 	try {
 		const opaque = await import('@serenity-kit/opaque');
 		await opaque.ready;
 		if (typeof opaque.client?.startRegistration !== 'function') {
-			throw new RegistrationError(
+			throw new CredentialFlowError(
 				'Secure registration could not start. Check that JavaScript and WebAssembly are enabled, then reload this page.'
 			);
 		}
@@ -88,7 +102,8 @@ export async function registerCredential(password: string, grant: string) {
 			'/opaque/register/start',
 			start.registrationRequest,
 			'grant',
-			grant
+			grant,
+			purpose
 		);
 		if (
 			!response ||
@@ -96,8 +111,8 @@ export async function registerCredential(password: string, grant: string) {
 			typeof response.transaction !== 'string' ||
 			response.transaction.length === 0
 		) {
-			throw new RegistrationError(
-				'Registration could not be completed. Ask an administrator for a new setup link.'
+			throw new CredentialFlowError(
+				`${purpose === 'registration' ? 'Registration' : 'Recovery'} could not be completed. Ask an administrator for a new ${purpose === 'registration' ? 'setup' : 'recovery'} link.`
 			);
 		}
 		const finish = opaque.client.finishRegistration({
@@ -110,7 +125,8 @@ export async function registerCredential(password: string, grant: string) {
 			'/opaque/register/finish',
 			finish.registrationRecord,
 			'transaction',
-			response.transaction
+			response.transaction,
+			purpose
 		);
 		clearSetupGrant();
 	} finally {
@@ -122,7 +138,8 @@ async function send(
 	path: string,
 	value: string,
 	credentialName: 'grant' | 'transaction',
-	credential: string
+	credential: string,
+	purpose: 'registration' | 'recovery'
 ): Promise<{ value: string; transaction?: string } | null> {
 	const response = await fetch(path, {
 		method: 'POST',
@@ -132,12 +149,12 @@ async function send(
 	});
 	if (!response.ok) {
 		if (response.status === 410) {
-			throw new RegistrationError(
-				'This setup link has expired or was already used. Ask an administrator for a new one.'
+			throw new CredentialFlowError(
+				`This ${purpose === 'registration' ? 'setup' : 'recovery'} link has expired or was already used. Ask an administrator for a new one.`
 			);
 		}
-		throw new RegistrationError(
-			'Registration could not be completed. Check your connection and try again.'
+		throw new CredentialFlowError(
+			`${purpose === 'registration' ? 'Registration' : 'Recovery'} could not be completed. Check your connection and try again.`
 		);
 	}
 	return response.status === 204 ? null : response.json();

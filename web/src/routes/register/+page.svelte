@@ -1,11 +1,11 @@
 <script lang="ts">
 	import { afterNavigate, goto } from '$app/navigation';
 	import { setupGrant } from '../../lib/setup-grant.svelte.js';
-	import { createRegistrationFlow } from '../../lib/registration-flow.svelte.js';
+	import { createCredentialFlow } from '../../lib/credential-flow.svelte.js';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
-	const flow = createRegistrationFlow();
+	const flow = createCredentialFlow('registration');
 	afterNavigate((navigation) => {
 		flow.sanitizeURL(
 			navigation.to?.url,

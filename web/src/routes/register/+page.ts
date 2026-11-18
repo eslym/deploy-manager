@@ -1,9 +1,9 @@
 import { browser } from '$app/env';
-import { createRegistrationFlow } from '../../lib/registration-flow.svelte.js';
+import { createCredentialFlow } from '../../lib/credential-flow.svelte.js';
 import type { PageLoad } from './$types';
 
 export const load: PageLoad = () => {
-	const flow = createRegistrationFlow();
+	const flow = createCredentialFlow('registration');
 	if (browser) {
 		const grant = window.location.hash.slice(1);
 		flow.intakeGrant(grant);
