@@ -92,7 +92,7 @@ export async function registerCredential(
 		await opaque.ready;
 		if (typeof opaque.client?.startRegistration !== 'function') {
 			throw new CredentialFlowError(
-				'Secure registration could not start. Check that JavaScript and WebAssembly are enabled, then reload this page.'
+				`Secure ${purpose} could not start. Check that JavaScript and WebAssembly are enabled, then reload this page.`
 			);
 		}
 
