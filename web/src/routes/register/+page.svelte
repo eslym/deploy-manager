@@ -1,28 +1,20 @@
 <script lang="ts">
 	import { afterNavigate, goto } from '$app/navigation';
+	import { clearSetupGrant, getSetupGrant, setupGrant } from '../../lib/setup-grant.svelte.js';
 	import {
-		beginSetupGrantSanitizing,
-		clearSetupGrant,
-		getSetupGrant,
-		markSetupGrantReady,
-		setupGrant
-	} from '../../lib/setup-grant.svelte.js';
+		registerCredential,
+		RegistrationError,
+		sanitizeSetupGrantURL
+	} from '../../lib/registration-flow.js';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
 	afterNavigate((navigation) => {
-		const target = navigation.to?.url;
-		if (!target || target.pathname !== '/register' || !target.hash) return;
-		if (!getSetupGrant() || !beginSetupGrantSanitizing()) return;
-
-		const cleanURL = new URL(target);
-		cleanURL.hash = '';
-		void goto(cleanURL, { replace: true, shallow: true })
-			.then(() => {
-				if (window.location.href === cleanURL.href) markSetupGrantReady();
-				else clearSetupGrant();
-			})
-			.catch(clearSetupGrant);
+		sanitizeSetupGrantURL(
+			navigation.to?.url,
+			(url) => goto(url, { replace: true, shallow: true }),
+			() => window.location.href
+		);
 	});
 	let grantAvailable = $derived(data.hasGrant && setupGrant.ready);
 	let status = $state('');
@@ -36,8 +28,6 @@
 	);
 	let busy = $state(false);
 	let complete = $state(false);
-
-	class RegistrationError extends Error {}
 
 	async function submit(event: SubmitEvent) {
 		event.preventDefault();
@@ -57,36 +47,7 @@
 		busy = true;
 		status = 'Creating your account securely…';
 		try {
-			// Keep the OPAQUE module out of the shared SPA bundle and load it only for enrollment.
-			const opaque = await import('@serenity-kit/opaque');
-			await opaque.ready;
-			if (typeof opaque.client?.startRegistration !== 'function') {
-				throw new RegistrationError(
-					'Secure registration could not start. Check that JavaScript and WebAssembly are enabled, then reload this page.'
-				);
-			}
-
-			const profile = { 'argon2id-custom': { iterations: 1, memory: 65536, parallelism: 4 } };
-			const start = opaque.client.startRegistration({ password });
-			const response = await send('/opaque/register/start', start.registrationRequest, grant);
-			if (
-				!response ||
-				typeof response.value !== 'string' ||
-				typeof response.transaction !== 'string' ||
-				response.transaction.length === 0
-			)
-				throw new RegistrationError(
-					'Registration could not be completed. Ask an administrator for a new setup link.'
-				);
-			const finish = opaque.client.finishRegistration({
-				password,
-				registrationResponse: response.value,
-				clientRegistrationState: start.clientRegistrationState,
-				keyStretching: profile
-			});
-			password = '';
-			await send('/opaque/register/finish', finish.registrationRecord, response.transaction);
-			clearSetupGrant();
+			await registerCredential(password, grant);
 			complete = true;
 			status = 'Administrator account created. You can close this page.';
 		} catch (error) {
@@ -99,34 +60,6 @@
 			passwordField.value = '';
 			busy = false;
 		}
-	}
-
-	async function send(
-		path: string,
-		value: string,
-		credential: string
-	): Promise<{ value: string; transaction?: string } | null> {
-		const response = await fetch(path, {
-			method: 'POST',
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(
-				path === '/opaque/register/start'
-					? { grant: credential, value }
-					: { transaction: credential, value }
-			)
-		});
-		if (!response.ok) {
-			if (response.status === 410) {
-				throw new RegistrationError(
-					'This setup link has expired or was already used. Ask an administrator for a new one.'
-				);
-			}
-			throw new RegistrationError(
-				'Registration could not be completed. Check your connection and try again.'
-			);
-		}
-		return response.status === 204 ? null : response.json();
 	}
 </script>
 

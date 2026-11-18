@@ -199,6 +199,25 @@ try {
   if (noGrantPosts !== 0) throw new Error("missing grant fell back to an unprotected registration request");
   await noGrantPage.close();
 
+  // A malformed successful response must fail closed through the registration
+  // credential flow: do not submit a finish message and clear the password.
+  const malformedPage = await context.newPage();
+  let malformedFinishRequests = 0;
+  await malformedPage.route("**/opaque/register/start", route =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ value: "malformed" }) }),
+  );
+  malformedPage.on("request", request => {
+    if (new URL(request.url()).pathname === "/opaque/register/finish") malformedFinishRequests++;
+  });
+  await navigate(malformedPage, failedInitLink, { waitUntil: "domcontentloaded" });
+  await malformedPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
+  await malformedPage.getByLabel("Password").fill(testPassword);
+  await malformedPage.getByRole("button", { name: "Create account" }).click();
+  await malformedPage.getByText(/new setup link/).waitFor({ timeout: 30000 });
+  if (await malformedPage.getByLabel("Password").inputValue()) throw new Error("malformed registration response left password in the form");
+  if (malformedFinishRequests !== 0) throw new Error("malformed registration response proceeded to finish");
+  await malformedPage.close();
+
   const page = await context.newPage();
   const postedBodies = [];
   const registrationRequests = [];
