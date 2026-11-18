@@ -12,6 +12,23 @@ export function createRegistrationFlow() {
 
 	return {
 		state,
+		sanitizeURL(
+			target: URL | undefined,
+			navigate: (url: URL) => Promise<unknown>,
+			currentURL: () => string
+		) {
+			if (!target || target.pathname !== '/register' || !target.hash) return;
+			if (!getSetupGrant() || !beginSetupGrantSanitizing()) return;
+
+			const cleanURL = new URL(target);
+			cleanURL.hash = '';
+			void navigate(cleanURL)
+				.then(() => {
+					if (currentURL() === cleanURL.href) markSetupGrantReady();
+					else clearSetupGrant();
+				})
+				.catch(clearSetupGrant);
+		},
 		async submit(passwordField: HTMLInputElement) {
 			if (state.pending || state.complete) return;
 			const grant = getSetupGrant();
@@ -44,24 +61,6 @@ export function createRegistrationFlow() {
 			}
 		}
 	};
-}
-
-export function sanitizeSetupGrantURL(
-	target: URL | undefined,
-	navigate: (url: URL) => Promise<unknown>,
-	currentURL: () => string
-) {
-	if (!target || target.pathname !== '/register' || !target.hash) return;
-	if (!getSetupGrant() || !beginSetupGrantSanitizing()) return;
-
-	const cleanURL = new URL(target);
-	cleanURL.hash = '';
-	void navigate(cleanURL)
-		.then(() => {
-			if (currentURL() === cleanURL.href) markSetupGrantReady();
-			else clearSetupGrant();
-		})
-		.catch(clearSetupGrant);
 }
 
 export async function registerCredential(password: string, grant: string) {

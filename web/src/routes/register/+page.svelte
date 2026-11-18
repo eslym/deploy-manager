@@ -1,21 +1,18 @@
 <script lang="ts">
 	import { afterNavigate, goto } from '$app/navigation';
 	import { setupGrant } from '../../lib/setup-grant.svelte.js';
-	import {
-		createRegistrationFlow,
-		sanitizeSetupGrantURL
-	} from '../../lib/registration-flow.svelte.js';
+	import { createRegistrationFlow } from '../../lib/registration-flow.svelte.js';
 	import type { PageProps } from './$types';
 
 	let { data }: PageProps = $props();
+	const flow = createRegistrationFlow();
 	afterNavigate((navigation) => {
-		sanitizeSetupGrantURL(
+		flow.sanitizeURL(
 			navigation.to?.url,
 			(url) => goto(url, { replace: true, shallow: true }),
 			() => window.location.href
 		);
 	});
-	const flow = createRegistrationFlow();
 	let grantAvailable = $derived(data.hasGrant && setupGrant.ready);
 	let statusMessage = $derived(
 		flow.state.error ||

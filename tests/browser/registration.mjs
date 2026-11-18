@@ -257,6 +257,7 @@ try {
   const page = await context.newPage();
   const postedBodies = [];
   const registrationRequests = [];
+  const grantFragmentAtProtectedStart = [];
   const pageErrors = [];
   const failedScripts = [];
   const failedRequests = [];
@@ -288,6 +289,9 @@ try {
   });
   page.on("request", request => {
     if (request.method() === "POST") {
+      if (new URL(request.url()).pathname === "/opaque/register/start") {
+        grantFragmentAtProtectedStart.push(Boolean(new URL(page.url()).hash));
+      }
       const body = request.postData() || "";
       postedBodies.push(body);
       registrationRequests.push({ path: new URL(request.url()).pathname, body: JSON.parse(body) });
@@ -339,6 +343,7 @@ try {
   if (observedURLs.some(url => url.includes(grant))) throw new Error("registration grant leaked into a browser request URL");
   const registrationStarts = registrationRequests.filter(request => request.path === "/opaque/register/start");
   const registrationFinishes = registrationRequests.filter(request => request.path === "/opaque/register/finish");
+  if (grantFragmentAtProtectedStart.some(Boolean)) throw new Error("registration submitted its protected grant before flow-owned fragment cleanup");
   if (!registrationStarts.length || registrationStarts.some(request => request.body.grant !== grant || request.body.transaction)) throw new Error("setup grant was not confined to registration-start requests");
   if (!registrationFinishes.length || registrationFinishes.some(request => request.body.grant || typeof request.body.transaction !== "string" || !request.body.transaction)) throw new Error("registration finish was not bound to its one-use transaction handle");
   if (await context.cookies().then(cookies => cookies.length)) throw new Error("registration unexpectedly issued a session cookie");
