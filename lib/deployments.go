@@ -569,6 +569,7 @@ func (a *App) enqueueDeployment(deploymentID, commit string, generation int64) (
 		return "", err
 	}
 	slot.enqueue(jobID)
+	a.invalidateJob(deploymentID)
 	return jobID, nil
 }
 
@@ -686,7 +687,10 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 	var forceRedeploy bool
 	job, err := a.store.DeploymentJob.Query().Where(jobmodel.ID(jobID), jobmodel.Status("queued")).WithDeployment().Only(ctx)
 	if err != nil || job.Edges.Deployment == nil || job.Generation != job.Edges.Deployment.Generation {
-		_, _ = a.store.DeploymentJob.UpdateOneID(jobID).Where(jobmodel.Status("queued")).SetStatus("superseded").SetLog("deployment was removed or its target changed").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
+		updated, updateErr := a.store.DeploymentJob.UpdateOneID(jobID).Where(jobmodel.Status("queued")).SetStatus("superseded").SetLog("deployment was removed or its target changed").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
+		if updateErr == nil {
+			a.invalidateJob(updated.DeploymentID)
+		}
 		return
 	}
 	model := job.Edges.Deployment
@@ -706,6 +710,7 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 	if _, claimErr := a.store.DeploymentJob.UpdateOneID(jobID).Where(jobmodel.Status("queued")).SetStatus("running").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx); claimErr != nil {
 		return
 	}
+	a.invalidateJob(d.ID)
 	// Another job in this generation may have published while this worker was
 	// waiting for the deployment lock (notably a preceding rollback).
 	currentAtLock, checkErr := a.store.Deployment.Get(ctx, d.ID)
@@ -790,6 +795,7 @@ func (a *App) runLockedDeploymentJob(jobID string) {
 	if _, err = a.store.Deployment.Update().Where(deploymentmodel.IDEQ(d.ID), deploymentmodel.GenerationEQ(generation)).SetStatus("publishing").SetError("").Save(ctx); err != nil {
 		return
 	}
+	a.invalidateJob(d.ID)
 	select {
 	case <-ctx.Done():
 		a.failJob(jobID, d.ID, generation, "publication timed out")
@@ -901,7 +907,9 @@ func (a *App) failJob(jobID, id string, generation int64, message string) {
 	}
 	if err = tx.Commit(); err != nil {
 		log.Printf("cannot commit failed deployment record %s: %v", id, err)
+		return
 	}
+	a.invalidateJob(id)
 }
 
 func (a *App) finishJob(jobID, id string, generation int64, status, message, commit string) {
@@ -932,7 +940,9 @@ func (a *App) finishJob(jobID, id string, generation int64, status, message, com
 	}
 	if err := tx.Commit(); err != nil {
 		log.Printf("cannot commit completion of deployment job %s: %v", jobID, err)
+		return
 	}
+	a.invalidateJob(id)
 }
 
 func (a *App) publish(ctx context.Context, jobID string, d deployment, generation int64) error {
@@ -1149,6 +1159,7 @@ func (a *App) publish(ctx context.Context, jobID string, d deployment, generatio
 	if err = boundaryTx.Commit(); err != nil {
 		return err
 	}
+	a.invalidateJob(d.ID)
 	if err = fault("after-state"); err != nil {
 		return err
 	}
@@ -1181,7 +1192,10 @@ func (a *App) supersedeJob(jobID, message string) error {
 	if err != nil {
 		return err
 	}
-	_, err = a.store.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).SetStatus("superseded").SetLog(appendJobLog(job.Log, message)).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
+	updated, err := a.store.DeploymentJob.Update().Where(jobmodel.IDEQ(jobID), jobmodel.StatusEQ("running")).SetStatus("superseded").SetLog(appendJobLog(job.Log, message)).SetUpdatedAt(a.cfg.Now().UnixNano()).Save(ctx)
+	if err == nil && updated > 0 {
+		a.invalidateJob(job.DeploymentID)
+	}
 	return err
 }
 
@@ -1638,6 +1652,7 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slot.enqueue(job)
+	a.invalidateJob(id)
 	writeOutcome(w, http.StatusCreated, "deployment.created", "Deployment created. Publication queued.", map[string]any{"id": id, "jobId": job, "status": "queued", "publicationPath": path})
 }
 
@@ -1734,6 +1749,7 @@ func (a *App) hardRedeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slot.enqueue(jobID)
+	a.invalidateJob(id)
 	writeOutcome(w, http.StatusAccepted, "deployment.hard_redeploy_queued", "Hard re-deploy queued.", map[string]string{"jobId": jobID, "status": "queued"})
 }
 
@@ -1850,5 +1866,6 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slot.enqueue(jobID)
+	a.invalidateJob(id)
 	writeOutcome(w, http.StatusAccepted, "deployment.target_changed", "Target changed. Publication queued.", map[string]string{"jobId": jobID, "status": "queued"})
 }

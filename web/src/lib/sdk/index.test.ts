@@ -8,6 +8,31 @@ function response(body: unknown, status = 200): Response {
 	});
 }
 
+class FakeEventSocket {
+	listeners = new Map<string, ((event: Event) => void)[]>();
+	closed = false;
+
+	addEventListener(type: string, listener: (event: Event) => void) {
+		this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+	}
+
+	close() {
+		this.closed = true;
+	}
+
+	emit(type: string, data?: string) {
+		for (const listener of this.listeners.get(type) ?? []) {
+			listener(new MessageEvent(type, { data }));
+		}
+	}
+
+	closeWith(code: number) {
+		for (const listener of this.listeners.get('close') ?? []) {
+			listener(new CloseEvent('close', { code }));
+		}
+	}
+}
+
 describe('browser SDK authentication transport', () => {
 	it('uses named lifecycle operations and does not retry destructive mutations', async () => {
 		const send = vi
@@ -255,6 +280,191 @@ describe('browser SDK authentication transport', () => {
 		const outcome = await api.auth.recoveryFinish({ transaction: 'handle', value: 'record' });
 		expect(outcome.code).toBe('auth.future_result');
 		expect(onSessionEnded).not.toHaveBeenCalled();
+	});
+});
+
+describe('browser SDK live event ownership', () => {
+	it('shares one connection, refreshes on ready and invalidation, and closes after the last disposal', () => {
+		const socket = new FakeEventSocket();
+		const webSocket = vi.fn(() => socket);
+		const api = createBrowserSDK({ webSocket });
+		const first = vi.fn();
+		const second = vi.fn();
+		const disposeFirst = api.events.subscribe(first);
+		const disposeSecond = api.events.subscribe(second);
+
+		expect(webSocket).toHaveBeenCalledTimes(1);
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				message: 'Live updates connected.',
+				data: { epoch: 'epoch', sequence: 3 }
+			})
+		);
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				message: 'Dashboard data changed.',
+				data: { epoch: 'epoch', sequence: 4, resources: [{ kind: 'jobs', deploymentId: 'd1' }] }
+			})
+		);
+		expect(first).toHaveBeenCalledTimes(2);
+		expect(second).toHaveBeenCalledTimes(2);
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				message: 'Dashboard data changed.',
+				data: { epoch: 'epoch', sequence: 4, resources: [{ kind: 'jobs', deploymentId: 'd1' }] }
+			})
+		);
+		expect(first).toHaveBeenCalledTimes(2);
+
+		disposeFirst();
+		expect(socket.closed).toBe(false);
+		disposeSecond();
+		expect(socket.closed).toBe(true);
+	});
+
+	it('resynchronizes unknown event codes and closes a malformed stream', () => {
+		const socket = new FakeEventSocket();
+		const api = createBrowserSDK({ webSocket: () => socket });
+		const refresh = vi.fn();
+		api.events.subscribe(refresh);
+
+		socket.emit('message', JSON.stringify({ code: 'events.future', data: null }));
+		expect(refresh).toHaveBeenCalledOnce();
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'epoch', sequence: 'invalid', resources: [] }
+			})
+		);
+		expect(socket.closed).toBe(true);
+	});
+
+	it('reconnects after an established socket closes and disposes the pending timer', () => {
+		const first = new FakeEventSocket();
+		const second = new FakeEventSocket();
+		const sockets = [first, second];
+		const timers = new Map<number, { callback: () => void; delay: number }>();
+		let nextTimer = 0;
+		const api = createBrowserSDK({
+			webSocket: vi.fn(() => sockets.shift()!),
+			random: () => 0.5,
+			setTimeout: (callback, delay) => {
+				const id = ++nextTimer;
+				timers.set(id, { callback, delay });
+				return id as unknown as ReturnType<typeof setTimeout>;
+			},
+			clearTimeout: (timer) => timers.delete(timer as unknown as number)
+		});
+		const dispose = api.events.subscribe(vi.fn());
+		first.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				message: 'Live updates connected.',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		first.emit('close');
+		const reconnect = [...timers.entries()].find(([, timer]) => timer.delay === 1000);
+		expect(reconnect).toBeDefined();
+		reconnect![1].callback();
+		timers.delete(reconnect![0]);
+		expect(second.closed).toBe(false);
+		dispose();
+		expect(second.closed).toBe(true);
+	});
+
+	it('applies jitter to exponential reconnect delays and resets only after a healthy interval', () => {
+		const first = new FakeEventSocket();
+		const second = new FakeEventSocket();
+		const third = new FakeEventSocket();
+		const sockets = [first, second, third];
+		const timers = new Map<number, { callback: () => void; delay: number }>();
+		let nextTimer = 0;
+		const api = createBrowserSDK({
+			webSocket: () => sockets.shift()!,
+			random: () => 0,
+			setTimeout: (callback, delay) => {
+				const id = ++nextTimer;
+				timers.set(id, { callback, delay });
+				return id as unknown as ReturnType<typeof setTimeout>;
+			},
+			clearTimeout: (timer) => timers.delete(timer as unknown as number)
+		});
+		const dispose = api.events.subscribe(vi.fn());
+		first.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		first.closeWith(1006);
+		const firstReconnect = [...timers.entries()].find(([, timer]) => timer.delay === 1000);
+		expect(firstReconnect).toBeDefined();
+		firstReconnect![1].callback();
+		timers.delete(firstReconnect![0]);
+		second.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		second.closeWith(1006);
+		const secondReconnect = [...timers.entries()].find(([, timer]) => timer.delay === 1600);
+		expect(secondReconnect).toBeDefined();
+		secondReconnect![1].callback();
+		timers.delete(secondReconnect![0]);
+		third.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		const healthy = [...timers.entries()].find(([, timer]) => timer.delay === 30_000);
+		expect(healthy).toBeDefined();
+		healthy![1].callback();
+		timers.delete(healthy![0]);
+		third.closeWith(1006);
+		expect([...timers.values()].some((timer) => timer.delay === 1000)).toBe(true);
+		dispose();
+	});
+
+	it('probes the session after a failed handshake and stops on verified session loss', async () => {
+		const socket = new FakeEventSocket();
+		const onSessionLost = vi.fn();
+		let reportSessionLost!: () => void;
+		const sessionLost = new Promise<void>((resolve) => {
+			reportSessionLost = resolve;
+		});
+		onSessionLost.mockImplementation(reportSessionLost);
+		const fetch = vi
+			.fn()
+			.mockResolvedValue(
+				response(
+					{ code: 'auth.session_required', message: 'Sign in to continue.', data: null },
+					401
+				)
+			);
+		const api = createBrowserSDK({ webSocket: () => socket, fetch, onSessionLost });
+		api.events.subscribe(vi.fn());
+
+		socket.closeWith(1006);
+		await sessionLost;
+		expect(onSessionLost).toHaveBeenCalledOnce();
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/session',
+			expect.objectContaining({ method: 'GET', credentials: 'same-origin' })
+		);
 	});
 });
 

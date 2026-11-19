@@ -57,7 +57,9 @@ func (a *App) finishAutomaticFetch(jobID, id string, generation int64, paused bo
 	}
 	if err = tx.Commit(); err != nil {
 		log.Printf("cannot commit completion of automatic deployment job %s: %v", jobID, err)
+		return
 	}
+	a.invalidateJob(id)
 }
 
 func (a *App) pauseDeployment(w http.ResponseWriter, r *http.Request) {
@@ -134,6 +136,11 @@ func (a *App) controlDeploymentAutomation(w http.ResponseWriter, r *http.Request
 	if err = tx.Commit(); err != nil {
 		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
+	}
+	if pause {
+		a.invalidateDeployment(id)
+	} else {
+		a.invalidateJob(id)
 	}
 	if pause {
 		writeOutcome(w, http.StatusOK, "deployment.paused", "Automatic deployment paused.", map[string]any{"automationPaused": true})

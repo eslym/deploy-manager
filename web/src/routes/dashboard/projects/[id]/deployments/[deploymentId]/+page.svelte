@@ -389,7 +389,7 @@
 		}
 	}
 
-	let timeout: number | undefined;
+	let unsubscribeEvents: (() => void) | undefined;
 	afterNavigate(() => {
 		const id = projectId;
 		const deployment = deploymentId;
@@ -398,7 +398,8 @@
 		projectReadController?.abort();
 		refreshController?.abort();
 		refreshController = undefined;
-		if (timeout !== undefined) window.clearTimeout(timeout);
+		unsubscribeEvents?.();
+		unsubscribeEvents = undefined;
 		project = null;
 		item = null;
 		refs = [];
@@ -419,19 +420,17 @@
 		moveConfirmation = null;
 		publicationRoot = '';
 		moveRootError = '';
-		const poll = async () => {
-			if (version !== viewVersion) return;
-			await load(id, deployment, version);
-			if (version === viewVersion && !missing) timeout = window.setTimeout(poll, 2000);
-		};
-		void poll();
+		void load(id, deployment, version);
+		unsubscribeEvents = sdk.events.subscribe(() => {
+			if (version === viewVersion) void load(id, deployment, version);
+		});
 	});
 	onDestroy(() => {
 		++viewVersion;
 		++loadVersion;
+		unsubscribeEvents?.();
 		projectReadController?.abort();
 		refreshController?.abort();
-		if (timeout !== undefined) window.clearTimeout(timeout);
 	});
 </script>
 

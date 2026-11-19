@@ -200,6 +200,61 @@ including `sdk.projects.delete`. Lifecycle deployment actions use
 These operations accept an optional `AbortSignal`; cancellation does not cancel
 durably accepted server work and mutations are never automatically retried.
 
+### Live deployment updates
+
+`GET /api/events` is a read-only native WebSocket endpoint. The browser uses
+the existing HttpOnly session cookie; query credentials and bearer
+subprotocols are not accepted. Before upgrade, Go requires the exact configured
+Origin, canonical Host, an authorized session, and the configured HTTPS policy.
+Cleartext `ws:` is accepted only for the explicitly enabled canonical HTTP
+origin. Failed handshakes return the normal JSON outcome envelope; browser code
+uses `GET /api/session` to distinguish session loss from a generic socket
+failure.
+
+The server sends a ready frame after registering the socket:
+
+```json
+{"code":"events.ready","message":"Live updates connected.","data":{"epoch":"<daemon-id>","sequence":0}}
+```
+
+Committed deployment/job changes send invalidation frames, never resource
+bodies or logs:
+
+```json
+{"code":"events.invalidate","message":"Dashboard data changed.","data":{"epoch":"<daemon-id>","sequence":1,"resources":[{"kind":"jobs","deploymentId":"<id>"},{"kind":"deployments","deploymentId":"<id>"}]}}
+```
+
+The daemon-wide sequence increases per committed batch. It is diagnostic only;
+the random epoch changes on restart and there is no replay. The deployment
+views subscribe through the singleton `sdk.events` owner, refresh on ready and
+invalidation, and dispose subscriptions during navigation. A healthy connection
+does not poll. The current slice reconnects with bounded exponential backoff
+and probes the session after a failed handshake. The broader visible-resource
+15-second fallback, foreground/offline recovery, and complete resource-kind
+synchronization are deferred to #73.
+
+The endpoint limits connection attempts to 20 per minute per peer IP, active
+sockets to 8 per session and 64 per daemon, outbound queues to 64 frames, text
+frames to 16 KiB, and client messages to 1 KiB (all client application
+messages are rejected). It checks session validity at least every 5 seconds,
+uses 25-second protocol pings and bounded writes, closes slow clients rather
+than dropping invalidations, revokes sockets on logout/password replacement,
+and closes them on shutdown. Deployment/job notifications follow committed
+queue, worker, and terminal state updates; clients always fetch authoritative
+HTTP state, including sanitized job logs. The SDK resynchronizes active views
+on each ready frame, ignores duplicate/older invalidations, and closes malformed
+streams for bounded-backoff reconnect. Reconnect delay is jittered, capped at
+30 seconds, and resets after 30 seconds of a healthy connection.
+Job invalidations are coalesced per deployment to at most four batches per
+second, with a pending terminal refresh flushed after the coalescing interval.
+Verified webhook queue commits invalidate the affected deployment/job views.
+
+Vite forwards `/api` WebSocket upgrades to the Go backend without rewriting the
+browser Origin or Host. Production reverse proxies must forward `Upgrade` and
+`Connection: upgrade` and use an idle timeout longer than the 25-second ping
+interval. Do not weaken canonical Host, trusted-proxy, or Origin validation to
+accommodate a proxy.
+
 ### Flow and state details
 
 1. **Setup/recovery:** local CLI commands issue a short-lived, single-use grant.

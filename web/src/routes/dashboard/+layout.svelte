@@ -9,13 +9,17 @@
 	let status = $state('');
 
 	onMount(() => {
+		const unsubscribeEvents = sdk.events.subscribe(() => {});
 		const handleSessionLost = () => {
 			const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
 			const query = new URLSearchParams({ next });
 			void goto(`/login?${query.toString()}`, { replace: true });
 		};
 		window.addEventListener('deploy-manager:session-lost', handleSessionLost);
-		return () => window.removeEventListener('deploy-manager:session-lost', handleSessionLost);
+		return () => {
+			window.removeEventListener('deploy-manager:session-lost', handleSessionLost);
+			unsubscribeEvents();
+		};
 	});
 
 	async function logout() {

@@ -175,6 +175,9 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 	a.sessions = make(map[[32]byte]sessionState)
 	a.logins = make(map[string]pendingLogin)
 	a.registrationTxs = make(map[string]registrationTransaction)
+	if a.events != nil {
+		a.events.revokeAll()
+	}
 	http.SetCookie(w, &http.Cookie{Name: a.cookieName(), Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: a.cookieName() == sessionCookie, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	if purpose == "recovery" {
 		writeOutcome(w, http.StatusOK, "auth.registration_completed", "Registration completed. Sign in to continue.", nil)

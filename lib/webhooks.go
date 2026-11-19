@@ -431,6 +431,7 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 	}
 	outcome := "ignored"
 	jobIDs := make([]string, 0)
+	invalidationIDs := make([]string, 0)
 	if event == "push" && branch != "" && !deleted {
 		targets, queryErr := tx.Deployment.Query().Where(depmodel.ProjectID(projectID), depmodel.TargetKind("branch"), depmodel.TargetName(branch), depmodel.StatusNotIn("deleting", "deletion_failed")).All(context.Background())
 		if queryErr != nil {
@@ -448,6 +449,7 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 				if _, err = tx.DeploymentJob.UpdateOneID(pending.ID).Where(jobmodel.Status("queued")).SetLog("Latest branch update queued").SetUpdatedAt(a.cfg.Now().UnixNano()).Save(context.Background()); err != nil {
 					return err
 				}
+				invalidationIDs = append(invalidationIDs, target.ID)
 				continue
 			}
 			select {
@@ -471,6 +473,7 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 				return err
 			}
 			jobIDs = append(jobIDs, jobID)
+			invalidationIDs = append(invalidationIDs, target.ID)
 		}
 		if len(targets) > 0 {
 			outcome = "queued"
@@ -498,6 +501,9 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 	}
 	for _, id := range jobIDs {
 		a.deployQueue <- id
+	}
+	for _, id := range invalidationIDs {
+		a.invalidateJob(id)
 	}
 	keepSlots = true
 	if postCommitErr != nil {

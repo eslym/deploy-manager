@@ -109,6 +109,7 @@ type App struct {
 	deployLocks          sync.Map
 	deploymentJobsMu     sync.Mutex
 	deploymentJobCancels map[string]activeDeploymentJob
+	events               *eventHub
 	webhookFault         func(string) error
 	daemonOwnership      *storageLock
 	storageAccess        *storageLock
@@ -376,6 +377,7 @@ func prepareStorage(cfg Config, daemonUpgrade bool) (*readyStorage, error) {
 		}
 	}
 	app := &App{cfg: cfg, db: db, store: store, protocol: protocol, des: des, keyGeneration: keyGeneration, credentialGeneration: credentialGeneration, rate: make(map[string][]time.Time), logins: make(map[string]pendingLogin), sessions: make(map[[32]byte]sessionState), repositoryMaster: repositoryMaster, registrationTxs: make(map[string]registrationTransaction)}
+	app.events = newEventHub(app)
 	masterTransferred = true
 	ready := false
 	defer func() {
@@ -497,6 +499,9 @@ func writeExclusive(path string, b []byte) error {
 }
 func (a *App) Close() error {
 	a.deployCloseOnce.Do(func() {
+		if a.events != nil {
+			a.events.close()
+		}
 		if a.deployStop != nil {
 			close(a.deployStop)
 			a.deployWG.Wait()
@@ -604,6 +609,8 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /opaque/login/start", a.loginStart)
 	m.HandleFunc("POST /opaque/login/finish", a.loginFinish)
 	m.HandleFunc("GET /api/session", a.sessionStatus)
+	m.HandleFunc("/api/events", a.events.methodNotAllowed)
+	m.HandleFunc("GET /api/events", a.events.serveHTTP)
 	m.HandleFunc("POST /api/logout", a.logout)
 	m.HandleFunc("GET /api/projects", a.listProjects)
 	m.HandleFunc("POST /api/projects", a.createProject)

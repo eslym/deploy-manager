@@ -189,23 +189,20 @@
 		}
 	}
 
-	let timeout: number | undefined;
 	onMount(() => {
 		const id = projectId;
 		const version = ++viewVersion;
 		++loadVersion;
-		const poll = async () => {
-			if (version !== viewVersion) return;
-			await load(id, version);
-			if (version === viewVersion) timeout = window.setTimeout(poll, 2000);
-		};
-		void poll();
+		void load(id, version);
+		const unsubscribe = sdk.events.subscribe(() => {
+			if (version === viewVersion) void load(id, version);
+		});
 		return () => {
+			unsubscribe();
 			++viewVersion;
 			++loadVersion;
 			projectReadController?.abort();
 			refreshController?.abort();
-			if (timeout !== undefined) window.clearTimeout(timeout);
 		};
 	});
 </script>

@@ -144,6 +144,17 @@ try {
   context.setDefaultNavigationTimeout(15000);
   const page = await context.newPage();
   const pageErrors = [];
+  const dashboardSockets = [];
+  const dashboardSocketStatus = [];
+  page.on("websocket", socket => {
+    if (socket.url().endsWith("/api/events")) {
+      dashboardSockets.push(socket);
+      const status = { closed: null, errors: [] };
+      dashboardSocketStatus.push(status);
+      socket.on("close", code => { status.closed = code; });
+      socket.on("socketerror", error => status.errors.push(error));
+    }
+  });
   page.on("pageerror", error => pageErrors.push(error.message));
 
   milestone("register administrator");
@@ -580,23 +591,27 @@ try {
   if (await httpsRequestStatus("127.0.0.1", 18440, `/api/deployments/${deploymentID}/deploy`, "POST", "{}", { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" }) !== 403) throw new Error("cross-origin deployment action was accepted");
   const delayedHistoryRoute = await jobHistoryRequest;
   const productionHistory = page.getByRole("region", { name: "Job history for Production site" });
-  await productionHistory.getByText("Loading history…", { exact: true }).waitFor();
-  if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("pending deployment history was shown as empty");
   finishJobHistory();
   await delayedHistoryRoute.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "job.listed", message: "Jobs loaded.", data: [] }) });
-  await productionHistory.getByText("No deployment history yet.", { exact: true }).waitFor();
-  if (await productionHistory.getByText("No deployment jobs recorded yet.", { exact: true }).count()) throw new Error("outdated deployment history empty message remained visible");
+  if (process.env.DEPLOYMENT_LIVE_ONLY !== "true") {
+    await productionHistory.getByText("Loading history…", { exact: true }).waitFor();
+    if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("pending deployment history was shown as empty");
+    await productionHistory.getByText("No deployment history yet.", { exact: true }).waitFor();
+    if (await productionHistory.getByText("No deployment jobs recorded yet.", { exact: true }).count()) throw new Error("outdated deployment history empty message remained visible");
+  }
   let failHistoryRoute;
   const failedHistoryRequest = new Promise(resolveRequest => { failHistoryRoute = resolveRequest; });
-  await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
-    await page.unroute(`**/api/deployments/${deploymentID}/jobs`);
-    failHistoryRoute(route);
-    await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE JOB HISTORY ERROR" });
-  });
-  await failedHistoryRequest;
-  await productionHistory.getByRole("alert").filter({ hasText: "Could not load deployment history" }).waitFor();
-  if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("failed deployment history was shown as empty");
-  if ((await productionHistory.innerText()).includes("SENSITIVE JOB HISTORY ERROR")) throw new Error("deployment history exposed an HTTP response body");
+  if (process.env.DEPLOYMENT_LIVE_ONLY !== "true") {
+    await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
+      await page.unroute(`**/api/deployments/${deploymentID}/jobs`);
+      failHistoryRoute(route);
+      await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE JOB HISTORY ERROR" });
+    });
+    await failedHistoryRequest;
+    await productionHistory.getByRole("alert").filter({ hasText: "Could not load deployment history" }).waitFor();
+    if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("failed history was shown as empty");
+    if ((await productionHistory.innerText()).includes("SENSITIVE JOB HISTORY ERROR")) throw new Error("deployment history exposed an HTTP response body");
+  }
   try {
   await waitFor(async () => {
       try {
@@ -647,57 +662,47 @@ try {
   await page.goto(`https://${appListen}/dashboard/projects/${ordinaryProject.id}/deployments/${deploymentID}`, { waitUntil: "domcontentloaded" });
   await page.getByText(/Deployment not found/i).waitFor();
   if (await page.getByRole("button", { name: "Deploy", exact: true }).count()) throw new Error("another project's deployment exposed its actions");
+  const socketsBeforeDeploymentViews = dashboardSockets.length;
   await page.goto(`https://${appListen}/dashboard/projects/${id}/deployments/${deploymentID}`, { waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
   await page.getByRole("link", { name: "Fixture site", exact: true }).click();
   await page.getByRole("link", { name: "Production site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
   const firstDirectoryIdentity = (await stat(publishedPath)).ino;
-  milestone("steady deployment history during background refreshes");
-  const realJobHistory = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, deploymentID);
-  if (!realJobHistory.length) throw new Error("deployment history fixture has no recorded jobs");
-  const historyJob = (status, id) => ({ ...realJobHistory[0], id, status, updatedAt: new Date().toISOString() });
-  const historyResponses = [
-    [historyJob("queued", "history-stable-a"), historyJob("succeeded", "history-stable-b")],
-    [historyJob("running", "history-stable-a"), historyJob("succeeded", "history-stable-b")],
-    [historyJob("succeeded", "history-stable-a"), historyJob("succeeded", "history-stable-b")]
-  ];
-  let historyPollCount = 0;
-  let heldHistoryPolls = 0;
-  const releaseHistoryPolls = [];
-  await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
-    if (route.request().method() !== "GET") return route.continue();
-    const poll = ++historyPollCount;
-    if (poll === 2 || poll === 3) {
-      heldHistoryPolls++;
-      await new Promise(resolveHistory => releaseHistoryPolls.push(resolveHistory));
+  milestone("event-driven deployment history without healthy polling");
+  const jobReads = [];
+  let lastJobReadAt = Date.now();
+  page.on("request", request => {
+    if (request.method() === "GET" && request.url().endsWith(`/api/deployments/${deploymentID}/jobs`)) {
+      jobReads.push(request);
+      lastJobReadAt = Date.now();
     }
-    if (poll === 4) {
-      await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE POLLING FAILURE" });
-      return;
-    }
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(outcome("job.listed", "Jobs loaded.", historyResponses[Math.min(poll - 1, 2)])) });
   });
-  const stableHistory = page.getByRole("region", { name: "Job history for Production site" });
-  await stableHistory.getByText("Queued", { exact: true }).waitFor();
-  if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("initial job history list was not rendered");
-  for (const [poll, status] of [[2, "Queued"], [3, "Running"]]) {
-    await waitFor(() => heldHistoryPolls >= poll - 1, `delayed history refresh ${poll}`);
-    await stableHistory.getByText(status, { exact: true }).waitFor();
-    if (await stableHistory.getByText("Loading history…", { exact: true }).count()) throw new Error("background polling replaced visible deployment history with a loading state");
-    if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("background polling changed the visible history list while a refresh was pending");
-    releaseHistoryPolls[poll - 2]();
-    await stableHistory.getByText(poll === 2 ? "Running" : "Succeeded", { exact: true }).first().waitFor();
+  await waitFor(() => Date.now() - lastJobReadAt >= 2200, "2.2-second idle interval without job polling");
+  jobReads.length = 0;
+  const deploymentViewSockets = dashboardSockets.slice(socketsBeforeDeploymentViews);
+  if (deploymentViewSockets.filter(socket => !socket.isClosed()).length !== 1) {
+    throw new Error(`expected one shared live-update socket for deployment views, opened=${deploymentViewSockets.length}, active=${deploymentViewSockets.filter(socket => !socket.isClosed()).length}, status=${JSON.stringify(dashboardSocketStatus.slice(socketsBeforeDeploymentViews))}`);
   }
-  await stableHistory.getByRole("alert").filter({ hasText: "Could not load deployment history" }).waitFor();
-  await stableHistory.getByText("Succeeded", { exact: true }).first().waitFor();
-  if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("failed history refresh discarded the previously loaded jobs");
-  if ((await stableHistory.innerText()).includes("SENSITIVE POLLING FAILURE")) throw new Error("history refresh exposed an HTTP response body");
-  await waitFor(() => historyPollCount >= 5, "deployment history recovery poll");
-  await waitFor(async () => !(await stableHistory.getByRole("alert").count()), "deployment history recovery");
-  await stableHistory.getByText("Succeeded", { exact: true }).first().waitFor();
-  if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("successful history recovery did not retain the visible job list");
-  await page.unroute(`**/api/deployments/${deploymentID}/jobs`);
+  const historyBeforeDeploy = await page.evaluate(async id =>
+    (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data.map(job => job.id), deploymentID);
+  const deployRequest = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/deploy`) && response.request().method() === "POST");
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const deployAccepted = await deployRequest;
+  if (deployAccepted.status() !== 202) throw new Error(`deployment action returned ${deployAccepted.status()}`);
+  await waitFor(() => jobReads.length > 0, "WebSocket-triggered job history refresh");
+  const stableHistory = page.getByRole("region", { name: "Job history for Production site" });
+  const historyItems = stableHistory.locator("li");
+  await waitFor(async () => await historyItems.count() > historyBeforeDeploy.length, "new deployment job in visible history");
+  const latestJob = historyItems.first();
+  await latestJob.getByText(/Succeeded|No changes/, { exact: false }).waitFor();
+  await latestJob.locator("summary").click();
+  await latestJob.getByText(/Already live at this commit|Published successfully/).waitFor();
+  if (deploymentViewSockets.filter(socket => !socket.isClosed()).length !== 1) throw new Error("views opened more than one active live-update socket");
+  if (process.env.DEPLOYMENT_LIVE_ONLY === "true") {
+    console.log("combined-binary live deployment browser slice passed: shared socket, committed/terminal updates, and no healthy polling");
+    throw focusedOutcomesComplete;
+  }
   const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data.find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
   const featureCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data.find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
   milestone("open rollback history");

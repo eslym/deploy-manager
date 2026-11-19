@@ -120,10 +120,22 @@ export interface ProtocolReply {
 	transaction?: string;
 }
 
+interface EventSocket {
+	addEventListener(
+		type: 'open' | 'message' | 'close' | 'error',
+		listener: (event: Event) => void
+	): void;
+	close(): void;
+}
+
 interface SDKAdapters {
 	fetch?: typeof fetch;
 	onSessionLost?: () => void;
 	onSessionEnded?: () => void;
+	webSocket?: (url: string) => EventSocket;
+	setTimeout?: (callback: () => void, delay: number) => ReturnType<typeof setTimeout>;
+	clearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
+	random?: () => number;
 }
 
 export type SDKError =
@@ -167,6 +179,186 @@ function cancelled(cause: unknown): boolean {
 export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	const transport: typeof fetch = adapters.fetch ?? ((input, init) => fetch(input, init));
 	let sessionLossReported = false;
+	const subscribers = new Set<() => void>();
+	let eventSocket: EventSocket | undefined;
+	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+	let healthyTimer: ReturnType<typeof setTimeout> | undefined;
+	let reconnectDelay = 1000;
+	let disposedEvents = false;
+	let eventReady = false;
+	let eventEpoch: string | undefined;
+	let eventSequence = 0;
+	let sessionProbeInFlight = false;
+	const schedule = adapters.setTimeout ?? ((callback, delay) => setTimeout(callback, delay));
+	const unschedule = adapters.clearTimeout ?? ((timer) => clearTimeout(timer));
+	const random = adapters.random ?? Math.random;
+
+	function notifyInvalidation(): void {
+		for (const listener of [...subscribers]) listener();
+	}
+
+	function reportEventSessionLoss(): void {
+		if (sessionLossReported) return;
+		sessionLossReported = true;
+		adapters.onSessionLost?.();
+	}
+
+	async function probeEventSession(): Promise<void> {
+		if (sessionProbeInFlight || sessionLossReported) return;
+		sessionProbeInFlight = true;
+		try {
+			await request(
+				'/api/session',
+				'GET',
+				undefined,
+				isSession,
+				undefined,
+				true,
+				'auth.session_valid'
+			);
+		} catch {
+			// A network failure is not evidence that the session ended.
+		} finally {
+			sessionProbeInFlight = false;
+			if (!sessionLossReported) scheduleReconnect();
+		}
+	}
+
+	function connectEvents(): void {
+		if (eventSocket || subscribers.size === 0 || disposedEvents) return;
+		if (typeof window === 'undefined' && !adapters.webSocket) return;
+		const protocol =
+			typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+		const host = typeof window !== 'undefined' ? window.location.host : 'localhost';
+		let socket: EventSocket;
+		try {
+			socket = adapters.webSocket
+				? adapters.webSocket(`${protocol}//${host}/api/events`)
+				: new WebSocket(`${protocol}//${host}/api/events`);
+		} catch {
+			scheduleReconnect();
+			return;
+		}
+		eventSocket = socket;
+		eventReady = false;
+		socket.addEventListener('message', (event) => {
+			if (eventSocket !== socket || typeof (event as MessageEvent).data !== 'string') return;
+			let frame: unknown;
+			try {
+				frame = JSON.parse((event as MessageEvent<string>).data);
+			} catch {
+				socket.close();
+				return;
+			}
+			if (!isObject(frame) || typeof frame.code !== 'string') {
+				socket.close();
+				return;
+			}
+			if (frame.code === 'events.ready') {
+				if (
+					!isObject(frame.data) ||
+					typeof frame.data.epoch !== 'string' ||
+					frame.data.epoch.length === 0 ||
+					!Number.isSafeInteger(frame.data.sequence) ||
+					(frame.data.sequence as number) < 0
+				) {
+					socket.close();
+					return;
+				}
+				eventReady = true;
+				eventEpoch = frame.data.epoch;
+				eventSequence = frame.data.sequence as number;
+				if (healthyTimer) unschedule(healthyTimer);
+				healthyTimer = schedule(() => {
+					healthyTimer = undefined;
+					reconnectDelay = 1000;
+				}, 30_000);
+				notifyInvalidation();
+				return;
+			}
+			if (frame.code === 'events.invalidate') {
+				if (
+					!isObject(frame.data) ||
+					typeof frame.data.epoch !== 'string' ||
+					frame.data.epoch.length === 0 ||
+					!Number.isSafeInteger(frame.data.sequence) ||
+					(frame.data.sequence as number) < 1 ||
+					!Array.isArray(frame.data.resources) ||
+					!frame.data.resources.every(
+						(resource) =>
+							isObject(resource) &&
+							typeof resource.kind === 'string' &&
+							resource.kind.length > 0 &&
+							(resource.projectId === undefined || typeof resource.projectId === 'string') &&
+							(resource.deploymentId === undefined || typeof resource.deploymentId === 'string')
+					)
+				) {
+					socket.close();
+					return;
+				}
+				const sequence = frame.data.sequence as number;
+				if (frame.data.epoch === eventEpoch && sequence <= eventSequence) return;
+				notifyInvalidation();
+				eventEpoch = frame.data.epoch;
+				eventSequence = sequence;
+				return;
+			}
+			// Future event codes are not understood, so synchronize from HTTP.
+			notifyInvalidation();
+		});
+		socket.addEventListener('close', (event) => {
+			if (eventSocket === socket) eventSocket = undefined;
+			const wasReady = eventReady;
+			eventReady = false;
+			if (healthyTimer) unschedule(healthyTimer);
+			healthyTimer = undefined;
+			const closeCode = (event as CloseEvent).code;
+			if (closeCode === 4401) {
+				reportEventSessionLoss();
+				return;
+			}
+			if (!wasReady) {
+				void probeEventSession();
+				return;
+			}
+			scheduleReconnect();
+		});
+		socket.addEventListener('error', () => {
+			// Browsers follow errors with close; reconnect is scheduled there.
+		});
+	}
+
+	function scheduleReconnect(): void {
+		if (reconnectTimer || subscribers.size === 0 || disposedEvents) return;
+		const jitter = Math.max(0, Math.min(1, random()));
+		const delay = Math.max(
+			1000,
+			Math.min(30_000, Math.round(reconnectDelay * (0.8 + jitter * 0.4)))
+		);
+		reconnectDelay = Math.min(30_000, reconnectDelay * 2);
+		reconnectTimer = schedule(() => {
+			reconnectTimer = undefined;
+			connectEvents();
+		}, delay);
+	}
+
+	function subscribeToInvalidations(onInvalidate: () => void): () => void {
+		subscribers.add(onInvalidate);
+		disposedEvents = false;
+		connectEvents();
+		return () => {
+			subscribers.delete(onInvalidate);
+			if (subscribers.size !== 0) return;
+			disposedEvents = true;
+			if (reconnectTimer) unschedule(reconnectTimer);
+			reconnectTimer = undefined;
+			if (healthyTimer) unschedule(healthyTimer);
+			healthyTimer = undefined;
+			const socket = eventSocket;
+			eventSocket = undefined;
+			socket?.close();
+		};
+	}
 
 	async function request<T>(
 		path: string,
@@ -227,10 +419,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			});
 		}
 		if (!response.ok) {
-			if (protectedRequest && parsed.code === 'auth.session_required' && !sessionLossReported) {
-				sessionLossReported = true;
-				adapters.onSessionLost?.();
-			}
+			if (protectedRequest && parsed.code === 'auth.session_required') reportEventSessionLoss();
 			throw new BrowserSDKError({
 				kind: 'server',
 				status: response.status,
@@ -267,9 +456,9 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	const isSession = (value: unknown): value is { authenticated: true } =>
 		isObject(value) && value.authenticated === true;
 	const repositoryOperations = createRepositoryOperations(request);
-
 	return {
 		...repositoryOperations,
+		events: { subscribe: subscribeToInvalidations },
 		deployments: createDeploymentSDK(request),
 		auth: {
 			registerStart: (input: { grant: string; value: string }, signal?: AbortSignal) =>

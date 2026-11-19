@@ -214,6 +214,9 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 		a.mu.Lock()
 		delete(a.sessions, digest)
 		a.mu.Unlock()
+		if a.events != nil {
+			a.events.revoke(digest)
+		}
 	}
 	http.SetCookie(w, &http.Cookie{Name: a.cookieName(), Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: a.cookieName() == sessionCookie, HttpOnly: true, SameSite: http.SameSiteStrictMode})
 	writeOutcome(w, http.StatusOK, "auth.logged_out", "Signed out.", nil)

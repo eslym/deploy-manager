@@ -14,7 +14,7 @@ export default defineConfig(({ mode }) => {
 		},
 		server: {
 			proxy: {
-				'/api': backendURL,
+				'/api': { target: backendURL, ws: true, changeOrigin: false },
 				'/opaque': backendURL,
 				'/webhooks': backendURL
 			}
