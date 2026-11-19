@@ -497,6 +497,9 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		if (['deploy', 'hard-redeploy', 'target', 'rollback', 'resume', 'delete'].includes(match[2])) {
 			resources.push({ kind: 'jobs', deploymentId });
 		}
+		if (match[2] === 'delete') {
+			resources.push({ kind: 'history', deploymentId });
+		}
 		notifyInvalidation(resources);
 	}
 

@@ -17,6 +17,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
+	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
 )
 
 func newEventsTestServer(t *testing.T) (*App, *httptest.Server, string) {
@@ -344,6 +345,93 @@ func TestDeploymentQueueCommitInvalidatesAnOpenSocket(t *testing.T) {
 	}
 	if refetched.StatusCode != http.StatusOK || jobsOutcome.Code != "job.listed" || len(jobsOutcome.Data) != 1 {
 		t.Fatalf("HTTP refetch did not observe committed job: status=%d outcome=%+v", refetched.StatusCode, jobsOutcome)
+	}
+}
+
+func TestDeploymentDeletionInvalidatesHistoryAfterCommittedRemoval(t *testing.T) {
+	app, server, origin := newEventsTestServer(t)
+	projectID, deploymentID := strings.Repeat("1", 32), strings.Repeat("2", 32)
+	token := make([]byte, 32)
+	for i := range token {
+		token[i] = byte(i + 1)
+	}
+	digest := sha256.Sum256(token)
+	app.mu.Lock()
+	app.sessions[digest] = sessionState{expires: time.Now().Add(time.Hour), generation: app.credentialGeneration}
+	app.mu.Unlock()
+	now := time.Now().UnixNano()
+	if _, err := app.store.Project.Create().SetID(projectID).SetName("Project").SetRemoteURL("https://git.example/repo").SetCreatedAt(now).Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store.Deployment.Create().SetID(deploymentID).SetProjectID(projectID).SetName("Site").SetCommitID(strings.Repeat("a", 40)).SetPublicationName("site").SetGeneration(1).SetStatus("live").SetCreatedAt(now).SetUpdatedAt(now).SetTargetKind("commit").Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	cookie := app.cookieName() + "=" + base64.RawURLEncoding.EncodeToString(token)
+	conn, response, err := eventsClient(t, server.URL, origin, cookie)
+	if err != nil {
+		t.Fatalf("dial events: response=%v err=%v", response, err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	var ready map[string]any
+	if err := wsjson.Read(context.Background(), conn, &ready); err != nil {
+		t.Fatal(err)
+	}
+
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/deployments/"+deploymentID+"/delete", strings.NewReader(`{"confirm":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Origin", origin)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Cookie", cookie)
+	result, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result.Body.Close()
+	if result.StatusCode != http.StatusOK {
+		t.Fatalf("deployment deletion status = %d, want 200", result.StatusCode)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	historyInvalidated := false
+	for !historyInvalidated {
+		var frame struct {
+			Code string `json:"code"`
+			Data struct {
+				Resources []eventResource `json:"resources"`
+			} `json:"data"`
+		}
+		if err := wsjson.Read(ctx, conn, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Code != "events.invalidate" {
+			t.Fatalf("unexpected deletion event: %+v", frame)
+		}
+		for _, resource := range frame.Data.Resources {
+			if resource.Kind == "history" && resource.DeploymentID == deploymentID {
+				historyInvalidated = true
+			}
+		}
+	}
+
+	historyRequest, err := http.NewRequest(http.MethodGet, server.URL+"/api/deployments/"+deploymentID+"/history", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historyRequest.Header.Set("Cookie", cookie)
+	historyResponse, err := http.DefaultClient.Do(historyRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer historyResponse.Body.Close()
+	if historyResponse.StatusCode != http.StatusNotFound {
+		t.Fatalf("history after committed deletion status = %d, want 404", historyResponse.StatusCode)
+	}
+	exists, err := app.store.Deployment.Query().Where(deploymentmodel.IDEQ(deploymentID)).Exist(context.Background())
+	if err != nil || exists {
+		t.Fatalf("deleted deployment remains committed: exists=%t err=%v", exists, err)
 	}
 }
 

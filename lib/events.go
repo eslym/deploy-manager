@@ -472,6 +472,7 @@ func (a *App) invalidateDeletedDeployment(projectID, deploymentID string) {
 			eventResource{Kind: "refs", ProjectID: projectID},
 			eventResource{Kind: "jobs", DeploymentID: deploymentID},
 			eventResource{Kind: "deployments", DeploymentID: deploymentID},
+			eventResource{Kind: "history", DeploymentID: deploymentID},
 		)
 	}
 }

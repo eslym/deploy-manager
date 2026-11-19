@@ -427,6 +427,45 @@ describe('browser SDK live event ownership', () => {
 		});
 	});
 
+	it('refreshes active deployment history after local and remote deletion', async () => {
+		const socket = new FakeEventSocket();
+		const send = vi
+			.fn()
+			.mockResolvedValue(
+				response({ code: 'deployment.deleted', message: 'Deployment deleted.', data: null })
+			);
+		const api = createBrowserSDK({ fetch: send, webSocket: () => socket });
+		const historyRead = vi.fn(async () => []);
+		const dispose = api.resources.subscribe({
+			identity: { kind: 'history', deploymentId: 'd1', search: '', page: 1, limit: 20 },
+			read: historyRead,
+			onValue: vi.fn()
+		});
+		await vi.waitFor(() => expect(historyRead).toHaveBeenCalledOnce());
+		socket.emit(
+			'message',
+			JSON.stringify({ code: 'events.ready', data: { epoch: 'epoch', sequence: 0 } })
+		);
+		await vi.waitFor(() => expect(historyRead).toHaveBeenCalledTimes(2));
+
+		await api.deployments.delete('d1');
+		await vi.waitFor(() => expect(historyRead).toHaveBeenCalledTimes(3));
+		expect(send).toHaveBeenCalledWith(
+			'/api/deployments/d1/delete',
+			expect.objectContaining({ method: 'POST' })
+		);
+
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'epoch', sequence: 1, resources: [{ kind: 'history', deploymentId: 'd1' }] }
+			})
+		);
+		await vi.waitFor(() => expect(historyRead).toHaveBeenCalledTimes(4));
+		dispose();
+	});
+
 	it('resynchronizes every active read on a sequence gap or epoch change', async () => {
 		const socket = new FakeEventSocket();
 		const api = createBrowserSDK({ webSocket: () => socket });
