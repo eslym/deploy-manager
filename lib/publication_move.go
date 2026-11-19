@@ -312,5 +312,6 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
+	a.invalidateDeployment(id)
 	writeOutcome(w, http.StatusOK, "deployment.moved", "Publication path changed.", map[string]string{"publicationPath": destination})
 }

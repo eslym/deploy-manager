@@ -85,6 +85,7 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
+	a.invalidateJob(id)
 	a.cancelDeploymentJobs(id)
 	if err = a.finishDeploymentDeletion(id); err != nil {
 		writeOutcome(w, http.StatusServiceUnavailable, "operation.cleanup_pending", "Cleanup is pending. Refresh before taking further action.", map[string]bool{"operationAccepted": true, "recoveryRequired": true})
@@ -340,7 +341,11 @@ func (a *App) finishDeploymentDeletionRecord(id string) error {
 	if err = tx.DeploymentDeletion.DeleteOneID(id).Exec(ctx); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	a.invalidateJob(id)
+	return nil
 }
 
 func (a *App) recordDeletionFailure(id string, cause error) error {
@@ -348,6 +353,7 @@ func (a *App) recordDeletionFailure(id string, cause error) error {
 	now := a.cfg.Now().UnixNano()
 	_, _ = a.store.DeploymentDeletion.Update().Where(deploymentdeletion.IDEQ(id)).SetStatus("blocked").SetLastError("safe cleanup is pending; check publication paths and retry").SetRetryAfter(a.cfg.Now().Add(retryDelay(0)).UnixNano()).SetUpdatedAt(now).Save(ctx)
 	_, _ = a.store.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.StatusEQ("deleting")).SetStatus("deletion_failed").SetError("Deletion is blocked; cleanup will retry after the path is safe").SetUpdatedAt(now).Save(ctx)
+	a.invalidateJob(id)
 	return fmt.Errorf("deployment deletion pending: %w", cause)
 }
 

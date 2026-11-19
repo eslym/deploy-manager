@@ -45,18 +45,19 @@ type eventInvalidation struct {
 }
 
 type eventHub struct {
-	app        *App
-	mu         sync.Mutex
-	epoch      string
-	sequence   uint64
-	conns      map[*eventConn]struct{}
-	attempts   map[string][]time.Time
-	jobLast    map[string]time.Time
-	jobPending map[string][]eventResource
-	jobTimers  map[string]*time.Timer
-	closed     bool
-	stop       chan struct{}
-	wg         sync.WaitGroup
+	app         *App
+	mu          sync.Mutex
+	broadcastMu sync.Mutex
+	epoch       string
+	sequence    uint64
+	conns       map[*eventConn]struct{}
+	attempts    map[string][]time.Time
+	jobLast     map[string]time.Time
+	jobPending  map[string][]eventResource
+	jobTimers   map[string]*time.Timer
+	closed      bool
+	stop        chan struct{}
+	wg          sync.WaitGroup
 }
 
 type eventConn struct {
@@ -293,8 +294,12 @@ func (c *eventConn) writeLoop() {
 					pingResult <- c.conn.Ping(ctx)
 				}()
 			}
-		case <-pingResult:
+		case err := <-pingResult:
 			pingInFlight = false
+			if err != nil {
+				c.close(websocket.StatusTryAgainLater, "Live updates timed out.")
+				return
+			}
 		}
 	}
 }
@@ -365,6 +370,8 @@ func (h *eventHub) invalidate(resources ...eventResource) {
 	if len(resources) == 0 {
 		return
 	}
+	h.broadcastMu.Lock()
+	defer h.broadcastMu.Unlock()
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()

@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -334,6 +336,100 @@ func TestDeploymentQueueCommitInvalidatesAnOpenSocket(t *testing.T) {
 	}
 	if refetched.StatusCode != http.StatusOK || jobsOutcome.Code != "job.listed" || len(jobsOutcome.Data) != 1 {
 		t.Fatalf("HTTP refetch did not observe committed job: status=%d outcome=%+v", refetched.StatusCode, jobsOutcome)
+	}
+}
+
+func TestConcurrentCommittedInvalidationsPreserveSocketSequenceOrder(t *testing.T) {
+	app, server, origin := newEventsTestServer(t)
+	token := make([]byte, 32)
+	for i := range token {
+		token[i] = byte(i + 1)
+	}
+	digest := sha256.Sum256(token)
+	app.mu.Lock()
+	app.sessions[digest] = sessionState{expires: time.Now().Add(time.Hour), generation: app.credentialGeneration}
+	app.mu.Unlock()
+	now := time.Now().UnixNano()
+	if _, err := app.store.Project.Create().SetID("project-1").SetName("Project").SetRemoteURL("https://git.example/repo").SetCreatedAt(now).Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	deploymentIDs := []string{"deployment-1", "deployment-2"}
+	for _, id := range deploymentIDs {
+		if _, err := app.store.Deployment.Create().SetID(id).SetProjectID("project-1").SetName(id).SetCommitID(strings.Repeat("a", 40)).SetPublicationName(id).SetGeneration(1).SetStatus("live").SetCreatedAt(now).SetUpdatedAt(now).SetTargetKind("commit").Save(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cookie := app.cookieName() + "=" + base64.RawURLEncoding.EncodeToString(token)
+	conn, response, err := eventsClient(t, server.URL, origin, cookie)
+	if err != nil {
+		t.Fatalf("dial events: response=%v err=%v", response, err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	var ready map[string]any
+	if err := wsjson.Read(context.Background(), conn, &ready); err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, len(deploymentIDs))
+	var group sync.WaitGroup
+	for _, id := range deploymentIDs {
+		group.Add(1)
+		go func(id string) {
+			defer group.Done()
+			<-start
+			request, requestErr := http.NewRequest(http.MethodPost, server.URL+"/api/deployments/"+id+"/deploy", strings.NewReader("{}"))
+			if requestErr != nil {
+				results <- requestErr
+				return
+			}
+			request.Header.Set("Origin", origin)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Cookie", cookie)
+			result, requestErr := http.DefaultClient.Do(request)
+			if requestErr != nil {
+				results <- requestErr
+				return
+			}
+			result.Body.Close()
+			if result.StatusCode != http.StatusAccepted {
+				results <- fmt.Errorf("deployment action status = %d", result.StatusCode)
+				return
+			}
+			results <- nil
+		}(id)
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	for requestErr := range results {
+		if requestErr != nil {
+			t.Fatal(requestErr)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var previous uint64
+	received := 0
+	for received < len(deploymentIDs) {
+		var frame struct {
+			Code string `json:"code"`
+			Data struct {
+				Sequence uint64 `json:"sequence"`
+			} `json:"data"`
+		}
+		if err := wsjson.Read(ctx, conn, &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Code != "events.invalidate" {
+			continue
+		}
+		if frame.Data.Sequence <= previous {
+			t.Fatalf("invalidation sequence decreased: got %d after %d", frame.Data.Sequence, previous)
+		}
+		previous = frame.Data.Sequence
+		received++
 	}
 }
 

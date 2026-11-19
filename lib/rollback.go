@@ -241,6 +241,7 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
+	a.invalidateJob(id)
 	a.cancelDeploymentJobsBefore(id, newGeneration)
 	slot.enqueue(job)
 	writeOutcome(w, http.StatusAccepted, "deployment.rollback_queued", "Rollback queued.", map[string]string{"jobId": job, "status": "queued"})
