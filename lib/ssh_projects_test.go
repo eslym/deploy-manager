@@ -65,6 +65,29 @@ func TestSCPSSHRemoteNormalization(t *testing.T) {
 	}
 }
 
+func TestSSHRemoteDetectionPreservesHTTPSAtPaths(t *testing.T) {
+	for _, remote := range []string{
+		"https://example.com/owner/repo@name.git",
+		"https://example.com/@scope/repo.git",
+		"https://example.com/owner/repo.git",
+	} {
+		if isSSHRemote(remote) {
+			t.Errorf("isSSHRemote(%q) = true, want public HTTPS", remote)
+		}
+		if _, err := safeRemote(remote); err != nil {
+			t.Errorf("safeRemote(%q): %v", remote, err)
+		}
+	}
+	for _, remote := range []string{
+		"ssh://git@example.com/owner/repo.git",
+		"git@example.com:owner/repo.git",
+	} {
+		if !isSSHRemote(remote) {
+			t.Errorf("isSSHRemote(%q) = false, want SSH", remote)
+		}
+	}
+}
+
 // This end-to-end application test uses an in-process SSH server and go-git's
 // upload-pack implementation; it never starts a local Git/SSH executable.
 func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
