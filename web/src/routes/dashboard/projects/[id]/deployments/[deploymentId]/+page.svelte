@@ -724,6 +724,7 @@
 			{#if item.targetKind === 'branch' && item.targetName && !['deleting', 'deletion_failed', 'recovery_required'].includes(item.status)}
 				{#key `${item.id}:${item.targetName}`}
 					<RollbackHistory
+						projectId={item.projectId}
 						deploymentId={item.id}
 						deploymentName={item.name}
 						branch={item.targetName}

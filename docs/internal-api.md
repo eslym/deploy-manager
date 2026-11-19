@@ -225,13 +225,27 @@ bodies or logs:
 ```
 
 The daemon-wide sequence increases per committed batch. It is diagnostic only;
-the random epoch changes on restart and there is no replay. The deployment
-views subscribe through the singleton `sdk.events` owner, refresh on ready and
-invalidation, and dispose subscriptions during navigation. A healthy connection
-does not poll. The current slice reconnects with bounded exponential backoff
-and probes the session after a failed handshake. The broader visible-resource
-15-second fallback, foreground/offline recovery, and complete resource-kind
-synchronization are deferred to #73.
+the random epoch changes on restart and there is no replay. Successful
+application POSTs emit invalidations only after their handler has returned a
+successful response; worker notifications follow committed state transitions.
+Invalidations cover projects/refs/history, deployments/jobs, repository keys,
+SSH hosts, LFS settings, and webhook settings, including dependent project and
+deployment reads. They contain metadata only; reads never emit events.
+
+The singleton SDK owns connection state, resource subscriptions, HTTP refreshes,
+and disposal. It refreshes all active reads on ready/reconnect, epoch change,
+sequence gap, unknown code, or malformed frame, and retains notifications that
+arrive during an in-flight read. Reconnect uses jittered exponential delays from
+1 to 30 seconds, reset only after 30 healthy seconds. If no usable socket is
+available after 10 seconds, visible active reads refresh every 15 seconds while
+reconnecting; fallback stops on ready. Hidden tabs suspend fallback, and
+foreground return refreshes active reads once. Offline status suppresses
+reconnect attempts until the browser returns online. Failed handshakes probe
+`GET /api/session`; only a verified 401 or socket close 4401 ends the session.
+Session loss clears protected resource values and stops sockets and timers.
+Network failure alone is not treated as logout. Each authenticated layout must
+dispose its subscriptions on teardown. Healthy connected dashboards do not
+poll.
 
 The endpoint limits connection attempts to 20 per minute per peer IP, active
 sockets to 8 per session and 64 per daemon, outbound queues to 64 frames, text
@@ -250,10 +264,11 @@ second, with a pending terminal refresh flushed after the coalescing interval.
 Verified webhook queue commits invalidate the affected deployment/job views.
 
 Vite forwards `/api` WebSocket upgrades to the Go backend without rewriting the
-browser Origin or Host. Production reverse proxies must forward `Upgrade` and
-`Connection: upgrade` and use an idle timeout longer than the 25-second ping
-interval. Do not weaken canonical Host, trusted-proxy, or Origin validation to
-accommodate a proxy.
+browser Origin or Host. Production reverse proxies must use HTTP/1.1 upstream,
+forward `Upgrade` and `Connection: upgrade`, preserve the browser `Origin` and
+canonical `Host`, and set their WebSocket idle/read timeout longer than the
+25-second ping interval (60 seconds or more is recommended). Do not weaken
+canonical Host, trusted-proxy, or Origin validation to accommodate a proxy.
 
 ### Flow and state details
 

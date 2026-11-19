@@ -298,6 +298,7 @@ func TestDeploymentQueueCommitInvalidatesAnOpenSocket(t *testing.T) {
 			Sequence  uint64 `json:"sequence"`
 			Resources []struct {
 				Kind         string `json:"kind"`
+				ProjectID    string `json:"projectId"`
 				DeploymentID string `json:"deploymentId"`
 			} `json:"resources"`
 		} `json:"data"`
@@ -312,10 +313,17 @@ func TestDeploymentQueueCommitInvalidatesAnOpenSocket(t *testing.T) {
 	}
 	kinds := map[string]bool{}
 	for _, resource := range frame.Data.Resources {
-		kinds[resource.Kind] = resource.DeploymentID == "deployment-1"
+		switch resource.Kind {
+		case "jobs", "deployments":
+			kinds[resource.Kind] = resource.DeploymentID == "deployment-1"
+		case "refs":
+			kinds[resource.Kind] = resource.ProjectID == "project-1"
+		case "projects":
+			kinds[resource.Kind] = true
+		}
 	}
-	if !kinds["jobs"] || !kinds["deployments"] {
-		t.Fatalf("invalidation omitted deployment-scoped resource kinds: %+v", frame.Data.Resources)
+	if !kinds["jobs"] || !kinds["deployments"] || !kinds["projects"] || !kinds["refs"] {
+		t.Fatalf("invalidation omitted dependent project, ref, deployment, or job reads: %+v", frame.Data.Resources)
 	}
 	read, err := http.NewRequest(http.MethodGet, server.URL+"/api/deployments/deployment-1/jobs", nil)
 	if err != nil {

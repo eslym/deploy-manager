@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+	deploymentmodel "github.com/eslym/deploy-manager/lib/ent/deployment"
 )
 
 const (
@@ -410,10 +411,73 @@ func (a *App) invalidateJob(deploymentID string) {
 	}
 }
 
+func (a *App) invalidateMutation(r *http.Request) {
+	if a.events == nil {
+		return
+	}
+	projectID := r.PathValue("id")
+	var resources []eventResource
+	switch {
+	case r.URL.Path == "/api/projects":
+		resources = []eventResource{{Kind: "projects"}}
+	case strings.HasSuffix(r.URL.Path, "/refresh") && projectID != "":
+		resources = []eventResource{{Kind: "projects"}, {Kind: "refs", ProjectID: projectID}}
+	case strings.HasSuffix(r.URL.Path, "/lfs") && projectID != "":
+		resources = []eventResource{{Kind: "lfs_settings", ProjectID: projectID}, {Kind: "projects"}}
+	case strings.HasSuffix(r.URL.Path, "-webhook") && projectID != "":
+		resources = []eventResource{{Kind: "webhook_settings", ProjectID: projectID}}
+	case strings.HasSuffix(r.URL.Path, "/key") && projectID != "":
+		resources = []eventResource{{Kind: "repository_keys"}, {Kind: "projects"}}
+	case strings.HasSuffix(r.URL.Path, "/cache/recreate") && projectID != "":
+		resources = []eventResource{{Kind: "projects"}, {Kind: "refs", ProjectID: projectID}}
+	case strings.HasPrefix(r.URL.Path, "/api/repository-keys"):
+		resources = []eventResource{{Kind: "repository_keys"}, {Kind: "projects"}}
+	}
+	if len(resources) > 0 {
+		a.events.invalidate(resources...)
+	}
+}
+
+func (a *App) invalidateSSHHostState() {
+	if a.events != nil {
+		a.events.invalidate(eventResource{Kind: "ssh_hosts"}, eventResource{Kind: "projects"})
+	}
+}
+
+func (a *App) invalidateProjectRefs(projectID string) {
+	if a.events != nil {
+		a.events.invalidate(
+			eventResource{Kind: "projects"},
+			eventResource{Kind: "refs", ProjectID: projectID},
+		)
+	}
+}
+
+func (a *App) invalidateDeletedProject(projectID string) {
+	if a.events != nil {
+		a.events.invalidate(
+			eventResource{Kind: "projects"},
+			eventResource{Kind: "refs", ProjectID: projectID},
+			eventResource{Kind: "lfs_settings", ProjectID: projectID},
+			eventResource{Kind: "webhook_settings", ProjectID: projectID},
+			eventResource{Kind: "deployments", ProjectID: projectID},
+		)
+	}
+}
+
 func (h *eventHub) invalidateJob(deploymentID string) {
 	resources := []eventResource{
 		{Kind: "jobs", DeploymentID: deploymentID},
 		{Kind: "deployments", DeploymentID: deploymentID},
+	}
+	if deployment, err := h.app.store.Deployment.Query().
+		Where(deploymentmodel.IDEQ(deploymentID)).
+		Only(context.Background()); err == nil {
+		resources = append(
+			resources,
+			eventResource{Kind: "projects"},
+			eventResource{Kind: "refs", ProjectID: deployment.ProjectID},
+		)
 	}
 	now := time.Now()
 	h.mu.Lock()

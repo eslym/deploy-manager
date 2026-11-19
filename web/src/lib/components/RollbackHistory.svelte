@@ -6,12 +6,14 @@
 
 	let {
 		deploymentId,
+		projectId,
 		deploymentName,
 		branch,
 		busy = $bindable(false),
 		onqueued
 	}: {
 		deploymentId: string;
+		projectId: string;
 		deploymentName: string;
 		branch: string;
 		busy?: boolean;
@@ -28,9 +30,10 @@
 	let queued = $state('');
 	let selected = $state.raw<DeploymentHistoryCommit | null>(null);
 	let permanent = $state(false);
-	let requestedPage = 1;
-	let requestedSearch = '';
+	let requestedPage = $state(1);
+	let requestedSearch = $state('');
 	let requestController: AbortController | null = null;
+	let historySubscription: (() => void) | null = null;
 	let requestVersion = 0;
 	let latestHistoryQuery: {
 		deploymentId: string;
@@ -53,6 +56,8 @@
 	}
 
 	beforeNavigate(() => {
+		historySubscription?.();
+		historySubscription = null;
 		requestController?.abort();
 	});
 
@@ -61,68 +66,74 @@
 		requestController?.abort();
 	});
 
-	async function loadHistory(page = 1, query = activeSearch) {
+	function loadHistory(page = requestedPage, query = activeSearch) {
 		if (busy) return;
-		requestController?.abort();
-		const controller = new AbortController();
-		requestController = controller;
-		const version = ++requestVersion;
-		const queryIdentity = {
+		requestedPage = page;
+		requestedSearch = query;
+		activeSearch = query;
+		selected = null;
+		rollbackError = '';
+		sdk.resources.refresh({
+			kind: 'history',
+			projectId,
 			deploymentId,
 			search: query,
 			page,
 			limit: historyLimit
+		});
+	}
+
+	$effect(() => {
+		if (!open) return;
+		const queryIdentity = {
+			projectId,
+			deploymentId,
+			search: requestedSearch,
+			page: requestedPage,
+			limit: historyLimit
 		};
+		requestController?.abort();
+		const controller = new AbortController();
+		requestController = controller;
+		const version = ++requestVersion;
 		latestHistoryQuery = queryIdentity;
 		loading = true;
 		historyError = '';
-		selected = null;
-		rollbackError = '';
-		requestedPage = page;
-		requestedSearch = query;
-		try {
-			const result = (
-				await sdk.deployments.history(
-					queryIdentity.deploymentId,
-					{
-						search: queryIdentity.search,
-						page: queryIdentity.page,
-						limit: queryIdentity.limit
-					},
-					controller.signal
-				)
-			).data;
-			if (
-				destroyed ||
-				controller.signal.aborted ||
-				!isLatestHistoryQuery(queryIdentity, version) ||
-				queryIdentity.deploymentId !== deploymentId
-			)
-				return;
-			history = result;
-			historyDeploymentId = queryIdentity.deploymentId;
-			activeSearch = queryIdentity.search;
-		} catch {
-			if (
-				destroyed ||
-				controller.signal.aborted ||
-				!isLatestHistoryQuery(queryIdentity, version) ||
-				queryIdentity.deploymentId !== deploymentId
-			)
-				return;
-			historyError =
-				'Could not load commit history. Try again. If the branch has not been fetched yet, refresh branches and tags first.';
-		} finally {
-			if (!destroyed && version === requestVersion) {
+		const dispose = sdk.resources.subscribe({
+			identity: { kind: 'history', ...queryIdentity },
+			read: async () =>
+				(
+					await sdk.deployments.history(
+						deploymentId,
+						{ search: queryIdentity.search, page: queryIdentity.page, limit: queryIdentity.limit },
+						controller.signal
+					)
+				).data,
+			onValue: (value, cause) => {
+				if (destroyed || controller.signal.aborted || !isLatestHistoryQuery(queryIdentity, version))
+					return;
+				if (cause) {
+					historyError =
+						'Could not load commit history. Try again. If the branch has not been fetched yet, refresh branches and tags first.';
+				} else if (value) {
+					history = value;
+					historyDeploymentId = deploymentId;
+					historyError = '';
+				}
 				loading = false;
-				requestController = null;
 			}
-		}
-	}
+		});
+		historySubscription = dispose;
+		return () => {
+			dispose();
+			if (historySubscription === dispose) historySubscription = null;
+			controller.abort();
+			if (requestController === controller) requestController = null;
+		};
+	});
 
 	function toggle() {
 		open = !open;
-		if (open && !history && !loading) void loadHistory();
 		if (!open) selected = null;
 	}
 

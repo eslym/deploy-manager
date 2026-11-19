@@ -141,8 +141,17 @@ export type ResourceIdentity =
 	| { kind: 'root' }
 	| { kind: 'projects' }
 	| { kind: 'refs'; projectId: string }
+	| { kind: 'repository_keys' | 'ssh_hosts' }
+	| { kind: 'lfs_settings' | 'webhook_settings'; projectId: string }
 	| { kind: 'jobs'; deploymentId: string }
-	| { kind: 'history'; deploymentId: string; search: string; page: number; limit: number };
+	| {
+			kind: 'history';
+			deploymentId: string;
+			projectId?: string;
+			search: string;
+			page: number;
+			limit: number;
+	  };
 
 export interface ResourceSubscription<T> {
 	identity: ResourceIdentity;
@@ -167,6 +176,13 @@ interface SDKAdapters {
 	setTimeout?: (callback: () => void, delay: number) => ReturnType<typeof setTimeout>;
 	clearTimeout?: (timer: ReturnType<typeof setTimeout>) => void;
 	random?: () => number;
+	isOnline?: () => boolean;
+	isVisible?: () => boolean;
+	lifecycle?: (handlers: {
+		foreground: () => void;
+		online: () => void;
+		offline: () => void;
+	}) => () => void;
 }
 
 export type SDKError =
@@ -240,6 +256,10 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	let eventSocket: EventSocket | undefined;
 	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	let healthyTimer: ReturnType<typeof setTimeout> | undefined;
+	let fallbackStartTimer: ReturnType<typeof setTimeout> | undefined;
+	let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+	let browserListenersAttached = false;
+	let removeBrowserListeners: (() => void) | undefined;
 	let reconnectDelay = 1000;
 	let disposedEvents = false;
 	let eventReady = false;
@@ -265,10 +285,14 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			case 'deployment':
 			case 'root':
 			case 'projects':
+			case 'repository_keys':
+			case 'ssh_hosts':
 				return identity.kind === 'deployment'
 					? JSON.stringify([identity.kind, identity.projectId, identity.deploymentId])
 					: JSON.stringify([identity.kind]);
 			case 'refs':
+			case 'lfs_settings':
+			case 'webhook_settings':
 				return JSON.stringify([identity.kind, identity.projectId]);
 			case 'jobs':
 				return JSON.stringify([identity.kind, identity.deploymentId]);
@@ -276,6 +300,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 				return JSON.stringify([
 					identity.kind,
 					identity.deploymentId,
+					identity.projectId ?? '',
 					identity.search,
 					identity.page,
 					identity.limit
@@ -299,12 +324,25 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 				return false;
 			case 'projects':
 				return resource.kind === 'projects' || resource.kind === 'refs';
+			case 'repository_keys':
+				return resource.kind === 'repository_keys';
+			case 'ssh_hosts':
+				return resource.kind === 'ssh_hosts';
 			case 'refs':
 				return resource.kind === 'refs' && resource.projectId === identity.projectId;
+			case 'lfs_settings':
+				return resource.kind === 'lfs_settings' && resource.projectId === identity.projectId;
+			case 'webhook_settings':
+				return resource.kind === 'webhook_settings' && resource.projectId === identity.projectId;
 			case 'jobs':
 				return resource.kind === 'jobs' && resource.deploymentId === identity.deploymentId;
 			case 'history':
-				return resource.kind === 'history' && resource.deploymentId === identity.deploymentId;
+				return (
+					(resource.kind === 'history' && resource.deploymentId === identity.deploymentId) ||
+					(resource.kind === 'refs' &&
+						identity.projectId !== undefined &&
+						resource.projectId === identity.projectId)
+				);
 		}
 	}
 
@@ -333,7 +371,12 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		} finally {
 			entry.reading = false;
 			if (entry.dirty && entry.listeners.size > 0) void readResource(entry);
-			else if (entry.listeners.size === 0) resourceReads.delete(identityKey(entry.identity));
+			else if (
+				entry.listeners.size === 0 &&
+				resourceReads.get(identityKey(entry.identity)) === entry
+			) {
+				resourceReads.delete(identityKey(entry.identity));
+			}
 		}
 	}
 
@@ -364,7 +407,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			if (entry!.listeners.size === 0) {
 				entry!.generation++;
 				entry!.dirty = entry!.reading;
-				if (!entry!.reading) resourceReads.delete(key);
+				if (!entry!.reading && resourceReads.get(key) === entry) resourceReads.delete(key);
 			}
 		};
 	}
@@ -378,6 +421,47 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	}
 
 	function invalidateAfterMutation(path: string): void {
+		if (path === '/api/projects') {
+			notifyInvalidation([{ kind: 'projects' }]);
+			return;
+		}
+		const projectResource = path.match(
+			/^\/api\/projects\/([^/]+)\/(key|cache\/recreate|lfs|github-webhook|gitea-webhook|delete)$/
+		);
+		if (projectResource) {
+			const projectId = decodeURIComponent(projectResource[1]);
+			const resources: EventResource[] = [{ kind: 'projects' }];
+			switch (projectResource[2]) {
+				case 'key':
+					resources.push({ kind: 'repository_keys' });
+					break;
+				case 'lfs':
+					resources.push({ kind: 'lfs_settings', projectId });
+					break;
+				case 'github-webhook':
+				case 'gitea-webhook':
+					resources.push({ kind: 'webhook_settings', projectId });
+					break;
+				case 'delete':
+					resources.push(
+						{ kind: 'refs', projectId },
+						{ kind: 'lfs_settings', projectId },
+						{ kind: 'webhook_settings', projectId },
+						{ kind: 'deployments', projectId }
+					);
+					break;
+			}
+			notifyInvalidation(resources);
+			return;
+		}
+		if (path === '/api/repository-keys' || /^\/api\/repository-keys\/[^/]+\/delete$/.test(path)) {
+			notifyInvalidation([{ kind: 'repository_keys' }, { kind: 'projects' }]);
+			return;
+		}
+		if (path === '/api/ssh-hosts/approve' || path === '/api/ssh-hosts/revoke') {
+			notifyInvalidation([{ kind: 'ssh_hosts' }, { kind: 'projects' }]);
+			return;
+		}
 		const projectRefresh = path.match(/^\/api\/projects\/([^/]+)\/refresh$/);
 		if (projectRefresh) {
 			notifyInvalidation([
@@ -405,6 +489,23 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	function reportEventSessionLoss(): void {
 		if (sessionLossReported) return;
 		sessionLossReported = true;
+		disposedEvents = true;
+		if (reconnectTimer) unschedule(reconnectTimer);
+		reconnectTimer = undefined;
+		if (healthyTimer) unschedule(healthyTimer);
+		healthyTimer = undefined;
+		stopFallbackPolling();
+		if (fallbackStartTimer) unschedule(fallbackStartTimer);
+		fallbackStartTimer = undefined;
+		const socket = eventSocket;
+		eventSocket = undefined;
+		socket?.close();
+		detachBrowserListeners();
+		for (const entry of resourceReads.values()) {
+			entry.generation++;
+			for (const listener of [...entry.listeners]) listener(undefined);
+		}
+		resourceReads.clear();
 		adapters.onSessionLost?.();
 	}
 
@@ -473,6 +574,9 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 				eventReady = true;
 				eventEpoch = frame.data.epoch;
 				eventSequence = frame.data.sequence as number;
+				if (fallbackStartTimer) unschedule(fallbackStartTimer);
+				fallbackStartTimer = undefined;
+				stopFallbackPolling();
 				if (healthyTimer) unschedule(healthyTimer);
 				healthyTimer = schedule(() => {
 					healthyTimer = undefined;
@@ -530,6 +634,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 
 	function scheduleReconnect(): void {
 		if (reconnectTimer || subscribers.size === 0 || disposedEvents) return;
+		if (!(adapters.isOnline?.() ?? (typeof navigator === 'undefined' || navigator.onLine))) return;
 		const jitter = Math.max(0, Math.min(1, random()));
 		const delay = Math.max(
 			1000,
@@ -547,11 +652,25 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	): () => void {
 		subscribers.add(onInvalidate);
 		disposedEvents = false;
+		if (subscribers.size === 1) {
+			fallbackStartTimer = schedule(() => {
+				fallbackStartTimer = undefined;
+				if (!eventReady) {
+					notifyInvalidation();
+					startFallbackPolling();
+				}
+			}, 10_000);
+			attachBrowserListeners();
+		}
 		connectEvents();
 		return () => {
 			subscribers.delete(onInvalidate);
 			if (subscribers.size !== 0) return;
 			disposedEvents = true;
+			stopFallbackPolling();
+			if (fallbackStartTimer) unschedule(fallbackStartTimer);
+			fallbackStartTimer = undefined;
+			detachBrowserListeners();
 			if (reconnectTimer) unschedule(reconnectTimer);
 			reconnectTimer = undefined;
 			if (healthyTimer) unschedule(healthyTimer);
@@ -560,6 +679,78 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			eventSocket = undefined;
 			socket?.close();
 		};
+	}
+
+	function isVisible(): boolean {
+		return (
+			adapters.isVisible?.() ??
+			(typeof document === 'undefined' || document.visibilityState !== 'hidden')
+		);
+	}
+
+	function startFallbackPolling(): void {
+		if (fallbackTimer || eventReady || disposedEvents || !isVisible()) return;
+		fallbackTimer = schedule(() => {
+			fallbackTimer = undefined;
+			if (eventReady || disposedEvents || !isVisible()) return;
+			notifyInvalidation();
+			startFallbackPolling();
+		}, 15_000);
+	}
+
+	function stopFallbackPolling(): void {
+		if (fallbackTimer) unschedule(fallbackTimer);
+		fallbackTimer = undefined;
+	}
+
+	function onForeground(): void {
+		if (!isVisible() || subscribers.size === 0 || disposedEvents) return;
+		notifyInvalidation();
+		if (!eventSocket) connectEvents();
+		if (!eventReady) startFallbackPolling();
+	}
+
+	function onOffline(): void {
+		if (reconnectTimer) unschedule(reconnectTimer);
+		reconnectTimer = undefined;
+	}
+
+	function onOnline(): void {
+		if (subscribers.size === 0 || disposedEvents) return;
+		connectEvents();
+		if (!eventReady) scheduleReconnect();
+	}
+
+	function attachBrowserListeners(): void {
+		if (browserListenersAttached || (!adapters.lifecycle && typeof window === 'undefined')) return;
+		browserListenersAttached = true;
+		if (adapters.lifecycle) {
+			removeBrowserListeners = adapters.lifecycle({
+				foreground: onForeground,
+				online: onOnline,
+				offline: onOffline
+			});
+			return;
+		}
+		window.addEventListener('focus', onForeground);
+		window.addEventListener('online', onOnline);
+		window.addEventListener('offline', onOffline);
+		document.addEventListener('visibilitychange', onForeground);
+	}
+
+	function detachBrowserListeners(): void {
+		if (!browserListenersAttached) return;
+		browserListenersAttached = false;
+		if (removeBrowserListeners) {
+			removeBrowserListeners();
+			removeBrowserListeners = undefined;
+			return;
+		}
+		if (typeof window === 'undefined') return;
+		window.removeEventListener('focus', onForeground);
+		window.removeEventListener('online', onOnline);
+		window.removeEventListener('offline', onOffline);
+		document.removeEventListener('visibilitychange', onForeground);
 	}
 
 	async function request<T>(

@@ -111,6 +111,7 @@ func (a *App) projectSSHHostKeyCallback(host string, port int) ssh.HostKeyCallba
 		if writeErr != nil {
 			return errors.New("SSH host key could not be verified because trust storage is unavailable")
 		}
+		a.invalidateSSHHostState()
 		return errSSHHostApprovalRequired
 	}
 }
@@ -215,6 +216,7 @@ func (a *App) approveSSHHost(w http.ResponseWriter, r *http.Request) {
 		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
+	a.invalidateSSHHostState()
 	writeOutcome(w, http.StatusOK, "ssh_host.approved", "SSH host approved.", nil)
 }
 
@@ -262,5 +264,6 @@ func (a *App) revokeSSHHost(w http.ResponseWriter, r *http.Request) {
 		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
+	a.invalidateSSHHostState()
 	writeOutcome(w, http.StatusOK, "ssh_host.revoked", "SSH host trust revoked.", nil)
 }

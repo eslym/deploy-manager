@@ -495,6 +495,7 @@ func (a *App) recordWebhookDelivery(provider, projectID, deliveryID, event, bran
 			return fmt.Errorf("commit outcome unavailable: %w", err)
 		}
 	}
+	a.invalidateProjectRefs(projectID)
 	var postCommitErr error
 	if a.webhookFault != nil {
 		postCommitErr = a.webhookFault("after-commit")

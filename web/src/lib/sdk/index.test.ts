@@ -564,6 +564,7 @@ describe('browser SDK live event ownership', () => {
 		const api = createBrowserSDK({
 			webSocket: vi.fn(() => sockets.shift()!),
 			random: () => 0.5,
+			isOnline: () => true,
 			setTimeout: (callback, delay) => {
 				const id = ++nextTimer;
 				timers.set(id, { callback, delay });
@@ -600,6 +601,7 @@ describe('browser SDK live event ownership', () => {
 		const api = createBrowserSDK({
 			webSocket: () => sockets.shift()!,
 			random: () => 0,
+			isOnline: () => true,
 			setTimeout: (callback, delay) => {
 				const id = ++nextTimer;
 				timers.set(id, { callback, delay });
@@ -674,6 +676,178 @@ describe('browser SDK live event ownership', () => {
 			'/api/session',
 			expect.objectContaining({ method: 'GET', credentials: 'same-origin' })
 		);
+	});
+
+	it('starts scoped fallback reads after ten seconds and stops polling on ready', async () => {
+		const socket = new FakeEventSocket();
+		const timers = new Map<number, { callback: () => void; delay: number }>();
+		let nextTimer = 0;
+		const read = vi.fn(async () => []);
+		const api = createBrowserSDK({
+			webSocket: () => socket,
+			isOnline: () => true,
+			isVisible: () => true,
+			setTimeout: (callback, delay) => {
+				const id = ++nextTimer;
+				timers.set(id, { callback, delay });
+				return id as unknown as ReturnType<typeof setTimeout>;
+			},
+			clearTimeout: (timer) => timers.delete(timer as unknown as number)
+		});
+		const dispose = api.resources.subscribe({
+			identity: { kind: 'repository_keys' },
+			read,
+			onValue: vi.fn()
+		});
+		await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+		const fallbackStart = [...timers.entries()].find(([, timer]) => timer.delay === 10_000);
+		expect(fallbackStart).toBeDefined();
+		fallbackStart![1].callback();
+		timers.delete(fallbackStart![0]);
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+		expect([...timers.values()].some((timer) => timer.delay === 15_000)).toBe(true);
+
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(3));
+		expect([...timers.values()].some((timer) => timer.delay === 15_000)).toBe(false);
+		dispose();
+	});
+
+	it('routes every resource invalidation to its active typed read and dependencies', async () => {
+		const socket = new FakeEventSocket();
+		const api = createBrowserSDK({ webSocket: () => socket });
+		const subscriptions = [
+			{ identity: { kind: 'projects' } as const, resource: { kind: 'projects' } },
+			{
+				identity: { kind: 'refs', projectId: 'p1' } as const,
+				resource: { kind: 'refs', projectId: 'p1' }
+			},
+			{ identity: { kind: 'deployments' } as const, resource: { kind: 'deployments' } },
+			{
+				identity: { kind: 'jobs', deploymentId: 'd1' } as const,
+				resource: { kind: 'jobs', deploymentId: 'd1' }
+			},
+			{
+				identity: {
+					kind: 'history',
+					projectId: 'p1',
+					deploymentId: 'd1',
+					search: '',
+					page: 1,
+					limit: 20
+				} as const,
+				resource: { kind: 'refs', projectId: 'p1' }
+			},
+			{ identity: { kind: 'repository_keys' } as const, resource: { kind: 'repository_keys' } },
+			{ identity: { kind: 'ssh_hosts' } as const, resource: { kind: 'ssh_hosts' } },
+			{
+				identity: { kind: 'lfs_settings', projectId: 'p1' } as const,
+				resource: { kind: 'lfs_settings', projectId: 'p1' }
+			},
+			{
+				identity: { kind: 'webhook_settings', projectId: 'p1' } as const,
+				resource: { kind: 'webhook_settings', projectId: 'p1' }
+			}
+		];
+		const reads = subscriptions.map(() => vi.fn(async () => 0));
+		const disposers = subscriptions.map((subscription, index) =>
+			api.resources.subscribe({
+				identity: subscription.identity,
+				read: reads[index],
+				onValue: vi.fn()
+			})
+		);
+		await vi.waitFor(() => reads.forEach((read) => expect(read).toHaveBeenCalledOnce()));
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		await vi.waitFor(() => reads.forEach((read) => expect(read).toHaveBeenCalledTimes(2)));
+
+		const events = [
+			{ kind: 'projects' },
+			{ kind: 'refs', projectId: 'p1' },
+			{ kind: 'deployments', projectId: 'p1' },
+			{ kind: 'jobs', deploymentId: 'd1' },
+			{ kind: 'repository_keys' },
+			{ kind: 'ssh_hosts' },
+			{ kind: 'lfs_settings', projectId: 'p1' },
+			{ kind: 'webhook_settings', projectId: 'p1' }
+		];
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'epoch', sequence: 1, resources: events }
+			})
+		);
+		await vi.waitFor(() => {
+			expect(reads[0]).toHaveBeenCalledTimes(3);
+			expect(reads[1]).toHaveBeenCalledTimes(3);
+			expect(reads[2]).toHaveBeenCalledTimes(3);
+			expect(reads[3]).toHaveBeenCalledTimes(3);
+			expect(reads[4]).toHaveBeenCalledTimes(3);
+			expect(reads[5]).toHaveBeenCalledTimes(3);
+			expect(reads[6]).toHaveBeenCalledTimes(3);
+			expect(reads[7]).toHaveBeenCalledTimes(3);
+			expect(reads[8]).toHaveBeenCalledTimes(3);
+		});
+		disposers.forEach((dispose) => dispose());
+	});
+
+	it('suspends fallback while hidden, refreshes once on foreground, and detaches lifecycle handlers', async () => {
+		const socket = new FakeEventSocket();
+		const timers = new Map<number, { callback: () => void; delay: number }>();
+		let nextTimer = 0;
+		let visible = true;
+		let lifecycle: { foreground: () => void; online: () => void; offline: () => void } | undefined;
+		const removeLifecycle = vi.fn(() => {
+			lifecycle = undefined;
+		});
+		const read = vi.fn(async () => []);
+		const api = createBrowserSDK({
+			webSocket: () => socket,
+			isOnline: () => true,
+			isVisible: () => visible,
+			lifecycle: (handlers) => {
+				lifecycle = handlers;
+				return removeLifecycle;
+			},
+			setTimeout: (callback, delay) => {
+				const id = ++nextTimer;
+				timers.set(id, { callback, delay });
+				return id as unknown as ReturnType<typeof setTimeout>;
+			},
+			clearTimeout: (timer) => timers.delete(timer as unknown as number)
+		});
+		const dispose = api.resources.subscribe({
+			identity: { kind: 'projects' },
+			read,
+			onValue: vi.fn()
+		});
+		await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+		visible = false;
+		const fallbackStart = [...timers.entries()].find(([, timer]) => timer.delay === 10_000);
+		fallbackStart![1].callback();
+		timers.delete(fallbackStart![0]);
+		expect([...timers.values()].some((timer) => timer.delay === 15_000)).toBe(false);
+
+		visible = true;
+		lifecycle!.foreground();
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+		expect([...timers.values()].some((timer) => timer.delay === 15_000)).toBe(true);
+		dispose();
+		expect(removeLifecycle).toHaveBeenCalledOnce();
+		expect(lifecycle).toBeUndefined();
 	});
 });
 

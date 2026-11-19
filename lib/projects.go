@@ -631,6 +631,9 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	refresh := p.refreshProjectCache(r.Context(), id, remote, sshAuth)
 	if refresh.message != "" {
+		if current, stateErr := a.store.Project.Get(r.Context(), id); stateErr == nil && current.Warning != storedProject.Warning {
+			a.invalidateProjectRefs(id)
+		}
 		_, code, message := classifyProjectGitFailure(refresh.cause, refresh.status)
 		var lifecycleErr *refreshLifecycleError
 		if errors.Is(refresh.cause, errProjectCacheRecoveryRequired) ||

@@ -671,11 +671,39 @@ func (a *App) Handler() http.Handler {
 			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/webhooks/") || strings.HasPrefix(r.URL.Path, "/api/") {
-			m.ServeHTTP(w, r)
+			if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/") {
+				tracked := &mutationResponseWriter{ResponseWriter: w}
+				m.ServeHTTP(tracked, r)
+				if tracked.status >= 200 && tracked.status < 300 {
+					a.invalidateMutation(r)
+				}
+			} else {
+				m.ServeHTTP(w, r)
+			}
 			return
 		}
 		serveSPA(w, r, m)
 	}))
+}
+
+type mutationResponseWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *mutationResponseWriter) WriteHeader(status int) {
+	if w.status != 0 {
+		return
+	}
+	w.status = status
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *mutationResponseWriter) Write(body []byte) (int, error) {
+	if w.status == 0 {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
 }
 
 func serveSPA(w http.ResponseWriter, r *http.Request, backend http.Handler) {
