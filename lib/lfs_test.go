@@ -112,6 +112,12 @@ func TestLFSSettingsRequireAuthenticatedIndependentApprovalAndPersist(t *testing
 	}
 	requireOutcome(t, missingInternalConfirmation, "request.policy_rejected", "null")
 	missingInternalConfirmation.Body.Close()
+	unverifiableInternalDestination := post(`{"endpoint":"https://0.0.0.0/info/lfs","objectOrigins":["https://0.0.0.0"],"allowInternal":true,"confirmation":"I independently verified these LFS destinations","internalConfirmation":"I independently verified these LFS destinations"}`)
+	if unverifiableInternalDestination.StatusCode != http.StatusForbidden {
+		t.Fatalf("unverifiable internal destination status = %d", unverifiableInternalDestination.StatusCode)
+	}
+	requireOutcome(t, unverifiableInternalDestination, "request.policy_rejected", "null")
+	unverifiableInternalDestination.Body.Close()
 	approved := post(`{"endpoint":"https://127.0.0.1/info/lfs","objectOrigins":["https://127.0.0.1"],"allowInternal":true,"confirmation":"I independently verified these LFS destinations","internalConfirmation":"I independently verified these LFS destinations"}`)
 	if approved.StatusCode != http.StatusOK {
 		t.Fatalf("approved settings status = %d", approved.StatusCode)

@@ -21,6 +21,27 @@ import (
 	"github.com/coder/websocket/wsjson"
 )
 
+func readProjectInvalidation(t *testing.T, socket *websocket.Conn) eventInvalidation {
+	t.Helper()
+	var frame struct {
+		Code string            `json:"code"`
+		Data eventInvalidation `json:"data"`
+	}
+	if err := wsjson.Read(context.Background(), socket, &frame); err != nil {
+		t.Fatalf("read project invalidation: %v", err)
+	}
+	if frame.Code != "events.invalidate" {
+		t.Fatalf("expected invalidation frame, got %q", frame.Code)
+	}
+	for _, resource := range frame.Data.Resources {
+		if resource.Kind == "projects" {
+			return frame.Data
+		}
+	}
+	t.Fatalf("invalidation omitted project collection: %+v", frame.Data)
+	return eventInvalidation{}
+}
+
 type deletionCacheFS struct {
 	osProjectCacheFS
 	fail bool
@@ -221,17 +242,12 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 		!strings.Contains(outcome, `"operationAccepted":true`) {
 		t.Fatalf("project cleanup outcome=%s", outcome)
 	}
-	var pendingEvent struct {
-		Code string `json:"code"`
-		Data struct {
-			Resources []eventResource `json:"resources"`
-		} `json:"data"`
-	}
-	if err = wsjson.Read(context.Background(), socket, &pendingEvent); err != nil {
-		t.Fatalf("read pending cleanup invalidation: %v", err)
-	}
-	if pendingEvent.Code != "events.invalidate" || len(pendingEvent.Data.Resources) != 1 || pendingEvent.Data.Resources[0].Kind != "projects" {
-		t.Fatalf("cleanup-pending event claimed deleted resources: %+v", pendingEvent)
+	pendingEvent := readProjectInvalidation(t, socket)
+	// Cleanup is still pending: the project remains authoritative state. The
+	// socket may also contain committed worker invalidations queued earlier.
+	var projectCount int
+	if err = app.db.QueryRow(`SELECT count(*) FROM projects WHERE id=?`, projectID).Scan(&projectCount); err != nil || projectCount != 1 {
+		t.Fatalf("cleanup-pending project state changed: count=%d err=%v event=%+v", projectCount, err, pendingEvent)
 	}
 	cacheFS.fail = false
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/projects/"+projectID+"/delete", `{"confirm":true}`)
@@ -241,17 +257,9 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 	if outcome := responseText(response); !strings.Contains(outcome, `"code":"project.deleted"`) {
 		t.Fatalf("project deletion outcome=%s", outcome)
 	}
-	var deletedEvent struct {
-		Code string `json:"code"`
-		Data struct {
-			Resources []eventResource `json:"resources"`
-		} `json:"data"`
-	}
-	if err = wsjson.Read(context.Background(), socket, &deletedEvent); err != nil {
-		t.Fatalf("read committed deletion invalidation: %v", err)
-	}
-	if deletedEvent.Code != "events.invalidate" || len(deletedEvent.Data.Resources) != 5 {
-		t.Fatalf("committed deletion did not invalidate deleted-resource reads: %+v", deletedEvent)
+	deletedEvent := readProjectInvalidation(t, socket)
+	if err = app.db.QueryRow(`SELECT count(*) FROM projects WHERE id=?`, projectID).Scan(&projectCount); err != nil || projectCount != 0 {
+		t.Fatalf("committed project deletion not reflected in authoritative state: count=%d err=%v event=%+v", projectCount, err, deletedEvent)
 	}
 	if _, err = os.Stat(cache); !os.IsNotExist(err) {
 		t.Fatalf("project cache remains after deletion: %v", err)
