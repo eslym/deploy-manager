@@ -258,7 +258,6 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 
 	return {
 		...repositoryOperations,
-		projects: createProjectOperations(request),
 		deployments: createDeploymentSDK(request),
 		auth: {
 			registerStart: (input: { grant: string; value: string }, signal?: AbortSignal) =>

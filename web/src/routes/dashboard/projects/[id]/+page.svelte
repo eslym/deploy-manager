@@ -158,7 +158,11 @@
 		const projectId = project.id;
 		error = '';
 		try {
-			await sdk.projects.assignKey(projectId, { keyId: keyAssignments[projectId] }, controller.signal);
+			await sdk.projects.assignKey(
+				projectId,
+				{ keyId: keyAssignments[projectId] },
+				controller.signal
+			);
 		} catch (cause) {
 			if (!controller.signal.aborted && selected === projectId)
 				error = cause instanceof Error ? cause.message : 'Could not assign the key.';

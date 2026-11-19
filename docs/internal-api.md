@@ -158,8 +158,9 @@ For example, success is `{"code":"auth.login_completed","message":"Signed in.","
 
 ### Browser SDK (authentication, project, repository, and deployment operations)
 
-Authentication and deployment callers use the framework-independent
-[`web/src/lib/sdk/index.ts`](../web/src/lib/sdk/index.ts) barrel. It owns
+Authentication, project, repository, and deployment callers use the
+framework-independent [`web/src/lib/sdk/index.ts`](../web/src/lib/sdk/index.ts)
+barrel. It owns
 same-origin credentials, JSON encoding, envelope and endpoint-data validation,
 safe fallback errors, cancellation, and session-required signaling. Named
 operations such as `sdk.auth.loginStart`, `sdk.auth.session`,
@@ -200,10 +201,9 @@ Project and repository routes use named SDK operations and outcome envelopes.
 Deployment, webhook ingestion/settings, and destructive project deletion retain
 their separate migration ownership.
 
-Project routes remain on their existing response shapes and callers; their
-conversion to named SDK methods and outcome envelopes remains planned, not
-implemented. Publication move and deployment deletion are likewise deferred to
-#70; their shared authorization/security guards are already envelope-based.
+Publication move and deployment deletion remain on their route-specific legacy
+contracts and are deferred to #70; their shared authorization/security guards
+are already envelope-based.
 
 ### Flow and state details
 

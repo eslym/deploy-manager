@@ -88,15 +88,24 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 	if keyResponse.StatusCode != http.StatusCreated {
 		t.Fatalf("shared key create status=%d: %s", keyResponse.StatusCode, responseText(keyResponse))
 	}
-	var sharedKey repositoryKey
-	if err = json.NewDecoder(keyResponse.Body).Decode(&sharedKey); err != nil {
+	var sharedKeyOutcome struct {
+		Data repositoryKey `json:"data"`
+	}
+	if err = json.NewDecoder(keyResponse.Body).Decode(&sharedKeyOutcome); err != nil {
 		t.Fatal(err)
 	}
 	keyResponse.Body.Close()
+	sharedKey := sharedKeyOutcome.Data
 	assigned := projectPost(t, server.Client(), server.URL, cookie, "/api/projects/"+projectID+"/key", fmt.Sprintf(`{"keyId":%q}`, sharedKey.ID))
+	var assignedOutcome struct {
+		Code string `json:"code"`
+	}
+	if err = json.NewDecoder(assigned.Body).Decode(&assignedOutcome); err != nil {
+		t.Fatal(err)
+	}
 	assigned.Body.Close()
-	if assigned.StatusCode != http.StatusNoContent {
-		t.Fatalf("project key assignment status=%d", assigned.StatusCode)
+	if assigned.StatusCode != http.StatusOK || assignedOutcome.Code != "project.key_assigned" {
+		t.Fatalf("project key assignment status=%d outcome=%#v", assigned.StatusCode, assignedOutcome)
 	}
 	if _, err = app.db.Exec(`INSERT INTO ssh_host_trust(host,port,trusted_key,warning) VALUES('example.test',22,?,'')`, []byte("trusted host key")); err != nil {
 		t.Fatal(err)
@@ -128,11 +137,14 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var visible []deployment
-	if err = json.NewDecoder(listResponse.Body).Decode(&visible); err != nil {
+	var visibleOutcome struct {
+		Data []deployment `json:"data"`
+	}
+	if err = json.NewDecoder(listResponse.Body).Decode(&visibleOutcome); err != nil {
 		t.Fatal(err)
 	}
 	listResponse.Body.Close()
+	visible := visibleOutcome.Data
 	foundFailure := false
 	for _, item := range visible {
 		if item.ID == firstID && (item.Status == "deletion_failed" || item.Status == "deleting") && item.Error != "" {
@@ -198,11 +210,14 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var remainingKeys []repositoryKey
-	if err = json.NewDecoder(keysResp.Body).Decode(&remainingKeys); err != nil {
+	var remainingKeysOutcome struct {
+		Data []repositoryKey `json:"data"`
+	}
+	if err = json.NewDecoder(keysResp.Body).Decode(&remainingKeysOutcome); err != nil {
 		t.Fatal(err)
 	}
 	keysResp.Body.Close()
+	remainingKeys := remainingKeysOutcome.Data
 	if len(remainingKeys) != 1 || remainingKeys[0].ID != sharedKey.ID {
 		t.Fatalf("project deletion removed a shared repository key: %#v", remainingKeys)
 	}
