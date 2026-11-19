@@ -55,11 +55,12 @@ Use [GLOSSARY.md](../GLOSSARY.md) for deployment/release terminology.
 ### Bodies, responses, and errors
 
 Send JSON bodies with `Content-Type: application/json`. Authentication,
-repository-key, SSH-host, LFS, webhook-settings, and webhook-ingestion routes,
-their authorization guards, and maintenance responses use an outcome envelope.
-Other application routes retain their existing response forms until their
-coordinated migration slice lands. Times are JSON RFC 3339 timestamps, not Unix
-integers. Unmigrated list responses are bare arrays unless stated otherwise.
+repository-key, SSH-host, LFS, webhook-settings, webhook-ingestion, and project
+routes, their authorization guards, and maintenance responses use an outcome
+envelope. Other application routes retain their existing response forms until
+their coordinated migration slice lands. Times are JSON RFC 3339 timestamps,
+not Unix integers. Unmigrated list responses are bare arrays unless stated
+otherwise; migrated resource arrays are in envelope `data`.
 Optional fields marked below may be omitted.
 
 Unmigrated errors generally use Go's `http.Error`: `text/plain; charset=utf-8`
@@ -140,15 +141,19 @@ values, and trailing JSON are rejected.
 
 For example, success is `{"code":"auth.login_completed","message":"Signed in.","data":null}`. Errors use the same shape. Authentication codes include `auth.session_required` (401), `auth.login_failed` (401), `auth.protocol_invalid` (400), `auth.registration_expired` (410), `auth.registration_conflict` (409), `auth.recent_login_required` (401), and `auth.capacity_exceeded` (existing 429). Shared request and service codes are `request.https_required`, `request.json_required`, `request.policy_rejected`, `request.origin_rejected`, `request.rate_limited`, `service.unavailable`, and `service.internal_error`, retaining their existing statuses. Authentication errors do not disclose account existence, password validity, or grant-consumption details.
 
-### Browser SDK (authentication and repository management)
+### Browser SDK (authentication, project, and repository operations)
 
 Authentication callers and route guards use the framework-independent
 [`web/src/lib/sdk/index.ts`](../web/src/lib/sdk/index.ts) barrel. It owns
 same-origin credentials, JSON encoding, envelope and endpoint-data validation,
 safe fallback errors, cancellation, and session-required signaling. Named
 operations such as `sdk.auth.loginStart`, `sdk.auth.session`,
-`sdk.auth.recoveryFinish`, and `sdk.auth.passwordChangeFinish` accept an optional `AbortSignal`. Mutations,
-including OPAQUE exchanges, are never retried automatically. SDK errors are
+`sdk.auth.recoveryFinish`, and `sdk.auth.passwordChangeFinish` accept an optional `AbortSignal`.
+Project operations are grouped under `sdk.projects`: `list`, `create`,
+`refs(id)`, `refresh(id)`, `assignKey(id, { keyId })`, and `clearCache(id)`.
+They return the validated outcome envelope; callers read resource payloads from
+`data` and may pass an `AbortSignal`. Project paths and full IDs are handled by
+the SDK. Mutations, including OPAQUE exchanges, are never retried automatically. SDK errors are
 discriminated as `server`, `network`, `invalid_response`, or `cancelled`;
 proxy HTML and raw exception text are not displayed as trusted messages.
 Only server outcomes carry server-returned codes. SDK-local failures carry
@@ -172,6 +177,9 @@ through the same barrel: `sdk.repositoryKeys.list/create/delete`,
 resource IDs, accept an optional `AbortSignal`, and never retry mutations.
 Webhook rotation returns its printable secret only in that authorized response;
 the settings read and live notifications never include it.
+Project and repository routes use named SDK operations and outcome envelopes.
+Deployment, webhook ingestion/settings, and destructive project deletion retain
+their separate migration ownership.
 
 ### Flow and state details
 
@@ -220,13 +228,22 @@ list again for measured sizes.
 
 | Method and path | Request / success | Important behavior |
 | --- | --- | --- |
-| GET `/api/projects` | 200 Project[] | Ordered by creation time then ID; measures Git/LFS cache sizes. |
-| POST `/api/projects` | `{"name":"site","url":"https://git.example/site.git"}`; 201 Project | Synchronously clones without checkout and saves cached refs; not a queued job. |
-| GET `/api/projects/{id}/refs` | 200 Ref[] | Cached only, sorted by kind/name; does not fetch. |
-| POST `/api/projects/{id}/refresh` | No body required; 200 `{"lastFetched":"<timestamp>","warning":""}` | Synchronously fetches; failed refresh preserves cached refs and last successful fetch information. |
-| POST `/api/projects/{id}/key` | `{"keyId":"<key-id>"}`; 204 | SSH projects only; changes assigned managed key, does not fetch. |
-| POST `/api/projects/{id}/cache/recreate` | `{"confirm":true}`; 204 | Clears Git and verified LFS caches; see limitation below. |
+| GET `/api/projects` | 200 `project.listed`; `data` is Project[] | Ordered by creation time then ID; measures Git/LFS cache sizes. |
+| POST `/api/projects` | `{"name":"site","url":"https://git.example/site.git"}`; 201 `project.created`; `data` is Project | Synchronously clones without checkout and saves cached refs; not a queued job. |
+| GET `/api/projects/{id}/refs` | 200 `project.refs_listed`; `data` is Ref[] | Cached only, sorted by kind/name; does not fetch. |
+| POST `/api/projects/{id}/refresh` | No body required; 200 `project.refreshed`; `data` is `{"lastFetched":"<timestamp>","warning":""}` | Synchronously fetches; failed refresh preserves cached refs and last successful fetch information. |
+| POST `/api/projects/{id}/key` | `{"keyId":"<key-id>"}`; 200 `project.key_assigned`; `data` is null | SSH projects only; changes assigned managed key, does not fetch. |
+| POST `/api/projects/{id}/cache/recreate` | `{"confirm":true}`; 200 `project.cache_cleared`; `data` is null | Clears Git and verified LFS caches; this does not clone or fetch a replacement repository. Recovery-required errors mean inspect/restart recovery before retrying. |
 | POST `/api/projects/{id}/delete` | `{"confirm":true}`; 204 | Blocked with 409 while deployments exist; removes project caches/settings. |
+
+Project failure outcomes use `request.invalid` (400), `request.not_found` (404),
+`git.target_unavailable` (400/502), `git.authentication_failed` (502),
+`ssh_host.approval_required` (409/502), `operation.capacity_exceeded` (413 or
+the existing upstream failure status), `operation.upstream_failed` (existing
+upstream status), and `project.cache_recovery_required` (503) where applicable.
+Failures do not echo upstream Git text in the outcome message. A failed repository
+refresh preserves the last successful cached refs and fetch time; inspect its
+warning before retrying. Cache recovery-required means do not assume retry safety.
 
 Project creation accepts `keyId` for an `ssh://` URL or conventional SCP-style
 SSH origin (for example, `git@github.com:owner/repo.git`) and requires it for SSH.

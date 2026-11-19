@@ -235,9 +235,9 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if createdRes.StatusCode != http.StatusCreated {
 		t.Fatalf("project creation status %d: %s", createdRes.StatusCode, responseText(createdRes))
 	}
-	var created project
-	if err := json.NewDecoder(createdRes.Body).Decode(&created); err != nil {
-		t.Fatal(err)
+	created := decodeProjectOutcome(t, createdRes.Body)
+	if createdRes.StatusCode != http.StatusCreated {
+		t.Fatalf("project creation status %d", createdRes.StatusCode)
 	}
 	createdRes.Body.Close()
 	if created.LastFetched == nil {
@@ -736,17 +736,14 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		response := projectPost(t, client, appServer.URL, cookie, "/api/projects", `{"name":"`+unsupported.name+`","url":"`+unsupported.url+`"}`)
 		message := responseText(response)
 		response.Body.Close()
-		if response.StatusCode != http.StatusBadRequest || strings.Contains(message, unsupported.url) {
+		var outcome struct {
+			Code string `json:"code"`
+		}
+		if err := json.Unmarshal([]byte(message), &outcome); err != nil {
+			t.Fatalf("unsupported repository returned a non-outcome response: %s", message)
+		}
+		if response.StatusCode != http.StatusBadRequest || strings.Contains(message, unsupported.url) || outcome.Code != "git.target_unavailable" {
 			t.Fatalf("unsupported %s repository was not safely rejected: status %d, %s", unsupported.name, response.StatusCode, message)
-		}
-		if unsupported.name == "SHA-256 Git" && !strings.Contains(strings.ToLower(message), "sha-256") {
-			t.Fatalf("SHA-256 rejection is not actionable: %s", message)
-		}
-		if unsupported.name == "dumb HTTP" && !strings.Contains(strings.ToLower(message), "smart https") {
-			t.Fatalf("dumb HTTP rejection is not actionable: %s", message)
-		}
-		if unsupported.name == "partial clone" && !strings.Contains(strings.ToLower(message), "partial") && !strings.Contains(strings.ToLower(message), "incomplete") {
-			t.Fatalf("incomplete repository rejection is not actionable: %s", message)
 		}
 	}
 
@@ -800,7 +797,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("oversized pack refresh status %d: %s", oversized.StatusCode, responseText(oversized))
 	}
 	oversizedMessage := responseText(oversized)
-	if !strings.Contains(strings.ToLower(oversizedMessage), "limit") {
+	var oversizedOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(oversizedMessage), &oversizedOutcome); err != nil || oversizedOutcome.Code != "operation.capacity_exceeded" {
 		t.Fatalf("oversized pack error is not actionable: %s", oversizedMessage)
 	}
 	refsAfterOversizedRefresh := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
@@ -874,7 +874,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if measuredPackBytes.Load() <= 1024 || measuredPackBytes.Load() >= 1<<20 {
 		t.Fatalf("high-compressibility smart-HTTPS pack bytes = %d, want >1 KiB storage headroom and <1 MiB transfer ceiling", measuredPackBytes.Load())
 	}
-	if cacheLimitedRefresh.StatusCode != http.StatusRequestEntityTooLarge || !strings.Contains(strings.ToLower(cacheLimitMessage), "cache limit") {
+	var cacheLimitOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(cacheLimitMessage), &cacheLimitOutcome); err != nil || cacheLimitedRefresh.StatusCode != http.StatusRequestEntityTooLarge || cacheLimitOutcome.Code != "operation.capacity_exceeded" {
 		t.Fatalf("compressed-object cache limit status/message = %d, %q; want 413 with cache-limit class", cacheLimitedRefresh.StatusCode, cacheLimitMessage)
 	}
 	assertPreviousCache := func(reason string) {
@@ -929,7 +932,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	refLimitMessage := responseText(tooManyRefs)
 	tooManyRefs.Body.Close()
-	if !strings.Contains(strings.ToLower(refLimitMessage), "ref") {
+	var refLimitOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(refLimitMessage), &refLimitOutcome); err != nil || refLimitOutcome.Code != "git.target_unavailable" {
 		t.Fatalf("excessive refs error is not actionable: %s", refLimitMessage)
 	}
 	if measuredPackBytes.Load() <= 0 || measuredPackBytes.Load() >= 1<<20 {
@@ -1130,7 +1136,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	rollbackFailure := projectPost(t, restarted.Client(), restarted.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
 	rollbackMessage := responseText(rollbackFailure)
 	rollbackFailure.Body.Close()
-	if rollbackFailure.StatusCode != http.StatusServiceUnavailable || !strings.Contains(strings.ToLower(rollbackMessage), "restoration failed") {
+	var rollbackOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(rollbackMessage), &rollbackOutcome); err != nil || rollbackFailure.StatusCode != http.StatusServiceUnavailable || rollbackOutcome.Code != "project.cache_recovery_required" {
 		t.Fatalf("rollback failure was not surfaced/blocked: status %d message %q", rollbackFailure.StatusCode, rollbackMessage)
 	}
 	requestsAfterRollbackFailure := gitRequests.Load()
@@ -1140,7 +1149,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	blockedRetry := projectPost(t, restarted.Client(), restarted.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
 	blockedMessage := responseText(blockedRetry)
 	blockedRetry.Body.Close()
-	if blockedRetry.StatusCode != http.StatusServiceUnavailable || !strings.Contains(strings.ToLower(blockedMessage), "blocked") || gitRequests.Load() != requestsAfterRollbackFailure {
+	var blockedOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(blockedMessage), &blockedOutcome); err != nil || blockedRetry.StatusCode != http.StatusServiceUnavailable || blockedOutcome.Code != "project.cache_recovery_required" || gitRequests.Load() != requestsAfterRollbackFailure {
 		t.Fatalf("cache recovery block was not enforced: status=%d message=%q requests=%d", blockedRetry.StatusCode, blockedMessage, gitRequests.Load())
 	}
 	if _, err := os.Stat(app.projects.repoPath(created.ID)); !os.IsNotExist(err) {
@@ -1179,7 +1191,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	cleanupFailure := projectPost(t, recoveredServer.Client(), recoveredServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
 	cleanupMessage := responseText(cleanupFailure)
 	cleanupFailure.Body.Close()
-	if cleanupFailure.StatusCode != http.StatusServiceUnavailable || !strings.Contains(strings.ToLower(cleanupMessage), "staging cleanup failed") {
+	var cleanupOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(cleanupMessage), &cleanupOutcome); err != nil || cleanupFailure.StatusCode != http.StatusServiceUnavailable || cleanupOutcome.Code != "project.cache_recovery_required" {
 		t.Fatalf("staging cleanup failure was hidden: status=%d message=%q", cleanupFailure.StatusCode, cleanupMessage)
 	}
 	if gitRequests.Load() <= requestsBeforeCleanupFailure {
@@ -1440,10 +1455,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	// tests identity isolation rather than the deliberately tiny transfer cap.
 	app.projects.maxTransferBytes = 32 << 20
 	second := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/projects", `{"name":"second Gitea project","url":"`+remote.URL+`/repo.git"}`)
-	var secondProject project
-	if second.StatusCode != 201 || json.NewDecoder(second.Body).Decode(&secondProject) != nil {
+	if second.StatusCode != http.StatusCreated {
 		t.Fatalf("second project = %d: %s", second.StatusCode, responseText(second))
 	}
+	secondProject := decodeProjectOutcome(t, second.Body)
 	second.Body.Close()
 	secondSecret := setupProviderWebhook(t, branchServer, cookie, secondProject.ID, "gitea")
 	deployment := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments", `{"projectId":"`+secondProject.ID+`","name":"second Gitea site","targetKind":"branch","targetName":"feature/search"}`)
@@ -1844,11 +1859,32 @@ func listProjectsFromAPI(t *testing.T, client *http.Client, origin, cookie strin
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("list projects status %d: %s", response.StatusCode, responseText(response))
 	}
-	var result []project
+	var result struct {
+		Code string    `json:"code"`
+		Data []project `json:"data"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	return result
+	if result.Code != "project.listed" {
+		t.Fatalf("project list outcome code %q", result.Code)
+	}
+	return result.Data
+}
+
+func decodeProjectOutcome(t *testing.T, body io.Reader) project {
+	t.Helper()
+	var result struct {
+		Code string  `json:"code"`
+		Data project `json:"data"`
+	}
+	if err := json.NewDecoder(body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Code != "project.created" {
+		t.Fatalf("project creation outcome code %q", result.Code)
+	}
+	return result.Data
 }
 
 func projectRefsFromAPI(t *testing.T, client *http.Client, origin, cookie, id string) []projectRef {
@@ -1863,11 +1899,17 @@ func projectRefsFromAPI(t *testing.T, client *http.Client, origin, cookie, id st
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("project refs status %d: %s", response.StatusCode, responseText(response))
 	}
-	var result []projectRef
+	var result struct {
+		Code string       `json:"code"`
+		Data []projectRef `json:"data"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	return result
+	if result.Code != "project.refs_listed" {
+		t.Fatalf("project refs outcome code %q", result.Code)
+	}
+	return result.Data
 }
 
 func requireProjectRefs(t *testing.T, refs []projectRef, featureID string) {

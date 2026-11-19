@@ -127,10 +127,7 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("project: %d %s", response.StatusCode, responseText(response))
 	}
-	var project struct{ ID string }
-	if err = json.NewDecoder(response.Body).Decode(&project); err != nil {
-		t.Fatal(err)
-	}
+	project := decodeProjectOutcome(t, response.Body)
 	response.Body.Close()
 	f.projectID = project.ID
 	response = projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/"+f.provider+"-webhook", `{"rotate":true}`)

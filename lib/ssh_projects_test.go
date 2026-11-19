@@ -172,10 +172,7 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	if createdResponse.StatusCode != http.StatusCreated {
 		t.Fatalf("approved SSH create status=%d body=%s", createdResponse.StatusCode, responseText(createdResponse))
 	}
-	var created project
-	if err = json.NewDecoder(createdResponse.Body).Decode(&created); err != nil {
-		t.Fatal(err)
-	}
+	created := decodeProjectOutcome(t, createdResponse.Body)
 	createdResponse.Body.Close()
 	refs := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
 	if len(refs) != 1 || refs[0].Name != "main" {
@@ -193,7 +190,13 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	}
 	revokedRefresh := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
 	revokedMessage := responseText(revokedRefresh)
-	if revokedRefresh.StatusCode != http.StatusBadGateway || !strings.Contains(strings.ToLower(revokedMessage), "ssh host key is not approved") {
+	var revokedOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(revokedMessage), &revokedOutcome); err != nil {
+		t.Fatalf("SSH refresh returned a non-outcome response: %s", revokedMessage)
+	}
+	if revokedRefresh.StatusCode != http.StatusBadGateway || revokedOutcome.Code != "ssh_host.approval_required" {
 		t.Fatalf("SSH connection after revocation was not blocked: status=%d body=%s", revokedRefresh.StatusCode, revokedMessage)
 	}
 	revokedRefresh.Body.Close()
@@ -287,10 +290,7 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	if second.StatusCode != http.StatusCreated {
 		t.Fatalf("second SSH project status=%d body=%s", second.StatusCode, responseText(second))
 	}
-	var secondProject project
-	if err = json.NewDecoder(second.Body).Decode(&secondProject); err != nil {
-		t.Fatal(err)
-	}
+	secondProject := decodeProjectOutcome(t, second.Body)
 	second.Body.Close()
 	blockedDelete := projectPost(t, client, appServer.URL, cookie, "/api/repository-keys/"+key.ID+"/delete", `{}`)
 	if blockedDelete.StatusCode != http.StatusConflict {
@@ -304,7 +304,11 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	}
 	for _, projectID := range []string{created.ID, secondProject.ID} {
 		assigned := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+projectID+"/key", fmt.Sprintf(`{"keyId":%q}`, replacement.ID))
-		if assigned.StatusCode != http.StatusNoContent {
+		var assignmentOutcome struct {
+			Code string `json:"code"`
+			Data any    `json:"data"`
+		}
+		if assigned.StatusCode != http.StatusOK || json.NewDecoder(assigned.Body).Decode(&assignmentOutcome) != nil || assignmentOutcome.Code != "project.key_assigned" || assignmentOutcome.Data != nil {
 			t.Fatalf("reassign key status=%d body=%s", assigned.StatusCode, responseText(assigned))
 		}
 		assigned.Body.Close()
@@ -325,7 +329,10 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	}
 	failedMessage := responseText(failed)
 	failed.Body.Close()
-	if !strings.Contains(strings.ToLower(failedMessage), "ssh authentication failed") {
+	var failedOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(failedMessage), &failedOutcome); err != nil || failedOutcome.Code != "git.authentication_failed" {
 		t.Fatalf("SSH authentication failure was not actionable: %q", failedMessage)
 	}
 	failedAssignedDelete := projectPost(t, client, appServer.URL, cookie, "/api/repository-keys/"+replacement.ID+"/delete", `{}`)

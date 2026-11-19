@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
-	import { sdk } from '#lib/sdk/index.js';
+	import { sdk, serverErrorCode } from '#lib/sdk/index.js';
 	import { formatBytes } from '#lib/format-bytes.js';
-	import { tick } from 'svelte';
+	import { onDestroy, tick } from 'svelte';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import Deployments from '#lib/components/Deployments.svelte';
@@ -103,6 +103,9 @@
 	let cacheRecreateBusy = $state(false);
 	let cacheRecreateError = $state('');
 	let cacheRecreateNotice = $state('');
+	let projectReadController: AbortController | undefined;
+	let refreshController: AbortController | undefined;
+	let cacheReadController: AbortController | undefined;
 	let selected = $derived(page.params.id ?? '');
 	let project = $derived(projects.find((item) => item.id === selected));
 	let loading = $state(true);
@@ -114,12 +117,19 @@
 	);
 
 	async function loadProjects() {
+		projectReadController?.abort();
+		const controller = new AbortController();
+		projectReadController = controller;
+		const projectId = selected;
 		try {
-			projects = await request('/api/projects');
+			const loaded = (await sdk.projects.list(controller.signal)).data;
+			if (controller.signal.aborted || selected !== projectId) return;
+			projects = loaded;
 			for (const project of projects) keyAssignments[project.id] = project.keyId ?? '';
 			missing = !projects.some((project) => project.id === selected);
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not load projects.';
+			if (!controller.signal.aborted && selected === projectId)
+				error = cause instanceof Error ? cause.message : 'Could not load projects.';
 		}
 	}
 	async function loadRepositoryKeys() {
@@ -139,10 +149,7 @@
 	async function assignKey(project: Project) {
 		error = '';
 		try {
-			await request(`/api/projects/${project.id}/key`, {
-				method: 'POST',
-				body: JSON.stringify({ keyId: keyAssignments[project.id] })
-			});
+			await sdk.projects.assignKey(project.id, { keyId: keyAssignments[project.id] });
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not assign the key.';
 		}
@@ -214,21 +221,29 @@
 	}
 	async function refresh(project: Project) {
 		if (busy) return;
+		refreshController?.abort();
+		const controller = new AbortController();
+		refreshController = controller;
 		busy = true;
 		try {
-			await request(
-				`/api/projects/${project.id}/refresh`,
-				{ method: 'POST', body: '{}' },
-				{ sshRefresh: project.url.startsWith('ssh://') }
-			);
-			const refreshedRefs: Ref[] = await request(`/api/projects/${project.id}/refs`);
-			const refreshedProjects: Project[] = await request('/api/projects');
+			await sdk.projects.refresh(project.id, controller.signal);
+			const refreshedRefs: Ref[] = (await sdk.projects.refs(project.id, controller.signal)).data;
+			const refreshedProjects: Project[] = (await sdk.projects.list(controller.signal)).data;
+			if (controller.signal.aborted || selected !== project.id) return;
 			refs[project.id] = refreshedRefs;
 			projects = refreshedProjects;
 			error = '';
 		} catch (cause) {
+			if (controller.signal.aborted || selected !== project.id) return;
 			const message =
-				cause instanceof Error ? cause.message : 'The request could not be completed. Try again.';
+				project.url.startsWith('ssh://') &&
+				['git.target_unavailable', 'git.authentication_failed'].includes(
+					serverErrorCode(cause) ?? ''
+				)
+					? 'SSH connection failed. Check the repository key and SSH host warnings.'
+					: cause instanceof Error
+						? cause.message
+						: 'The request could not be completed. Try again.';
 			projects = projects.map((item) =>
 				item.id === project.id
 					? {
@@ -239,7 +254,10 @@
 			);
 			if (project.url.startsWith('ssh://')) await loadSshHosts();
 		} finally {
-			busy = false;
+			if (refreshController === controller) {
+				refreshController = undefined;
+				busy = false;
+			}
 		}
 	}
 	async function deleteProject(project: Project) {
@@ -270,27 +288,32 @@
 	}
 	async function recreateCache(project: Project) {
 		if (cacheRecreateBusy || cacheRecreateConfirmation !== project.id) return;
+		cacheReadController?.abort();
+		const readController = new AbortController();
+		cacheReadController = readController;
 		cacheRecreateBusy = true;
 		cacheRecreateError = '';
 		cacheRecreateNotice = '';
 		let storageCleared = false;
 		try {
-			await request(`/api/projects/${project.id}/cache/recreate`, {
-				method: 'POST',
-				body: JSON.stringify({ confirm: true })
-			});
+			await sdk.projects.clearCache(project.id);
 			storageCleared = true;
-			const refreshedProjects: Project[] = await request('/api/projects');
+			const refreshedProjects: Project[] = (await sdk.projects.list(readController.signal)).data;
+			if (readController.signal.aborted || selected !== project.id) return;
 			projects = refreshedProjects;
 			if (cacheRecreateConfirmation === project.id) closeCacheRecreateConfirmation(true);
 			if (selected === project.id)
 				cacheRecreateNotice = 'Repository storage cleared. Sizes updated.';
 		} catch (cause) {
+			if (readController.signal.aborted || selected !== project.id) return;
 			cacheRecreateError = storageCleared
 				? 'Storage was cleared, but the sizes could not be refreshed. Reload the page to check them.'
 				: 'Could not clear repository storage. Try again.';
 		} finally {
-			cacheRecreateBusy = false;
+			if (cacheReadController === readController) {
+				cacheReadController = undefined;
+				cacheRecreateBusy = false;
+			}
 		}
 	}
 	async function openCacheRecreateConfirmation(project: Project) {
@@ -339,6 +362,13 @@
 		}
 	}
 	async function loadDetail(id: string) {
+		projectReadController?.abort();
+		cacheReadController?.abort();
+		refreshController?.abort();
+		refreshController = undefined;
+		busy = false;
+		const controller = new AbortController();
+		projectReadController = controller;
 		const version = ++lfsSelectionVersion;
 		lfsLoadVersion++;
 		loading = true;
@@ -352,8 +382,8 @@
 		cacheRecreateError = '';
 		cacheRecreateNotice = '';
 		try {
-			const loaded: Project[] = await request('/api/projects');
-			if (version !== lfsSelectionVersion || selected !== id) return;
+			const loaded: Project[] = (await sdk.projects.list(controller.signal)).data;
+			if (controller.signal.aborted || version !== lfsSelectionVersion || selected !== id) return;
 			projects = loaded;
 			const project = loaded.find((item) => item.id === id);
 			if (!project) {
@@ -363,22 +393,29 @@
 			keyAssignments[id] = project.keyId ?? '';
 			void loadLfsSettings(id);
 			try {
-				const loadedRefs: Ref[] = await request(`/api/projects/${id}/refs`);
-				if (version === lfsSelectionVersion && selected === id) refs[id] = loadedRefs;
+				const loadedRefs: Ref[] = (await sdk.projects.refs(id, controller.signal)).data;
+				if (!controller.signal.aborted && version === lfsSelectionVersion && selected === id)
+					refs[id] = loadedRefs;
 			} catch (cause) {
-				if (version === lfsSelectionVersion && selected === id)
+				if (!controller.signal.aborted && version === lfsSelectionVersion && selected === id)
 					error = cause instanceof Error ? cause.message : 'Could not load branches and tags.';
 			}
 		} catch (cause) {
-			if (version === lfsSelectionVersion && selected === id)
+			if (!controller.signal.aborted && version === lfsSelectionVersion && selected === id)
 				error = cause instanceof Error ? cause.message : 'Could not load projects.';
 		} finally {
-			if (version === lfsSelectionVersion && selected === id) loading = false;
+			if (!controller.signal.aborted && version === lfsSelectionVersion && selected === id)
+				loading = false;
 		}
 	}
 	afterNavigate(() => {
 		void loadDetail(selected);
 		void loadRepositoryKeys();
+	});
+	onDestroy(() => {
+		projectReadController?.abort();
+		cacheReadController?.abort();
+		refreshController?.abort();
 	});
 </script>
 

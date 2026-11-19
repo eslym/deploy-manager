@@ -77,7 +77,10 @@ func TestProjectHTTPRejectsUnauthenticatedAndUnsupportedURLs(t *testing.T) {
 	if localRes.StatusCode != http.StatusBadRequest {
 		t.Fatalf("loopback HTTPS status = %d", localRes.StatusCode)
 	}
-	var projects []project
+	var listOutcome struct {
+		Code string    `json:"code"`
+		Data []project `json:"data"`
+	}
 	getReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/projects", nil)
 	getReq.AddCookie(&http.Cookie{Name: sessionCookie, Value: base64.RawURLEncoding.EncodeToString(token)})
 	get, err := client.Do(getReq)
@@ -85,8 +88,12 @@ func TestProjectHTTPRejectsUnauthenticatedAndUnsupportedURLs(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer get.Body.Close()
-	if err := json.NewDecoder(get.Body).Decode(&projects); err != nil {
+	if err := json.NewDecoder(get.Body).Decode(&listOutcome); err != nil {
 		t.Fatal(err)
+	}
+	projects := listOutcome.Data
+	if listOutcome.Code != "project.listed" {
+		t.Fatalf("unexpected project list code %q", listOutcome.Code)
 	}
 	if len(projects) != 0 {
 		t.Fatalf("unsupported URL created %d projects", len(projects))
@@ -138,9 +145,16 @@ func TestListProjectsIncludesAssignedAndUnassignedKeysInProjectOrder(t *testing.
 	if res.StatusCode != http.StatusOK {
 		t.Fatalf("project list status = %d, want 200", res.StatusCode)
 	}
-	var got []project
-	if err := json.NewDecoder(res.Body).Decode(&got); err != nil {
+	var listOutcome struct {
+		Code string    `json:"code"`
+		Data []project `json:"data"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&listOutcome); err != nil {
 		t.Fatal(err)
+	}
+	got := listOutcome.Data
+	if listOutcome.Code != "project.listed" {
+		t.Fatalf("unexpected project list code %q", listOutcome.Code)
 	}
 	if len(got) != 4 {
 		t.Fatalf("got %d projects, want 4", len(got))
@@ -213,12 +227,19 @@ func TestProjectCacheSizesAndExplicitRecreationOverHTTP(t *testing.T) {
 		return res
 	}
 	listed := request(http.MethodGet, "/api/projects", "")
-	var projects []project
-	if listed.StatusCode != http.StatusOK || json.NewDecoder(listed.Body).Decode(&projects) != nil {
+	var listOutcome struct {
+		Code string    `json:"code"`
+		Data []project `json:"data"`
+	}
+	if listed.StatusCode != http.StatusOK || json.NewDecoder(listed.Body).Decode(&listOutcome) != nil {
 		listed.Body.Close()
 		t.Fatalf("project listing status = %d; want a cache size response", listed.StatusCode)
 	}
 	listed.Body.Close()
+	projects := listOutcome.Data
+	if listOutcome.Code != "project.listed" {
+		t.Fatalf("unexpected project list code %q", listOutcome.Code)
+	}
 	if len(projects) != 1 || projects[0].GitCacheBytes == 0 || projects[0].LFSCacheBytes != int64(len(payload)) {
 		t.Fatalf("reported project cache sizes = %+v", projects)
 	}
@@ -228,17 +249,28 @@ func TestProjectCacheSizesAndExplicitRecreationOverHTTP(t *testing.T) {
 		t.Fatalf("recreation without explicit confirmation status = %d, want 400", missingConfirmation.StatusCode)
 	}
 	confirmed := request(http.MethodPost, "/api/projects/"+projectID+"/cache/recreate", `{"confirm":true}`)
+	var cleared struct {
+		Code string `json:"code"`
+		Data any    `json:"data"`
+	}
+	if confirmed.StatusCode != http.StatusOK || json.NewDecoder(confirmed.Body).Decode(&cleared) != nil {
+		t.Fatalf("confirmed cache recreation status = %d, want 200 outcome", confirmed.StatusCode)
+	}
 	confirmed.Body.Close()
-	if confirmed.StatusCode != http.StatusNoContent {
-		t.Fatalf("confirmed cache recreation status = %d, want 204", confirmed.StatusCode)
+	if cleared.Code != "project.cache_cleared" || cleared.Data != nil {
+		t.Fatalf("unexpected cache-clear outcome: %+v", cleared)
 	}
 	listed = request(http.MethodGet, "/api/projects", "")
-	projects = nil
-	if listed.StatusCode != http.StatusOK || json.NewDecoder(listed.Body).Decode(&projects) != nil {
+	listOutcome = struct {
+		Code string    `json:"code"`
+		Data []project `json:"data"`
+	}{}
+	if listed.StatusCode != http.StatusOK || json.NewDecoder(listed.Body).Decode(&listOutcome) != nil {
 		listed.Body.Close()
 		t.Fatalf("project listing after recreation status = %d", listed.StatusCode)
 	}
 	listed.Body.Close()
+	projects = listOutcome.Data
 	if len(projects) != 1 || projects[0].GitCacheBytes != 0 || projects[0].LFSCacheBytes != 0 {
 		t.Fatalf("cache sizes after recreation = %+v, want project retained with empty caches", projects)
 	}
@@ -400,7 +432,11 @@ func TestRecreatedLFSCacheFailureIsVisibleThroughDeploymentApplication(t *testin
 	}
 
 	recreated := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/cache/recreate", `{"confirm":true}`)
-	if recreated.StatusCode != http.StatusNoContent {
+	var cacheOutcome struct {
+		Code string `json:"code"`
+		Data any    `json:"data"`
+	}
+	if recreated.StatusCode != http.StatusOK || json.NewDecoder(recreated.Body).Decode(&cacheOutcome) != nil || cacheOutcome.Code != "project.cache_cleared" || cacheOutcome.Data != nil {
 		t.Fatalf("cache recreation: %d %s", recreated.StatusCode, responseText(recreated))
 	}
 	recreated.Body.Close()

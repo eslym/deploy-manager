@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
-	import { sdk } from '#lib/sdk/index.js';
+	import { sdk, serverErrorCode } from '#lib/sdk/index.js';
 	import { formatBytes } from '#lib/format-bytes.js';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
@@ -96,6 +96,7 @@
 	let pendingCreate = $state<{ name: string; url: string; keyId: string } | null>(null);
 	let observedHost = $state<SshHost | null>(null);
 	let approvalError = $state('');
+	let projectListController: AbortController | undefined;
 	function parseSshOrigin(repositoryUrl: string) {
 		const sshScheme = /^ssh:\/\//i.test(repositoryUrl);
 		try {
@@ -126,10 +127,14 @@
 		);
 	}
 	async function loadProjects() {
+		projectListController?.abort();
+		const controller = new AbortController();
+		projectListController = controller;
 		try {
-			projects = await request('/api/projects');
+			projects = (await sdk.projects.list(controller.signal)).data;
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not load projects.';
+			if (!controller.signal.aborted)
+				error = cause instanceof Error ? cause.message : 'Could not load projects.';
 		}
 	}
 	async function loadRepositoryKeys() {
@@ -147,16 +152,13 @@
 		const sshOrigin = parseSshOrigin(url);
 		const createValues = { name, url, keyId: sshOrigin.isSsh ? keyId : '' };
 		try {
-			const created: Project = await request(
-				'/api/projects',
-				{
-					method: 'POST',
-					body: JSON.stringify(createValues)
-				},
-				{ sshCreate: sshOrigin.isSsh }
-			);
+			const created: Project = (await sdk.projects.create(createValues)).data;
 			await goto(`/dashboard/projects/${encodeURIComponent(created.id)}`);
 		} catch (cause) {
+			if (sshOrigin.isSsh && serverErrorCode(cause) === 'ssh_host.approval_required') {
+				error =
+					'Host key not approved. Verify the fingerprint in SSH host warnings independently before approving it.';
+			}
 			if (sshOrigin.isSsh) {
 				try {
 					const observed = await findObservedHost(url);
@@ -188,14 +190,7 @@
 				confirm: true
 			});
 			const approvedCreate = createSnapshot;
-			const created: Project = await request(
-				'/api/projects',
-				{
-					method: 'POST',
-					body: JSON.stringify(approvedCreate)
-				},
-				{ sshCreate: true }
-			);
+			const created: Project = (await sdk.projects.create(approvedCreate)).data;
 			pendingCreate = null;
 			observedHost = null;
 			await goto(`/dashboard/projects/${encodeURIComponent(created.id)}`);
@@ -231,6 +226,7 @@
 	onMount(() => {
 		void loadProjects();
 		void loadRepositoryKeys();
+		return () => projectListController?.abort();
 	});
 </script>
 

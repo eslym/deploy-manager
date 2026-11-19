@@ -257,12 +257,12 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := a.projects.ensureCacheReady(); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	projects, err := a.store.Project.Query().Order(ent.Asc(projectent.FieldCreatedAt), ent.Asc(projectent.FieldID)).All(r.Context())
 	if err != nil {
-		http.Error(w, "projects are temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	out := []project{}
@@ -290,7 +290,7 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 			a.projects.lfsCacheMu.Unlock()
 			a.projects.cacheMu.RUnlock()
 			a.projects.cacheLifecycleMu.RUnlock()
-			http.Error(w, "project cache sizes are temporarily unavailable", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 			return
 		}
 	}
@@ -308,7 +308,7 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 			}
 			assignments, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDIn(projectIDs...)).All(r.Context())
 			if assignmentErr != nil {
-				http.Error(w, "projects are temporarily unavailable", 500)
+				writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 				return
 			}
 			for _, assignment := range assignments {
@@ -321,7 +321,7 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	writeJSON(w, out)
+	writeOutcome(w, http.StatusOK, "project.listed", "Projects loaded.", out)
 }
 
 func (a *App) recreateProjectCache(w http.ResponseWriter, r *http.Request) {
@@ -330,7 +330,7 @@ func (a *App) recreateProjectCache(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if !validProjectID(id) {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1024)
@@ -340,7 +340,7 @@ func (a *App) recreateProjectCache(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&input) != nil || !input.Confirm {
-		http.Error(w, "explicit cache recreation confirmation is required", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	p := a.projects
@@ -350,7 +350,7 @@ func (a *App) recreateProjectCache(w http.ResponseWriter, r *http.Request) {
 		p.cacheRecreationBeforeLifecycleLock()
 	}
 	if err := p.ensureCacheReady(); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	p.cacheLifecycleMu.Lock()
@@ -360,24 +360,24 @@ func (a *App) recreateProjectCache(w http.ResponseWriter, r *http.Request) {
 	p.lfsCacheMu.Lock()
 	defer p.lfsCacheMu.Unlock()
 	if _, err := a.store.Project.Get(r.Context(), id); err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if err := p.markCacheRecreation(id); err != nil {
-		http.Error(w, "cache recreation could not be recorded", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		return
 	}
 	if err := p.clearProjectCaches(id); err != nil {
 		p.setBlocked("project cache recreation is incomplete; restart to finish safely")
-		http.Error(w, "cache recreation is incomplete; restart to finish safely", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	if err := p.clearCacheRecreation(id); err != nil {
 		p.setBlocked("project cache recreation is incomplete; restart to finish safely")
-		http.Error(w, "cache recreation is incomplete; restart to finish safely", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "project.cache_cleared", "Repository caches cleared.", nil)
 }
 
 func projectCacheSize(path string) (int64, error) {
@@ -425,7 +425,7 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if dec.Decode(&input) != nil || strings.TrimSpace(input.Name) == "" || len(input.Name) > 100 {
-		http.Error(w, "enter a project name and repository URL", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the project name and repository URL.")
 		return
 	}
 	remote, sshHost, sshPort, keyID := "", "", 0, input.KeyID
@@ -434,21 +434,21 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		var err error
 		sshURL, sshHost, sshPort, remote, err = safeSSHRemote(input.URL)
 		if err != nil {
-			http.Error(w, err.Error(), 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the repository URL.")
 			return
 		}
 		if keyID == "" {
-			http.Error(w, "select a repository key for this SSH project", 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Select a repository key for this SSH project.")
 			return
 		}
 	} else {
 		if keyID != "" {
-			http.Error(w, "repository keys are only used with SSH repositories", 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Repository keys can only be used with SSH repositories.")
 			return
 		}
 		u, err := safeRemote(input.URL)
 		if err != nil {
-			http.Error(w, err.Error(), 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the repository URL.")
 			return
 		}
 		remote = u.String()
@@ -457,18 +457,18 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.ensureCacheReady(); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	if keyID != "" {
 		if _, err := a.store.RepositoryKey.Get(r.Context(), keyID); err != nil {
-			http.Error(w, "select an available repository key", 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Select an available repository key.")
 			return
 		}
 	}
 	idBytes := make([]byte, 16)
 	if _, err := rand.Read(idBytes); err != nil {
-		http.Error(w, "project creation is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	id := fmt.Sprintf("%x", idBytes)
@@ -476,17 +476,17 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	ctx = withGitHTTPPolicy(ctx, p)
 	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size >= p.maxCacheBytes {
-		http.Error(w, "project caches have no remaining space under the configured storage limit", http.StatusRequestEntityTooLarge)
+		writeOutcomeError(w, http.StatusRequestEntityTooLarge, "operation.capacity_exceeded", "Repository cache capacity is unavailable.")
 		return
 	}
 	stage, err := p.cacheFS.MkdirTemp(p.root, ".git-stage-create-")
 	if err != nil {
-		http.Error(w, "could not prepare bounded repository staging", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer func() {
 		if cleanupErr := p.cleanupStage(stage); cleanupErr != nil {
-			buffered.replace(http.StatusServiceUnavailable, cleanupErr.Error())
+			buffered.replaceOutcome(http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		}
 	}()
 	var auth transport.AuthMethod
@@ -498,33 +498,39 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		var authErr error
 		auth, authErr = a.projectSSHAuth(keyID, sshHost, sshPort, user)
 		if authErr != nil {
-			http.Error(w, "managed repository key is unavailable", http.StatusBadRequest)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Repository key is temporarily unavailable.")
 			return
 		}
 	}
 	_, err = git.CloneContext(ctx, boundedStorage(stage, p.maxCacheBytes), nil, &git.CloneOptions{URL: remote, NoCheckout: true, Tags: git.AllTags, Auth: auth})
 	if err != nil {
 		if errors.Is(err, errGitCacheLimit) {
-			http.Error(w, "repository object storage exceeded the configured cache limit", http.StatusRequestEntityTooLarge)
+			writeOutcomeError(w, http.StatusRequestEntityTooLarge, "operation.capacity_exceeded", "Repository cache capacity was exceeded.")
 			return
 		}
-		message := sanitizeGitError(err, remote)
 		status := http.StatusBadRequest
+		code := "git.target_unavailable"
 		if strings.Contains(strings.ToLower(err.Error()), "ssh host key is not approved") {
 			status = http.StatusConflict
+			code = "ssh_host.approval_required"
 		}
 		if strings.Contains(strings.ToLower(err.Error()), "unable to authenticate") || strings.Contains(strings.ToLower(err.Error()), "authentication failed") {
 			status = http.StatusBadGateway
+			code = "git.authentication_failed"
 		}
-		http.Error(w, message, status)
+		writeOutcomeError(w, status, code, map[string]string{
+			"git.target_unavailable":     "Selected Git target is unavailable.",
+			"ssh_host.approval_required": "Verify and approve the SSH host first.",
+			"git.authentication_failed":  "Repository authentication failed.",
+		}[code])
 		return
 	}
 	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes {
-		http.Error(w, "project caches exceed the configured storage limit", http.StatusRequestEntityTooLarge)
+		writeOutcomeError(w, http.StatusRequestEntityTooLarge, "operation.capacity_exceeded", "Repository cache capacity was exceeded.")
 		return
 	}
 	if err = p.cacheFS.Rename(stage, p.repoPath(id)); err != nil {
-		http.Error(w, "repository fetched but could not be promoted from staging", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	stage = ""
@@ -544,7 +550,7 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	err = txErr
 	if err != nil {
 		_ = os.RemoveAll(p.repoPath(id))
-		http.Error(w, "could not save project", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = saveProjectRefs(context.Background(), p.store, id, p.repoPath(id), p.maxRefs); err != nil {
@@ -558,13 +564,13 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 		}
 		_ = os.RemoveAll(p.repoPath(id))
 		if errors.Is(err, errGitIncompleteRepository) || errors.Is(err, errGitTooManyRefs) {
-			http.Error(w, sanitizeGitError(err, remote), http.StatusBadRequest)
+			writeOutcomeError(w, http.StatusBadRequest, "git.target_unavailable", "Selected Git target is unavailable.")
 		} else {
-			http.Error(w, "repository fetched but project could not be saved; try again", 500)
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		}
 		return
 	}
-	writeJSONStatus(w, http.StatusCreated, project{ID: id, Name: strings.TrimSpace(input.Name), URL: remote, LastFetched: &now, KeyID: keyID})
+	writeOutcome(w, http.StatusCreated, "project.created", "Project created.", project{ID: id, Name: strings.TrimSpace(input.Name), URL: remote, LastFetched: &now, KeyID: keyID})
 }
 
 func (a *App) projectRefs(w http.ResponseWriter, r *http.Request) {
@@ -573,19 +579,19 @@ func (a *App) projectRefs(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	if _, err := a.store.Project.Get(r.Context(), id); err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	storedRefs, err := a.store.ProjectRef.Query().Where(projectref.IDEQ(id)).Order(ent.Asc(projectref.FieldKind), ent.Asc(projectref.FieldName)).All(r.Context())
 	if err != nil {
-		http.Error(w, "refs are temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	refs := make([]projectRef, 0, len(storedRefs))
 	for _, stored := range storedRefs {
 		refs = append(refs, projectRef{Kind: stored.Kind, Name: stored.Name, Commit: stored.CommitID})
 	}
-	writeJSON(w, refs)
+	writeOutcome(w, http.StatusOK, "project.refs_listed", "Cached refs loaded.", refs)
 }
 
 func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
@@ -599,17 +605,17 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if err := p.ensureCacheReady(); err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	id := r.PathValue("id")
 	if !validProjectID(id) {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	storedProject, projectErr := a.store.Project.Get(r.Context(), id)
 	if projectErr != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	remote := storedProject.RemoteURL
@@ -619,7 +625,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		parsed, host, port, _, parseErr := safeSSHRemote(remote)
 		assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(id)).Only(r.Context())
 		if parseErr != nil || assignmentErr != nil {
-			http.Error(w, "SSH repository key is unavailable", 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "SSH repository key is unavailable.")
 			return
 		}
 		keyID = assignment.KeyID
@@ -630,16 +636,38 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 		var authErr error
 		sshAuth, authErr = a.projectSSHAuth(keyID, host, port, sshUser)
 		if authErr != nil {
-			http.Error(w, "managed repository key is unavailable", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Repository key is temporarily unavailable.")
 			return
 		}
 	}
 	refresh := p.refreshProjectCache(r.Context(), id, remote, sshAuth)
 	if refresh.message != "" {
-		http.Error(w, refresh.message, refresh.status)
+		code := "operation.upstream_failed"
+		message := "Repository operation failed."
+		switch {
+		case refresh.status == http.StatusRequestEntityTooLarge:
+			code = "operation.capacity_exceeded"
+			message = "Repository cache capacity was exceeded."
+		case refresh.cause != nil && (strings.Contains(strings.ToLower(refresh.cause.Error()), "limit") || strings.Contains(strings.ToLower(refresh.cause.Error()), "too large")):
+			code = "operation.capacity_exceeded"
+			message = "Repository cache capacity was exceeded."
+		case refresh.status == http.StatusServiceUnavailable:
+			code = "project.cache_recovery_required"
+			message = "Repository cache recovery is required."
+		case refresh.cause != nil && (strings.Contains(strings.ToLower(refresh.cause.Error()), "ssh host key is not approved")):
+			code = "ssh_host.approval_required"
+			message = "Verify and approve the SSH host first."
+		case refresh.cause != nil && (strings.Contains(strings.ToLower(refresh.cause.Error()), "unable to authenticate") || strings.Contains(strings.ToLower(refresh.cause.Error()), "authentication failed")):
+			code = "git.authentication_failed"
+			message = "Repository authentication failed."
+		case refresh.status == http.StatusBadGateway:
+			code = "git.target_unavailable"
+			message = "Selected Git target is unavailable."
+		}
+		writeOutcomeError(w, refresh.status, code, message)
 		return
 	}
-	writeJSON(w, map[string]any{"lastFetched": refresh.fetchedAt, "warning": refresh.warning})
+	writeOutcome(w, http.StatusOK, "project.refreshed", "Repository refreshed.", map[string]any{"lastFetched": refresh.fetchedAt, "warning": refresh.warning})
 }
 
 func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
@@ -650,7 +678,7 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 		KeyID string `json:"keyId"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&input); err != nil || input.KeyID == "" {
-		http.Error(w, "select a repository key", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Select a repository key.")
 		return
 	}
 	p := a.projects
@@ -661,22 +689,22 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	storedProject, projectErr := a.store.Project.Get(r.Context(), id)
 	if projectErr != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	remote := storedProject.RemoteURL
 	if !isSSHRemote(remote) {
-		http.Error(w, "repository keys can only be assigned to SSH projects", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Repository keys can only be assigned to SSH projects.")
 		return
 	}
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "project key assignment is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	if _, err = tx.RepositoryKey.Get(r.Context(), input.KeyID); err != nil {
-		http.Error(w, "repository key was not found", 404)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	exists, err := tx.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(id)).Exist(r.Context())
@@ -686,14 +714,14 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.ProjectSSHKey.Create().SetID(id).SetKeyID(input.KeyID).Save(r.Context())
 	}
 	if err != nil {
-		http.Error(w, "project key assignment is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "project key assignment is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "project.key_assigned", "Repository key assigned.", nil)
 }
 
 func saveProjectRefs(ctx context.Context, store *ent.Client, id, dir string, maxRefs int) error {

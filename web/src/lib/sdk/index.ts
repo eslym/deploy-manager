@@ -3,6 +3,7 @@ import {
 	repositoryOutcomeCodes,
 	type RepositoryOutcomeCode
 } from './repository';
+import { createProjectOperations } from './projects';
 
 export type OutcomeCode =
 	| RepositoryOutcomeCode
@@ -27,7 +28,21 @@ export type OutcomeCode =
 	| 'request.origin_rejected'
 	| 'request.rate_limited'
 	| 'service.unavailable'
-	| 'service.internal_error';
+	| 'service.internal_error'
+	| 'project.listed'
+	| 'project.created'
+	| 'project.refs_listed'
+	| 'project.refreshed'
+	| 'project.key_assigned'
+	| 'project.cache_cleared'
+	| 'git.target_unavailable'
+	| 'git.authentication_failed'
+	| 'ssh_host.approval_required'
+	| 'request.invalid'
+	| 'request.not_found'
+	| 'operation.capacity_exceeded'
+	| 'operation.upstream_failed'
+	| 'project.cache_recovery_required';
 
 const knownCodes = new Set<string>([
 	'auth.registration_started',
@@ -52,7 +67,21 @@ const knownCodes = new Set<string>([
 	'request.rate_limited',
 	'service.unavailable',
 	'service.internal_error',
-	...repositoryOutcomeCodes
+	...repositoryOutcomeCodes,
+	'project.listed',
+	'project.created',
+	'project.refs_listed',
+	'project.refreshed',
+	'project.key_assigned',
+	'project.cache_cleared',
+	'git.target_unavailable',
+	'git.authentication_failed',
+	'ssh_host.approval_required',
+	'request.invalid',
+	'request.not_found',
+	'operation.capacity_exceeded',
+	'operation.upstream_failed',
+	'project.cache_recovery_required'
 ]);
 
 export interface Outcome<T> {
@@ -320,7 +349,10 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 				}
 				return outcome;
 			}
-		}
+		},
+		projects: createProjectOperations((path, method, body, validate, signal, expectedCode) =>
+			request(path, method, body, validate, signal, true, expectedCode as OutcomeCode | undefined)
+		)
 	};
 }
 

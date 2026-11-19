@@ -3,6 +3,7 @@ package lib
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -575,6 +576,15 @@ func (w *stagedResponseWriter) replace(status int, message string) {
 	w.status = status
 	w.body = []byte(message + "\n")
 	w.header.Set("Content-Type", "text/plain; charset=utf-8")
+	w.header.Set("X-Content-Type-Options", "nosniff")
+}
+
+func (w *stagedResponseWriter) replaceOutcome(status int, code, message string) {
+	w.status = status
+	w.body, _ = json.Marshal(httpOutcome{Code: code, Message: message, Data: nil})
+	w.body = append(w.body, '\n')
+	w.header.Set("Content-Type", "application/json")
+	w.header.Set("Cache-Control", "no-store")
 	w.header.Set("X-Content-Type-Options", "nosniff")
 }
 

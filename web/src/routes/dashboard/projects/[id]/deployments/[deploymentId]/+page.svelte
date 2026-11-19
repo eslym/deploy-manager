@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import { sdk } from '#lib/sdk/index.js';
 	import {
 		isReservedPublicationFolder,
 		isValidPublicationFolder,
@@ -67,6 +68,8 @@
 	let movePreview = $derived(publicationFolderPreview(publicationRoot, movePath));
 	let loadVersion = 0;
 	let viewVersion = 0;
+	let projectReadController: AbortController | undefined;
+	let refreshController: AbortController | undefined;
 	const key = (ref: Ref) => `${ref.kind}:${ref.name}`;
 	let matchingRefs = $derived(
 		refs.filter((ref) => ref.name.toLowerCase().includes(targetSearch.toLowerCase()))
@@ -105,8 +108,13 @@
 	}
 
 	async function load(id = projectId, deployment = deploymentId, currentView = viewVersion) {
+		if (!id || !deployment) return;
+		projectReadController?.abort();
+		const controller = new AbortController();
+		projectReadController = controller;
 		const version = ++loadVersion;
 		const current = () =>
+			!controller.signal.aborted &&
 			version === loadVersion &&
 			currentView === viewVersion &&
 			id === projectId &&
@@ -114,7 +122,7 @@
 		try {
 			const [all, projects]: [Deployment[], Project[]] = await Promise.all([
 				request('/api/deployments'),
-				request('/api/projects')
+				sdk.projects.list(controller.signal).then((result) => result.data)
 			]);
 			if (!current()) return;
 			publicationStatusError = '';
@@ -144,7 +152,7 @@
 			missing = false;
 			// Only fetch deployment-scoped data after the project/deployment association is verified.
 			const [refsResult, jobsResult, rootResult] = await Promise.allSettled([
-				request(`/api/projects/${id}/refs`) as Promise<Ref[]>,
+				sdk.projects.refs(id, controller.signal).then((result) => result.data),
 				request(`/api/deployments/${deployment}/jobs`) as Promise<Job[]>,
 				request('/api/deployments/root') as Promise<{ publicationRoot: string }>
 			]);
@@ -196,20 +204,28 @@
 	}
 
 	async function refreshRefs() {
-		if (busy || !project || !item) return;
+		if (busy || !project || !item || !projectId) return;
+		refreshController?.abort();
+		const controller = new AbortController();
+		refreshController = controller;
 		busy = true;
 		error = '';
 		refsError = '';
 		try {
-			await request(`/api/projects/${projectId}/refresh`, { method: 'POST', body: '{}' });
+			await sdk.projects.refresh(projectId, controller.signal);
+			if (controller.signal.aborted) return;
 			await load();
 		} catch (cause) {
+			if (controller.signal.aborted) return;
 			const message = cause instanceof Error ? cause.message : 'Could not refresh targets.';
 			refsError = refsLoaded
 				? `${message} Refresh and try again. Your current branches and tags are still shown.`
 				: message;
 		} finally {
-			busy = false;
+			if (refreshController === controller) {
+				refreshController = undefined;
+				busy = false;
+			}
 		}
 	}
 
@@ -322,6 +338,9 @@
 		const deployment = deploymentId;
 		const version = ++viewVersion;
 		++loadVersion;
+		projectReadController?.abort();
+		refreshController?.abort();
+		refreshController = undefined;
 		if (timeout !== undefined) window.clearTimeout(timeout);
 		project = null;
 		item = null;
@@ -352,6 +371,8 @@
 	onDestroy(() => {
 		++viewVersion;
 		++loadVersion;
+		projectReadController?.abort();
+		refreshController?.abort();
 		if (timeout !== undefined) window.clearTimeout(timeout);
 	});
 </script>

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import { sdk } from '#lib/sdk/index.js';
 	import {
 		isReservedPublicationFolder,
 		isValidPublicationFolder,
@@ -42,6 +43,8 @@
 	let busy = $state(false);
 	let loadVersion = 0;
 	let viewVersion = 0;
+	let projectReadController: AbortController | undefined;
+	let refreshController: AbortController | undefined;
 	const key = (ref: Ref) => `${ref.kind}:${ref.name}`;
 	let filteredRefs = $derived(
 		refs.filter((ref) => ref.name.toLowerCase().includes(refSearch.toLowerCase()))
@@ -64,6 +67,9 @@
 	}
 
 	async function load(id = projectId, currentView = viewVersion) {
+		projectReadController?.abort();
+		const controller = new AbortController();
+		projectReadController = controller;
 		const version = ++loadVersion;
 		try {
 			const [all, projects, cachedRefs, root]: [
@@ -73,11 +79,17 @@
 				{ publicationRoot: string }
 			] = await Promise.all([
 				request('/api/deployments'),
-				request('/api/projects'),
-				request(`/api/projects/${id}/refs`),
+				sdk.projects.list(controller.signal).then((result) => result.data),
+				sdk.projects.refs(id, controller.signal).then((result) => result.data),
 				request('/api/deployments/root')
 			]);
-			if (version !== loadVersion || currentView !== viewVersion || id !== projectId) return;
+			if (
+				controller.signal.aborted ||
+				version !== loadVersion ||
+				currentView !== viewVersion ||
+				id !== projectId
+			)
+				return;
 			refs = cachedRefs;
 			refsLoaded = true;
 			lastFetched = projects.find((project) => project.id === id)?.lastFetched ?? null;
@@ -86,7 +98,13 @@
 			deploymentsLoaded = true;
 			error = '';
 		} catch (cause) {
-			if (version !== loadVersion || currentView !== viewVersion || id !== projectId) return;
+			if (
+				controller.signal.aborted ||
+				version !== loadVersion ||
+				currentView !== viewVersion ||
+				id !== projectId
+			)
+				return;
 			if (cause instanceof PublicationStatusUnavailableError) {
 				deployments = [];
 				deploymentsLoaded = false;
@@ -127,18 +145,26 @@
 
 	async function refreshRefs() {
 		if (busy) return;
+		refreshController?.abort();
+		const controller = new AbortController();
+		refreshController = controller;
 		busy = true;
 		error = '';
 		try {
-			await request(`/api/projects/${projectId}/refresh`, { method: 'POST', body: '{}' });
+			await sdk.projects.refresh(projectId, controller.signal);
+			if (controller.signal.aborted) return;
 			await load();
 		} catch (cause) {
+			if (controller.signal.aborted) return;
 			const message = cause instanceof Error ? cause.message : 'Could not refresh targets.';
 			error = refsLoaded
 				? `${message} Refresh and try again. Your current branches and tags are still shown.`
 				: message;
 		} finally {
-			busy = false;
+			if (refreshController === controller) {
+				refreshController = undefined;
+				busy = false;
+			}
 		}
 	}
 
@@ -156,6 +182,8 @@
 		return () => {
 			++viewVersion;
 			++loadVersion;
+			projectReadController?.abort();
+			refreshController?.abort();
 			if (timeout !== undefined) window.clearTimeout(timeout);
 		};
 	});
