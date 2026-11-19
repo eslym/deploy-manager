@@ -92,11 +92,12 @@
 	let url = $state('');
 	let keyId = $state('');
 	let error = $state('');
+	let projectsReadError = $state('');
+	let keysReadError = $state('');
 	let busy = $state(false);
 	let pendingCreate = $state<{ name: string; url: string; keyId: string } | null>(null);
 	let observedHost = $state<SshHost | null>(null);
 	let approvalError = $state('');
-	let projectListController: AbortController | undefined;
 	function parseSshOrigin(repositoryUrl: string) {
 		const sshScheme = /^ssh:\/\//i.test(repositoryUrl);
 		try {
@@ -125,24 +126,6 @@
 					host.warning && host.host.toLowerCase() === address.host && host.port === address.port
 			) ?? null
 		);
-	}
-	async function loadProjects() {
-		projectListController?.abort();
-		const controller = new AbortController();
-		projectListController = controller;
-		try {
-			projects = (await sdk.projects.list(controller.signal)).data;
-		} catch (cause) {
-			if (!controller.signal.aborted)
-				error = cause instanceof Error ? cause.message : 'Could not load projects.';
-		}
-	}
-	async function loadRepositoryKeys() {
-		try {
-			repositoryKeys = (await sdk.repositoryKeys.list()).data;
-		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not load repository keys.';
-		}
 	}
 	async function createProject(event: SubmitEvent) {
 		event.preventDefault();
@@ -224,9 +207,35 @@
 		approvalError = '';
 	}
 	onMount(() => {
-		void loadProjects();
-		void loadRepositoryKeys();
-		return () => projectListController?.abort();
+		const disposeProjects = sdk.resources.subscribe({
+			identity: { kind: 'projects' },
+			read: () => sdk.projects.list().then((result) => result.data),
+			onValue: (items, cause) => {
+				if (cause) {
+					projectsReadError = cause instanceof Error ? cause.message : 'Could not load projects.';
+					return;
+				}
+				projects = items ?? [];
+				projectsReadError = '';
+			}
+		});
+		const disposeKeys = sdk.resources.subscribe({
+			identity: { kind: 'repository_keys' },
+			read: () => sdk.repositoryKeys.list().then((result) => result.data),
+			onValue: (items, cause) => {
+				if (cause) {
+					keysReadError =
+						cause instanceof Error ? cause.message : 'Could not load repository keys.';
+					return;
+				}
+				repositoryKeys = items ?? [];
+				keysReadError = '';
+			}
+		});
+		return () => {
+			disposeProjects();
+			disposeKeys();
+		};
 	});
 </script>
 
@@ -252,6 +261,18 @@
 			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
 		>
 			{error}
+		</p>{/if}
+	{#if projectsReadError}<p
+			role="alert"
+			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{projectsReadError}
+		</p>{/if}
+	{#if keysReadError}<p
+			role="alert"
+			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{keysReadError}
 		</p>{/if}
 	<section class="mt-8 rounded-xl border border-[#e1e6df] bg-white p-5">
 		<h2 class="m-0 text-xl font-semibold text-[#243528]">Add a repository</h2>

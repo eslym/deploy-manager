@@ -334,7 +334,10 @@ try {
   await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
   if (!(await page.title()).includes("Fixture site")) throw new Error("project detail lacks its own page title");
   await page.getByRole("heading", { name: "Branches and tags" }).waitFor({ timeout: 30000 });
-  await page.getByRole("alert").filter({ hasText: "The request could not be completed. Try again." }).waitFor();
+  await page.getByRole("region", { name: "GitHub webhook", exact: true }).getByRole("alert").filter({ hasText: "The request could not be completed. Try again." }).waitFor();
+  if (await page.getByRole("region", { name: "Gitea webhook", exact: true }).getByRole("alert").count()) {
+    throw new Error("a GitHub settings failure incorrectly affected Gitea settings");
+  }
   const dashboardURLBeforeRetry = page.url();
   const githubWebhook = page.getByRole("region", { name: "GitHub webhook", exact: true });
   await githubWebhook.getByRole("button", { name: "Retry loading settings" }).click();
@@ -523,6 +526,29 @@ try {
   const firstGiteaSecret = await webhookSecret();
   if (!firstGiteaSecret) throw new Error("Gitea setup did not show a signing secret");
   await giteaWebhook.getByText(`https://${appListen}/webhooks/gitea/${id}`, { exact: true }).waitFor();
+  milestone("synchronize webhook settings in a second dashboard tab");
+  const secondTab = await context.newPage();
+  let secondTabWebhookReads = 0;
+  const secondTabSockets = [];
+  await secondTab.routeWebSocket(/\/api\/events$/, route => {
+    secondTabSockets.push(route);
+    if (secondTabSockets.length === 1) {
+      void route.close({ code: 1011, reason: "test interrupted connection" });
+      return;
+    }
+    route.connectToServer();
+  });
+  secondTab.on("request", request => {
+    if (request.url().endsWith(giteaSettingsPath) && request.method() === "GET") secondTabWebhookReads++;
+  });
+  await secondTab.goto(`https://${appListen}/dashboard/projects/${id}`, { waitUntil: "domcontentloaded" });
+  await secondTab.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
+  const secondGiteaWebhook = secondTab.getByRole("region", { name: "Gitea webhook", exact: true });
+  await secondGiteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).waitFor();
+  const readsBeforeRecovery = secondTabWebhookReads;
+  await waitFor(() => secondTabSockets.length > 1, "second-tab WebSocket reconnect after interruption");
+  await waitFor(() => secondTabWebhookReads > readsBeforeRecovery, "active settings refresh after reconnect");
+  const initialSecondTabReads = secondTabWebhookReads;
   const giteaStatus = await page.evaluate(async path => await (await fetch(path)).json(), giteaSettingsPath);
   if (!giteaStatus.data.configured || "secret" in giteaStatus.data) throw new Error("Gitea settings did not hide its configured secret");
   async function sendGitea(secret, delivery) {
@@ -533,10 +559,18 @@ try {
   page.once("dialog", dialog => dialog.accept());
   await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).click();
   await waitFor(async () => (await webhookSecret()) !== firstGiteaSecret, "rotated Gitea secret");
+  await waitFor(() => secondTabWebhookReads > initialSecondTabReads, "second-tab webhook settings refresh after rotation");
   const rotatedGiteaSecret = await webhookSecret();
   if (!rotatedGiteaSecret) throw new Error("Gitea rotation did not show a new secret");
+  if ((await secondTab.locator("body").innerText()).includes(rotatedGiteaSecret)) {
+    throw new Error("webhook rotation secret was exposed in the second tab");
+  }
   if (await sendGitea(firstGiteaSecret, "browser-gitea-old") !== 401) throw new Error("old Gitea secret still authenticated after rotation");
   if (await sendGitea(rotatedGiteaSecret, "browser-gitea-new") !== 200) throw new Error("rotated Gitea secret did not authenticate a push");
+  if (process.env.LIVE_UPDATES_ONLY === "true") {
+    console.log("combined-binary live-update browser slice passed: socket recovery, second-tab webhook refresh, and secret isolation");
+    throw focusedOutcomesComplete;
+  }
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
   await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).waitFor();

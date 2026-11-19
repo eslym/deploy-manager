@@ -314,6 +314,10 @@ func (a *App) finishDeploymentDeletionRecord(id string) error {
 	if intent || cleanup {
 		return errors.New("publication cleanup journal remains pending")
 	}
+	deployment, err := tx.Deployment.Get(ctx, id)
+	if err != nil {
+		return err
+	}
 	jobs, err := tx.DeploymentJob.Query().Where(deploymentjob.DeploymentIDEQ(id)).All(ctx)
 	if err != nil {
 		return err
@@ -344,7 +348,7 @@ func (a *App) finishDeploymentDeletionRecord(id string) error {
 	if err = tx.Commit(); err != nil {
 		return err
 	}
-	a.invalidateJob(id)
+	a.invalidateDeletedDeployment(deployment.ProjectID, id)
 	return nil
 }
 
@@ -534,6 +538,7 @@ func (a *App) finishProjectDeletion(id string, want, wantLFS dirIdentity) error 
 		a.setProjectDeletionError(id)
 		return err
 	}
+	a.invalidateDeletedProject(id)
 	return nil
 }
 func (a *App) setProjectDeletionError(id string) {
@@ -542,8 +547,13 @@ func (a *App) setProjectDeletionError(id string) {
 		return
 	}
 	now := a.cfg.Now()
-	_, _ = a.store.ProjectDeletion.Update().Where(projectdeletion.IDEQ(id)).SetStatus("blocked").SetLastError("cache cleanup is pending; retry deletion").AddAttempts(1).SetRetryAfter(now.Add(retryDelay(deletion.Attempts)).UnixNano()).SetUpdatedAt(now.UnixNano()).Save(context.Background())
-	_, _ = a.store.Project.Update().Where(projectmodel.IDEQ(id)).SetWarning("Deletion is blocked; cache cleanup will retry").Save(context.Background())
+	if _, err := a.store.ProjectDeletion.Update().Where(projectdeletion.IDEQ(id)).SetStatus("blocked").SetLastError("cache cleanup is pending; retry deletion").AddAttempts(1).SetRetryAfter(now.Add(retryDelay(deletion.Attempts)).UnixNano()).SetUpdatedAt(now.UnixNano()).Save(context.Background()); err == nil {
+		if _, err := a.store.Project.Update().Where(projectmodel.IDEQ(id)).SetWarning("Deletion is blocked; cache cleanup will retry").Save(context.Background()); err == nil {
+			if a.events != nil {
+				a.events.invalidate(eventResource{Kind: "projects"})
+			}
+		}
+	}
 }
 
 func (a *App) retryProjectDeletions() {

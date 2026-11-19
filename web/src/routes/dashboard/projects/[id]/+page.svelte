@@ -35,6 +35,9 @@
 	let keyAssignments = $state<Record<string, string>>({});
 	let search = $state('');
 	let error = $state('');
+	let projectsReadError = $state('');
+	let keysReadError = $state('');
+	let refsReadError = $state('');
 	let busy = $state(false);
 	const lfsConfirmation = 'I independently verified these LFS destinations';
 	let lfsEndpoint = $state('');
@@ -59,6 +62,7 @@
 	let refreshController: AbortController | undefined;
 	let cacheReadController: AbortController | undefined;
 	let actionController: AbortController | undefined;
+	let resourceDisposers: Array<() => void> = [];
 	let selected = $derived(page.params.id ?? '');
 	let project = $derived(projects.find((item) => item.id === selected));
 	let loading = $state(true);
@@ -80,16 +84,10 @@
 			projects = loaded;
 			for (const project of projects) keyAssignments[project.id] = project.keyId ?? '';
 			missing = !projects.some((project) => project.id === selected);
+			projectsReadError = '';
 		} catch (cause) {
 			if (!controller.signal.aborted && selected === projectId)
-				error = cause instanceof Error ? cause.message : 'Could not load projects.';
-		}
-	}
-	async function loadRepositoryKeys() {
-		try {
-			repositoryKeys = (await sdk.repositoryKeys.list()).data;
-		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not load repository keys.';
+				projectsReadError = cause instanceof Error ? cause.message : 'Could not load projects.';
 		}
 	}
 	async function loadSshHosts() {
@@ -352,7 +350,7 @@
 			first?.focus();
 		}
 	}
-	async function loadDetail(id: string) {
+	function loadDetail() {
 		projectReadController?.abort();
 		cacheReadController?.abort();
 		refreshController?.abort();
@@ -360,13 +358,14 @@
 		actionController = undefined;
 		refreshController = undefined;
 		busy = false;
-		const controller = new AbortController();
-		projectReadController = controller;
-		const version = ++lfsSelectionVersion;
+		lfsSelectionVersion++;
 		lfsLoadVersion++;
 		loading = true;
 		missing = false;
 		error = '';
+		projectsReadError = '';
+		keysReadError = '';
+		refsReadError = '';
 		projects = [];
 		refs = {};
 		search = '';
@@ -374,38 +373,79 @@
 		closeCacheRecreateConfirmation(false);
 		cacheRecreateError = '';
 		cacheRecreateNotice = '';
-		try {
-			const loaded: Project[] = (await sdk.projects.list(controller.signal)).data;
-			if (controller.signal.aborted || version !== lfsSelectionVersion || selected !== id) return;
-			projects = loaded;
-			const project = loaded.find((item) => item.id === id);
-			if (!project) {
-				missing = true;
-				return;
-			}
-			keyAssignments[id] = project.keyId ?? '';
-			void loadLfsSettings(id);
-			try {
-				const loadedRefs: Ref[] = (await sdk.projects.refs(id, controller.signal)).data;
-				if (!controller.signal.aborted && version === lfsSelectionVersion && selected === id)
-					refs[id] = loadedRefs;
-			} catch (cause) {
-				if (!controller.signal.aborted && version === lfsSelectionVersion && selected === id)
-					error = cause instanceof Error ? cause.message : 'Could not load branches and tags.';
-			}
-		} catch (cause) {
-			if (!controller.signal.aborted && version === lfsSelectionVersion && selected === id)
-				error = cause instanceof Error ? cause.message : 'Could not load projects.';
-		} finally {
-			if (!controller.signal.aborted && version === lfsSelectionVersion && selected === id)
-				loading = false;
-		}
 	}
 	afterNavigate(() => {
-		void loadDetail(selected);
-		void loadRepositoryKeys();
+		for (const dispose of resourceDisposers) dispose();
+		resourceDisposers = [];
+		loadDetail();
+		const id = selected;
+		resourceDisposers.push(
+			sdk.resources.subscribe({
+				identity: { kind: 'projects' },
+				read: () => sdk.projects.list().then((result) => result.data),
+				onValue: (items, cause) => {
+					if (selected !== id) return;
+					if (cause) {
+						projectsReadError = cause instanceof Error ? cause.message : 'Could not load projects.';
+						loading = false;
+						return;
+					}
+					projects = items ?? [];
+					for (const item of projects) keyAssignments[item.id] = item.keyId ?? '';
+					missing = !projects.some((item) => item.id === id);
+					projectsReadError = '';
+					loading = false;
+				}
+			}),
+			sdk.resources.subscribe({
+				identity: { kind: 'repository_keys' },
+				read: () => sdk.repositoryKeys.list().then((result) => result.data),
+				onValue: (keys, cause) => {
+					if (selected !== id) return;
+					if (cause) {
+						keysReadError =
+							cause instanceof Error ? cause.message : 'Could not load repository keys.';
+						return;
+					}
+					repositoryKeys = keys ?? [];
+					keysReadError = '';
+				}
+			}),
+			sdk.resources.subscribe({
+				identity: { kind: 'refs', projectId: id },
+				read: () => sdk.projects.refs(id).then((result) => result.data),
+				onValue: (cachedRefs, cause) => {
+					if (selected !== id) return;
+					if (cause) {
+						refsReadError =
+							cause instanceof Error ? cause.message : 'Could not load branches and tags.';
+						return;
+					}
+					refs[id] = cachedRefs ?? [];
+					refsReadError = '';
+				}
+			}),
+			sdk.resources.subscribe({
+				identity: { kind: 'lfs_settings', projectId: id },
+				read: () => sdk.lfs.settings(id).then((result) => result.data),
+				onValue: (result, cause) => {
+					if (selected !== id) return;
+					if (cause) {
+						lfsError = cause instanceof Error ? cause.message : 'Could not load LFS settings.';
+						lfsLoading = false;
+						return;
+					}
+					lfsEndpoint = result!.settings.endpoint;
+					lfsOrigins = result!.settings.objectOrigins.join('\n');
+					lfsAllowInternal = result!.settings.allowInternal;
+					lfsSuggestedEndpoint = result!.suggestedEndpoint;
+					lfsLoading = false;
+				}
+			})
+		);
 	});
 	onDestroy(() => {
+		for (const dispose of resourceDisposers) dispose();
 		projectReadController?.abort();
 		cacheReadController?.abort();
 		refreshController?.abort();
@@ -440,6 +480,24 @@
 			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
 		>
 			{error}
+		</p>{/if}
+	{#if projectsReadError}<p
+			role="alert"
+			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{projectsReadError}
+		</p>{/if}
+	{#if keysReadError}<p
+			role="alert"
+			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{keysReadError}
+		</p>{/if}
+	{#if refsReadError}<p
+			role="alert"
+			class="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{refsReadError}
 		</p>{/if}
 	{#if !loading && !missing && project}
 		<section class="mt-8 min-w-0">

@@ -18,7 +18,7 @@ GOFLAGS='-tags=integrationtest' ./scripts/build.sh
 go build -o "$workspace/smart-https-fixture" ./tests/fixtures/smart-https
 go build -o "$workspace/ssh-git-fixture" ./tests/fixtures/ssh-git
 go build -o "$workspace/repository-key-state" ./tests/fault/repository-key-state
-if [[ "${LIFECYCLE_OUTCOMES_ONLY:-false}" == "true" || "${PROJECT_OUTCOMES_ONLY:-false}" == "true" ]]; then
+if [[ "${LIFECYCLE_OUTCOMES_ONLY:-false}" == "true" || "${PROJECT_OUTCOMES_ONLY:-false}" == "true" || "${LIVE_UPDATES_ONLY:-false}" == "true" ]]; then
 	cd "$workspace/tests/browser"
 	bun install --frozen-lockfile
 	DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" \

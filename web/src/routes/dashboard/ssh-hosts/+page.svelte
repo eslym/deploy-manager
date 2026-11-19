@@ -51,7 +51,18 @@
 		}
 	}
 	onMount(() => {
-		void loadSshHosts();
+		return sdk.resources.subscribe({
+			identity: { kind: 'ssh_hosts' },
+			read: () => sdk.sshHosts.list().then((result) => result.data),
+			onValue: (hosts, cause) => {
+				if (cause) {
+					hostError = cause instanceof Error ? cause.message : 'Could not load SSH hosts.';
+					return;
+				}
+				sshHosts = hosts ?? [];
+				hostError = '';
+			}
+		});
 	});
 </script>
 

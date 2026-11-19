@@ -465,6 +465,17 @@ func (a *App) invalidateDeletedProject(projectID string) {
 	}
 }
 
+func (a *App) invalidateDeletedDeployment(projectID, deploymentID string) {
+	if a.events != nil {
+		a.events.invalidate(
+			eventResource{Kind: "projects"},
+			eventResource{Kind: "refs", ProjectID: projectID},
+			eventResource{Kind: "jobs", DeploymentID: deploymentID},
+			eventResource{Kind: "deployments", DeploymentID: deploymentID},
+		)
+	}
+}
+
 func (h *eventHub) invalidateJob(deploymentID string) {
 	resources := []eventResource{
 		{Kind: "jobs", DeploymentID: deploymentID},

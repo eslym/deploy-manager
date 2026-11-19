@@ -48,7 +48,18 @@
 		}
 	}
 	onMount(() => {
-		void loadRepositoryKeys();
+		return sdk.resources.subscribe({
+			identity: { kind: 'repository_keys' },
+			read: () => sdk.repositoryKeys.list().then((result) => result.data),
+			onValue: (keys, cause) => {
+				if (cause) {
+					keyError = cause instanceof Error ? cause.message : 'Could not load repository keys.';
+					return;
+				}
+				repositoryKeys = keys ?? [];
+				keyError = '';
+			}
+		});
 	});
 </script>
 

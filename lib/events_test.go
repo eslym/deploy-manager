@@ -347,6 +347,87 @@ func TestDeploymentQueueCommitInvalidatesAnOpenSocket(t *testing.T) {
 	}
 }
 
+func TestJobRetentionInvalidatesSocketAfterCommittedPruning(t *testing.T) {
+	app, server, origin := newEventsTestServer(t)
+	token := make([]byte, 32)
+	for i := range token {
+		token[i] = byte(i + 1)
+	}
+	digest := sha256.Sum256(token)
+	app.mu.Lock()
+	app.sessions[digest] = sessionState{expires: time.Now().Add(time.Hour), generation: app.credentialGeneration}
+	app.mu.Unlock()
+
+	now := time.Now()
+	if _, err := app.store.Project.Create().SetID("project-1").SetName("Project").SetRemoteURL("https://git.example/repo").SetCreatedAt(now.UnixNano()).Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store.Deployment.Create().SetID("deployment-1").SetProjectID("project-1").SetName("Site").SetCommitID(strings.Repeat("a", 40)).SetPublicationName("site").SetGeneration(1).SetStatus("live").SetCreatedAt(now.UnixNano()).SetUpdatedAt(now.UnixNano()).SetTargetKind("commit").Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.store.DeploymentJob.Create().SetID("job-expired").SetDeploymentID("deployment-1").SetCommitID(strings.Repeat("a", 40)).SetGeneration(1).SetStatus("succeeded").SetLog("Published").SetCreatedAt(now.Add(-2 * time.Hour).UnixNano()).SetUpdatedAt(now.Add(-2 * time.Hour).UnixNano()).Save(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	app.cfg.JobRetention = time.Hour
+	cookie := app.cookieName() + "=" + base64.RawURLEncoding.EncodeToString(token)
+	conn, response, err := eventsClient(t, server.URL, origin, cookie)
+	if err != nil {
+		t.Fatalf("dial events: response=%v err=%v", response, err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "")
+	var ready map[string]any
+	if err := wsjson.Read(context.Background(), conn, &ready); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.cleanupPublications(true); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var frame struct {
+		Code string `json:"code"`
+		Data struct {
+			Resources []eventResource `json:"resources"`
+		} `json:"data"`
+	}
+	if err := wsjson.Read(ctx, conn, &frame); err != nil {
+		t.Fatalf("read retention invalidation: %v", err)
+	}
+	if frame.Code != "events.invalidate" {
+		t.Fatalf("unexpected event frame: %+v", frame)
+	}
+	var invalidatedJobs bool
+	for _, resource := range frame.Data.Resources {
+		if resource.Kind == "jobs" && resource.DeploymentID == "deployment-1" {
+			invalidatedJobs = true
+		}
+	}
+	if !invalidatedJobs {
+		t.Fatalf("retention event did not identify the affected jobs: %+v", frame.Data.Resources)
+	}
+
+	request, err := http.NewRequest(http.MethodGet, server.URL+"/api/deployments/deployment-1/jobs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.AddCookie(&http.Cookie{Name: app.cookieName(), Value: base64.RawURLEncoding.EncodeToString(token)})
+	responseHTTP, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer responseHTTP.Body.Close()
+	var outcome struct {
+		Data []deploymentJob `json:"data"`
+	}
+	if err := json.NewDecoder(responseHTTP.Body).Decode(&outcome); err != nil {
+		t.Fatal(err)
+	}
+	if responseHTTP.StatusCode != http.StatusOK || len(outcome.Data) != 0 {
+		t.Fatalf("jobs read after retention = status %d, data %+v", responseHTTP.StatusCode, outcome.Data)
+	}
+}
+
 func TestConcurrentCommittedInvalidationsPreserveSocketSequenceOrder(t *testing.T) {
 	app, server, origin := newEventsTestServer(t)
 	token := make([]byte, 32)

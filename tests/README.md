@@ -44,10 +44,14 @@ frontend and executable, but skip the Go suite and unrelated browser scenarios:
 ```sh
 docker compose -f tests/compose.yaml run --build --rm -e LIFECYCLE_OUTCOMES_ONLY=true test
 docker compose -f tests/compose.yaml run --build --rm -e PROJECT_OUTCOMES_ONLY=true test
+docker compose -f tests/compose.yaml run --build --rm -e LIVE_UPDATES_ONLY=true test
 ```
 
 CLI behavior tests build one shared executable per package run; each scenario
 still uses isolated installation data and runs outside the source directory.
+The live-update slice exercises a real authenticated browser session, forced
+socket reconnection, and cross-tab webhook settings refresh without running the
+full Go suite or unrelated browser scenarios.
 With `go test -race`, this executable and the versioned upgrade/recovery fixture
 executables are also built with `-race`, so child-process behavior is actually
 instrumented. The recovery rehearsal retains two distinct fixture executables

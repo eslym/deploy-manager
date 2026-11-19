@@ -7,7 +7,8 @@
 	type Settings = { configured: boolean; url: string };
 	let settings = $state<Settings | null>(null);
 	let secret = $state('');
-	let error = $state('');
+	let actionError = $state('');
+	let settingsError = $state('');
 	let busy = $state(false);
 	let loading = $state(true);
 	let copied = $state('');
@@ -15,7 +16,7 @@
 
 	async function load(id: string, version: number) {
 		loading = true;
-		error = '';
+		settingsError = '';
 		try {
 			const outcome = await sdk.webhooks.settings(id, provider);
 			const result: Settings = outcome.data;
@@ -23,7 +24,7 @@
 				settings = { ...result, url: new URL(result.url, window.location.origin).toString() };
 		} catch (cause) {
 			if (version === loadVersion && id === projectId)
-				error = cause instanceof Error ? cause.message : 'Could not load webhook settings.';
+				settingsError = cause instanceof Error ? cause.message : 'Could not load webhook settings.';
 		} finally {
 			if (version === loadVersion && id === projectId) loading = false;
 		}
@@ -43,7 +44,7 @@
 		const version = loadVersion;
 		secret = '';
 		copied = '';
-		error = '';
+		actionError = '';
 		try {
 			const outcome = await sdk.webhooks.rotate(id, provider);
 			const result: { url: string; secret: string } = outcome.data;
@@ -52,7 +53,8 @@
 			settings = { configured: true, url: new URL(result.url, window.location.origin).toString() };
 		} catch (cause) {
 			if (version === loadVersion && id === projectId)
-				error = cause instanceof Error ? cause.message : 'Could not create the webhook secret.';
+				actionError =
+					cause instanceof Error ? cause.message : 'Could not create the webhook secret.';
 		} finally {
 			if (version === loadVersion && id === projectId) busy = false;
 		}
@@ -68,8 +70,42 @@
 	}
 
 	onMount(() => {
-		void load(projectId, ++loadVersion);
+		const id = projectId;
+		const version = ++loadVersion;
+		const dispose = sdk.resources.subscribe({
+			identity: { kind: 'webhook_settings', projectId: id },
+			read: async () => {
+				const [github, gitea] = await Promise.allSettled([
+					sdk.webhooks.settings(id, 'github').then((outcome) => outcome.data),
+					sdk.webhooks.settings(id, 'gitea').then((outcome) => outcome.data)
+				]);
+				return { github, gitea };
+			},
+			onValue: (results, cause) => {
+				if (version !== loadVersion || id !== projectId) return;
+				if (cause) {
+					settingsError =
+						cause instanceof Error ? cause.message : 'Could not load webhook settings.';
+					loading = false;
+					return;
+				}
+				const providerResult = results![provider];
+				if (providerResult.status === 'rejected') {
+					settingsError =
+						providerResult.reason instanceof Error
+							? providerResult.reason.message
+							: 'Could not load webhook settings.';
+					loading = false;
+					return;
+				}
+				const result = providerResult.value;
+				settings = { ...result, url: new URL(result.url, window.location.origin).toString() };
+				settingsError = '';
+				loading = false;
+			}
+		});
 		return () => {
+			dispose();
 			loadVersion++;
 			secret = '';
 		};
@@ -86,13 +122,19 @@
 	<p class="mt-2 text-sm text-[#58645b]">
 		Deployments following a branch can update automatically when {providerName} pushes to it.
 	</p>
-	{#if error}<p
+	{#if actionError}<p
 			role="alert"
 			class="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
 		>
-			{error}
+			{actionError}
 		</p>{/if}
-	{#if error && !settings}
+	{#if settingsError}<p
+			role="alert"
+			class="mt-3 rounded-lg border border-red-200 bg-red-50 p-3 text-red-800"
+		>
+			{settingsError}
+		</p>{/if}
+	{#if settingsError && !settings}
 		<button
 			class="mt-3 rounded-lg border border-[#aeb9ae] px-4 py-2 font-semibold disabled:opacity-60"
 			onclick={() => void load(projectId, ++loadVersion)}

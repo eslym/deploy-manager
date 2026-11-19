@@ -1402,6 +1402,7 @@ func (a *App) cleanupPublications(startup bool) error {
 			if _, recordErr := a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("old publication cleanup failed; retry scheduled").AddAttempts(1).SetNotBefore(a.cfg.Now().Add(delay).UnixNano()).Save(context.Background()); recordErr != nil {
 				return fmt.Errorf("record publication cleanup failure: %w", recordErr)
 			}
+			a.invalidateJob(c.id)
 			continue
 		}
 		live, liveErr := a.store.Deployment.Get(context.Background(), c.id)
@@ -1420,6 +1421,7 @@ func (a *App) cleanupPublications(startup bool) error {
 			if _, err := a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("cleanup blocked because the old directory is still live").Save(context.Background()); err != nil {
 				return fmt.Errorf("record blocked publication cleanup: %w", err)
 			}
+			a.invalidateJob(c.id)
 			continue
 		}
 		ok, e := sameIdentity(path, c.identity)
@@ -1431,11 +1433,13 @@ func (a *App) cleanupPublications(startup bool) error {
 				if _, e = a.store.PublicationCleanup.Delete().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).Exec(context.Background()); e != nil {
 					return fmt.Errorf("reconcile removed publication cleanup: %w", e)
 				}
+				a.invalidateJob(c.id)
 				continue
 			}
 			if _, e = a.store.PublicationCleanup.Update().Where(publicationcleanup.IDEQ(c.id), publicationcleanup.JobIDEQ(c.job)).SetLastError("directory identity changed; cleanup blocked").Save(context.Background()); e != nil {
 				return fmt.Errorf("record ambiguous publication cleanup: %w", e)
 			}
+			a.invalidateJob(c.id)
 			continue
 		}
 		if err = os.RemoveAll(path); err == nil {
@@ -1454,16 +1458,61 @@ func (a *App) cleanupPublications(startup bool) error {
 			if recordErr != nil {
 				return fmt.Errorf("record publication cleanup failure: %w", recordErr)
 			}
+			a.invalidateJob(c.id)
 		}
 		if err != nil {
 			return err
 		}
+		a.invalidateJob(c.id)
 	}
-	if _, err := a.db.Exec(`DELETE FROM deployment_jobs WHERE updated_at<? AND status IN ('succeeded','failed','superseded','noop') AND id NOT IN (SELECT job_id FROM publication_cleanup) AND id NOT IN (SELECT job_id FROM publication_intents)`, a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano()); err != nil {
+	retentionCutoff := a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano()
+	expiredJobs, err := a.db.Query(`SELECT DISTINCT deployment_id FROM deployment_jobs WHERE updated_at<? AND status IN ('succeeded','failed','superseded','noop') AND id NOT IN (SELECT job_id FROM publication_cleanup) AND id NOT IN (SELECT job_id FROM publication_intents)`, retentionCutoff)
+	if err != nil {
+		return fmt.Errorf("find expired deployment jobs: %w", err)
+	}
+	jobDeployments := make(map[string]struct{})
+	for expiredJobs.Next() {
+		var deploymentID string
+		if err := expiredJobs.Scan(&deploymentID); err != nil {
+			_ = expiredJobs.Close()
+			return fmt.Errorf("read expired deployment jobs: %w", err)
+		}
+		jobDeployments[deploymentID] = struct{}{}
+	}
+	if err := expiredJobs.Err(); err != nil {
+		_ = expiredJobs.Close()
+		return fmt.Errorf("read expired deployment jobs: %w", err)
+	}
+	_ = expiredJobs.Close()
+	prunedJobs, err := a.db.Exec(`DELETE FROM deployment_jobs WHERE updated_at<? AND status IN ('succeeded','failed','superseded','noop') AND id NOT IN (SELECT job_id FROM publication_cleanup) AND id NOT IN (SELECT job_id FROM publication_intents)`, retentionCutoff)
+	if err != nil {
 		return fmt.Errorf("prune expired deployment jobs: %w", err)
 	}
-	if _, err := a.store.ArchivedDeploymentJob.Delete().Where(archiveddeploymentjob.UpdatedAtLT(a.cfg.Now().Add(-a.cfg.JobRetention).UnixNano())).Exec(context.Background()); err != nil {
+	prunedCount, err := prunedJobs.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("count pruned deployment jobs: %w", err)
+	}
+	if prunedCount > 0 {
+		for deploymentID := range jobDeployments {
+			a.invalidateJob(deploymentID)
+		}
+	}
+	archivedJobs, err := a.store.ArchivedDeploymentJob.Query().Where(archiveddeploymentjob.UpdatedAtLT(retentionCutoff)).All(context.Background())
+	if err != nil {
+		return fmt.Errorf("find expired archived deployment jobs: %w", err)
+	}
+	archivedDeployments := make(map[string]struct{})
+	for _, job := range archivedJobs {
+		archivedDeployments[job.DeploymentID] = struct{}{}
+	}
+	archivedPruned, err := a.store.ArchivedDeploymentJob.Delete().Where(archiveddeploymentjob.UpdatedAtLT(retentionCutoff)).Exec(context.Background())
+	if err != nil {
 		return fmt.Errorf("prune expired archived deployment jobs: %w", err)
+	}
+	if archivedPruned > 0 {
+		for deploymentID := range archivedDeployments {
+			a.invalidateJob(deploymentID)
+		}
 	}
 	return nil
 }
