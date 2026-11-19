@@ -429,7 +429,30 @@ try {
   await openProject(page, id, "Fixture site");
   await page.getByLabel("LFS server URL").waitFor();
 
-  if (process.env.REPOSITORY_OUTCOMES_ONLY === "true") {
+  if (process.env.PROJECT_OUTCOMES_ONLY === "true") {
+    milestone("exercise project outcome operations against the combined binary");
+    const cachedRefsBeforeFailure = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, id);
+    if (await httpsRequestStatus("127.0.0.1", 18441, "/__fixture/fail", "POST") !== 204) throw new Error("could not make the Git server unavailable for the focused refresh failure");
+    const failedRefreshResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
+    await page.getByRole("button", { name: "Refresh project branches and tags" }).click();
+    const failedRefresh = await failedRefreshResponse;
+    const failedRefreshOutcome = await failedRefresh.json();
+    if (failedRefresh.status() !== 502 || failedRefreshOutcome.code !== "operation.upstream_failed") throw new Error(`upstream refresh failure returned ${JSON.stringify(failedRefreshOutcome)}`);
+    const refsAfterFailure = await page.evaluate(async projectID => (await (await fetch(`/api/projects/${projectID}/refs`)).json()).data, id);
+    if (JSON.stringify(refsAfterFailure) !== JSON.stringify(cachedRefsBeforeFailure)) throw new Error("failed refresh changed cached refs");
+    const cacheSection = page.getByRole("region", { name: "Repository storage" });
+    await cacheSection.getByRole("button", { name: "Clear cache…" }).click();
+    const cacheCleared = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/cache/recreate`));
+    await cacheSection.getByRole("button", { name: "Clear cache", exact: true }).click();
+    const cacheResponse = await cacheCleared;
+    const cacheOutcome = await cacheResponse.json();
+    if (cacheResponse.status() !== 200 || cacheOutcome.code !== "project.cache_cleared" || cacheOutcome.data !== null) throw new Error(`cache clear returned ${JSON.stringify(cacheOutcome)}`);
+    const projectAfterCacheClear = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id), id);
+    if (projectAfterCacheClear.gitCacheBytes !== 0 || projectAfterCacheClear.lfsCacheBytes !== 0) throw new Error(`cache sizes were not cleared: ${JSON.stringify(projectAfterCacheClear)}`);
+    const refsAfterCacheClear = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, id);
+    if (!refsAfterCacheClear.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("cache clearing removed the cached-ref metadata");
+    console.log("combined-binary project outcome browser slice passed: project create, cached refs, refresh, and cache clearing");
+  } else if (process.env.REPOSITORY_OUTCOMES_ONLY === "true") {
     milestone("exercise repository-key and SSH-host SDK operations against the combined binary");
     await page.goto(`https://${appListen}/dashboard/keys`, { waitUntil: "domcontentloaded" });
     await page.getByLabel("Key name").fill("Repository outcomes browser key");
