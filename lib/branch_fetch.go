@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net"
 	"net/url"
-	"strings"
 	"syscall"
 	"time"
 
@@ -102,7 +101,7 @@ func (a *App) fetchProjectForBranchAttempt(ctx context.Context, id string) error
 	}
 	remote := storedProject.RemoteURL
 	var auth transport.AuthMethod
-	if strings.HasPrefix(remote, "ssh://") {
+	if isSSHRemote(remote) {
 		parsed, host, port, _, parseErr := safeSSHRemote(remote)
 		if parseErr != nil {
 			return errors.New("SSH repository configuration is invalid")

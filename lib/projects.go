@@ -159,7 +159,21 @@ func safeRemote(raw string) (*url.URL, error) {
 }
 
 func safeSSHRemote(raw string) (*url.URL, string, int, string, error) {
-	u, err := url.Parse(strings.TrimSpace(raw))
+	raw = strings.TrimSpace(raw)
+	scpStyle := !strings.HasPrefix(raw, "ssh://")
+	if scpStyle {
+		at := strings.IndexByte(raw, '@')
+		colon := strings.IndexByte(raw, ':')
+		if at <= 0 || colon <= at+1 || strings.IndexByte(raw[at+1:], '@') >= 0 || strings.ContainsAny(raw[:colon], "/?#\\\r\n\x00\t ") || strings.ContainsAny(raw[colon+1:], "\r\n\x00") {
+			return nil, "", 0, "", errors.New("use an SSH repository URL with a host and path, without query or fragment")
+		}
+		path := raw[colon+1:]
+		if path == "" {
+			return nil, "", 0, "", errors.New("SSH repository URL has an invalid repository path")
+		}
+		raw = "ssh://" + raw[:colon] + "/" + path
+	}
+	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "ssh" || u.Hostname() == "" || u.Fragment != "" || u.RawQuery != "" || u.Opaque != "" {
 		return nil, "", 0, "", errors.New("use an SSH repository URL with a host and path, without query or fragment")
 	}
@@ -192,7 +206,16 @@ func safeSSHRemote(raw string) (*url.URL, string, int, string, error) {
 		return nil, "", 0, "", errors.New("SSH repository URL has an invalid username")
 	}
 	canonical := (&url.URL{Scheme: "ssh", User: url.User(user), Host: net.JoinHostPort(host, strconv.Itoa(port)), Path: "/" + decoded}).String()
+	if scpStyle {
+		u.Path = decoded
+		u.RawPath = ""
+		canonical = url.User(user).String() + "@" + host + ":" + decoded
+	}
 	return u, host, port, canonical, nil
+}
+
+func isSSHRemote(remote string) bool {
+	return strings.HasPrefix(remote, "ssh://") || strings.Contains(remote, "@")
 }
 
 func (p *projectManager) repoPath(id string) string { return filepath.Join(p.root, id) }
@@ -395,7 +418,7 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 	}
 	remote, sshHost, sshPort, keyID := "", "", 0, input.KeyID
 	var sshURL *url.URL
-	if strings.HasPrefix(strings.TrimSpace(input.URL), "ssh://") {
+	if isSSHRemote(strings.TrimSpace(input.URL)) {
 		var err error
 		sshURL, sshHost, sshPort, remote, err = safeSSHRemote(input.URL)
 		if err != nil {
@@ -580,7 +603,7 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	remote := storedProject.RemoteURL
 	var keyID, sshUser string
 	var sshAuth transport.AuthMethod
-	if strings.HasPrefix(remote, "ssh://") {
+	if isSSHRemote(remote) {
 		parsed, host, port, _, parseErr := safeSSHRemote(remote)
 		assignment, assignmentErr := a.store.ProjectSSHKey.Query().Where(projectsshkey.IDEQ(id)).Only(r.Context())
 		if parseErr != nil || assignmentErr != nil {
@@ -630,7 +653,7 @@ func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	remote := storedProject.RemoteURL
-	if !strings.HasPrefix(remote, "ssh://") {
+	if !isSSHRemote(remote) {
 		http.Error(w, "repository keys can only be assigned to SSH projects", 400)
 		return
 	}
@@ -829,7 +852,7 @@ func verifyCompleteCommit(repo *git.Repository, commit *object.Commit, checked m
 func sanitizeGitError(err error, remote string) string {
 	s := strings.ReplaceAll(err.Error(), remote, "repository URL")
 	lower := strings.ToLower(s)
-	if strings.HasPrefix(remote, "ssh://") {
+	if isSSHRemote(remote) {
 		if strings.Contains(lower, "ssh host key is not approved") || strings.Contains(lower, "host key could not be verified") {
 			return "SSH host key is not approved; independently verify the observed fingerprint in SSH host warnings before approval"
 		}

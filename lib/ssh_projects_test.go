@@ -42,6 +42,29 @@ func TestSSHRemoteURLValidation(t *testing.T) {
 	}
 }
 
+func TestSCPSSHRemoteNormalization(t *testing.T) {
+	for _, tc := range []struct {
+		input, want, path string
+	}{
+		{"git@github.com:owner/repo.git", "git@github.com:owner/repo.git", "owner/repo.git"},
+		{"Deploy@Git.Example.test:team/site.git", "Deploy@git.example.test:team/site.git", "team/site.git"},
+	} {
+		parsed, host, port, canonical, err := safeSSHRemote(tc.input)
+		if err != nil || parsed == nil || host == "" || port != 22 || canonical != tc.want || parsed.Path != tc.path {
+			t.Errorf("safeSSHRemote(%q) = (%v, %q, %d, %q, %v), want canonical %q", tc.input, parsed, host, port, canonical, err, tc.want)
+		}
+	}
+	for _, input := range []string{
+		"git@github.com:", "git@:owner/repo", "git@github.com:../repo",
+		"git@github.com:-upload-pack", "git@github.com:owner/repo\nexec",
+		"git:password@github.com:owner/repo", "https://github.com/owner/repo.git",
+	} {
+		if _, _, _, _, err := safeSSHRemote(input); err == nil {
+			t.Errorf("safeSSHRemote accepted unsafe input %q", input)
+		}
+	}
+}
+
 // This end-to-end application test uses an in-process SSH server and go-git's
 // upload-pack implementation; it never starts a local Git/SSH executable.
 func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
