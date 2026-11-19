@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { onDestroy } from 'svelte';
+	import { beforeNavigate } from '$app/navigation';
 	import { BrowserSDKError, sdk } from '#lib/sdk/index.js';
 	import type { DeploymentHistory, DeploymentHistoryCommit } from '#lib/sdk/deployments.js';
 
@@ -28,9 +30,50 @@
 	let permanent = $state(false);
 	let requestedPage = 1;
 	let requestedSearch = '';
+	let requestController: AbortController | null = null;
+	let requestVersion = 0;
+	let latestHistoryQuery: {
+		deploymentId: string;
+		search: string;
+		page: number;
+		limit: number;
+	} | null = null;
+	let destroyed = false;
+	let historyDeploymentId = $state('');
+	const historyLimit = 20;
+
+	function isLatestHistoryQuery(query: NonNullable<typeof latestHistoryQuery>, version: number) {
+		return (
+			version === requestVersion &&
+			latestHistoryQuery?.deploymentId === query.deploymentId &&
+			latestHistoryQuery.search === query.search &&
+			latestHistoryQuery.page === query.page &&
+			latestHistoryQuery.limit === query.limit
+		);
+	}
+
+	beforeNavigate(() => {
+		requestController?.abort();
+	});
+
+	onDestroy(() => {
+		destroyed = true;
+		requestController?.abort();
+	});
 
 	async function loadHistory(page = 1, query = activeSearch) {
-		if (loading || busy) return;
+		if (busy) return;
+		requestController?.abort();
+		const controller = new AbortController();
+		requestController = controller;
+		const version = ++requestVersion;
+		const queryIdentity = {
+			deploymentId,
+			search: query,
+			page,
+			limit: historyLimit
+		};
+		latestHistoryQuery = queryIdentity;
 		loading = true;
 		historyError = '';
 		selected = null;
@@ -38,19 +81,42 @@
 		requestedPage = page;
 		requestedSearch = query;
 		try {
-			history = (
-				await sdk.deployments.history(deploymentId, {
-					search: query,
-					page,
-					limit: 20
-				})
+			const result = (
+				await sdk.deployments.history(
+					queryIdentity.deploymentId,
+					{
+						search: queryIdentity.search,
+						page: queryIdentity.page,
+						limit: queryIdentity.limit
+					},
+					controller.signal
+				)
 			).data;
-			activeSearch = query;
+			if (
+				destroyed ||
+				controller.signal.aborted ||
+				!isLatestHistoryQuery(queryIdentity, version) ||
+				queryIdentity.deploymentId !== deploymentId
+			)
+				return;
+			history = result;
+			historyDeploymentId = queryIdentity.deploymentId;
+			activeSearch = queryIdentity.search;
 		} catch {
+			if (
+				destroyed ||
+				controller.signal.aborted ||
+				!isLatestHistoryQuery(queryIdentity, version) ||
+				queryIdentity.deploymentId !== deploymentId
+			)
+				return;
 			historyError =
 				'Could not load commit history. Try again. If the branch has not been fetched yet, refresh branches and tags first.';
 		} finally {
-			loading = false;
+			if (!destroyed && version === requestVersion) {
+				loading = false;
+				requestController = null;
+			}
 		}
 	}
 
@@ -150,7 +216,7 @@
 				>
 			{/if}
 			{#if loading}<p role="status" class="mt-3 text-sm text-[#58645b]">Loading commits…</p>{/if}
-			{#if history && !loading}
+			{#if history && historyDeploymentId === deploymentId && !loading}
 				{#if activeSearch}<p class="mt-3 text-sm text-[#58645b]">
 						Results for “{activeSearch}”
 					</p>{/if}

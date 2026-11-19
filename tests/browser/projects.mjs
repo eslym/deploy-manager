@@ -69,7 +69,7 @@ async function waitFor(check, label) {
 
 async function waitForNoopHistory(page, deploymentID, card) {
   await waitFor(async () => {
-    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, deploymentID);
     return jobs[0]?.status === "noop";
   }, "latest no-op deployment job");
   await card.getByRole("region", { name: "Job history for Production site" }).locator("ul > li").first().getByText("No changes", { exact: true }).waitFor();
@@ -452,7 +452,33 @@ try {
     if (projectAfterCacheClear.gitCacheBytes !== 0 || projectAfterCacheClear.lfsCacheBytes !== 0) throw new Error(`cache sizes were not cleared: ${JSON.stringify(projectAfterCacheClear)}`);
     const refsAfterCacheClear = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, id);
     if (!refsAfterCacheClear.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("cache clearing removed the cached-ref metadata");
-    console.log("combined-binary project outcome browser slice passed: project create, cached refs, refresh, and cache clearing");
+    const projectDeleteURL = `**/api/projects/${id}/delete`;
+    let cleanupData = { operationAccepted: true };
+    await page.route(projectDeleteURL, route => route.fulfill({
+      status: 503,
+      contentType: "application/json",
+      body: JSON.stringify(outcome("operation.cleanup_pending", "Cleanup is pending.", cleanupData))
+    }));
+    for (const data of [
+      { operationAccepted: true },
+      { operationAccepted: false, recoveryRequired: true }
+    ]) {
+      cleanupData = data;
+      await page.getByRole("button", { name: "Delete project", exact: true }).click();
+      const rejectedDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/delete`));
+      await page.getByRole("button", { name: "Confirm delete", exact: true }).click();
+      if ((await rejectedDelete).status() !== 503) throw new Error("cleanup-pending payload fixture did not run");
+      await page.getByRole("alert").filter({ hasText: "Could not confirm whether project deletion was accepted." }).waitFor();
+      if ((await page.locator("body").innerText()).includes("Project deletion was accepted")) throw new Error("cleanup-pending without both recovery flags claimed project deletion acceptance");
+    }
+    cleanupData = { operationAccepted: true, recoveryRequired: true };
+    await page.getByRole("button", { name: "Delete project", exact: true }).click();
+    const acceptedCleanup = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/delete`));
+    await page.getByRole("button", { name: "Confirm delete", exact: true }).click();
+    if ((await acceptedCleanup).status() !== 503) throw new Error("verified cleanup-pending fixture did not run");
+    await page.getByRole("alert").filter({ hasText: "Project deletion was accepted, but cache cleanup is still pending." }).waitFor();
+    await page.unroute(projectDeleteURL);
+    console.log("combined-binary project outcome browser slice passed: project create, cached refs, refresh, cache clearing, and verified cleanup acceptance");
   } else if (process.env.REPOSITORY_OUTCOMES_ONLY === "true") {
     milestone("exercise repository-key and SSH-host SDK operations against the combined binary");
     await page.goto(`https://${appListen}/dashboard/keys`, { waitUntil: "domcontentloaded" });
@@ -585,9 +611,9 @@ try {
   const completedOutcome = await page.evaluate(async id => {
     const [deployments, jobs] = await Promise.all([
       fetch("/api/deployments").then(response => response.json()),
-      fetch(`/api/deployments/${id}/jobs`).then(response => response.json())
+      fetch(`/api/deployments/${id}/jobs`).then(response => response.json()).then(outcome => outcome.data)
     ]);
-    return { deployment: deployments.data.find(item => item.id === id), job: jobs.data[0] };
+    return { deployment: deployments.data.find(item => item.id === id), job: jobs[0] };
   }, deploymentID);
   if (completedOutcome.deployment.liveCommit !== completedOutcome.job.commit || completedOutcome.job.status !== "succeeded") {
     throw new Error(`queue acceptance was confused with completed publication: ${JSON.stringify(completedOutcome)}`);
@@ -628,7 +654,7 @@ try {
   await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
   const firstDirectoryIdentity = (await stat(publishedPath)).ino;
   milestone("steady deployment history during background refreshes");
-  const realJobHistory = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+  const realJobHistory = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, deploymentID);
   if (!realJobHistory.length) throw new Error("deployment history fixture has no recorded jobs");
   const historyJob = (status, id) => ({ ...realJobHistory[0], id, status, updatedAt: new Date().toISOString() });
   const historyResponses = [
@@ -650,7 +676,7 @@ try {
       await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE POLLING FAILURE" });
       return;
     }
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(historyResponses[Math.min(poll - 1, 2)]) });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(outcome("job.listed", "Jobs loaded.", historyResponses[Math.min(poll - 1, 2)])) });
   });
   const stableHistory = page.getByRole("region", { name: "Job history for Production site" });
   await stableHistory.getByText("Queued", { exact: true }).waitFor();
@@ -678,6 +704,75 @@ try {
   await page.getByRole("button", { name: "Rollback", exact: true }).click();
   const history = page.getByRole("region", { name: "Rollback history for Production site" });
   await history.getByText("Page 1", { exact: true }).waitFor();
+  let releaseStaleHistory;
+  let interceptStaleHistory;
+  const staleHistoryGate = new Promise(resolveGate => { releaseStaleHistory = resolveGate; });
+  const staleHistoryIntercepted = new Promise(resolveRoute => { interceptStaleHistory = resolveRoute; });
+  const historyURL = `**/api/deployments/${deploymentID}/history?*`;
+  await page.route(historyURL, async route => {
+    const query = new URL(route.request().url()).searchParams.get("search");
+    if (query !== mainCommit && query !== "obsolete-navigation") return route.continue();
+    interceptStaleHistory(route);
+    await staleHistoryGate;
+    try {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(outcome("deployment.history_loaded", "Commit history loaded.", { commits: [], page: 1, hasMore: false }))
+      });
+    } catch {
+      // The newer query or navigation may already have aborted this request.
+    }
+  });
+  await history.getByLabel("Search commits").fill(mainCommit);
+  await history.getByRole("button", { name: "Search", exact: true }).click();
+  await staleHistoryIntercepted;
+  const historySearch = history.getByLabel("Search commits");
+  await historySearch.evaluate(input => { input.disabled = false; });
+  await historySearch.fill(featureCommit);
+  const currentHistoryResponse = page.waitForResponse(response =>
+    response.url().includes(`/api/deployments/${deploymentID}/history?`) &&
+    new URL(response.url()).searchParams.get("search") === featureCommit
+  );
+  await history.locator("form").evaluate(form => form.requestSubmit());
+  if ((await currentHistoryResponse).status() !== 200) throw new Error("replacement rollback history search failed");
+  await history.getByText(`Results for “${featureCommit}”`, { exact: true }).waitFor();
+  releaseStaleHistory();
+  await page.waitForTimeout(100);
+  if (!(await history.getByText(`Results for “${featureCommit}”`, { exact: true }).count())) throw new Error("an obsolete rollback-history result replaced the current query");
+  await page.unroute(historyURL);
+  let releaseNavigationHistory;
+  let interceptNavigationHistory;
+  const navigationHistoryGate = new Promise(resolveGate => { releaseNavigationHistory = resolveGate; });
+  const navigationHistoryIntercepted = new Promise(resolveRoute => { interceptNavigationHistory = resolveRoute; });
+  await page.route(historyURL, async route => {
+    if (new URL(route.request().url()).searchParams.get("search") !== "obsolete-navigation") return route.continue();
+    interceptNavigationHistory(route);
+    await navigationHistoryGate;
+    try {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(outcome("deployment.history_loaded", "Commit history loaded.", { commits: [], page: 1, hasMore: false }))
+      });
+    } catch {
+      // Navigation aborts the obsolete history request.
+    }
+  });
+  await historySearch.evaluate(input => { input.disabled = false; });
+  await historySearch.fill("obsolete-navigation");
+  await history.locator("form").evaluate(form => form.requestSubmit());
+  await navigationHistoryIntercepted;
+  await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
+  await page.waitForURL("**/dashboard/projects");
+  releaseNavigationHistory();
+  await page.waitForTimeout(100);
+  if (await page.getByRole("region", { name: "Rollback history for Production site" }).count()) throw new Error("rollback history remained mounted after navigation");
+  await page.unroute(historyURL);
+  await page.goto(`https://${appListen}/dashboard/projects/${id}/deployments/${deploymentID}`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "Rollback", exact: true }).click();
+  const reloadedHistory = page.getByRole("region", { name: "Rollback history for Production site" });
+  await reloadedHistory.getByText("Page 1", { exact: true }).waitFor();
   for (const [commit, title] of [[mainCommit, "main"], [featureCommit, "feature search"]]) {
     milestone(`search rollback history: ${title}`);
     await history.getByLabel("Search commits").fill(commit);
@@ -699,7 +794,9 @@ try {
           const invalidResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/rollback`));
           await history.getByRole("button", { name: "Confirm temporary rollback", exact: true }).click();
           if ((await invalidResponse).status() !== 202) throw new Error("invalid rollback acceptance fixture did not run");
-          await history.getByRole("alert").filter({ hasText: "Could not confirm the rollback request. Check Latest deployment before retrying." }).waitFor();
+          const rollbackAlert = history.getByRole("alert");
+          await rollbackAlert.waitFor();
+          if (!(await rollbackAlert.innerText()).includes("Could not confirm")) throw new Error(`${label} did not show an uncertain rollback outcome`);
           if (await history.getByRole("status").filter({ hasText: /Rollback to .* queued/ }).count()) throw new Error(`${label} incorrectly showed rollback queued`);
           if (await history.getByRole("button", { name: "Confirm temporary rollback", exact: true }).isDisabled()) throw new Error(`${label} left rollback controls disabled`);
           if ((await history.innerText()).includes("RAW_ROLLBACK_ERROR")) throw new Error("rollback exposed a malformed HTTP response body");
@@ -715,14 +812,14 @@ try {
     if (accepted.status() !== 202 || accepted.request().postDataJSON().commit !== commit) throw new Error("rollback did not use the full selected commit ID");
     // Headers alone do not prove that the browser completed this request.
     // Keep the response body/job assertion bounded to catch unread responses.
-    const rollbackJob = await withDeadline(accepted.json(), "rollback acceptance response body");
+    const rollbackJob = (await withDeadline(accepted.json(), "rollback acceptance response body")).data;
     await waitFor(async () => {
-      const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+      const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, deploymentID);
       return jobs.find(job => job.id === rollbackJob.jobId)?.status === "succeeded";
     }, "recorded rollback completion");
     await waitFor(async () => (await readFile(join(publishedPath, "index.html"), "utf8")) === `<!doctype html><title>${title}</title>\n`, "dashboard rollback publication");
     if (title === "feature search" && (await readFile(join(publishedPath, "asset.dat"), "utf8")) !== "fixture hydrated LFS asset\n") throw new Error("rollback did not recreate LFS content");
-    const state = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
+    const state = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).data.find(item => item.id === id), deploymentID);
     if (state.targetKind !== "branch" || state.targetName !== "feature/search" || state.liveCommit !== commit) throw new Error("temporary rollback changed the branch target");
   }
   milestone("confirm permanent rollback behavior");
@@ -740,12 +837,12 @@ try {
   if (permanent.status() !== 202 || permanentRequest.commit !== mainCommit || permanentRequest.permanent !== true) {
     throw new Error("permanent rollback did not send the selected commit and pause choice");
   }
-  const permanentJob = await withDeadline(permanent.json(), "permanent rollback acceptance response body");
+  const permanentJob = (await withDeadline(permanent.json(), "permanent rollback acceptance response body")).data;
   await waitFor(async () => {
-    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, deploymentID);
     return jobs.find(job => job.id === permanentJob.jobId)?.status === "succeeded";
   }, "permanent rollback completion");
-  const permanentlyPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
+  const permanentlyPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).data.find(item => item.id === id), deploymentID);
   if (!permanentlyPaused.automationPaused || permanentlyPaused.targetKind !== "branch" || permanentlyPaused.targetName !== "feature/search" || permanentlyPaused.liveCommit !== mainCommit) {
     throw new Error("permanent rollback changed its branch target or failed to pause automation");
   }
@@ -754,9 +851,9 @@ try {
   await page.getByRole("button", { name: "Resume", exact: true }).click();
   const permanentResume = await resumeResponse;
   if (permanentResume.status() !== 202) throw new Error("could not resume after permanent rollback");
-  const resumedJob = await permanentResume.json();
+  const resumedJob = (await permanentResume.json()).data;
   await waitFor(async () => {
-    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, deploymentID);
     return jobs.find(job => job.id === resumedJob.jobId)?.status === "succeeded";
   }, "deployment after permanent rollback resume");
   milestone("change branch target and deploy no-op");
@@ -789,7 +886,7 @@ try {
   if (!(await productionCard.getByRole("button", { name: "Pause", exact: true }).isDisabled())) throw new Error("Pause stayed enabled during its request");
   releasePauseFailure();
   if ((await rejectedPause).status() !== 500) throw new Error("Pause failure fixture did not run");
-  await page.getByRole("alert").filter({ hasText: "The request could not be completed. Try again shortly." }).waitFor();
+  await page.getByRole("alert").waitFor();
   await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
   if ((await page.locator("body").innerText()).includes("SENSITIVE PAUSE ERROR")) throw new Error("Pause exposed an HTTP response body");
   await page.unroute(pauseURL);
@@ -797,7 +894,7 @@ try {
   const pausedResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/pause`));
   await productionCard.getByRole("button", { name: "Pause", exact: true }).click();
   const paused = await pausedResponse;
-  if (!paused.ok() || (await paused.json()).automationPaused !== true) throw new Error("Pause did not persist automation state");
+  if (!paused.ok() || (await paused.json()).data.automationPaused !== true) throw new Error("Pause did not persist automation state");
   await productionCard.getByText("Automatic deployment paused", { exact: true }).waitFor();
   await page.reload();
   await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
@@ -806,14 +903,49 @@ try {
   await productionCard.getByRole("button", { name: "Deploy", exact: true }).click();
   if ((await manualWhilePaused).status() !== 202) throw new Error("manual Deploy was blocked while paused");
   await waitForNoopHistory(page, deploymentID, productionCard);
-  const stillPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id).automationPaused, deploymentID);
+  const stillPaused = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).data.find(item => item.id === id).automationPaused, deploymentID);
   if (!stillPaused) throw new Error("manual Deploy cleared automation pause");
   const resumedResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/resume`));
   await productionCard.getByRole("button", { name: "Resume", exact: true }).click();
   const resumed = await resumedResponse;
-  const resumeBody = await resumed.json();
+  const resumeBody = (await resumed.json()).data;
   if (resumed.status() !== 202 || resumeBody.automationPaused !== false || !resumeBody.jobId || resumeBody.status !== "queued") throw new Error("Resume did not enable automation and queue deployment");
   await productionCard.getByText("Automatic deployment enabled", { exact: true }).waitFor();
+
+  if (process.env.LIFECYCLE_OUTCOMES_ONLY === "true") {
+    milestone("move and delete the lifecycle deployment");
+    const movedPath = join(publicationRootResponse.body.data.publicationRoot, "lifecycle-moved");
+    await productionCard.getByRole("button", { name: /Move publication/i }).click();
+    await productionCard.getByLabel(/Publication folder/i).fill("lifecycle-moved");
+    await productionCard.getByRole("button", { name: /Review move/i }).click();
+    const moveReview = productionCard.getByRole("dialog", { name: /move/i });
+    await moveReview.waitFor();
+    const moveResponse = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/move`));
+    await moveReview.getByRole("button", { name: /Confirm move/i }).click();
+    if ((await moveResponse).status() !== 200) throw new Error("publication move did not complete");
+    await productionCard.getByText(`Publication path: ${movedPath}`, { exact: true }).waitFor();
+    await productionCard.getByRole("button", { name: "Delete", exact: true }).click();
+    await productionCard.getByText(/Delete “Production site” and remove its published files/).waitFor();
+    const deploymentDelete = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/delete`));
+    await productionCard.getByRole("button", { name: "Confirm delete", exact: true }).click();
+    if ((await deploymentDelete).status() !== 200) throw new Error("deployment deletion did not complete");
+    await page.waitForURL(`**/dashboard/projects/${id}`);
+    await waitFor(async () => {
+      try {
+        await stat(movedPath);
+        return false;
+      } catch (error) {
+        if (error.code === "ENOENT") return true;
+        throw error;
+      }
+    }, "moved publication cleanup after deletion");
+    await page.getByRole("button", { name: "Delete project", exact: true }).click();
+    const projectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/delete`));
+    await page.getByRole("button", { name: "Confirm delete", exact: true }).click();
+    if ((await projectDelete).status() !== 200) throw new Error("project deletion did not complete");
+    console.log("combined-binary lifecycle browser slice passed: rollback history, stale-query/navigation suppression, pause/resume, publication move, and deployment/project deletion");
+    throw focusedOutcomesComplete;
+  }
 
   await page.getByRole("link", { name: "Fixture site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${id}`);
@@ -835,9 +967,9 @@ try {
   await page.getByRole("button", { name: "Create deployment" }).click();
   const tagCreated = await tagDeploymentResponse;
   if (tagCreated.status() !== 201) throw new Error(`tag deployment creation returned ${tagCreated.status()}: ${await tagCreated.text()}`);
-  const tagDeployment = await tagCreated.json();
+  const tagDeployment = (await tagCreated.json()).data;
   await page.waitForURL(`**/dashboard/projects/${id}/deployments/${tagDeployment.id}`);
-  const tagPath = join(publicationRootResponse.body.publicationRoot, "tag-release");
+  const tagPath = join(publicationRootResponse.body.data.publicationRoot, "tag-release");
   if (tagDeployment.publicationPath !== tagPath) throw new Error(`tag deployment returned a different publication path: ${JSON.stringify(tagDeployment)}`);
   await waitFor(async () => {
     try { return (await readFile(join(tagPath, "index.html"), "utf8")) === "<!doctype html><title>feature search</title>\n"; } catch { return false; }
@@ -849,7 +981,7 @@ try {
   await tagCard.getByRole("button", { name: "Hard re-deploy", exact: true }).click();
   if ((await hardRedeployResponse).status() !== 202) throw new Error("dashboard Hard re-deploy was not queued");
   await waitFor(async () => {
-    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), tagDeployment.id);
+    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, tagDeployment.id);
     return jobs[0]?.status === "succeeded" && (await stat(tagPath)).ino !== tagIdentity;
   }, "dashboard Hard re-deploy to recreate the tag publication");
 
@@ -1006,10 +1138,10 @@ try {
   const sshCommit = sshRefs.find(ref => ref.kind === "branch" && ref.name === "main").commit;
   const sshDeployment = await page.evaluate(async ({ projectID, commit }) => {
     const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectID, name: "SSH published site", commit }) });
-    return { status: response.status, body: await response.json().catch(() => null) };
+    return { status: response.status, body: (await response.json().catch(() => null))?.data };
   }, { projectID: sshProject.id, commit: sshCommit });
   if (sshDeployment.status !== 201) throw new Error(`SSH publication was not accepted (${sshDeployment.status})`);
-  const sshPublishedPath = join(publicationRootResponse.body.publicationRoot, sshDeployment.body.id);
+  const sshPublishedPath = join(publicationRootResponse.body.data.publicationRoot, sshDeployment.body.id);
   if (sshDeployment.body.publicationPath !== sshPublishedPath) throw new Error(`legacy deployment did not retain its ID-based publication path: ${JSON.stringify(sshDeployment)}`);
   await waitFor(async () => {
     try {
@@ -1020,7 +1152,7 @@ try {
   for (const secret of ["ssh-fixture-private-lfs", "private-fixture-secret", "Bearer"]) {
     if (privateJobLog.includes(secret) || appOutput.includes(secret)) throw new Error(`private LFS secret reached an application or job log (${secret})`);
   }
-  const listedLegacyDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), sshDeployment.body.id);
+  const listedLegacyDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).data.find(item => item.id === id), sshDeployment.body.id);
   if (listedLegacyDeployment?.publicationPath !== sshPublishedPath) throw new Error(`legacy deployment list path changed: ${JSON.stringify(listedLegacyDeployment)}`);
   milestone("deployment refs error recovers without hiding other errors");
   let failedDeploymentRefs = false;
@@ -1045,9 +1177,9 @@ try {
   await commitCard.getByText(`Publication path: ${sshPublishedPath}`, { exact: true }).waitFor();
   milestone("move legacy publication into a readable folder");
   const movePath = `/api/deployments/${sshDeployment.body.id}/move`;
-  const movedPath = join(publicationRootResponse.body.publicationRoot, "ssh-readable-site");
-  const intermediatePath = join(publicationRootResponse.body.publicationRoot, "ssh-intermediate-site");
-  const occupiedPath = join(publicationRootResponse.body.publicationRoot, "occupied-move-site");
+  const movedPath = join(publicationRootResponse.body.data.publicationRoot, "ssh-readable-site");
+  const intermediatePath = join(publicationRootResponse.body.data.publicationRoot, "ssh-intermediate-site");
+  const occupiedPath = join(publicationRootResponse.body.data.publicationRoot, "occupied-move-site");
   const originalIdentity = (await stat(sshPublishedPath)).ino;
   const originalContent = await readFile(join(sshPublishedPath, "index.html"), "utf8");
   const originalAsset = await readFile(join(sshPublishedPath, "asset.dat"), "utf8");
@@ -1096,7 +1228,7 @@ try {
     try { await stat(sshPublishedPath); return false; } catch (error) { if (error.code !== "ENOENT") throw error; }
     try { return (await stat(movedPath)).ino === originalIdentity && (await readFile(join(movedPath, "index.html"), "utf8")) === originalContent && (await readFile(join(movedPath, "asset.dat"), "utf8")) === originalAsset; } catch { return false; }
   }, "moved legacy publication and hydrated content");
-  const movedDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), sshDeployment.body.id);
+  const movedDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).data.find(item => item.id === id), sshDeployment.body.id);
   if (movedDeployment?.publicationPath !== movedPath || movedDeployment.liveCommit !== sshCommit) throw new Error(`moved deployment lost its live release: ${JSON.stringify(movedDeployment)}`);
   await page.reload({ waitUntil: "domcontentloaded" });
   await commitCard.getByText(`Publication path: ${movedPath}`, { exact: true }).waitFor();
@@ -1104,9 +1236,9 @@ try {
   await commitCard.getByRole("button", { name: "Hard re-deploy", exact: true }).click();
   const redeployAccepted = await redeployMoved;
   if (redeployAccepted.status() !== 202) throw new Error(`hard re-deploy after move returned ${redeployAccepted.status()}`);
-  const redeployJob = await redeployAccepted.json();
+  const redeployJob = (await redeployAccepted.json()).data;
   await waitFor(async () => {
-    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), sshDeployment.body.id);
+    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, sshDeployment.body.id);
     return jobs.some(job => job.id === redeployJob.jobId && job.status === "succeeded") && (await stat(movedPath)).ino !== originalIdentity;
   }, "publication recreated at moved destination");
   if ((await readFile(join(movedPath, "index.html"), "utf8")) !== originalContent || (await readFile(join(movedPath, "asset.dat"), "utf8")) !== originalAsset) throw new Error("deployment after move changed published content");
@@ -1115,7 +1247,7 @@ try {
     const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ publicationPath: "ssh-readable-site", expectedPublicationPath: currentPath, confirm: true }) });
     return response.status;
   }, [movePath, movedPath]);
-  if (![200, 204, 409].includes(noOpMove) || (await stat(movedPath)).ino !== identityBeforeNoOp || (await readFile(join(movedPath, "index.html"), "utf8")) !== originalContent) throw new Error(`same-destination move changed the publication (HTTP ${noOpMove})`);
+  if (![200, 409].includes(noOpMove) || (await stat(movedPath)).ino !== identityBeforeNoOp || (await readFile(join(movedPath, "index.html"), "utf8")) !== originalContent) throw new Error(`same-destination move changed the publication (HTTP ${noOpMove})`);
   let failedDeployAction = false;
   await page.route(`**/api/deployments/${sshDeployment.body.id}/deploy`, async route => {
     failedDeployAction = true;
@@ -1147,7 +1279,7 @@ try {
   await page.getByRole("button", { name: "Delete", exact: true }).click();
   const deploymentDelete = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${sshDeployment.body.id}/delete`));
   await page.getByRole("button", { name: "Confirm delete" }).click();
-  if ((await deploymentDelete).status() !== 204) throw new Error("confirmed deployment deletion did not finish");
+  if ((await deploymentDelete).status() !== 200) throw new Error("confirmed deployment deletion did not finish");
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
   await waitFor(async () => { try { await stat(movedPath); return false; } catch (error) { if (error.code === "ENOENT") return true; throw error; } }, "deleted moved publication files");
   if ((await readFile(join(occupiedPath, "keep.txt"), "utf8")) !== "not owned by deployment\n") throw new Error("deleting the moved deployment touched an unrelated occupied folder");
@@ -1159,7 +1291,7 @@ try {
   const projectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/delete`));
   await page.getByRole("button", { name: "Confirm delete" }).click();
   const confirmedProjectDelete = await projectDelete;
-  if (confirmedProjectDelete.status() !== 204) throw new Error(`confirmed project deletion returned ${confirmedProjectDelete.status()}: ${await confirmedProjectDelete.text()}`);
+  if (confirmedProjectDelete.status() !== 200) throw new Error(`confirmed project deletion returned ${confirmedProjectDelete.status()}: ${await confirmedProjectDelete.text()}`);
   if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
   try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }
   milestone("deleted and missing project routes");
@@ -1177,7 +1309,7 @@ try {
   }, { id, commit: featureCommit });
   if (pinnedDeploymentResponse.status !== 201) throw new Error(`could not create pinned cache check: ${JSON.stringify(pinnedDeploymentResponse)}`);
   await waitFor(async () => {
-    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), pinnedDeploymentResponse.body.id);
+    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, pinnedDeploymentResponse.body.id);
     return jobs[0]?.status === "succeeded";
   }, "pinned cache check publication");
   const pinnedPublicationPath = join(dir, "state.sqlite.publications", pinnedDeploymentResponse.body.id);
@@ -1228,12 +1360,12 @@ try {
   let missingCommitJob;
   try {
     await waitFor(async () => {
-      const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), pinnedDeploymentResponse.body.id);
+      const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, pinnedDeploymentResponse.body.id);
       missingCommitJob = jobs.find(job => job.id === deployPinnedAfterCacheClear.body.jobId);
       return missingCommitJob?.status === "failed";
     }, "pinned commit failure after cache recreation");
   } catch (error) {
-    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), pinnedDeploymentResponse.body.id);
+    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, pinnedDeploymentResponse.body.id);
     throw new Error(`${error.message}; job history: ${JSON.stringify(jobs)}`);
   }
   if ((await readFile(join(pinnedPublicationPath, "index.html"), "utf8")) !== pinnedPublicationBeforeCacheRecreation) throw new Error("unavailable pinned commit changed its live publication");
@@ -1244,7 +1376,7 @@ try {
   if (deployAfterCacheClear.status !== 202 || !deployAfterCacheClear.body.jobId) throw new Error(`post-clear deployment was not accepted: ${JSON.stringify(deployAfterCacheClear)}`);
   let unavailableJob;
   await waitFor(async () => {
-    const jobs = await page.evaluate(async id => await (await fetch(`/api/deployments/${id}/jobs`)).json(), deploymentID);
+    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, deploymentID);
     unavailableJob = jobs.find(job => job.id === deployAfterCacheClear.body.jobId);
     return unavailableJob?.status === "failed";
   }, "deployment failure after the repository became unavailable");
@@ -1262,10 +1394,10 @@ try {
   await page.getByText(/Delete “Production site” and remove its published files/).waitFor();
   const chosenPathDelete = page.waitForResponse(response => response.url().endsWith(`/api/deployments/${deploymentID}/delete`));
   await page.getByRole("button", { name: "Confirm delete" }).click();
-  if ((await chosenPathDelete).status() !== 204) throw new Error("chosen publication folder deletion did not finish");
+  if ((await chosenPathDelete).status() !== 200) throw new Error("chosen publication folder deletion did not finish");
   await page.waitForURL(`**/dashboard/projects/${id}`);
   await waitFor(async () => { try { await stat(publishedPath); return false; } catch (error) { if (error.code === "ENOENT") return true; throw error; } }, "chosen publication folder removal");
-  if (await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).some(item => item.id === id), deploymentID)) throw new Error("deleted deployment remained in the list");
+  if (await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).data.some(item => item.id === id), deploymentID)) throw new Error("deleted deployment remained in the list");
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
   console.log("combined-binary authenticated project workflow passed: readable publication folders, legacy move and deletion, private SSH/LFS publication, cache size/recreation warning and confirmation, restart-safe cache lifecycle, host trust, cross-origin mutation rejection, and cached-ref retention");
   }

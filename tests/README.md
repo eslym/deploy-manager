@@ -37,6 +37,15 @@ its system dependencies are supplied by the pinned Playwright image. Run
 `govulncheck ./...` separately after generating frontend assets; it is not
 installed in this environment.
 
+To run only the combined-binary lifecycle or project-outcome browser slice,
+pass its selector to the same pinned container. These modes still build the
+frontend and executable, but skip the Go suite and unrelated browser scenarios:
+
+```sh
+docker compose -f tests/compose.yaml run --build --rm -e LIFECYCLE_OUTCOMES_ONLY=true test
+docker compose -f tests/compose.yaml run --build --rm -e PROJECT_OUTCOMES_ONLY=true test
+```
+
 CLI behavior tests build one shared executable per package run; each scenario
 still uses isolated installation data and runs outside the source directory.
 With `go test -race`, this executable and the versioned upgrade/recovery fixture

@@ -245,22 +245,34 @@
 		} catch (cause) {
 			if (!isCurrent()) return;
 			const code = serverErrorCode(cause);
+			const cleanupAccepted =
+				cause instanceof BrowserSDKError &&
+				cause.outcome.kind === 'server' &&
+				cause.outcome.code === 'operation.cleanup_pending' &&
+				typeof cause.outcome.data === 'object' &&
+				cause.outcome.data !== null &&
+				'operationAccepted' in cause.outcome.data &&
+				cause.outcome.data.operationAccepted === true &&
+				'recoveryRequired' in cause.outcome.data &&
+				cause.outcome.data.recoveryRequired === true;
 			error =
 				code === 'project.has_deployments'
 					? "Remove the project's deployments before deleting it."
-					: code === 'operation.cleanup_pending'
+					: cleanupAccepted
 						? 'Project deletion was accepted, but cache cleanup is still pending. Refresh to check its status; do not submit the deletion again.'
-						: cause instanceof Error
-							? cause.message
-							: 'Could not confirm whether the project was deleted. Refresh to check its status before trying again.';
+						: code === 'operation.cleanup_pending'
+							? 'Could not confirm whether project deletion was accepted. Refresh to check its status before trying again.'
+							: cause instanceof Error
+								? cause.message
+								: 'Could not confirm whether the project was deleted. Refresh to check its status before trying again.';
 			if (code === 'project.has_deployments') projectDeleteConfirmation = '';
 			if (
-				code === 'operation.cleanup_pending' ||
+				cleanupAccepted ||
 				(cause instanceof BrowserSDKError &&
 					(cause.outcome.kind !== 'server' || cause.outcome.status >= 500))
 			)
 				projectDeleteConfirmation = '';
-			if (code !== 'operation.cleanup_pending') await loadProjects();
+			if (!cleanupAccepted) await loadProjects();
 		} finally {
 			if (isCurrent()) busy = false;
 		}
