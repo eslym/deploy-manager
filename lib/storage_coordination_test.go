@@ -734,9 +734,7 @@ func completeFixtureLogin(t *testing.T, app *App, password string) *http.Cookie 
 		t.Fatal(err)
 	}
 	finish := registrationRequest(app, http.MethodPost, "/opaque/login/finish", finishBody, origin)
-	if finish.Code != http.StatusOK {
-		t.Fatalf("OPAQUE login finish returned %d: %s", finish.Code, finish.Body.String())
-	}
+	requireOpaqueSuccess(t, finish, http.StatusOK, "auth.login_completed", "null")
 	for _, cookie := range finish.Result().Cookies() {
 		if cookie.Name == sessionCookie {
 			return cookie
