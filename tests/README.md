@@ -47,6 +47,12 @@ docker compose -f tests/compose.yaml run --build --rm -e PROJECT_OUTCOMES_ONLY=t
 docker compose -f tests/compose.yaml run --build --rm -e LIVE_UPDATES_ONLY=true test
 ```
 
+To run the full projects browser scenario without repeating the Go suite:
+
+```sh
+docker compose -f tests/compose.yaml run --build --rm -e PROJECT_BROWSER_ONLY=true test
+```
+
 CLI behavior tests build one shared executable per package run; each scenario
 still uses isolated installation data and runs outside the source directory.
 The live-update slice exercises a real authenticated browser session, forced

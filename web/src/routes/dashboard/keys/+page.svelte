@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { sdk } from '#lib/sdk/index.js';
+	import { sdk, serverErrorCode } from '#lib/sdk/index.js';
 	import type { RepositoryKey } from '#lib/sdk/repository.js';
 	import { onMount } from 'svelte';
 	let repositoryKeys = $state<RepositoryKey[]>([]);
@@ -21,7 +21,7 @@
 			await loadRepositoryKeys();
 		} catch (cause) {
 			keyError =
-				cause instanceof Error && cause.message.includes('409')
+				serverErrorCode(cause) === 'repository_key.in_use'
 					? 'This key is assigned to a project. Assign another key before removing it.'
 					: cause instanceof Error
 						? cause.message
@@ -57,7 +57,6 @@
 					return;
 				}
 				repositoryKeys = keys ?? [];
-				keyError = '';
 			}
 		});
 	});

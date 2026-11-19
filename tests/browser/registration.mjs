@@ -517,8 +517,36 @@ try {
   const rejectedKeyText = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nnot-a-key\n-----END ENCRYPTED PRIVATE KEY-----";
   await authPage.getByLabel("Name for imported key").fill("rejected key");
   await authPage.getByLabel("Private key").fill(rejectedKeyText);
+  const rejectedKeyStartedAt = Date.now();
+  const rejectedKeyResponsePromise = authPage.waitForResponse(response =>
+    response.url().endsWith("/api/repository-keys") && response.request().method() === "POST"
+  );
   await authPage.getByRole("button", { name: "Import private key" }).click();
-  await authPage.getByRole("alert").waitFor({ timeout: 30000 });
+  const rejectedKeyResponse = await rejectedKeyResponsePromise;
+  const rejectedKeyResponseMs = Date.now() - rejectedKeyStartedAt;
+  try {
+    await authPage.getByRole("alert").waitFor({ timeout: 2500 });
+  } catch {
+    const state = await authPage.evaluate(() => ({
+      url: location.href,
+      alerts: [...document.querySelectorAll('[role="alert"]')].map(alert => alert.textContent?.trim()),
+      importButtonDisabled: [...document.querySelectorAll("button")].find(button => button.textContent?.includes("Import private key"))?.disabled
+    }));
+    throw new Error(`rejected repository key response ${rejectedKeyResponse.status()} arrived in ${rejectedKeyResponseMs}ms but no alert remained visible: ${JSON.stringify(state)}`);
+  }
+  if (rejectedKeyResponse.ok()) throw new Error(`invalid encrypted repository key unexpectedly succeeded (${rejectedKeyResponse.status()})`);
+  await authPage.waitForTimeout(250);
+  const alertAfterListRefresh = await authPage.evaluate(() => document.querySelector('[role="alert"]')?.textContent?.trim() ?? "");
+  if (!alertAfterListRefresh) throw new Error(`rejected repository key response ${rejectedKeyResponse.status()} arrived in ${rejectedKeyResponseMs}ms, but its alert was cleared by a later UI update`);
+  console.log(`invalid-key POST returned HTTP ${rejectedKeyResponse.status()} in ${rejectedKeyResponseMs}ms; alert persisted through list refresh`);
+  const refreshStatus = await authPage.evaluate(async () => (await fetch("/api/repository-keys", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: "subscription refresh regression key", generate: true })
+  })).status);
+  if (refreshStatus < 200 || refreshStatus >= 300) throw new Error(`could not trigger repository-key subscription refresh (${refreshStatus})`);
+  await authPage.getByText("subscription refresh regression key").waitFor({ timeout: 5000 });
+  if (!(await authPage.evaluate(() => document.querySelector('[role="alert"]')?.textContent?.trim()))) throw new Error("repository-key refresh cleared the rejected-key alert");
   if ((await authPage.locator("body").innerText()).includes("not-a-key")) throw new Error("rejected private key was echoed into the dashboard");
   const importedPair = generateKeyPairSync("ed25519");
   const importedPrivateKey = importedPair.privateKey.export({ format: "pem", type: "pkcs8" }).toString();
@@ -528,7 +556,7 @@ try {
   await authPage.getByText("imported integration key").waitFor({ timeout: 30000 });
   if (await authPage.getByLabel("Private key").inputValue()) throw new Error("imported private key remained in the browser form");
   const listedKeys = await authPage.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).data);
-  if (listedKeys.length !== 2 || listedKeys.some(key => !key.publicKey || !key.fingerprint || Object.keys(key).some(field => /private|ciphertext/i.test(field)))) throw new Error("key list did not contain only public metadata");
+  if (listedKeys.length !== 3 || listedKeys.some(key => !key.publicKey || !key.fingerprint || Object.keys(key).some(field => /private|ciphertext/i.test(field)))) throw new Error("key list did not contain only public metadata");
   if ((await authPage.locator("body").innerText()).includes(importedPrivateKey)) throw new Error("private key appeared in dashboard content");
   for (const suffix of ["state.sqlite", "state.sqlite-wal"]) {
     try { if ((await readFile(join(dir, suffix))).includes(Buffer.from(importedPrivateKey))) throw new Error("private key appeared in SQLite database/WAL"); }
@@ -536,7 +564,7 @@ try {
   }
   if (serverOutput.includes(importedPrivateKey)) throw new Error("private key appeared in application logs");
   const repositoryKeysBeforeCredentials = repositoryKeyState();
-  if (repositoryKeysBeforeCredentials.keys.length !== 2 || repositoryKeysBeforeCredentials.keys.some(key => !key.usable)) throw new Error("saved repository keys could not be decrypted and used in-process");
+  if (repositoryKeysBeforeCredentials.keys.length !== 3 || repositoryKeysBeforeCredentials.keys.some(key => !key.usable)) throw new Error("saved repository keys could not be decrypted and used in-process");
   await authPage.reload({ waitUntil: "domcontentloaded" });
   await authPage.getByRole("heading", { name: "Repository keys" }).waitFor({ timeout: 30000 });
   await authPage.waitForFunction(async () => (await fetch("/api/session")).status === 401, null, { timeout: 35000 });

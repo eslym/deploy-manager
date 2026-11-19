@@ -2,6 +2,7 @@
 	import { BrowserSDKError, sdk, serverErrorCode } from '#lib/sdk/index.js';
 	import { formatBytes } from '#lib/format-bytes.js';
 	import { onDestroy, tick } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import Deployments from '#lib/components/Deployments.svelte';
@@ -33,6 +34,7 @@
 		{ host: string; port: number; fingerprint: string; warning?: string; trusted: boolean }[]
 	>([]);
 	let keyAssignments = $state<Record<string, string>>({});
+	let dirtyKeyAssignments = new SvelteSet<string>();
 	let search = $state('');
 	let error = $state('');
 	let projectsReadError = $state('');
@@ -82,7 +84,9 @@
 			const loaded = (await sdk.projects.list(controller.signal)).data;
 			if (controller.signal.aborted || selected !== projectId) return;
 			projects = loaded;
-			for (const project of projects) keyAssignments[project.id] = project.keyId ?? '';
+			for (const project of projects) {
+				if (!dirtyKeyAssignments.has(project.id)) keyAssignments[project.id] = project.keyId ?? '';
+			}
 			missing = !projects.some((project) => project.id === selected);
 			projectsReadError = '';
 		} catch (cause) {
@@ -106,13 +110,14 @@
 		const controller = new AbortController();
 		actionController = controller;
 		const projectId = project.id;
+		const keyId = keyAssignments[projectId];
 		error = '';
 		try {
-			await sdk.projects.assignKey(
-				projectId,
-				{ keyId: keyAssignments[projectId] },
-				controller.signal
-			);
+			await sdk.projects.assignKey(projectId, { keyId }, controller.signal);
+			if (!controller.signal.aborted && selected === projectId) {
+				dirtyKeyAssignments.delete(projectId);
+				keyAssignments[projectId] = keyId;
+			}
 		} catch (cause) {
 			if (!controller.signal.aborted && selected === projectId)
 				error = cause instanceof Error ? cause.message : 'Could not assign the key.';
@@ -367,6 +372,8 @@
 		keysReadError = '';
 		refsReadError = '';
 		projects = [];
+		dirtyKeyAssignments.clear();
+		keyAssignments = {};
 		refs = {};
 		search = '';
 		lfsBusy = false;
@@ -391,7 +398,9 @@
 						return;
 					}
 					projects = items ?? [];
-					for (const item of projects) keyAssignments[item.id] = item.keyId ?? '';
+					for (const item of projects) {
+						if (!dirtyKeyAssignments.has(item.id)) keyAssignments[item.id] = item.keyId ?? '';
+					}
 					missing = !projects.some((item) => item.id === id);
 					projectsReadError = '';
 					loading = false;
@@ -624,6 +633,7 @@
 					<select
 						class="min-h-11 rounded-lg border border-[#aeb9ae] px-3"
 						bind:value={keyAssignments[project.id]}
+						onchange={() => dirtyKeyAssignments.add(project.id)}
 					>
 						<option value="">Choose a key</option>
 						{#each repositoryKeys as key (key.id)}<option value={key.id}>{key.name}</option>{/each}

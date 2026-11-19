@@ -625,11 +625,13 @@ try {
   if (await httpsRequestStatus("127.0.0.1", 18440, `/api/deployments/${deploymentID}/deploy`, "POST", "{}", { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" }) !== 403) throw new Error("cross-origin deployment action was accepted");
   const delayedHistoryRoute = await jobHistoryRequest;
   const productionHistory = page.getByRole("region", { name: "Job history for Production site" });
-  finishJobHistory();
-  await delayedHistoryRoute.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "job.listed", message: "Jobs loaded.", data: [] }) });
   if (process.env.DEPLOYMENT_LIVE_ONLY !== "true") {
     await productionHistory.getByText("Loading history…", { exact: true }).waitFor();
     if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("pending deployment history was shown as empty");
+  }
+  finishJobHistory();
+  await delayedHistoryRoute.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "job.listed", message: "Jobs loaded.", data: [] }) });
+  if (process.env.DEPLOYMENT_LIVE_ONLY !== "true") {
     await productionHistory.getByText("No deployment history yet.", { exact: true }).waitFor();
     if (await productionHistory.getByText("No deployment jobs recorded yet.", { exact: true }).count()) throw new Error("outdated deployment history empty message remained visible");
   }
@@ -641,6 +643,7 @@ try {
       failHistoryRoute(route);
       await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE JOB HISTORY ERROR" });
     });
+    await page.evaluate(() => window.dispatchEvent(new Event("focus")));
     await failedHistoryRequest;
     await productionHistory.getByRole("alert").filter({ hasText: "Could not load deployment history" }).waitFor();
     if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("failed history was shown as empty");
@@ -1049,7 +1052,8 @@ try {
   const refreshedBeforeReloadFailure = await refreshWithFailedListReload;
   if (refreshedBeforeReloadFailure.status() !== 200) throw new Error(`refresh before failed list reload returned ${refreshedBeforeReloadFailure.status()}`);
   await failedReload;
-  await page.getByText(/Your current branches and tags are still shown/).waitFor();
+  await page.locator('[role="alert"]').filter({ hasText: "The request could not be completed. Try again." }).first().waitFor({ timeout: 5000 });
+  if (await page.getByText(/Your current branches and tags are still shown/).count()) throw new Error("successful target refresh incorrectly showed a refresh-failure warning");
   await page.getByText("Fixture site", { exact: true }).waitFor();
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   if ((await page.locator("body").innerText()).includes("SENSITIVE INTERNAL RESPONSE DETAIL")) throw new Error("dashboard exposed an HTTP response body");
@@ -1064,7 +1068,7 @@ try {
   await page.getByRole("button", { name: "Refresh branches and tags", exact: true }).click();
   const failedRefresh = await failedRefreshResponse;
   if (failedRefresh.status() !== 502 || (await failedRefresh.json()).code !== "operation.upstream_failed") throw new Error(`failed refresh did not return an actionable upstream outcome (${failedRefresh.status()})`);
-  await page.getByText(/Your current branches and tags are still shown/).waitFor();
+  await page.getByText(/Your current branches and tags are still shown/).first().waitFor();
   const retainedRefs = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, id);
   if (JSON.stringify(retainedRefs) !== JSON.stringify(cachedRefs)) throw new Error("failed refresh changed the cached refs");
   const failedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id).lastFetched, id);
@@ -1144,12 +1148,24 @@ try {
   await page.getByRole("heading", { name: "SSH fixture site", exact: true }).waitFor();
   await page.getByLabel("SSH key").selectOption(replacementKeyId);
   const assignKeyResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/key`));
+  const assignKeyRequest = page.waitForRequest(request => request.url().endsWith(`/api/projects/${sshProject.id}/key`));
   await page.getByRole("button", { name: "Change SSH key" }).click();
   const assignedKeyOutcome = await assignKeyResponse;
+  const assignedKeyRequest = await assignKeyRequest;
+  if (assignedKeyRequest.postDataJSON()?.keyId !== replacementKeyId) throw new Error("project key assignment submitted a stale key selection");
   if (assignedKeyOutcome.status() !== 200 || (await assignedKeyOutcome.json()).code !== "project.key_assigned") throw new Error(`SSH key assignment returned an unexpected outcome (${assignedKeyOutcome.status()})`);
-  await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id)?.keyId, sshProject.id)) === replacementKeyId, "project key assignment");
+  await waitFor(async () => {
+    return await page.evaluate(async ({ id, keyId }) => {
+      const response = await fetch("/api/projects");
+      const outcome = await response.json();
+      return response.status === 200 && outcome.data?.find(project => project.id === id)?.keyId === keyId;
+    }, { id: sshProject.id, keyId: replacementKeyId });
+  }, "project key assignment");
   await page.getByLabel("SSH key").selectOption(sshKeyId);
+  const restoreKeyResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/key`));
   await page.getByRole("button", { name: "Change SSH key" }).click();
+  const restoredKeyOutcome = await restoreKeyResponse;
+  if (restoredKeyOutcome.status() !== 200 || (await restoredKeyOutcome.json()).code !== "project.key_assigned") throw new Error(`restoring SSH key returned an unexpected outcome (${restoredKeyOutcome.status()})`);
   await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id)?.keyId, sshProject.id)) === sshKeyId, "restored project key assignment");
   milestone("configure private LFS and publish SSH deployment");
   let oldProjectHistoryPolls = 0;
@@ -1207,7 +1223,8 @@ try {
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}/deployments/${sshDeployment.body.id}`);
   const commitCard = page.getByRole("main");
   await commitCard.waitFor();
-  await commitCard.getByRole("alert").filter({ hasText: "The request could not be completed. Try again shortly." }).waitFor();
+  await commitCard.getByRole("alert").filter({ hasText: "The request could not be completed. Try again." }).waitFor();
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await commitCard.getByRole("alert").waitFor({ state: "detached", timeout: 10000 });
   if (!failedDeploymentRefs || (await commitCard.innerText()).includes("SENSITIVE_REFS_FAILURE")) throw new Error("deployment refs failure did not recover safely");
   await page.unroute(`**/api/projects/${sshProject.id}/refs`);
@@ -1249,9 +1266,16 @@ try {
     return response.status;
   }, [movePath, sshPublishedPath]);
   if (concurrentMove !== 200) throw new Error(`concurrent move failed (${concurrentMove})`);
-  const staleResponse = page.waitForResponse(response => response.url().endsWith(movePath) && response.request().method() === "POST");
-  await moveReview.getByRole("button", { name: /Confirm move/i }).click();
-  if ((await staleResponse).status() !== 409 || (await stat(intermediatePath)).ino !== originalIdentity) throw new Error("stale confirmation moved the publication again");
+  await moveReview.waitFor({ state: "detached" });
+  const staleConfirmation = await page.evaluate(async ([path, oldPath]) => {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ publicationPath: "ssh-readable-site", expectedPublicationPath: oldPath, confirm: true })
+    });
+    return response.status;
+  }, [movePath, sshPublishedPath]);
+  if (staleConfirmation !== 409 || (await stat(intermediatePath)).ino !== originalIdentity) throw new Error("stale confirmation moved the publication again");
   try { await stat(movedPath); throw new Error("stale confirmation created its proposed destination"); } catch (error) { if (error.code !== "ENOENT") throw error; }
   await page.reload();
   await commitCard.getByText(`Publication path: ${intermediatePath}`, { exact: true }).waitFor();
@@ -1293,8 +1317,9 @@ try {
     await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE_DEPLOY_FAILURE" });
   });
   await commitCard.getByRole("button", { name: "Deploy", exact: true }).click();
-  await commitCard.getByRole("alert").filter({ hasText: "The request could not be completed. Try again shortly." }).waitFor();
+  await commitCard.getByRole("alert").filter({ hasText: "Could not confirm whether this action was accepted." }).waitFor();
   const successfulRefsAfterAction = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/refs`) && response.ok());
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await successfulRefsAfterAction;
   await page.waitForTimeout(150);
   if (!failedDeployAction || !(await commitCard.getByRole("alert").count())) throw new Error("successful refs fetch hid an unrelated deploy error");
@@ -1344,13 +1369,15 @@ try {
   await openProject(page, id, "Fixture site");
   const pinnedDeploymentResponse = await page.evaluate(async ({ id, commit }) => {
     const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: id, name: "Pinned cache check", commit }) });
-    return { status: response.status, body: await response.json() };
+    return { status: response.status, body: (await response.json()).data };
   }, { id, commit: featureCommit });
   if (pinnedDeploymentResponse.status !== 201) throw new Error(`could not create pinned cache check: ${JSON.stringify(pinnedDeploymentResponse)}`);
+  let pinnedJobs = [];
   await waitFor(async () => {
-    const jobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, pinnedDeploymentResponse.body.id);
-    return jobs[0]?.status === "succeeded";
+    pinnedJobs = await page.evaluate(async id => (await (await fetch(`/api/deployments/${id}/jobs`)).json()).data, pinnedDeploymentResponse.body.id);
+    return ["succeeded", "failed"].includes(pinnedJobs[0]?.status);
   }, "pinned cache check publication");
+  if (pinnedJobs[0]?.status !== "succeeded") throw new Error(`pinned cache check publication failed: ${JSON.stringify(pinnedJobs.map(job => ({ status: job.status, errorCode: job.errorCode })))}`);
   const pinnedPublicationPath = join(dir, "state.sqlite.publications", pinnedDeploymentResponse.body.id);
   const pinnedPublicationBeforeCacheRecreation = await readFile(join(pinnedPublicationPath, "index.html"), "utf8");
   const cacheSection = page.getByRole("region", { name: "Repository storage" });
@@ -1393,7 +1420,7 @@ try {
   if (await httpsRequestStatus("127.0.0.1", 18441, "/__fixture/fail", "POST") !== 204) throw new Error("could not make the Git server unavailable for the missing-cache check");
   const deployPinnedAfterCacheClear = await page.evaluate(async id => {
     const response = await fetch(`/api/deployments/${id}/hard-redeploy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    return { status: response.status, body: await response.json() };
+    return { status: response.status, body: (await response.json()).data };
   }, pinnedDeploymentResponse.body.id);
   if (deployPinnedAfterCacheClear.status !== 202) throw new Error(`pinned deployment was not accepted after cache clear: ${JSON.stringify(deployPinnedAfterCacheClear)}`);
   let missingCommitJob;
@@ -1410,7 +1437,7 @@ try {
   if ((await readFile(join(pinnedPublicationPath, "index.html"), "utf8")) !== pinnedPublicationBeforeCacheRecreation) throw new Error("unavailable pinned commit changed its live publication");
   const deployAfterCacheClear = await page.evaluate(async id => {
     const response = await fetch(`/api/deployments/${id}/deploy`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
-    return { status: response.status, body: await response.json() };
+    return { status: response.status, body: (await response.json()).data };
   }, deploymentID);
   if (deployAfterCacheClear.status !== 202 || !deployAfterCacheClear.body.jobId) throw new Error(`post-clear deployment was not accepted: ${JSON.stringify(deployAfterCacheClear)}`);
   let unavailableJob;
@@ -1425,7 +1452,7 @@ try {
     const response = await fetch("/api/deployments", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: id, name: "Unavailable cached commit", commit }) });
     return { status: response.status, body: await response.text() };
   }, { id, commit: featureCommit });
-  if (unavailableOldCommit.status !== 400 || !unavailableOldCommit.body.includes("commit is not available")) throw new Error(`removed commit remained deployable: ${JSON.stringify(unavailableOldCommit)}`);
+  if (unavailableOldCommit.status !== 400 || JSON.parse(unavailableOldCommit.body).code !== "git.target_unavailable") throw new Error(`removed commit remained deployable: ${JSON.stringify(unavailableOldCommit)}`);
   milestone("delete deployment from chosen publication folder");
   await page.goto(`https://${appListen}/dashboard/projects/${id}/deployments/${deploymentID}`, { waitUntil: "domcontentloaded" });
   await page.getByText(`Publication path: ${publishedPath}`, { exact: true }).waitFor();

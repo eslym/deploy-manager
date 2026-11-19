@@ -18,7 +18,15 @@ GOFLAGS='-tags=integrationtest' ./scripts/build.sh
 go build -o "$workspace/smart-https-fixture" ./tests/fixtures/smart-https
 go build -o "$workspace/ssh-git-fixture" ./tests/fixtures/ssh-git
 go build -o "$workspace/repository-key-state" ./tests/fault/repository-key-state
-if [[ "${LIFECYCLE_OUTCOMES_ONLY:-false}" == "true" || "${PROJECT_OUTCOMES_ONLY:-false}" == "true" || "${LIVE_UPDATES_ONLY:-false}" == "true" ]]; then
+if [[ "${REGISTRATION_ONLY:-false}" == "true" ]]; then
+	cd "$workspace/tests/browser"
+	bun install --frozen-lockfile
+	DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" \
+		REPOSITORY_KEY_STATE_BINARY="$workspace/repository-key-state" \
+		timeout --kill-after=10s 180s node registration.mjs
+	exit
+fi
+if [[ "${PROJECT_BROWSER_ONLY:-false}" == "true" || "${LIFECYCLE_OUTCOMES_ONLY:-false}" == "true" || "${PROJECT_OUTCOMES_ONLY:-false}" == "true" || "${LIVE_UPDATES_ONLY:-false}" == "true" ]]; then
 	cd "$workspace/tests/browser"
 	bun install --frozen-lockfile
 	DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" \
