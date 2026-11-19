@@ -33,9 +33,7 @@
 				error.outcome.kind === 'server' &&
 				error.outcome.code === 'auth.recent_login_required'
 			)
-				throw new PasswordChangeError(
-					'For security, sign in again before changing your password.'
-				);
+				throw new PasswordChangeError('For security, sign in again before changing your password.');
 			throw new PasswordChangeError(
 				'The secure password change could not be completed. Check your connection and try again.'
 			);
@@ -75,8 +73,9 @@
 			const keyStretching = {
 				'argon2id-custom': { iterations: 1, memory: 65536, parallelism: 4 }
 			};
-			let loginStart: ReturnType<typeof opaque.client.startLogin> | null =
-				opaque.client.startLogin({ password: currentPassword });
+			let loginStart: ReturnType<typeof opaque.client.startLogin> | null = opaque.client.startLogin(
+				{ password: currentPassword }
+			);
 			let loginState = loginStart.clientLoginState;
 			const challenge = await send<{ value: string; transaction?: string }>(() =>
 				sdk.auth.loginStart({ value: loginStart!.startLoginRequest })
@@ -98,9 +97,7 @@
 			loginState = '';
 			currentPassword = '';
 			if (!loginFinish?.finishLoginRequest) {
-				throw new PasswordChangeError(
-					'Current password was not accepted. Check it and try again.'
-				);
+				throw new PasswordChangeError('Current password was not accepted. Check it and try again.');
 			}
 			const loginRequest = loginFinish.finishLoginRequest;
 			loginFinish = null;
@@ -139,9 +136,10 @@
 			status =
 				'Password changed. Your sessions have been signed out; sign in with your new password.';
 		} catch (error) {
-			status = error instanceof PasswordChangeError
-				? error.message
-				: 'Secure password change could not be initialized or completed. Enable JavaScript and WebAssembly, then reload and try again.';
+			status =
+				error instanceof PasswordChangeError
+					? error.message
+					: 'Secure password change could not be initialized or completed. Enable JavaScript and WebAssembly, then reload and try again.';
 		} finally {
 			currentPassword = '';
 			newPassword = '';
