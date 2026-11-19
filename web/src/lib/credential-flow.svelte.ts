@@ -5,6 +5,7 @@ import {
 	markSetupGrantReady
 } from './setup-grant.svelte.js';
 import { rememberSetupGrant } from './setup-grant.svelte.js';
+import { BrowserSDKError, sdk } from './sdk/index.js';
 
 export class CredentialFlowError extends Error {}
 
@@ -99,10 +100,7 @@ export async function registerCredential(
 		const profile = { 'argon2id-custom': { iterations: 1, memory: 65536, parallelism: 4 } };
 		const start = opaque.client.startRegistration({ password });
 		const response = await send(
-			'/opaque/register/start',
-			start.registrationRequest,
-			'grant',
-			grant,
+			() => sdk.auth.registerStart({ grant, value: start.registrationRequest }),
 			purpose
 		);
 		if (
@@ -122,41 +120,37 @@ export async function registerCredential(
 			keyStretching: profile
 		});
 		password = '';
-		await send(
-			'/opaque/register/finish',
-			finish.registrationRecord,
-			'transaction',
-			response.transaction,
-			purpose
-		);
+		const finishRegistration = {
+			transaction: response.transaction,
+			value: finish.registrationRecord
+		};
+		if (purpose === 'recovery') {
+			await send(() => sdk.auth.recoveryFinish(finishRegistration), purpose);
+		} else {
+			await send(() => sdk.auth.registerFinish(finishRegistration), purpose);
+		}
 		clearSetupGrant();
 	} finally {
 		password = '';
 	}
 }
 
-async function send(
-	path: string,
-	value: string,
-	credentialName: 'grant' | 'transaction',
-	credential: string,
+async function send<T>(
+	request: () => Promise<{ data: T }>,
 	purpose: 'registration' | 'recovery'
-): Promise<{ value: string; transaction?: string } | null> {
-	const response = await fetch(path, {
-		method: 'POST',
-		credentials: 'same-origin',
-		headers: { 'Content-Type': 'application/json' },
-		body: JSON.stringify({ [credentialName]: credential, value })
-	});
-	if (!response.ok) {
-		if (response.status === 410) {
-			throw new CredentialFlowError(
-				`This ${purpose === 'registration' ? 'setup' : 'recovery'} link has expired or was already used. Ask an administrator for a new one.`
-			);
+): Promise<T> {
+	try {
+		return (await request()).data;
+	} catch (error) {
+		if (error instanceof BrowserSDKError && error.outcome.kind === 'server') {
+			if (error.outcome.code === 'auth.registration_expired') {
+				throw new CredentialFlowError(
+					`This ${purpose === 'registration' ? 'setup' : 'recovery'} link has expired or was already used. Ask an administrator for a new one.`
+				);
+			}
 		}
 		throw new CredentialFlowError(
 			`${purpose === 'registration' ? 'Registration' : 'Recovery'} could not be completed. Check your connection and try again.`
 		);
 	}
-	return response.status === 204 ? null : response.json();
 }

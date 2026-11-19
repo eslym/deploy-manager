@@ -466,7 +466,7 @@ func TestDocumentedOperatorRecoveryRehearsal(t *testing.T) {
 		t.Fatal(err)
 	}
 	transaction, record := newRegistrationFlow(t, app, grant, "https://manager.example", password)
-	if status := finishTestRegistration(app, "", transaction, record, "https://manager.example"); status != http.StatusNoContent {
+	if status := finishTestRegistration(app, "", transaction, record, "https://manager.example"); status != http.StatusOK {
 		t.Fatalf("OPAQUE fixture registration status=%d", status)
 	}
 	key, err := app.createRepositoryKey("recovery witness", nil, true)
@@ -709,13 +709,15 @@ func completeFixtureLogin(t *testing.T, app *App, password string) *http.Cookie 
 		t.Fatalf("OPAQUE login start returned %d: %s", start.Code, start.Body.String())
 	}
 	var startResponse struct {
-		Transaction string `json:"transaction"`
-		Value       string `json:"value"`
+		Data struct {
+			Transaction string `json:"transaction"`
+			Value       string `json:"value"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(start.Body.Bytes(), &startResponse); err != nil || startResponse.Transaction == "" {
+	if err := json.Unmarshal(start.Body.Bytes(), &startResponse); err != nil || startResponse.Data.Transaction == "" {
 		t.Fatalf("invalid OPAQUE login response: %+v (%v)", startResponse, err)
 	}
-	ke2Bytes, err := base64.RawURLEncoding.DecodeString(startResponse.Value)
+	ke2Bytes, err := base64.RawURLEncoding.DecodeString(startResponse.Data.Value)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -727,12 +729,12 @@ func completeFixtureLogin(t *testing.T, app *App, password string) *http.Cookie 
 	if err != nil {
 		t.Fatal(err)
 	}
-	finishBody, err := json.Marshal(protocolMessage{Transaction: &startResponse.Transaction, Value: base64.RawURLEncoding.EncodeToString(ke3.Serialize())})
+	finishBody, err := json.Marshal(protocolMessage{Transaction: &startResponse.Data.Transaction, Value: base64.RawURLEncoding.EncodeToString(ke3.Serialize())})
 	if err != nil {
 		t.Fatal(err)
 	}
 	finish := registrationRequest(app, http.MethodPost, "/opaque/login/finish", finishBody, origin)
-	if finish.Code != http.StatusNoContent {
+	if finish.Code != http.StatusOK {
 		t.Fatalf("OPAQUE login finish returned %d: %s", finish.Code, finish.Body.String())
 	}
 	for _, cookie := range finish.Result().Cookies() {

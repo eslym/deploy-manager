@@ -1,11 +1,16 @@
 import { browser } from '$app/env';
 import { redirect } from '@sveltejs/kit';
+import { sdk } from '../../lib/sdk/index.js';
 import type { PageLoad } from './$types';
 
-export const load: PageLoad = async ({ fetch }) => {
+export const load: PageLoad = async () => {
 	if (browser) {
-		const response = await fetch('/api/session', { credentials: 'same-origin' });
-		if (response.ok) redirect(302, '/dashboard');
+		try {
+			await sdk.auth.session();
+			redirect(302, '/dashboard');
+		} catch {
+			// A failed probe leaves the sign-in form available.
+		}
 	}
 	return {};
 };

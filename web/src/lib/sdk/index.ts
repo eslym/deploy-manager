@@ -1,0 +1,205 @@
+export type OutcomeCode =
+	| 'auth.registration_started'
+	| 'auth.registration_completed'
+	| 'auth.login_started'
+	| 'auth.login_completed'
+	| 'auth.login_failed'
+	| 'auth.session_valid'
+	| 'auth.session_required'
+	| 'auth.logged_out'
+	| 'auth.password_change_started'
+	| 'auth.password_changed'
+	| 'auth.recent_login_required'
+	| 'auth.protocol_invalid'
+	| 'auth.registration_expired'
+	| 'auth.registration_conflict'
+	| 'auth.capacity_exceeded'
+	| 'request.https_required'
+	| 'request.json_required'
+	| 'request.policy_rejected'
+	| 'request.origin_rejected'
+	| 'request.rate_limited'
+	| 'service.unavailable'
+	| 'service.internal_error';
+
+export interface Outcome<T> {
+	code: OutcomeCode | (string & {});
+	message: string;
+	data: T;
+}
+
+export interface ProtocolReply {
+	value: string;
+	transaction?: string;
+}
+
+interface SDKAdapters {
+	fetch?: typeof fetch;
+	onSessionLost?: () => void;
+	onSessionEnded?: () => void;
+}
+
+export type SDKError =
+	| { kind: 'server'; status: number; code: string; message: string; data: unknown }
+	| { kind: 'network'; message: string }
+	| { kind: 'invalid_response'; message: string }
+	| { kind: 'cancelled'; message: string };
+
+export class BrowserSDKError extends Error {
+	constructor(readonly outcome: SDKError) {
+		super(outcome.message);
+		this.name = 'BrowserSDKError';
+	}
+}
+
+const safeFallback = 'The request could not be completed. Try again.';
+const safeServerMessage = (value: unknown): value is string =>
+	typeof value === 'string' &&
+	value.length > 0 &&
+	value.length <= 120 &&
+	!/[\u0000-\u001f\u007f]/.test(value);
+const isObject = (value: unknown): value is Record<string, unknown> =>
+	typeof value === 'object' && value !== null && !Array.isArray(value);
+const isOutcome = (value: unknown): value is Outcome<unknown> =>
+	isObject(value) &&
+	typeof value.code === 'string' &&
+	value.code.length > 0 &&
+	safeServerMessage(value.message) &&
+	Object.hasOwn(value, 'data');
+
+function cancelled(cause: unknown): boolean {
+	return cause instanceof DOMException && cause.name === 'AbortError';
+}
+
+export function createBrowserSDK(adapters: SDKAdapters = {}) {
+	const transport: typeof fetch = adapters.fetch ?? ((input, init) => fetch(input, init));
+	let sessionLossReported = false;
+
+	async function request<T>(
+		path: string,
+		method: 'GET' | 'POST',
+		body: unknown,
+		validate: (data: unknown) => data is T,
+		signal?: AbortSignal,
+		protectedRequest = false
+	): Promise<Outcome<T>> {
+		let response: Response;
+		try {
+			response = await transport(path, {
+				method,
+				credentials: 'same-origin',
+				headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+				body: body === undefined ? undefined : JSON.stringify(body),
+				signal
+			});
+		} catch (cause) {
+			const isCancelled = signal?.aborted || cancelled(cause);
+			throw new BrowserSDKError({
+				kind: isCancelled ? 'cancelled' : 'network',
+				message: isCancelled ? 'Request cancelled.' : safeFallback
+			});
+		}
+
+		let parsed: unknown;
+		try {
+			parsed = await response.json();
+		} catch {
+			if (signal?.aborted) {
+				throw new BrowserSDKError({ kind: 'cancelled', message: 'Request cancelled.' });
+			}
+			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
+		}
+		if (!isOutcome(parsed)) {
+			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
+		}
+		if (!response.ok) {
+			if (protectedRequest && parsed.code === 'auth.session_required' && !sessionLossReported) {
+				sessionLossReported = true;
+				adapters.onSessionLost?.();
+			}
+			throw new BrowserSDKError({
+				kind: 'server',
+				status: response.status,
+				code: parsed.code,
+				message: parsed.message,
+				data: parsed.data
+			});
+		}
+		if (!validate(parsed.data)) {
+			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
+		}
+		return { code: parsed.code, message: parsed.message, data: parsed.data };
+	}
+
+	const isNull = (value: unknown): value is null => value === null;
+	const isProtocolReply = (value: unknown): value is ProtocolReply =>
+		isObject(value) &&
+		typeof value.value === 'string' &&
+		typeof value.transaction === 'string' &&
+		value.transaction.length > 0;
+	const isPasswordChangeReply = (value: unknown): value is { value: string } =>
+		isObject(value) && typeof value.value === 'string';
+	const isSession = (value: unknown): value is { authenticated: true } =>
+		isObject(value) && value.authenticated === true;
+
+	return {
+		auth: {
+			registerStart: (input: { grant: string; value: string }, signal?: AbortSignal) =>
+				request('/opaque/register/start', 'POST', input, isProtocolReply, signal),
+			registerFinish: (input: { transaction: string; value: string }, signal?: AbortSignal) =>
+				request('/opaque/register/finish', 'POST', input, isNull, signal),
+			async recoveryFinish(input: { transaction: string; value: string }, signal?: AbortSignal) {
+				const outcome = await request('/opaque/register/finish', 'POST', input, isNull, signal);
+				sessionLossReported = true;
+				adapters.onSessionEnded?.();
+				return outcome;
+			},
+			loginStart: (input: { value: string }, signal?: AbortSignal) =>
+				request('/opaque/login/start', 'POST', input, isProtocolReply, signal),
+			loginFinish: (input: { transaction: string; value: string }, signal?: AbortSignal) =>
+				request('/opaque/login/finish', 'POST', input, isNull, signal).then((outcome) => {
+					sessionLossReported = false;
+					return outcome;
+				}),
+			session: (signal?: AbortSignal) =>
+				request('/api/session', 'GET', undefined, isSession, signal, true),
+			async logout(signal?: AbortSignal) {
+				const outcome = await request('/api/logout', 'POST', undefined, isNull, signal, true);
+				sessionLossReported = true;
+				adapters.onSessionEnded?.();
+				return outcome;
+			},
+			passwordChangeStart: (input: { value: string }, signal?: AbortSignal) =>
+				request(
+					'/opaque/password/change/start',
+					'POST',
+					input,
+					isPasswordChangeReply,
+					signal,
+					true
+				),
+			async passwordChangeFinish(input: { value: string }, signal?: AbortSignal) {
+				const outcome = await request(
+					'/opaque/password/change/finish',
+					'POST',
+					input,
+					isNull,
+					signal,
+					true
+				);
+				sessionLossReported = true;
+				adapters.onSessionEnded?.();
+				return outcome;
+			}
+		}
+	};
+}
+
+const dispatchSessionEvent = (name: string) => {
+	if (typeof window !== 'undefined') window.dispatchEvent(new Event(name));
+};
+
+export const sdk = createBrowserSDK({
+	onSessionLost: () => dispatchSessionEvent('deploy-manager:session-lost'),
+	onSessionEnded: () => dispatchSessionEvent('deploy-manager:session-ended')
+});

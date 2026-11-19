@@ -1,21 +1,29 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { onMount } from 'svelte';
+	import { sdk } from '../../lib/sdk/index.js';
 	import type { LayoutProps } from './$types';
 
 	let { children }: LayoutProps = $props();
 	let busy = $state(false);
 	let status = $state('');
 
+	onMount(() => {
+		const handleSessionLost = () => {
+			const next = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+			const query = new URLSearchParams({ next });
+			void goto(`/login?${query.toString()}`, { replace: true });
+		};
+		window.addEventListener('deploy-manager:session-lost', handleSessionLost);
+		return () => window.removeEventListener('deploy-manager:session-lost', handleSessionLost);
+	});
+
 	async function logout() {
 		if (busy) return;
 		busy = true;
 		status = 'Signing out…';
 		try {
-			const response = await fetch('/api/logout', {
-				method: 'POST',
-				credentials: 'same-origin'
-			});
-			if (!response.ok) throw new Error('Sign-out request failed');
+			await sdk.auth.logout();
 			await goto('/login', { replaceState: true });
 		} catch {
 			status = 'Could not sign out. Check your connection and try again.';

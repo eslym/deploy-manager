@@ -4,7 +4,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/json"
 	"net"
 	"net/http"
 	"strings"
@@ -42,7 +41,7 @@ type sessionState struct {
 
 func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 	if !a.authSecure(r) {
-		http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
+		writeOutcomeError(w, http.StatusUpgradeRequired, "request.https_required", "HTTPS is required.")
 		return
 	}
 	m, ok := a.decode(w, r)
@@ -50,42 +49,42 @@ func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m.Transaction != nil || m.Grant != "" {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	input, err := decodeValue(m.Value)
 	if err != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	ke1, err := a.des.KE1(input)
 	if err != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	adminRecord, err := a.store.Administrator.Get(r.Context(), 1)
 	if err != nil {
 		if ent.IsNotFound(err) {
-			http.Error(w, "login unavailable", http.StatusUnauthorized)
+			writeOutcomeError(w, http.StatusUnauthorized, "auth.login_failed", "Sign-in failed.")
 		} else {
-			http.Error(w, "login temporarily unavailable", http.StatusInternalServerError)
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		}
 		return
 	}
 	record, err := a.des.RegistrationRecord(adminRecord.RegistrationRecord)
 	if err != nil || record == nil {
-		http.Error(w, "login temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	client := &opaque.ClientRecord{RegistrationRecord: record, CredentialIdentifier: []byte("administrator")}
 	ke2, output, err := a.protocol.GenerateKE2(ke1, client)
 	if err != nil {
-		http.Error(w, "login could not be started", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	transactionBytes := make([]byte, 32)
 	if _, err = rand.Read(transactionBytes); err != nil {
-		http.Error(w, "login temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	transaction := base64.RawURLEncoding.EncodeToString(transactionBytes)
@@ -98,7 +97,7 @@ func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(a.logins) >= 1024 {
 		a.mu.Unlock()
-		http.Error(w, "too many login attempts; try again shortly", http.StatusTooManyRequests)
+		writeOutcomeError(w, http.StatusTooManyRequests, "auth.capacity_exceeded", "Sign-in is temporarily unavailable.")
 		return
 	}
 	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
@@ -106,12 +105,12 @@ func (a *App) loginStart(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(map[string]string{"transaction": transaction, "value": base64.RawURLEncoding.EncodeToString(ke2.Serialize())})
+	writeOutcome(w, http.StatusOK, "auth.login_started", "Sign-in started.", map[string]string{"transaction": transaction, "value": base64.RawURLEncoding.EncodeToString(ke2.Serialize())})
 }
 
 func (a *App) loginFinish(w http.ResponseWriter, r *http.Request) {
 	if !a.authSecure(r) {
-		http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
+		writeOutcomeError(w, http.StatusUpgradeRequired, "request.https_required", "HTTPS is required.")
 		return
 	}
 	m, ok := a.decode(w, r)
@@ -119,7 +118,7 @@ func (a *App) loginFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m.Transaction == nil || len(*m.Transaction) < 32 || len(*m.Transaction) > 128 || m.Grant != "" {
-		http.Error(w, "login could not be verified", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.login_failed", "Sign-in failed.")
 		return
 	}
 	transaction := *m.Transaction
@@ -129,27 +128,27 @@ func (a *App) loginFinish(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	remoteIP, _, _ := net.SplitHostPort(r.RemoteAddr)
 	if !exists || !pending.expires.After(a.cfg.Now()) || pending.origin != r.Header.Get("Origin") || pending.remoteIP != remoteIP {
-		http.Error(w, "login could not be verified", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.login_failed", "Sign-in failed.")
 		return
 	}
 	input, err := decodeValue(m.Value)
 	if err != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	ke3, err := a.des.KE3(input)
 	if err != nil {
-		http.Error(w, "login could not be verified", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.login_failed", "Sign-in failed.")
 		return
 	}
 	if a.protocol.LoginFinish(ke3, pending.clientMAC) != nil {
-		http.Error(w, "login could not be verified", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.login_failed", "Sign-in failed.")
 		return
 	}
 	// This bearer token is independent random session material and is created only after KE3 verification.
 	token := make([]byte, 32)
 	if _, err = rand.Read(token); err != nil {
-		http.Error(w, "login temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	digest := sha256.Sum256(token)
@@ -157,7 +156,7 @@ func (a *App) loginFinish(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	if err := a.refreshCredentialGenerationLocked(); err != nil {
 		a.mu.Unlock()
-		http.Error(w, "login temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	for existing, expiry := range a.sessions {
@@ -167,38 +166,48 @@ func (a *App) loginFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	if pending.generation != a.credentialGeneration {
 		a.mu.Unlock()
-		http.Error(w, "login could not be verified", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.login_failed", "Sign-in failed.")
 		return
 	}
 	if len(a.sessions) >= 10000 {
 		a.mu.Unlock()
-		http.Error(w, "too many active sessions; try again shortly", http.StatusTooManyRequests)
+		writeOutcomeError(w, http.StatusTooManyRequests, "auth.capacity_exceeded", "Sign-in is temporarily unavailable.")
 		return
 	}
 	a.sessions[digest] = sessionState{expires: expires, generation: pending.generation, authenticatedAt: a.cfg.Now()}
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: a.cookieName(), Value: base64.RawURLEncoding.EncodeToString(token), Path: "/", Expires: expires, MaxAge: int(a.cfg.SessionTTL.Seconds()), Secure: a.cookieName() == sessionCookie, HttpOnly: true, SameSite: http.SameSiteStrictMode})
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "auth.login_completed", "Signed in.", nil)
 }
 
 func (a *App) sessionStatus(w http.ResponseWriter, r *http.Request) {
 	if !a.authSecure(r) {
-		http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
+		writeOutcomeError(w, http.StatusUpgradeRequired, "request.https_required", "HTTPS is required.")
 		return
 	}
 	if _, ok := a.session(r); !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.session_required", "Sign in to continue.")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(`{"authenticated":true}`))
+	writeOutcome(w, http.StatusOK, "auth.session_valid", "Signed in.", map[string]bool{"authenticated": true})
 }
 
 func (a *App) logout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost || !a.authSecure(r) || !a.originOK(r) || !a.allow(r) {
-		http.Error(w, "request rejected", http.StatusForbidden)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeOutcomeError(w, http.StatusMethodNotAllowed, "request.method_not_allowed", "Method not allowed.")
+		return
+	}
+	if !a.authSecure(r) {
+		writeOutcomeError(w, http.StatusUpgradeRequired, "request.https_required", "HTTPS is required.")
+		return
+	}
+	if !a.originOK(r) {
+		writeOutcomeError(w, http.StatusForbidden, "request.origin_rejected", "Request origin rejected.")
+		return
+	}
+	if !a.allow(r) {
+		writeOutcomeError(w, http.StatusTooManyRequests, "request.rate_limited", "Too many requests. Try again shortly.")
 		return
 	}
 	if digest, ok := a.session(r); ok {
@@ -207,8 +216,7 @@ func (a *App) logout(w http.ResponseWriter, r *http.Request) {
 		a.mu.Unlock()
 	}
 	http.SetCookie(w, &http.Cookie{Name: a.cookieName(), Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: a.cookieName() == sessionCookie, HttpOnly: true, SameSite: http.SameSiteStrictMode})
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "auth.logged_out", "Signed out.", nil)
 }
 
 func (a *App) session(r *http.Request) ([32]byte, bool) {

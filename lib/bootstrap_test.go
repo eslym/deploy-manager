@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -221,6 +222,10 @@ func TestOptedInHTTPSessionCookieAuthenticatesDashboardRequest(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("authenticated HTTP session status = %d, want 200: %s", w.Code, w.Body.String())
 	}
+	if !bytes.Contains(w.Body.Bytes(), []byte(`"auth.session_valid"`)) ||
+		!bytes.Contains(w.Body.Bytes(), []byte(`"authenticated":true`)) {
+		t.Fatalf("authenticated HTTP session outcome is incorrect: %s", w.Body.String())
+	}
 	if got := app.cookieName(); got != insecureSessionCookie {
 		t.Fatalf("HTTP cookie name = %q", got)
 	}
@@ -238,12 +243,47 @@ func TestOptedInHTTPSessionCookieAuthenticatesDashboardRequest(t *testing.T) {
 	logout.AddCookie(&http.Cookie{Name: app.cookieName(), Value: base64.RawURLEncoding.EncodeToString(token)})
 	loggedOut := httptest.NewRecorder()
 	app.Handler().ServeHTTP(loggedOut, logout)
-	if loggedOut.Code != http.StatusNoContent {
-		t.Fatalf("HTTP logout status = %d, want 204: %s", loggedOut.Code, loggedOut.Body.String())
+	if loggedOut.Code != http.StatusOK {
+		t.Fatalf("HTTP logout status = %d, want 200: %s", loggedOut.Code, loggedOut.Body.String())
+	}
+	if !bytes.Contains(loggedOut.Body.Bytes(), []byte(`"auth.logged_out"`)) ||
+		!bytes.Contains(loggedOut.Body.Bytes(), []byte(`"data":null`)) {
+		t.Fatalf("HTTP logout outcome is incorrect: %s", loggedOut.Body.String())
 	}
 	cookies := loggedOut.Result().Cookies()
 	if len(cookies) != 1 || cookies[0].Name != insecureSessionCookie || cookies[0].Secure || !cookies[0].HttpOnly {
 		t.Fatalf("HTTP session cookie clearing = %+v", cookies)
+	}
+}
+
+func TestSessionFailureUsesAuthenticationOutcomeEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	app, err := New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	request := httptest.NewRequest(http.MethodGet, "https://manager.example/api/session", nil)
+	response := httptest.NewRecorder()
+	app.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", response.Code)
+	}
+	var outcome struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Data    any    `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &outcome); err != nil {
+		t.Fatalf("response is not an outcome envelope: %v (%q)", err, response.Body.String())
+	}
+	if outcome.Code != "auth.session_required" || outcome.Message == "" || outcome.Data != nil {
+		t.Fatalf("unexpected outcome: %+v", outcome)
+	}
+	if response.Header().Get("Content-Type") != "application/json" || response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("unexpected response headers: %v", response.Header())
 	}
 }
 

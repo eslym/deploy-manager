@@ -48,19 +48,24 @@ Use [GLOSSARY.md](../GLOSSARY.md) for deployment/release terminology.
 - `projectAuthorized` in [`projects.go`](../lib/projects.go) is the shared
   dashboard guard: **426** for insecure transport, **401** for no valid session,
   **403** for a rejected mutation Origin, **429** for its mutation rate limit.
+  Its failures now use the outcome envelope described below.
   The limiter is shared with authentication, keyed by the connection peer IP,
   and configured by `AuthRequestsPerMinute` (default 20/minute).
 
 ### Bodies, responses, and errors
 
-Send JSON bodies with `Content-Type: application/json`. Successful JSON responses
-use that media type; **204** has no response body. Times are JSON RFC 3339
-timestamps, not Unix integers. List responses are bare arrays unless stated
-otherwise. Optional fields marked below may be omitted.
+Send JSON bodies with `Content-Type: application/json`. Authentication routes
+listed below, authentication guards, and maintenance responses use an outcome
+envelope. Other application routes have not yet migrated and retain their
+existing response forms (including **204** where documented). Times are JSON
+RFC 3339 timestamps, not Unix integers. List responses are bare arrays unless
+stated otherwise. Optional fields marked below may be omitted.
 
-Errors generally use Go's `http.Error`: `text/plain; charset=utf-8` with a trailing
-newline, **not** a JSON error envelope. Read the status before parsing JSON.
-Human-readable error strings are not machine-readable codes.
+Unmigrated errors generally use Go's `http.Error`: `text/plain; charset=utf-8`
+with a trailing newline. The outcome envelope has exactly `code`, `message`,
+and `data`; `data` is `null` when the operation has no response data. Messages
+are for display, never branching. JSON outcomes use `application/json` and
+`Cache-Control: no-store`.
 
 | Status | Typical meaning |
 | --- | --- |
@@ -89,7 +94,7 @@ Unknown backend paths never fall back to the SPA. Frontend shell fallback is
 restricted to recognized GET/HEAD navigations accepting HTML; missing assets and
 backend errors keep their real error statuses. A maintenance-locked daemon uses
 [`MaintenanceHandler`](../lib/maintenance.go) instead of application routing:
-**503** plain text for all paths, without loading the SPA or accessing app data.
+**503** `{"code":"service.maintenance_required","message":"Service unavailable. Maintenance is required.","data":null}` for all paths, without loading the SPA or accessing app data. HEAD has no body.
 
 ## Authentication and account lifecycle
 
@@ -106,14 +111,41 @@ values, and trailing JSON are rejected.
 
 | Method and path | Request JSON | Success |
 | --- | --- | --- |
-| POST `/opaque/register/start` | `{"grant":"<setup-or-recovery-token>","value":"<registration-request>"}` | 200 `{"value":"<registration-response>","transaction":"<handle>"}` |
-| POST `/opaque/register/finish` | `{"transaction":"<handle>","value":"<registration-record>"}` | 204; creates/replaces credentials, does not sign in |
-| POST `/opaque/login/start` | `{"value":"<KE1>"}` | 200 `{"transaction":"<handle>","value":"<KE2>"}` |
-| POST `/opaque/login/finish` | `{"transaction":"<handle>","value":"<KE3>"}` | 204 plus session cookie after KE3 verification |
-| GET `/api/session` | None | 200 `{"authenticated":true}`; otherwise 401 (not `false`) |
-| POST `/api/logout` | No body required | 204; invalidates current session if present and expires cookie |
-| POST `/opaque/password/change/start` | `{"value":"<new-password-registration-request>"}` | 200 `{"value":"<registration-response>"}` |
-| POST `/opaque/password/change/finish` | `{"value":"<new-password-registration-record>"}` | 204; replaces credentials and revokes sessions |
+| POST `/opaque/register/start` | `{"grant":"<setup-or-recovery-token>","value":"<registration-request>"}` | 200 `auth.registration_started`; `data` is `{"value":"<registration-response>","transaction":"<handle>"}` |
+| POST `/opaque/register/finish` | `{"transaction":"<handle>","value":"<registration-record>"}` | 200 `auth.registration_completed`; `data: null`; creates/replaces credentials, does not sign in |
+| POST `/opaque/login/start` | `{"value":"<KE1>"}` | 200 `auth.login_started`; `data` is `{"transaction":"<handle>","value":"<KE2>"}` |
+| POST `/opaque/login/finish` | `{"transaction":"<handle>","value":"<KE3>"}` | 200 `auth.login_completed`; `data: null` plus session cookie after KE3 verification |
+| GET `/api/session` | None | 200 `auth.session_valid`; `data: {"authenticated":true}` |
+| POST `/api/logout` | No body required | 200 `auth.logged_out`; `data: null`; invalidates current session if present and expires cookie |
+| POST `/opaque/password/change/start` | `{"value":"<new-password-registration-request>"}` | 200 `auth.password_change_started`; `data` is `{"value":"<registration-response>"}` |
+| POST `/opaque/password/change/finish` | `{"value":"<new-password-registration-record>"}` | 200 `auth.password_changed`; `data: null`; replaces credentials and revokes sessions |
+
+For example, success is `{"code":"auth.login_completed","message":"Signed in.","data":null}`. Errors use the same shape. Authentication codes include `auth.session_required` (401), `auth.login_failed` (401), `auth.protocol_invalid` (400), `auth.registration_expired` (410), `auth.registration_conflict` (409), `auth.recent_login_required` (401), and `auth.capacity_exceeded` (existing 429). Shared request and service codes are `request.https_required`, `request.json_required`, `request.policy_rejected`, `request.origin_rejected`, `request.rate_limited`, `service.unavailable`, and `service.internal_error`, retaining their existing statuses. Authentication errors do not disclose account existence, password validity, or grant-consumption details.
+
+### Browser SDK (implemented for authentication)
+
+Authentication callers and route guards use the framework-independent
+[`web/src/lib/sdk/index.ts`](../web/src/lib/sdk/index.ts) barrel. It owns
+same-origin credentials, JSON encoding, envelope and endpoint-data validation,
+safe fallback errors, cancellation, and session-required signaling. Named
+operations such as `sdk.auth.loginStart`, `sdk.auth.session`,
+`sdk.auth.recoveryFinish`, and `sdk.auth.passwordChangeFinish` accept an optional `AbortSignal`. Mutations,
+including OPAQUE exchanges, are never retried automatically. SDK errors are
+discriminated as `server`, `network`, `invalid_response`, or `cancelled`;
+proxy HTML and raw exception text are not displayed as trusted messages.
+Unknown nonempty server codes may be surfaced with valid envelope/data, but do
+not match known-code behavior. Only `auth.session_required` from a protected
+operation triggers session-loss handling; `auth.login_failed` and
+`auth.recent_login_required` do not.
+
+OPAQUE remains a dynamic import on sign-in, registration/recovery, and password
+change flows. Do not import its crypto package from the SDK or ordinary
+dashboard modules. Authentication flows continue to remove setup/recovery
+grants from the URL before submission and never send them in URLs.
+
+This is the first migration slice only. Other dashboard routes still use their
+existing response shapes and callers; their conversion to named SDK methods and
+outcome envelopes remains planned, not implemented.
 
 ### Flow and state details
 

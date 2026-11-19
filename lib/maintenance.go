@@ -85,12 +85,13 @@ func CheckMaintenance(cfg Config) error {
 // diagnostics. In particular, it never loads the SPA or authentication crypto.
 func MaintenanceHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		if r.Method != http.MethodHead {
-			_, _ = w.Write([]byte("Service unavailable: maintenance required.\n"))
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
 		}
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.maintenance_required", "Service unavailable. Maintenance is required.")
 	})
 }

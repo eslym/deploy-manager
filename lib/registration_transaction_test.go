@@ -36,7 +36,7 @@ func TestRegistrationAndRecoveryRequireOriginBoundOneUseTransaction(t *testing.T
 		t.Fatal(err)
 	}
 	setupHandle, setupRecord := newRegistrationFlow(t, app, setupGrant, origin, "initial secret")
-	if got := finishTestRegistration(app, "", setupHandle, setupRecord, origin); got != http.StatusNoContent {
+	if got := finishTestRegistration(app, "", setupHandle, setupRecord, origin); got != http.StatusOK {
 		t.Fatalf("initial registration status %d", got)
 	}
 
@@ -72,8 +72,8 @@ func TestRegistrationAndRecoveryRequireOriginBoundOneUseTransaction(t *testing.T
 	if app.credentialGeneration != 1 {
 		t.Fatal("cross-origin recovery finish changed the credential")
 	}
-	if got := finishTestRegistration(app, "", recoveryHandle, recoveryRecord, origin); got != http.StatusNoContent {
-		t.Fatalf("valid recovery finish status %d, want 204", got)
+	if got := finishTestRegistration(app, "", recoveryHandle, recoveryRecord, origin); got != http.StatusOK {
+		t.Fatalf("valid recovery finish status %d, want 200", got)
 	}
 	if got := finishTestRegistration(app, "", recoveryHandle, recoveryRecord, origin); got != http.StatusBadRequest && got != http.StatusGone {
 		t.Fatalf("replayed recovery finish status %d, want rejection", got)
@@ -95,7 +95,7 @@ func TestRestoredInstallationGrantPurgeAndCLIRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	handle, record := newRegistrationFlow(t, app, setupGrant, "https://manager.example", "restore-test password")
-	if got := finishTestRegistration(app, "", handle, record, "https://manager.example"); got != http.StatusNoContent {
+	if got := finishTestRegistration(app, "", handle, record, "https://manager.example"); got != http.StatusOK {
 		t.Fatalf("initial registration status=%d", got)
 	}
 	oldSession := completeFixtureLogin(t, app, "restore-test password")
@@ -179,8 +179,106 @@ func TestRestoredInstallationGrantPurgeAndCLIRecovery(t *testing.T) {
 	}
 	defer app.Close()
 	newHandle, newRecord := newRegistrationFlow(t, app, newGrant, "https://manager.example", "replacement restore password")
-	if got := finishTestRegistration(app, "", newHandle, newRecord, "https://manager.example"); got != http.StatusNoContent {
-		t.Fatalf("new CLI-issued recovery grant status=%d, want 204", got)
+	if got := finishTestRegistration(app, "", newHandle, newRecord, "https://manager.example"); got != http.StatusOK {
+		t.Fatalf("new CLI-issued recovery grant status=%d, want 200", got)
+	}
+}
+
+func TestPasswordChangeReturnsOutcomeAndRevokesSession(t *testing.T) {
+	dir := t.TempDir()
+	app, err := New(Config{
+		DatabasePath:  filepath.Join(dir, "state.sqlite"),
+		OPAQUEKeyPath: filepath.Join(dir, "opaque.key"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+
+	setupGrant, err := app.IssueRegistrationGrant()
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, record := newRegistrationFlow(t, app, setupGrant, "https://manager.example", "original password")
+	if status := finishTestRegistration(app, "", handle, record, "https://manager.example"); status != http.StatusOK {
+		t.Fatalf("registration status = %d, want 200", status)
+	}
+	cookie := completeFixtureLogin(t, app, "original password")
+
+	client, err := opaque.NewClient(opaque.DefaultConfiguration())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.ClearState()
+	request, err := client.RegistrationInit([]byte("replacement password"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(protocolMessage{Value: base64.RawURLEncoding.EncodeToString(request.Serialize())})
+	startRequest := httptest.NewRequest(http.MethodPost, "/opaque/password/change/start", bytes.NewReader(body))
+	startRequest.Host = "manager.example"
+	startRequest.RemoteAddr = "127.0.0.1:12345"
+	startRequest.TLS = &tls.ConnectionState{}
+	startRequest.Header.Set("Origin", "https://manager.example")
+	startRequest.Header.Set("Content-Type", "application/json")
+	startRequest.AddCookie(cookie)
+	start := httptest.NewRecorder()
+	app.Handler().ServeHTTP(start, startRequest)
+	if start.Code != http.StatusOK {
+		t.Fatalf("password change start status = %d: %s", start.Code, start.Body.String())
+	}
+	var startOutcome struct {
+		Code string `json:"code"`
+		Data struct {
+			Value string `json:"value"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(start.Body.Bytes(), &startOutcome); err != nil || startOutcome.Code != "auth.password_change_started" {
+		t.Fatalf("invalid password change outcome: %+v (%v)", startOutcome, err)
+	}
+	responseBytes, err := base64.RawURLEncoding.DecodeString(startOutcome.Data.Value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registrationResponse, err := client.Deserialize.RegistrationResponse(responseBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRecord, _, err := client.RegistrationFinalize(registrationResponse, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ = json.Marshal(protocolMessage{Value: base64.RawURLEncoding.EncodeToString(newRecord.Serialize())})
+	finishRequest := httptest.NewRequest(http.MethodPost, "/opaque/password/change/finish", bytes.NewReader(body))
+	finishRequest.Host = "manager.example"
+	finishRequest.RemoteAddr = "127.0.0.1:12345"
+	finishRequest.TLS = &tls.ConnectionState{}
+	finishRequest.Header.Set("Origin", "https://manager.example")
+	finishRequest.Header.Set("Content-Type", "application/json")
+	finishRequest.AddCookie(cookie)
+	finish := httptest.NewRecorder()
+	app.Handler().ServeHTTP(finish, finishRequest)
+
+	var finishOutcome struct {
+		Code string `json:"code"`
+		Data any    `json:"data"`
+	}
+	if finish.Code != http.StatusOK || json.Unmarshal(finish.Body.Bytes(), &finishOutcome) != nil ||
+		finishOutcome.Code != "auth.password_changed" || finishOutcome.Data != nil {
+		t.Fatalf("unexpected password change outcome: status=%d body=%s", finish.Code, finish.Body.String())
+	}
+	if got := finish.Result().Cookies(); len(got) != 1 || got[0].Value != "" {
+		t.Fatalf("password change did not clear the session cookie: %+v", got)
+	}
+	sessionRequest := httptest.NewRequest(http.MethodGet, "https://manager.example/api/session", nil)
+	sessionRequest.Host = "manager.example"
+	sessionRequest.RemoteAddr = "127.0.0.1:12345"
+	sessionRequest.TLS = &tls.ConnectionState{}
+	sessionRequest.AddCookie(cookie)
+	session := httptest.NewRecorder()
+	app.Handler().ServeHTTP(session, sessionRequest)
+	if session.Code != http.StatusUnauthorized || !bytes.Contains(session.Body.Bytes(), []byte(`"auth.session_required"`)) {
+		t.Fatalf("replaced session remained valid: status=%d body=%s", session.Code, session.Body.String())
 	}
 }
 
@@ -204,13 +302,15 @@ func pendingFixtureLoginFinish(t *testing.T, app *App, password string) []byte {
 		t.Fatalf("pre-restore OPAQUE login start status=%d: %s", start.Code, start.Body.String())
 	}
 	var response struct {
-		Transaction string `json:"transaction"`
-		Value       string `json:"value"`
+		Data struct {
+			Transaction string `json:"transaction"`
+			Value       string `json:"value"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(start.Body.Bytes(), &response); err != nil {
+	if err := json.Unmarshal(start.Body.Bytes(), &response); err != nil || response.Data.Transaction == "" {
 		t.Fatal(err)
 	}
-	ke2Bytes, err := base64.RawURLEncoding.DecodeString(response.Value)
+	ke2Bytes, err := base64.RawURLEncoding.DecodeString(response.Data.Value)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +322,7 @@ func pendingFixtureLoginFinish(t *testing.T, app *App, password string) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	finishBody, err := json.Marshal(protocolMessage{Transaction: &response.Transaction, Value: base64.RawURLEncoding.EncodeToString(ke3.Serialize())})
+	finishBody, err := json.Marshal(protocolMessage{Transaction: &response.Data.Transaction, Value: base64.RawURLEncoding.EncodeToString(ke3.Serialize())})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -249,13 +349,15 @@ func newRegistrationFlowWithIdentities(t *testing.T, app *App, grant, origin, pa
 		t.Fatalf("registration start status %d: %s", recorder.Code, recorder.Body.String())
 	}
 	var response struct {
-		Value       string `json:"value"`
-		Transaction string `json:"transaction"`
+		Data struct {
+			Value       string `json:"value"`
+			Transaction string `json:"transaction"`
+		} `json:"data"`
 	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Value == "" || response.Transaction == "" {
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil || response.Data.Value == "" || response.Data.Transaction == "" {
 		t.Fatalf("registration start returned incomplete challenge: %#v (%v)", response, err)
 	}
-	responseBytes, err := base64.RawURLEncoding.DecodeString(response.Value)
+	responseBytes, err := base64.RawURLEncoding.DecodeString(response.Data.Value)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -267,7 +369,7 @@ func newRegistrationFlowWithIdentities(t *testing.T, app *App, grant, origin, pa
 	if err != nil {
 		t.Fatal(err)
 	}
-	return response.Transaction, record.Serialize()
+	return response.Data.Transaction, record.Serialize()
 }
 
 func finishTestRegistration(app *App, grant, handle string, record []byte, origin string) int {

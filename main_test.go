@@ -74,7 +74,7 @@ func TestServeFlagsUseDMEnvironmentUnlessExplicitlySet(t *testing.T) {
 	want := map[string]string{
 		"data": "/env/data", "listen": "127.0.0.1:7777", "origin": "https://example.test",
 		"allow-http-origin": "false",
-		"tls-cert": "cert.pem", "tls-key": "key.pem", "trusted-proxy": "172.18.0.0/16,192.0.2.1", "repository-key-master": "master.key", "login-ttl": "3m0s",
+		"tls-cert":          "cert.pem", "tls-key": "key.pem", "trusted-proxy": "172.18.0.0/16,192.0.2.1", "repository-key-master": "master.key", "login-ttl": "3m0s",
 		"session-ttl": "13h0m0s", "git-timeout": "4m0s", "grant-ttl": "16m0s", "recent-auth-ttl": "6m0s",
 		"auth-rate-per-minute": "21", "publication-root": "/published", "deploy-max-files": "10001",
 		"deploy-max-bytes": "2147483648", "deploy-timeout": "3m0s", "deploy-concurrency": "4",
@@ -666,7 +666,7 @@ func TestLockedCommandServesMaintenanceForRawOptionsStar(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if res.StatusCode != http.StatusServiceUnavailable || res.Header.Get("Cache-Control") != "no-store" || res.Header.Get("Content-Type") != "text/plain; charset=utf-8" || string(body) != "Service unavailable: maintenance required.\n" {
+			if res.StatusCode != http.StatusServiceUnavailable || res.Header.Get("Cache-Control") != "no-store" || res.Header.Get("Content-Type") != "application/json" || string(body) != "{\"code\":\"service.maintenance_required\",\"message\":\"Service unavailable. Maintenance is required.\",\"data\":null}\n" {
 				t.Fatalf("raw OPTIONS * response: status=%d headers=%v body=%q", res.StatusCode, res.Header, body)
 			}
 			for _, secret := range []string{data, "sensitive invalid state", "secret-backup-path", "SELECT", "PRIVATE KEY"} {
@@ -799,11 +799,11 @@ func TestLockedCommandServesOnlyMaintenance(t *testing.T) {
 				}
 				defer res.Body.Close()
 				body, _ := io.ReadAll(res.Body)
-				want := "Service unavailable: maintenance required.\n"
+				want := "{\"code\":\"service.maintenance_required\",\"message\":\"Service unavailable. Maintenance is required.\",\"data\":null}\n"
 				if method == "HEAD" {
 					want = ""
 				}
-				if res.StatusCode != 503 || string(body) != want || res.Header.Get("Content-Type") != "text/plain; charset=utf-8" || res.Header.Get("Cache-Control") != "no-store" {
+				if res.StatusCode != 503 || string(body) != want || res.Header.Get("Content-Type") != "application/json" || res.Header.Get("Cache-Control") != "no-store" {
 					t.Fatalf("response: status=%d headers=%v body=%q", res.StatusCode, res.Header, body)
 				}
 			})

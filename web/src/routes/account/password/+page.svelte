@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { BrowserSDKError, sdk } from '../../../lib/sdk/index.js';
 
 	let status = $state('Confirm your current password, then choose a new one.');
 	let busy = $state(false);
@@ -7,23 +8,38 @@
 
 	class PasswordChangeError extends Error {}
 
-	async function send(path: string, body: { value: string; transaction?: string }) {
-		const response = await fetch(path, {
-			method: 'POST',
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify(body)
-		});
-		if (!response.ok) {
-			if (response.status === 401)
+	async function send<T>(request: () => Promise<{ data: T }>): Promise<T> {
+		try {
+			return (await request()).data;
+		} catch (error) {
+			if (
+				error instanceof BrowserSDKError &&
+				error.outcome.kind === 'server' &&
+				error.outcome.code === 'auth.session_required'
+			)
 				throw new PasswordChangeError(
 					'Your session is no longer valid. Sign in again, then retry.'
+				);
+			if (
+				error instanceof BrowserSDKError &&
+				error.outcome.kind === 'server' &&
+				error.outcome.code === 'auth.login_failed'
+			)
+				throw new PasswordChangeError(
+					'Your current password was not accepted. Check it and try again.'
+				);
+			if (
+				error instanceof BrowserSDKError &&
+				error.outcome.kind === 'server' &&
+				error.outcome.code === 'auth.recent_login_required'
+			)
+				throw new PasswordChangeError(
+					'For security, sign in again before changing your password.'
 				);
 			throw new PasswordChangeError(
 				'The secure password change could not be completed. Check your connection and try again.'
 			);
 		}
-		return response.status === 204 ? null : response.json();
 	}
 
 	async function submit(event: SubmitEvent) {
@@ -56,17 +72,22 @@
 					'Secure password change could not start. Enable JavaScript and WebAssembly, then reload.'
 				);
 			}
-			const keyStretching = { 'argon2id-custom': { iterations: 1, memory: 65536, parallelism: 4 } };
-			let loginStart: ReturnType<typeof opaque.client.startLogin> | null = opaque.client.startLogin(
-				{ password: currentPassword }
-			);
+			const keyStretching = {
+				'argon2id-custom': { iterations: 1, memory: 65536, parallelism: 4 }
+			};
+			let loginStart: ReturnType<typeof opaque.client.startLogin> | null =
+				opaque.client.startLogin({ password: currentPassword });
 			let loginState = loginStart.clientLoginState;
-			const challenge = await send('/opaque/login/start', { value: loginStart.startLoginRequest });
+			const challenge = await send<{ value: string; transaction?: string }>(() =>
+				sdk.auth.loginStart({ value: loginStart!.startLoginRequest })
+			);
 			loginStart = null;
-			if (!challenge?.transaction || !challenge?.value)
+			const loginTransaction = challenge?.transaction;
+			if (!loginTransaction || !challenge?.value) {
 				throw new PasswordChangeError(
 					'Could not verify your current password. Check it and try again.'
 				);
+			}
 			let loginFinish: ReturnType<typeof opaque.client.finishLogin> | null =
 				opaque.client.finishLogin({
 					password: currentPassword,
@@ -76,24 +97,27 @@
 				});
 			loginState = '';
 			currentPassword = '';
-			if (!loginFinish?.finishLoginRequest)
-				throw new PasswordChangeError('Current password was not accepted. Check it and try again.');
+			if (!loginFinish?.finishLoginRequest) {
+				throw new PasswordChangeError(
+					'Current password was not accepted. Check it and try again.'
+				);
+			}
 			const loginRequest = loginFinish.finishLoginRequest;
 			loginFinish = null;
-			await send('/opaque/login/finish', {
-				transaction: challenge.transaction,
-				value: loginRequest
-			});
+			await send(() =>
+				sdk.auth.loginFinish({ transaction: loginTransaction, value: loginRequest })
+			);
 			status = 'Current password verified. Creating a fresh secure registration…';
 			let registrationStart: ReturnType<typeof opaque.client.startRegistration> | null =
 				opaque.client.startRegistration({ password: newPassword });
-			const registrationResponse = await send('/opaque/password/change/start', {
-				value: registrationStart.registrationRequest
-			});
-			if (!registrationResponse?.value)
+			const registrationResponse = await send<{ value: string; transaction?: string }>(() =>
+				sdk.auth.passwordChangeStart({ value: registrationStart!.registrationRequest })
+			);
+			if (!registrationResponse?.value) {
 				throw new PasswordChangeError(
 					'Could not start the new password registration. Retry the change.'
 				);
+			}
 			let registrationFinish: ReturnType<typeof opaque.client.finishRegistration> | null =
 				opaque.client.finishRegistration({
 					password: newPassword,
@@ -103,21 +127,21 @@
 				});
 			newPassword = '';
 			registrationStart = null;
-			if (!registrationFinish?.registrationRecord)
+			if (!registrationFinish?.registrationRecord) {
 				throw new PasswordChangeError(
 					'Could not create the new password record. Retry the change.'
 				);
+			}
 			const record = registrationFinish.registrationRecord;
 			registrationFinish = null;
-			await send('/opaque/password/change/finish', { value: record });
+			await send(() => sdk.auth.passwordChangeFinish({ value: record }));
 			complete = true;
 			status =
 				'Password changed. Your sessions have been signed out; sign in with your new password.';
 		} catch (error) {
-			status =
-				error instanceof PasswordChangeError
-					? error.message
-					: 'Secure password change could not be initialized or completed. Enable JavaScript and WebAssembly, then reload and try again.';
+			status = error instanceof PasswordChangeError
+				? error.message
+				: 'Secure password change could not be initialized or completed. Enable JavaScript and WebAssembly, then reload and try again.';
 		} finally {
 			currentPassword = '';
 			newPassword = '';
@@ -172,13 +196,17 @@
 			<button
 				class="min-h-12 cursor-pointer rounded-lg border-0 bg-[#214c30] font-[inherit] font-semibold text-white focus-visible:outline-3 focus-visible:outline-offset-2 focus-visible:outline-[#82b392] disabled:cursor-wait disabled:opacity-70"
 				type="submit"
-				disabled={busy}>{busy ? 'Changing password…' : 'Change password'}</button
+				disabled={busy}
 			>
+				{busy ? 'Changing password…' : 'Change password'}
+			</button>
 		</form>
 	{:else}
 		<button
 			class="min-h-12 cursor-pointer rounded-lg border-0 bg-[#214c30] px-5 font-[inherit] font-semibold text-white focus-visible:outline-3 focus-visible:outline-offset-2 focus-visible:outline-[#82b392]"
-			onclick={() => goto('/login', { replaceState: true })}>Continue to sign in</button
+			onclick={() => goto('/login', { replaceState: true })}
 		>
+			Continue to sign in
+		</button>
 	{/if}
 </main>

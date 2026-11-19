@@ -640,14 +640,19 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/ssh-hosts/approve", a.approveSSHHost)
 	m.HandleFunc("POST /api/ssh-hosts/revoke", a.revokeSSHHost)
 	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		applicationPath := strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/webhooks/")
 		if a.cfg.CanonicalOrigin != "" {
 			origin, _ := url.Parse(a.cfg.CanonicalOrigin)
 			if !strings.EqualFold(r.Host, origin.Host) {
+				if applicationPath {
+					writeOutcomeError(w, http.StatusMisdirectedRequest, "request.host_rejected", "Application host does not match.")
+					return
+				}
 				http.Error(w, "request host is not the configured application origin", http.StatusMisdirectedRequest)
 				return
 			}
 		}
-		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/webhooks/") {
+		if applicationPath {
 			w.Header().Set("Cache-Control", "no-store")
 		}
 		if (r.URL.Path == "/login" || r.URL.Path == "/dashboard" || strings.HasPrefix(r.URL.Path, "/dashboard/") || r.URL.Path == "/account/password" || strings.HasPrefix(r.URL.Path, "/account/")) && !a.authSecure(r) {
@@ -995,23 +1000,36 @@ func (a *App) pendingRegistrationLocked(handle, origin, purpose string) (registr
 func (a *App) decode(w http.ResponseWriter, r *http.Request) (protocolMessage, bool) {
 	var m protocolMessage
 	r.Body = http.MaxBytesReader(w, r.Body, 65536)
-	if r.Method != "POST" || !a.secure(r) || !a.originOK(r) || !a.allow(r) {
-		http.Error(w, "request rejected", http.StatusForbidden)
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeOutcomeError(w, http.StatusMethodNotAllowed, "request.method_not_allowed", "Method not allowed.")
+		return m, false
+	}
+	if !a.secure(r) {
+		writeOutcomeError(w, http.StatusUpgradeRequired, "request.https_required", "HTTPS is required.")
+		return m, false
+	}
+	if !a.originOK(r) {
+		writeOutcomeError(w, http.StatusForbidden, "request.origin_rejected", "Request origin rejected.")
+		return m, false
+	}
+	if !a.allow(r) {
+		writeOutcomeError(w, http.StatusTooManyRequests, "request.rate_limited", "Too many requests. Try again shortly.")
 		return m, false
 	}
 	contentType, _, contentTypeErr := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if contentTypeErr != nil || contentType != "application/json" {
-		http.Error(w, "JSON content type required", http.StatusUnsupportedMediaType)
+		writeOutcomeError(w, http.StatusUnsupportedMediaType, "request.json_required", "JSON content type required.")
 		return m, false
 	}
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if e := decoder.Decode(&m); e != nil || len(m.Value) == 0 || len(m.Value) > 60000 {
-		http.Error(w, "invalid protocol message", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return m, false
 	}
 	if e := decoder.Decode(new(any)); e != io.EOF {
-		http.Error(w, "invalid protocol message", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return m, false
 	}
 	return m, true
@@ -1023,9 +1041,7 @@ func decodeValue(s string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(s)
 }
 func jsonValue(w http.ResponseWriter, b []byte) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(map[string]string{"value": base64.RawURLEncoding.EncodeToString(b)})
+	writeOutcome(w, http.StatusOK, "auth.password_change_started", "Password change started.", map[string]string{"value": base64.RawURLEncoding.EncodeToString(b)})
 }
 func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 	m, ok := a.decode(w, r)
@@ -1033,12 +1049,12 @@ func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m.Transaction != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	registered, err := a.HasAdministrator()
 	if err != nil {
-		http.Error(w, "registration is temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	purpose := "setup"
@@ -1048,37 +1064,35 @@ func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshCredentialGenerationLocked(); err != nil {
-		http.Error(w, "registration is temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	generation := a.credentialGeneration
 	if !a.grantValid(m.Grant, purpose, generation) {
-		http.Error(w, "invalid or expired grant", 410)
+		writeOutcomeError(w, http.StatusGone, "auth.registration_expired", "Registration expired or unavailable. Start again.")
 		return
 	}
 	b, e := decodeValue(m.Value)
 	if e != nil {
-		http.Error(w, "invalid protocol message", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	request, e := a.des.RegistrationRequest(b)
 	if e != nil {
-		http.Error(w, "invalid protocol message", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	response, e := a.protocol.RegistrationResponse(request, []byte("administrator"), nil)
 	if e != nil {
-		http.Error(w, "registration unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	handle, e := a.newRegistrationTransactionLocked(m.Grant, purpose, r.Header.Get("Origin"), generation)
 	if e != nil {
-		http.Error(w, "registration is temporarily unavailable", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "no-store")
-	_ = json.NewEncoder(w).Encode(map[string]string{"value": base64.RawURLEncoding.EncodeToString(response.Serialize()), "transaction": handle})
+	writeOutcome(w, http.StatusOK, "auth.registration_started", "Registration started.", map[string]string{"value": base64.RawURLEncoding.EncodeToString(response.Serialize()), "transaction": handle})
 }
 func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 	m, ok := a.decode(w, r)
@@ -1086,29 +1100,29 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m.Transaction == nil || *m.Transaction == "" || m.Grant != "" {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	handle := *m.Transaction
 	b, e := decodeValue(m.Value)
 	if e != nil {
-		http.Error(w, "invalid protocol message", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	record, e := a.des.RegistrationRecord(b)
 	if e != nil || record == nil {
-		http.Error(w, "invalid protocol message", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	registered, e := a.HasAdministrator()
 	if e != nil {
-		http.Error(w, "registration unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if err := a.refreshCredentialGenerationLocked(); err != nil {
-		http.Error(w, "registration unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	purpose := "setup"
@@ -1117,7 +1131,7 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 	}
 	pending, valid := a.pendingRegistrationLocked(handle, r.Header.Get("Origin"), purpose)
 	if !valid {
-		http.Error(w, "registration transaction expired or invalid; start again", http.StatusGone)
+		writeOutcomeError(w, http.StatusGone, "auth.registration_expired", "Registration expired or unavailable. Start again.")
 		return
 	}
 	if registered {
@@ -1127,44 +1141,44 @@ func (a *App) registerFinish(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tx, e := a.store.Tx(ctx)
 	if e != nil {
-		http.Error(w, "registration unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	count, e := tx.Administrator.Query().Count(ctx)
 	if e != nil {
-		http.Error(w, "registration unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if count != 0 {
-		http.Error(w, "registration is closed", http.StatusGone)
+		writeOutcomeError(w, http.StatusGone, "auth.registration_expired", "Registration expired or unavailable. Start again.")
 		return
 	}
 	now := a.cfg.Now().UnixNano()
 	res, e := tx.RegistrationGrant.Delete().Where(registrationgrant.IDEQ(pending.grantHash[:]), registrationgrant.PurposeEQ("setup"), registrationgrant.CredentialGenerationEQ(pending.generation), registrationgrant.ExpiresAtGTE(now)).Exec(ctx)
 	if e != nil {
-		http.Error(w, "registration unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if res != 1 {
-		http.Error(w, "grant expired or already used", 410)
+		writeOutcomeError(w, http.StatusGone, "auth.registration_expired", "Registration expired or unavailable. Start again.")
 		return
 	}
 	if _, e = tx.Administrator.Create().SetID(1).SetRegistrationRecord(b).SetProfileGeneration(1).SetCredentialGeneration(1).SetCreatedAt(now).Save(ctx); e != nil {
-		http.Error(w, "administrator already registered", 409)
+		writeOutcomeError(w, http.StatusConflict, "auth.registration_conflict", "Registration is no longer available.")
 		return
 	}
 	if _, e = tx.RegistrationGrant.Delete().Exec(ctx); e != nil {
-		http.Error(w, "registration unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if e = tx.Commit(); e != nil {
-		http.Error(w, "registration unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	a.credentialGeneration = 1
 	a.registrationTxs = make(map[string]registrationTransaction)
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "auth.registration_completed", "Registration completed. Sign in to continue.", nil)
 }
 
 func (a *App) grantValid(token, purpose string, generation int64) bool {

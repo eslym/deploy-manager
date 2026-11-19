@@ -137,7 +137,16 @@ try {
   browser = await chromium.launch({ headless: true, executablePath: browserPath, args: ["--no-sandbox"] });
   const context = await browser.newContext();
   const observedURLs = [];
+  const registrationOutcomeCodes = [];
   context.on("request", request => observedURLs.push(request.url()));
+  context.on("response", async response => {
+    if (response.headers()["content-type"]?.includes("application/json")) {
+      try {
+        const body = await response.json();
+        if (typeof body?.code === "string") registrationOutcomeCodes.push(body.code);
+      } catch {}
+    }
+  });
 
   const failedInitPage = await context.newPage();
   await failedInitPage.addInitScript(() => Object.defineProperty(globalThis, "WebAssembly", { value: undefined }));
@@ -249,7 +258,7 @@ try {
   await malformedPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
   await malformedPage.getByLabel("Password").fill(testPassword);
   await malformedPage.getByRole("button", { name: "Create account" }).click();
-  await malformedPage.getByText(/new setup link/).waitFor({ timeout: 30000 });
+  await malformedPage.getByText(/could not be completed/).waitFor({ timeout: 30000 });
   if (await malformedPage.getByLabel("Password").inputValue()) throw new Error("malformed registration response left password in the form");
   if (malformedFinishRequests !== 0) throw new Error("malformed registration response proceeded to finish");
   await malformedPage.close();
@@ -301,7 +310,7 @@ try {
   await page.route("**/opaque/register/finish", async route => {
     const results = await Promise.all([route.fetch(), route.fetch()]);
     finishRaceStatuses = results.map(result => result.status()).sort((a, b) => a - b);
-    const accepted = results.find(result => result.status() === 204);
+    const accepted = results.find(result => result.status() === 200);
     if (!accepted) throw new Error(`registration race had no accepted request: ${finishRaceStatuses}`);
     await route.fulfill({ response: accepted });
   });
@@ -338,8 +347,10 @@ try {
   await page.getByLabel("Password").fill(testPassword);
   await page.getByRole("button", { name: "Create account" }).click();
   await page.getByText("Administrator account created. You can close this page.").waitFor({ timeout: 60000 });
+  await page.waitForTimeout(50);
   if (pageCryptoLoads <= largeBundlesBeforeSubmit) throw new Error("OPAQUE bundle was not loaded when registration started");
-  if (JSON.stringify(finishRaceStatuses) !== JSON.stringify([204, 410])) throw new Error(`grant consumption race was not single-use: ${finishRaceStatuses}`);
+  if (JSON.stringify(finishRaceStatuses) !== JSON.stringify([200, 410])) throw new Error(`grant consumption race was not single-use: ${finishRaceStatuses}`);
+  if (!registrationOutcomeCodes.includes("auth.registration_started") || !registrationOutcomeCodes.includes("auth.registration_completed")) throw new Error(`registration did not use authentication outcome envelopes: ${registrationOutcomeCodes}`);
   if (observedURLs.some(url => url.includes(grant))) throw new Error("registration grant leaked into a browser request URL");
   const registrationStarts = registrationRequests.filter(request => request.path === "/opaque/register/start");
   const registrationFinishes = registrationRequests.filter(request => request.path === "/opaque/register/finish");
@@ -411,6 +422,7 @@ try {
   const authPage = await authContext.newPage();
   const authBodies = [];
   const authCryptoAssets = [];
+  const authOutcomeCodes = [];
   await authPage.addInitScript(() => {
     globalThis.__cspViolations = [];
     document.addEventListener("securitypolicyviolation", event => globalThis.__cspViolations.push(`${event.effectiveDirective}: ${event.blockedURI}`));
@@ -420,12 +432,20 @@ try {
   });
   authPage.on("response", response => {
     if (response.headers()["content-type"]?.includes("javascript") && Number(response.headers()["content-length"]) > 300000) authCryptoAssets.push(response.url());
+    if (response.headers()["content-type"]?.includes("application/json")) {
+      void response.json().then(body => {
+        if (typeof body?.code === "string") authOutcomeCodes.push(body.code);
+      }).catch(() => {});
+    }
   });
   await authPage.goto(`${secureOrigin}/dashboard/projects/nested`, { waitUntil: "domcontentloaded" });
   await authPage.getByLabel("Password").waitFor({ state: "visible", timeout: 30000 });
   if (await authPage.evaluate(() => globalThis.__cspViolations.length)) throw new Error(`CSP blocked login resources: ${await authPage.evaluate(() => globalThis.__cspViolations.join(", "))}`);
-  const unauthStatus = await authPage.evaluate(async () => (await fetch("/api/session")).status);
-  if (unauthStatus !== 401) throw new Error(`direct unauthenticated session read returned ${unauthStatus}`);
+  const unauthOutcome = await authPage.evaluate(async () => {
+    const response = await fetch("/api/session");
+    return { status: response.status, body: await response.json() };
+  });
+  if (unauthOutcome.status !== 401 || unauthOutcome.body.code !== "auth.session_required" || unauthOutcome.body.data !== null) throw new Error(`direct unauthenticated session read returned an unexpected outcome: ${JSON.stringify(unauthOutcome)}`);
   if (authCryptoAssets.length) throw new Error("dashboard/login loaded OPAQUE before an authentication attempt");
 
   await authPage.getByLabel("Password").fill("Wrong password 2026!");
@@ -485,9 +505,11 @@ try {
   if (!finishBody || finishBody.includes(testPassword) || finishBody.includes("clientLoginState") || finishBody.includes("sessionKey")) throw new Error("login transmitted password or local OPAQUE secret state");
   const authenticated = await authPage.evaluate(async () => (await fetch("/api/session")).status);
   if (authenticated !== 200) throw new Error(`authenticated session check returned ${authenticated}`);
+  if (!authOutcomeCodes.includes("auth.login_started") || !authOutcomeCodes.includes("auth.login_completed") || !authOutcomeCodes.includes("auth.login_failed") || !authOutcomeCodes.includes("auth.session_valid")) throw new Error(`browser authentication did not use expected outcomes: ${authOutcomeCodes}`);
   await authPage.goto(`${secureOrigin}/dashboard/projects/nested`, { waitUntil: "domcontentloaded" });
   await authPage.getByText(/Project not found|This project no longer exists/i).waitFor({ timeout: 30000 });
   await authPage.goto(`${secureOrigin}/dashboard/keys`);
+  await authPage.waitForTimeout(50);
   await authPage.getByRole("heading", { name: "Repository keys" }).waitFor({ timeout: 30000 });
   await authPage.getByLabel("Key name").fill("generated integration key");
   await authPage.getByRole("button", { name: "Create Ed25519 key" }).click();
@@ -519,7 +541,7 @@ try {
   await authPage.getByRole("heading", { name: "Repository keys" }).waitFor({ timeout: 30000 });
   await authPage.waitForFunction(async () => (await fetch("/api/session")).status === 401, null, { timeout: 35000 });
   const expiredLogout = await authPage.evaluate(async () => (await fetch("/api/logout", { method: "POST" })).status);
-  if (expiredLogout !== 204) throw new Error(`logout after session expiry returned ${expiredLogout}`);
+  if (expiredLogout !== 200) throw new Error(`logout after session expiry returned ${expiredLogout}`);
   await authPage.goto(`${secureOrigin}/login`, { waitUntil: "domcontentloaded" });
   try {
     await authPage.locator("#password").waitFor({ state: "visible", timeout: 10000 });
@@ -559,7 +581,7 @@ try {
   });
   await inflightPage.getByLabel("Password").fill(testPassword);
   await inflightPage.getByRole("button", { name: "Sign in" }).click();
-  await inflightPage.getByText("Sign-in failed. Check your password and try again.").waitFor({ timeout: 30000 });
+  await inflightPage.getByText("Sign-in could not be completed. Check your connection and try again.").waitFor({ timeout: 30000 });
   if (!staleLogin?.transaction) throw new Error("could not create a pre-replacement login handshake");
   const secondSessionContext = await browser.newContext({ ignoreHTTPSErrors: true });
   const secondSessionPage = await secondSessionContext.newPage();
@@ -578,6 +600,8 @@ try {
   await authPage.getByLabel("New password").fill(changedPassword);
   await authPage.getByRole("button", { name: "Change password" }).click();
   await authPage.getByText(/Password changed/).waitFor({ timeout: 60000 });
+  await authPage.waitForTimeout(50);
+  if (!authOutcomeCodes.includes("auth.password_change_started") || !authOutcomeCodes.includes("auth.password_changed")) throw new Error(`password change did not use authentication outcome envelopes: ${authOutcomeCodes}`);
   if (JSON.stringify(repositoryKeyState()) !== JSON.stringify(repositoryKeysBeforeCredentials)) throw new Error("password change altered repository key master/ciphertext or usability");
   if (await authPage.evaluate(async () => (await fetch("/api/session")).status) !== 401) throw new Error("credential replacement did not revoke the current session");
   if (await secondSessionPage.evaluate(async () => (await fetch("/api/session")).status) !== 401) throw new Error("credential replacement did not revoke another active session");
@@ -610,7 +634,7 @@ try {
   });
   await pendingPage.getByLabel("Password").fill(testPassword);
   await pendingPage.getByRole("button", { name: "Sign in" }).click();
-  await pendingPage.getByText("Sign-in failed. Check your password and try again.").waitFor({ timeout: 30000 });
+  await pendingPage.getByText("Sign-in could not be completed. Check your connection and try again.").waitFor({ timeout: 30000 });
   if (!interruptedLogin?.transaction) throw new Error("could not create the pending login used for restart coverage");
 
   server.kill("SIGTERM");
@@ -651,6 +675,14 @@ try {
   const recoveryBodies = [];
   const recoveryURLs = [];
   const recoveryRequests = [];
+  const recoveryOutcomeCodes = [];
+  recoveryPage.on("response", async response => {
+    if (!response.headers()["content-type"]?.includes("application/json")) return;
+    try {
+      const body = await response.json();
+      if (typeof body?.code === "string") recoveryOutcomeCodes.push(body.code);
+    } catch {}
+  });
   recoveryPage.on("request", request => {
     recoveryURLs.push(request.url());
     if (request.method() === "POST") {
@@ -682,15 +714,17 @@ try {
   await recoveryPage.route("**/opaque/register/finish", async route => {
     const results = await Promise.all([route.fetch(), route.fetch()]);
     recoveryRaceStatuses = results.map(result => result.status()).sort((a, b) => a - b);
-    const accepted = results.find(result => result.status() === 204);
+    const accepted = results.find(result => result.status() === 200);
     if (!accepted) throw new Error(`recovery race had no accepted request: ${recoveryRaceStatuses}`);
     await route.fulfill({ response: accepted });
   });
   await recoveryPage.getByLabel("Replace password").fill(recoveredPassword);
   await recoveryPage.getByRole("button", { name: "Replace password" }).click();
   await recoveryPage.getByText("Administrator password replaced. You can close this page.").waitFor({ timeout: 60000 });
+  await recoveryPage.waitForTimeout(50);
+  if (!recoveryOutcomeCodes.includes("auth.registration_started") || !recoveryOutcomeCodes.includes("auth.registration_completed")) throw new Error(`recovery did not use authentication outcome envelopes: ${recoveryOutcomeCodes}`);
   if (JSON.stringify(repositoryKeyState()) !== JSON.stringify(repositoryKeysBeforeCredentials)) throw new Error("CLI recovery altered repository key master/ciphertext or usability");
-  if (JSON.stringify(recoveryRaceStatuses) !== JSON.stringify([204, 410])) throw new Error(`recovery grant was not atomically consumed: ${recoveryRaceStatuses}`);
+  if (JSON.stringify(recoveryRaceStatuses) !== JSON.stringify([200, 410])) throw new Error(`recovery grant was not atomically consumed: ${recoveryRaceStatuses}`);
   if (recoveryURLs.some(url => url.includes(recoveryGrant))) throw new Error("recovery grant leaked into a request URL");
   if (!recoveryBodies.length || recoveryBodies.some(body => body.includes(recoveredPassword) || body.includes("clientRegistrationState"))) throw new Error("recovery requests transmitted a password or client state");
   const recoveryStarts = recoveryRequests.filter(request => request.path === "/opaque/register/start");

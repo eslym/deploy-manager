@@ -55,7 +55,7 @@ func TestDocumentedFullInstallationRestoreRehearsal(t *testing.T) {
 		t.Fatal(err)
 	}
 	registrationHandle, registrationRecord := newRegistrationFlow(t, app, setup, origin, initialPassword)
-	if status := finishTestRegistration(app, "", registrationHandle, registrationRecord, origin); status != http.StatusNoContent {
+	if status := finishTestRegistration(app, "", registrationHandle, registrationRecord, origin); status != http.StatusOK {
 		t.Fatalf("initial OPAQUE registration status=%d", status)
 	}
 	resurrectableGrant, err := app.IssueRecoveryGrant()
@@ -301,7 +301,7 @@ func TestDocumentedFullInstallationRestoreRehearsal(t *testing.T) {
 		t.Fatal(err)
 	}
 	recoveryHandle, recoveryRecord := newRegistrationFlow(t, app, newGrant, origin, "restored recovery password")
-	if status := finishTestRegistration(app, "", recoveryHandle, recoveryRecord, origin); status != http.StatusNoContent {
+	if status := finishTestRegistration(app, "", recoveryHandle, recoveryRecord, origin); status != http.StatusOK {
 		t.Fatalf("restored OPAQUE recovery status=%d", status)
 	}
 	if !app.repositoryKeyCanSign(repositoryKey.ID, []byte("repository key restore witness")) {

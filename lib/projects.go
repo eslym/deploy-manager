@@ -234,19 +234,19 @@ func (p *projectManager) repoPath(id string) string { return filepath.Join(p.roo
 
 func (a *App) projectAuthorized(w http.ResponseWriter, r *http.Request, mutation bool) bool {
 	if !a.authSecure(r) {
-		http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
+		writeOutcomeError(w, http.StatusUpgradeRequired, "request.https_required", "HTTPS is required.")
 		return false
 	}
 	if _, ok := a.session(r); !ok {
-		http.Error(w, "authentication required", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.session_required", "Sign in to continue.")
 		return false
 	}
 	if mutation && (r.Method != http.MethodPost || !a.originOK(r)) {
-		http.Error(w, "request rejected", http.StatusForbidden)
+		writeOutcomeError(w, http.StatusForbidden, "request.origin_rejected", "Request origin rejected.")
 		return false
 	}
 	if mutation && !a.allow(r) {
-		http.Error(w, "too many requests; try again shortly", http.StatusTooManyRequests)
+		writeOutcomeError(w, http.StatusTooManyRequests, "request.rate_limited", "Too many requests. Try again shortly.")
 		return false
 	}
 	return true

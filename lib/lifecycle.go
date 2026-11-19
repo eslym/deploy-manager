@@ -52,26 +52,30 @@ func (a *App) passwordChangeStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !a.recentSession(r) {
-		http.Error(w, "recent authentication required", http.StatusUnauthorized)
+		if _, ok := a.session(r); !ok {
+			writeOutcomeError(w, http.StatusUnauthorized, "auth.session_required", "Sign in to continue.")
+			return
+		}
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.recent_login_required", "Sign in again before changing your password.")
 		return
 	}
 	if m.Grant != "" || m.Transaction != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	b, err := decodeValue(m.Value)
 	if err != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	request, err := a.des.RegistrationRequest(b)
 	if err != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	response, err := a.protocol.RegistrationResponse(request, []byte("administrator"), nil)
 	if err != nil {
-		http.Error(w, "password change unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	jsonValue(w, response.Serialize())
@@ -83,28 +87,28 @@ func (a *App) passwordChangeFinish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if m.Grant != "" || m.Transaction != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	b, err := decodeValue(m.Value)
 	if err != nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	if rec, err := a.des.RegistrationRecord(b); err != nil || rec == nil {
-		http.Error(w, "invalid protocol message", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "auth.protocol_invalid", "Invalid authentication request.")
 		return
 	}
 	digest, ok := a.session(r)
 	if !ok {
-		http.Error(w, "recent authentication required", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.session_required", "Sign in to continue.")
 		return
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s, exists := a.sessions[digest]
 	if !exists || s.generation != a.credentialGeneration || a.cfg.Now().Sub(s.authenticatedAt) > a.cfg.RecentAuthTTL {
-		http.Error(w, "recent authentication required", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "auth.recent_login_required", "Sign in again before changing your password.")
 		return
 	}
 	a.replaceCredential(w, nil, b, "change", digest, "", "")
@@ -115,14 +119,14 @@ func (a *App) passwordChangeFinish(w http.ResponseWriter, r *http.Request) {
 // The caller holds a.mu so login completion cannot issue a stale session.
 func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte, purpose string, sessionDigest [32]byte, transaction, transactionOrigin string) {
 	if err := a.refreshCredentialGenerationLocked(); err != nil {
-		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	old := a.credentialGeneration
 	ctx := context.Background()
 	tx, err := a.store.Tx(ctx)
 	if err != nil {
-		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
@@ -130,40 +134,40 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 	if purpose == "recovery" {
 		pending, ok := a.pendingRegistrationLocked(transaction, transactionOrigin, "recovery")
 		if !ok || !bytes.Equal(pending.grantHash[:], grantHash) {
-			http.Error(w, "registration transaction expired or invalid; start again", http.StatusGone)
+			writeOutcomeError(w, http.StatusGone, "auth.registration_expired", "Registration expired or unavailable. Start again.")
 			return
 		}
 		res, e := tx.RegistrationGrant.Delete().Where(registrationgrant.IDEQ(grantHash), registrationgrant.PurposeEQ("recovery"), registrationgrant.CredentialGenerationEQ(old), registrationgrant.ExpiresAtGTE(now)).Exec(ctx)
 		if e != nil {
-			http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 			return
 		}
 		if res != 1 {
-			http.Error(w, "grant expired, superseded, or already used", http.StatusGone)
+			writeOutcomeError(w, http.StatusGone, "auth.registration_expired", "Registration expired or unavailable. Start again.")
 			return
 		}
 	} else {
 		s, ok := a.sessions[sessionDigest]
 		if !ok || s.generation != old || a.cfg.Now().Sub(s.authenticatedAt) > a.cfg.RecentAuthTTL {
-			http.Error(w, "recent authentication required", http.StatusUnauthorized)
+			writeOutcomeError(w, http.StatusUnauthorized, "auth.recent_login_required", "Sign in again before changing your password.")
 			return
 		}
 	}
 	res, err := tx.Administrator.Update().Where(administrator.IDEQ(1), administrator.CredentialGenerationEQ(old), administrator.ProfileGenerationEQ(1)).SetRegistrationRecord(record).AddCredentialGeneration(1).Save(ctx)
 	if err != nil {
-		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if res != 1 {
-		http.Error(w, "credential replacement conflicted", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	if _, err = tx.RegistrationGrant.Delete().Exec(ctx); err != nil {
-		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "credential replacement unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	a.credentialGeneration = old + 1
@@ -171,6 +175,9 @@ func (a *App) replaceCredential(w http.ResponseWriter, grantHash, record []byte,
 	a.logins = make(map[string]pendingLogin)
 	a.registrationTxs = make(map[string]registrationTransaction)
 	http.SetCookie(w, &http.Cookie{Name: a.cookieName(), Value: "", Path: "/", MaxAge: -1, Expires: time.Unix(1, 0), Secure: a.cookieName() == sessionCookie, HttpOnly: true, SameSite: http.SameSiteStrictMode})
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusNoContent)
+	if purpose == "recovery" {
+		writeOutcome(w, http.StatusOK, "auth.registration_completed", "Registration completed. Sign in to continue.", nil)
+		return
+	}
+	writeOutcome(w, http.StatusOK, "auth.password_changed", "Password changed. Sign in again.", nil)
 }

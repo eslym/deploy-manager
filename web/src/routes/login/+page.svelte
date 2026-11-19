@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { BrowserSDKError, sdk } from '../../lib/sdk/index.js';
 
 	let status = $state('Enter your password to sign in.');
 	let busy = $state(false);
@@ -28,15 +29,9 @@
 			}
 
 			const start = opaque.client.startLogin({ password });
-			const response = await fetch('/opaque/login/start', {
-				method: 'POST',
-				credentials: 'same-origin',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ value: start.startLoginRequest })
-			});
-			if (!response.ok) throw new LoginError('Sign-in failed. Check your password and try again.');
-
-			const challenge: { transaction: string; value: string } = await response.json();
+			const challenge = (await sdk.auth.loginStart({ value: start.startLoginRequest })).data;
+			if (!challenge.transaction)
+				throw new LoginError('Sign-in failed. Check your password and try again.');
 			if (typeof opaque.client?.finishLogin !== 'function') {
 				throw new LoginError('Secure sign-in could not finish. Reload this page and try again.');
 			}
@@ -53,22 +48,23 @@
 				throw new LoginError('Sign-in failed. Check your password and try again.');
 			}
 			password = '';
-			const completed = await fetch('/opaque/login/finish', {
-				method: 'POST',
-				credentials: 'same-origin',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					transaction: challenge.transaction,
-					value: finish.finishLoginRequest
-				})
+			await sdk.auth.loginFinish({
+				transaction: challenge.transaction,
+				value: finish.finishLoginRequest
 			});
-			if (!completed.ok) throw new LoginError('Sign-in failed. Check your password and try again.');
 			await goto('/dashboard', { replaceState: true });
 		} catch (error) {
-			status =
-				error instanceof LoginError
-					? error.message
-					: 'Secure sign-in could not be initialized or completed. Check that JavaScript and WebAssembly are enabled, then reload and try again.';
+			if (error instanceof BrowserSDKError) {
+				status =
+					error.outcome.kind === 'server' && error.outcome.code === 'auth.login_failed'
+						? 'Sign-in failed. Check your password and try again.'
+						: 'Sign-in could not be completed. Check your connection and try again.';
+			} else {
+				status =
+					error instanceof LoginError
+						? error.message
+						: 'Secure sign-in could not be initialized or completed. Check that JavaScript and WebAssembly are enabled, then reload and try again.';
+			}
 		} finally {
 			password = '';
 			passwordField.value = '';

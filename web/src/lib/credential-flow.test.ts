@@ -59,7 +59,16 @@ describe('registration flow', () => {
 		rememberSetupGrant('grant');
 		vi.stubGlobal(
 			'fetch',
-			vi.fn(async () => new Response('', { status: 410 }))
+			vi.fn(async () =>
+				new Response(
+					JSON.stringify({
+						code: 'auth.registration_expired',
+						message: 'Registration expired or unavailable. Start again.',
+						data: null
+					}),
+					{ status: 410, headers: { 'Content-Type': 'application/json' } }
+				)
+			)
 		);
 		const flow = createCredentialFlow('registration');
 		const field = { value: 'a-long-password-value' } as HTMLInputElement;
@@ -73,14 +82,23 @@ describe('registration flow', () => {
 		rememberSetupGrant('grant');
 		vi.stubGlobal(
 			'fetch',
-			vi.fn(async () => new Response('null', { status: 200 }))
+			vi.fn(async () =>
+				new Response(
+					JSON.stringify({
+						code: 'auth.registration_started',
+						message: 'Started.',
+						data: null
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				)
+			)
 		);
 		const flow = createCredentialFlow('registration');
 		const field = { value: 'a-long-password-value' } as HTMLInputElement;
 		await flow.submit(field);
 		expect(flow.state.pending).toBe(false);
 		expect(flow.state.complete).toBe(false);
-		expect(flow.state.statusMessage).toContain('new setup link');
+		expect(flow.state.statusMessage).toContain('could not be completed');
 		expect(setupGrant.value).toBe('grant');
 	});
 
@@ -110,11 +128,22 @@ describe('registration flow', () => {
 				requestCount++;
 				if (requestCount === 2) expect(setupGrant.value).toBe('grant');
 				return requestCount === 1
-					? new Response(JSON.stringify({ value: 'server-response', transaction: 'transaction' }), {
-							status: 200,
-							headers: { 'Content-Type': 'application/json' }
-						})
-					: new Response(null, { status: 204 });
+					? new Response(
+							JSON.stringify({
+								code: 'auth.registration_started',
+								message: 'Registration started.',
+								data: { value: 'server-response', transaction: 'transaction' }
+							}),
+							{ status: 200, headers: { 'Content-Type': 'application/json' } }
+						)
+					: new Response(
+							JSON.stringify({
+								code: 'auth.registration_completed',
+								message: 'Registration completed.',
+								data: null
+							}),
+							{ status: 200, headers: { 'Content-Type': 'application/json' } }
+						);
 			})
 		);
 		const flow = createCredentialFlow('registration');
@@ -144,163 +173,218 @@ describe('recovery purpose through the shared credential flow', () => {
 		);
 		expect(navigate).not.toHaveBeenCalled();
 
-		flow.sanitizeURL(new URL('https://manager.test/recover#recovery-secret'), navigate, currentURL);
+		flow.sanitizeURL(
+			new URL('https://manager.test/recover#recovery-secret'),
+			navigate,
+			currentURL
+		);
 		await vi.waitFor(() => expect(setupGrant.ready).toBe(true));
 		expect(navigate).toHaveBeenCalledOnce();
 		expect(navigate.mock.calls[0][0].hash).toBe('');
 		expect(setupGrant.value).toBe('recovery-secret');
 	});
 
-	it('reports an incomplete recovery grant without submitting or retaining the password', async () => {
-		const flow = createCredentialFlow('recovery');
-		const field = { value: 'recovery-password-value' } as HTMLInputElement;
-		const fetchMock = vi.fn();
-		vi.stubGlobal('fetch', fetchMock);
+	it(
+		'reports an incomplete recovery grant without submitting or retaining the password',
+		async () => {
+			const flow = createCredentialFlow('recovery');
+			const field = { value: 'recovery-password-value' } as HTMLInputElement;
+			const fetchMock = vi.fn();
+			vi.stubGlobal('fetch', fetchMock);
 
-		await flow.submit(field);
+			await flow.submit(field);
 
-		expect(field.value).toBe('');
-		expect(flow.state.statusMessage).toContain('recovery link is incomplete');
-		expect(fetchMock).not.toHaveBeenCalled();
-	});
-
-	it('uses the recovery message for expired grants and clears the password before the request', async () => {
-		rememberSetupGrant('recovery-grant');
-		const field = { value: 'recovery-password-value' } as HTMLInputElement;
-		const fetchMock = vi.fn<typeof fetch>(async () => {
 			expect(field.value).toBe('');
-			return new Response('', { status: 410 });
-		});
-		vi.stubGlobal('fetch', fetchMock);
-		const flow = createCredentialFlow('recovery');
+			expect(flow.state.statusMessage).toContain('recovery link is incomplete');
+			expect(fetchMock).not.toHaveBeenCalled();
+		}
+	);
 
-		await flow.submit(field);
-
-		expect(fetchMock).toHaveBeenCalledOnce();
-		expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
-			grant: 'recovery-grant',
-			value: 'request'
-		});
-		expect(flow.state.statusMessage).toContain('recovery link has expired or was already used');
-		expect(flow.state.pending).toBe(false);
-		expect(field.value).toBe('');
-		expect(flow.state.complete).toBe(false);
-	});
-
-	it('rejects malformed recovery responses before finishing and retains the grant for a retry', async () => {
-		rememberSetupGrant('recovery-grant');
-		const fetchMock = vi.fn(
-			async () => new Response(JSON.stringify({ value: 'missing transaction' }), { status: 200 })
-		);
-		vi.stubGlobal('fetch', fetchMock);
-		const flow = createCredentialFlow('recovery');
-		const field = { value: 'recovery-password-value' } as HTMLInputElement;
-
-		await flow.submit(field);
-
-		expect(fetchMock).toHaveBeenCalledOnce();
-		expect(flow.state.statusMessage).toContain('new recovery link');
-		expect(flow.state.complete).toBe(false);
-		expect(field.value).toBe('');
-		expect(setupGrant.value).toBe('recovery-grant');
-		expect(client.finishRegistration).not.toHaveBeenCalled();
-	});
-
-	it('fails closed when recovery OPAQUE initialization fails without making a request', async () => {
-		rememberSetupGrant('recovery-grant');
-		vi.mocked(client.startRegistration).mockImplementationOnce(() => {
-			throw new Error('initialization failed');
-		});
-		const fetchMock = vi.fn();
-		vi.stubGlobal('fetch', fetchMock);
-		const flow = createCredentialFlow('recovery');
-		const field = { value: 'recovery-password-value' } as HTMLInputElement;
-
-		await flow.submit(field);
-
-		expect(fetchMock).not.toHaveBeenCalled();
-		expect(flow.state.statusMessage).toContain('Secure recovery could not be initialized');
-		expect(flow.state.pending).toBe(false);
-		expect(field.value).toBe('');
-		expect(setupGrant.value).toBe('recovery-grant');
-	});
-
-	it('preserves recovery-specific failures while binding finish to the one-use transaction', async () => {
-		rememberSetupGrant('recovery-grant');
-		const requests: Array<{ path: string; body: Record<string, string> }> = [];
-		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-			requests.push({
-				path: String(input),
-				body: JSON.parse(String(init?.body))
+	it(
+		'uses the recovery message for expired grants and clears the password before the request',
+		async () => {
+			rememberSetupGrant('recovery-grant');
+			const field = { value: 'recovery-password-value' } as HTMLInputElement;
+			const fetchMock = vi.fn<typeof fetch>(async () => {
+				expect(field.value).toBe('');
+				return new Response(
+					JSON.stringify({
+						code: 'auth.registration_expired',
+						message: 'Registration expired or unavailable. Start again.',
+						data: null
+					}),
+					{ status: 410, headers: { 'Content-Type': 'application/json' } }
+				);
 			});
-			if (requests.length === 1) {
-				return new Response(
-					JSON.stringify({ value: 'server-response', transaction: 'recovery-tx' }),
-					{
-						status: 200,
-						headers: { 'Content-Type': 'application/json' }
-					}
-				);
-			}
-			return new Response('', { status: 503 });
-		});
-		vi.stubGlobal('fetch', fetchMock);
-		const flow = createCredentialFlow('recovery');
-		const field = { value: 'recovery-password-value' } as HTMLInputElement;
+			vi.stubGlobal('fetch', fetchMock);
+			const flow = createCredentialFlow('recovery');
 
-		await flow.submit(field);
+			await flow.submit(field);
 
-		expect(requests.map(({ path }) => path)).toEqual([
-			'/opaque/register/start',
-			'/opaque/register/finish'
-		]);
-		expect(requests[0].body).toEqual({ grant: 'recovery-grant', value: 'request' });
-		expect(requests[1].body).toEqual({ transaction: 'recovery-tx', value: 'record' });
-		expect(
-			requests.every(({ body }) => !JSON.stringify(body).includes('recovery-password-value'))
-		).toBe(true);
-		expect(flow.state.statusMessage).toContain('Recovery could not be completed');
-		expect(flow.state.complete).toBe(false);
-		expect(flow.state.pending).toBe(false);
-		expect(field.value).toBe('');
-		expect(setupGrant.value).toBe('recovery-grant');
-	});
+			expect(fetchMock).toHaveBeenCalledOnce();
+			expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
+				grant: 'recovery-grant',
+				value: 'request'
+			});
+			expect(flow.state.statusMessage).toContain(
+				'recovery link has expired or was already used'
+			);
+			expect(flow.state.pending).toBe(false);
+			expect(field.value).toBe('');
+			expect(flow.state.complete).toBe(false);
+		}
+	);
 
-	it('completes recovery only after both protocol requests and then clears the grant', async () => {
-		rememberSetupGrant('recovery-grant');
-		const requests: Array<{ path: string; body: Record<string, string> }> = [];
-		const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-			requests.push({ path: String(input), body: JSON.parse(String(init?.body)) });
-			if (requests.length === 1) {
-				return new Response(
-					JSON.stringify({ value: 'server-response', transaction: 'recovery-tx' }),
-					{
-						status: 200,
-						headers: { 'Content-Type': 'application/json' }
-					}
-				);
-			}
+	it(
+		'rejects malformed recovery responses before finishing and retains the grant for a retry',
+		async () => {
+			rememberSetupGrant('recovery-grant');
+			const fetchMock = vi.fn(
+				async () =>
+					new Response(
+						JSON.stringify({
+							code: 'auth.registration_started',
+							message: 'Registration started.',
+							data: { value: 'missing transaction' }
+						}),
+						{ status: 200, headers: { 'Content-Type': 'application/json' } }
+					)
+			);
+			vi.stubGlobal('fetch', fetchMock);
+			const flow = createCredentialFlow('recovery');
+			const field = { value: 'recovery-password-value' } as HTMLInputElement;
+
+			await flow.submit(field);
+
+			expect(fetchMock).toHaveBeenCalledOnce();
+			expect(flow.state.statusMessage).toContain('could not be completed');
+			expect(flow.state.complete).toBe(false);
+			expect(field.value).toBe('');
 			expect(setupGrant.value).toBe('recovery-grant');
-			return new Response(null, { status: 204 });
-		});
-		vi.stubGlobal('fetch', fetchMock);
-		const flow = createCredentialFlow('recovery');
-		const field = { value: 'recovery-password-value' } as HTMLInputElement;
+			expect(client.finishRegistration).not.toHaveBeenCalled();
+		}
+	);
 
-		await flow.submit(field);
+	it(
+		'fails closed when recovery OPAQUE initialization fails without making a request',
+		async () => {
+			rememberSetupGrant('recovery-grant');
+			vi.mocked(client.startRegistration).mockImplementationOnce(() => {
+				throw new Error('initialization failed');
+			});
+			const fetchMock = vi.fn();
+			vi.stubGlobal('fetch', fetchMock);
+			const flow = createCredentialFlow('recovery');
+			const field = { value: 'recovery-password-value' } as HTMLInputElement;
 
-		expect(flow.state.complete).toBe(true);
-		expect(flow.state.statusMessage).toBe(
-			'Administrator password replaced. You can close this page.'
-		);
-		expect(field.value).toBe('');
-		expect(setupGrant.value).toBe('');
-		expect(requests.map(({ path }) => path)).toEqual([
-			'/opaque/register/start',
-			'/opaque/register/finish'
-		]);
-		expect(
-			requests.every(({ body }) => !JSON.stringify(body).includes('recovery-password-value'))
-		).toBe(true);
-	});
+			await flow.submit(field);
+
+			expect(fetchMock).not.toHaveBeenCalled();
+			expect(flow.state.statusMessage).toContain('Secure recovery could not be initialized');
+			expect(flow.state.pending).toBe(false);
+			expect(field.value).toBe('');
+			expect(setupGrant.value).toBe('recovery-grant');
+		}
+	);
+
+	it(
+		'preserves recovery-specific failures while binding finish to the one-use transaction',
+		async () => {
+			rememberSetupGrant('recovery-grant');
+			const requests: Array<{ path: string; body: Record<string, string> }> = [];
+			const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+				requests.push({
+					path: String(input),
+					body: JSON.parse(String(init?.body))
+				});
+				if (requests.length === 1) {
+					return new Response(
+						JSON.stringify({
+							code: 'auth.registration_started',
+							message: 'Registration started.',
+							data: { value: 'server-response', transaction: 'recovery-tx' }
+						}),
+						{ status: 200, headers: { 'Content-Type': 'application/json' } }
+					);
+				}
+				return new Response(
+					JSON.stringify({
+						code: 'service.unavailable',
+						message: 'Try again later.',
+						data: null
+					}),
+					{ status: 503, headers: { 'Content-Type': 'application/json' } }
+				);
+			});
+			vi.stubGlobal('fetch', fetchMock);
+			const flow = createCredentialFlow('recovery');
+			const field = { value: 'recovery-password-value' } as HTMLInputElement;
+
+			await flow.submit(field);
+
+			expect(requests.map(({ path }) => path)).toEqual([
+				'/opaque/register/start',
+				'/opaque/register/finish'
+			]);
+			expect(requests[0].body).toEqual({ grant: 'recovery-grant', value: 'request' });
+			expect(requests[1].body).toEqual({ transaction: 'recovery-tx', value: 'record' });
+			expect(
+				requests.every(({ body }) => !JSON.stringify(body).includes('recovery-password-value'))
+			).toBe(true);
+			expect(flow.state.statusMessage).toContain('Recovery could not be completed');
+			expect(flow.state.complete).toBe(false);
+			expect(flow.state.pending).toBe(false);
+			expect(field.value).toBe('');
+			expect(setupGrant.value).toBe('recovery-grant');
+		}
+	);
+
+	it(
+		'completes recovery only after both protocol requests and then clears the grant',
+		async () => {
+			rememberSetupGrant('recovery-grant');
+			const requests: Array<{ path: string; body: Record<string, string> }> = [];
+			const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+				requests.push({ path: String(input), body: JSON.parse(String(init?.body)) });
+				if (requests.length === 1) {
+					return new Response(
+						JSON.stringify({
+							code: 'auth.registration_started',
+							message: 'Registration started.',
+							data: { value: 'server-response', transaction: 'recovery-tx' }
+						}),
+						{ status: 200, headers: { 'Content-Type': 'application/json' } }
+					);
+				}
+				expect(setupGrant.value).toBe('recovery-grant');
+				return new Response(
+					JSON.stringify({
+						code: 'auth.registration_completed',
+						message: 'Registration completed.',
+						data: null
+					}),
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
+				);
+			});
+			vi.stubGlobal('fetch', fetchMock);
+			const flow = createCredentialFlow('recovery');
+			const field = { value: 'recovery-password-value' } as HTMLInputElement;
+
+			await flow.submit(field);
+
+			expect(flow.state.complete).toBe(true);
+			expect(flow.state.statusMessage).toBe(
+				'Administrator password replaced. You can close this page.'
+			);
+			expect(field.value).toBe('');
+			expect(setupGrant.value).toBe('');
+			expect(requests.map(({ path }) => path)).toEqual([
+				'/opaque/register/start',
+				'/opaque/register/finish'
+			]);
+			expect(
+				requests.every(({ body }) => !JSON.stringify(body).includes('recovery-password-value'))
+			).toBe(true);
+		}
+	);
 });
