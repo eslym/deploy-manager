@@ -141,4 +141,39 @@ describe('browser SDK authentication transport', () => {
 		await api.auth.recoveryFinish({ transaction: 'handle', value: 'record' });
 		expect(onSessionEnded).toHaveBeenCalledOnce();
 	});
+
+	it('rejects a known success code for another endpoint without ending the session', async () => {
+		const onSessionEnded = vi.fn();
+		const api = createBrowserSDK({
+			fetch: vi
+				.fn()
+				.mockResolvedValue(
+					response({ code: 'auth.logged_out', message: 'Signed out.', data: null })
+				),
+			onSessionEnded
+		});
+
+		await expect(
+			api.auth.recoveryFinish({ transaction: 'handle', value: 'record' })
+		).rejects.toMatchObject({
+			outcome: { kind: 'invalid_response' }
+		});
+		expect(onSessionEnded).not.toHaveBeenCalled();
+	});
+
+	it('accepts an unknown valid outcome without treating it as the expected success', async () => {
+		const onSessionEnded = vi.fn();
+		const api = createBrowserSDK({
+			fetch: vi
+				.fn()
+				.mockResolvedValue(
+					response({ code: 'auth.future_result', message: 'Try again.', data: null })
+				),
+			onSessionEnded
+		});
+
+		const outcome = await api.auth.recoveryFinish({ transaction: 'handle', value: 'record' });
+		expect(outcome.code).toBe('auth.future_result');
+		expect(onSessionEnded).not.toHaveBeenCalled();
+	});
 });

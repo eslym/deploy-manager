@@ -1040,9 +1040,6 @@ func decodeValue(s string) ([]byte, error) {
 	}
 	return base64.RawURLEncoding.DecodeString(s)
 }
-func jsonValue(w http.ResponseWriter, b []byte) {
-	writeOutcome(w, http.StatusOK, "auth.password_change_started", "Password change started.", map[string]string{"value": base64.RawURLEncoding.EncodeToString(b)})
-}
 func (a *App) registerStart(w http.ResponseWriter, r *http.Request) {
 	m, ok := a.decode(w, r)
 	if !ok {

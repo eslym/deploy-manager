@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
-	import { BrowserSDKError, sdk } from '../../../lib/sdk/index.js';
+	import { sdk, serverErrorCode } from '../../../lib/sdk/index.js';
 
 	let status = $state('Confirm your current password, then choose a new one.');
 	let busy = $state(false);
@@ -12,27 +12,16 @@
 		try {
 			return (await request()).data;
 		} catch (error) {
-			if (
-				error instanceof BrowserSDKError &&
-				error.outcome.kind === 'server' &&
-				error.outcome.code === 'auth.session_required'
-			)
+			const code = serverErrorCode(error);
+			if (code === 'auth.session_required')
 				throw new PasswordChangeError(
 					'Your session is no longer valid. Sign in again, then retry.'
 				);
-			if (
-				error instanceof BrowserSDKError &&
-				error.outcome.kind === 'server' &&
-				error.outcome.code === 'auth.login_failed'
-			)
+			if (code === 'auth.login_failed')
 				throw new PasswordChangeError(
 					'Your current password was not accepted. Check it and try again.'
 				);
-			if (
-				error instanceof BrowserSDKError &&
-				error.outcome.kind === 'server' &&
-				error.outcome.code === 'auth.recent_login_required'
-			)
+			if (code === 'auth.recent_login_required')
 				throw new PasswordChangeError('For security, sign in again before changing your password.');
 			throw new PasswordChangeError(
 				'The secure password change could not be completed. Check your connection and try again.'

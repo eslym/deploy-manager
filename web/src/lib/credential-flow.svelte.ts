@@ -5,7 +5,7 @@ import {
 	markSetupGrantReady
 } from './setup-grant.svelte.js';
 import { rememberSetupGrant } from './setup-grant.svelte.js';
-import { BrowserSDKError, sdk } from './sdk/index.js';
+import { sdk, serverErrorCode } from './sdk/index.js';
 
 export class CredentialFlowError extends Error {}
 
@@ -142,12 +142,10 @@ async function send<T>(
 	try {
 		return (await request()).data;
 	} catch (error) {
-		if (error instanceof BrowserSDKError && error.outcome.kind === 'server') {
-			if (error.outcome.code === 'auth.registration_expired') {
-				throw new CredentialFlowError(
-					`This ${purpose === 'registration' ? 'setup' : 'recovery'} link has expired or was already used. Ask an administrator for a new one.`
-				);
-			}
+		if (serverErrorCode(error) === 'auth.registration_expired') {
+			throw new CredentialFlowError(
+				`This ${purpose === 'registration' ? 'setup' : 'recovery'} link has expired or was already used. Ask an administrator for a new one.`
+			);
 		}
 		throw new CredentialFlowError(
 			`${purpose === 'registration' ? 'Registration' : 'Recovery'} could not be completed. Check your connection and try again.`

@@ -3,6 +3,7 @@ package lib
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"net/http"
 	"time"
 
@@ -78,7 +79,7 @@ func (a *App) passwordChangeStart(w http.ResponseWriter, r *http.Request) {
 		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
-	jsonValue(w, response.Serialize())
+	writeOutcome(w, http.StatusOK, "auth.password_change_started", "Password change started.", map[string]string{"value": base64.RawURLEncoding.EncodeToString(response.Serialize())})
 }
 
 func (a *App) passwordChangeFinish(w http.ResponseWriter, r *http.Request) {

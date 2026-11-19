@@ -22,6 +22,31 @@ export type OutcomeCode =
 	| 'service.unavailable'
 	| 'service.internal_error';
 
+const knownCodes = new Set<string>([
+	'auth.registration_started',
+	'auth.registration_completed',
+	'auth.login_started',
+	'auth.login_completed',
+	'auth.login_failed',
+	'auth.session_valid',
+	'auth.session_required',
+	'auth.logged_out',
+	'auth.password_change_started',
+	'auth.password_changed',
+	'auth.recent_login_required',
+	'auth.protocol_invalid',
+	'auth.registration_expired',
+	'auth.registration_conflict',
+	'auth.capacity_exceeded',
+	'request.https_required',
+	'request.json_required',
+	'request.policy_rejected',
+	'request.origin_rejected',
+	'request.rate_limited',
+	'service.unavailable',
+	'service.internal_error'
+]);
+
 export interface Outcome<T> {
 	code: OutcomeCode | (string & {});
 	message: string;
@@ -50,6 +75,12 @@ export class BrowserSDKError extends Error {
 		super(outcome.message);
 		this.name = 'BrowserSDKError';
 	}
+}
+
+export function serverErrorCode(error: unknown): string | undefined {
+	return error instanceof BrowserSDKError && error.outcome.kind === 'server'
+		? error.outcome.code
+		: undefined;
 }
 
 const safeFallback = 'The request could not be completed. Try again.';
@@ -81,7 +112,8 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		body: unknown,
 		validate: (data: unknown) => data is T,
 		signal?: AbortSignal,
-		protectedRequest = false
+		protectedRequest = false,
+		expectedCode?: OutcomeCode
 	): Promise<Outcome<T>> {
 		let response: Response;
 		try {
@@ -128,6 +160,9 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		if (!validate(parsed.data)) {
 			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
 		}
+		if (expectedCode && knownCodes.has(parsed.code) && parsed.code !== expectedCode) {
+			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
+		}
 		return { code: parsed.code, message: parsed.message, data: parsed.data };
 	}
 
@@ -145,28 +180,80 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	return {
 		auth: {
 			registerStart: (input: { grant: string; value: string }, signal?: AbortSignal) =>
-				request('/opaque/register/start', 'POST', input, isProtocolReply, signal),
+				request(
+					'/opaque/register/start',
+					'POST',
+					input,
+					isProtocolReply,
+					signal,
+					false,
+					'auth.registration_started'
+				),
 			registerFinish: (input: { transaction: string; value: string }, signal?: AbortSignal) =>
-				request('/opaque/register/finish', 'POST', input, isNull, signal),
+				request(
+					'/opaque/register/finish',
+					'POST',
+					input,
+					isNull,
+					signal,
+					false,
+					'auth.registration_completed'
+				),
 			async recoveryFinish(input: { transaction: string; value: string }, signal?: AbortSignal) {
-				const outcome = await request('/opaque/register/finish', 'POST', input, isNull, signal);
-				sessionLossReported = true;
-				adapters.onSessionEnded?.();
+				const outcome = await request(
+					'/opaque/register/finish',
+					'POST',
+					input,
+					isNull,
+					signal,
+					false,
+					'auth.registration_completed'
+				);
+				if (outcome.code === 'auth.registration_completed') {
+					sessionLossReported = true;
+					adapters.onSessionEnded?.();
+				}
 				return outcome;
 			},
 			loginStart: (input: { value: string }, signal?: AbortSignal) =>
-				request('/opaque/login/start', 'POST', input, isProtocolReply, signal),
+				request(
+					'/opaque/login/start',
+					'POST',
+					input,
+					isProtocolReply,
+					signal,
+					false,
+					'auth.login_started'
+				),
 			loginFinish: (input: { transaction: string; value: string }, signal?: AbortSignal) =>
-				request('/opaque/login/finish', 'POST', input, isNull, signal).then((outcome) => {
-					sessionLossReported = false;
+				request(
+					'/opaque/login/finish',
+					'POST',
+					input,
+					isNull,
+					signal,
+					false,
+					'auth.login_completed'
+				).then((outcome) => {
+					if (outcome.code === 'auth.login_completed') sessionLossReported = false;
 					return outcome;
 				}),
 			session: (signal?: AbortSignal) =>
-				request('/api/session', 'GET', undefined, isSession, signal, true),
+				request('/api/session', 'GET', undefined, isSession, signal, true, 'auth.session_valid'),
 			async logout(signal?: AbortSignal) {
-				const outcome = await request('/api/logout', 'POST', undefined, isNull, signal, true);
-				sessionLossReported = true;
-				adapters.onSessionEnded?.();
+				const outcome = await request(
+					'/api/logout',
+					'POST',
+					undefined,
+					isNull,
+					signal,
+					true,
+					'auth.logged_out'
+				);
+				if (outcome.code === 'auth.logged_out') {
+					sessionLossReported = true;
+					adapters.onSessionEnded?.();
+				}
 				return outcome;
 			},
 			passwordChangeStart: (input: { value: string }, signal?: AbortSignal) =>
@@ -176,7 +263,8 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 					input,
 					isPasswordChangeReply,
 					signal,
-					true
+					true,
+					'auth.password_change_started'
 				),
 			async passwordChangeFinish(input: { value: string }, signal?: AbortSignal) {
 				const outcome = await request(
@@ -185,10 +273,13 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 					input,
 					isNull,
 					signal,
-					true
+					true,
+					'auth.password_changed'
 				);
-				sessionLossReported = true;
-				adapters.onSessionEnded?.();
+				if (outcome.code === 'auth.password_changed') {
+					sessionLossReported = true;
+					adapters.onSessionEnded?.();
+				}
 				return outcome;
 			}
 		}
