@@ -140,6 +140,113 @@ below. Statuses shown with multiple values depend on the route or failure stage;
 | `service.unavailable`                                                                                                                                                                                                                                                                                            | 503                                                                   |
 | `service.internal_error`                                                                                                                                                                                                                                                                                         | 500                                                                   |
 
+### Authoritative success route table
+
+This is the shipped method/status/code/message/data contract for every application
+success route. `<provider>` is only `github` or `gitea`; “Existing” payloads are
+described in the route sections below. `null` is JSON null, not an omitted field.
+
+| Method and path | Status | Code | Message | `data` |
+| --- | ---: | --- | --- | --- |
+| POST `/opaque/register/start` | 200 | `auth.registration_started` | Registration started. | Existing value and transaction |
+| POST `/opaque/register/finish` | 200 | `auth.registration_completed` | Registration completed. Sign in to continue. | `null` |
+| POST `/opaque/login/start` | 200 | `auth.login_started` | Sign-in started. | Existing value and transaction |
+| POST `/opaque/login/finish` | 200 | `auth.login_completed` | Signed in. | `null`; session cookie unchanged |
+| POST `/opaque/password/change/start` | 200 | `auth.password_change_started` | Password change started. | Existing value |
+| POST `/opaque/password/change/finish` | 200 | `auth.password_changed` | Password changed. Sign in again. | `null` |
+| GET `/api/session` | 200 | `auth.session_valid` | Signed in. | `{"authenticated":true}` |
+| POST `/api/logout` | 200 | `auth.logged_out` | Signed out. | `null` |
+| GET `/api/projects` | 200 | `project.listed` | Projects loaded. | Project array |
+| POST `/api/projects` | 201 | `project.created` | Project created. | Project |
+| GET `/api/projects/{id}/refs` | 200 | `project.refs_listed` | Cached refs loaded. | Ref array |
+| POST `/api/projects/{id}/refresh` | 200 | `project.refreshed` | Repository refreshed. | Existing `lastFetched` and `warning` |
+| POST `/api/projects/{id}/key` | 200 | `project.key_assigned` | Repository key assigned. | `null` |
+| POST `/api/projects/{id}/cache/recreate` | 200 | `project.cache_cleared` | Repository caches cleared. | `null` |
+| POST `/api/projects/{id}/delete` | 200 | `project.deleted` | Project deleted. | `null` |
+| GET `/api/projects/{id}/lfs` | 200 | `lfs.settings_loaded` | LFS settings loaded. | Existing settings and suggestion |
+| POST `/api/projects/{id}/lfs` | 200 | `lfs.settings_saved` | LFS settings saved. | `null` |
+| GET `/api/projects/{id}/<provider>-webhook` | 200 | `webhook.settings_loaded` | Webhook settings loaded. | Existing configured and URL fields |
+| POST `/api/projects/{id}/<provider>-webhook` | 201 | `webhook.secret_rotated` | Webhook secret rotated. | Existing URL and secret; only here |
+| GET `/api/deployments` | 200 | `deployment.listed` | Deployments loaded. | Deployment array |
+| GET `/api/deployments/root` | 200 | `deployment.root_loaded` | Publication root loaded. | Existing `publicationRoot` |
+| POST `/api/deployments` | 201 | `deployment.created` | Deployment created. Publication queued. | Existing id, jobId, status, publicationPath |
+| POST `/api/deployments/{id}/deploy` | 202 | `deployment.queued` | Deployment queued. | Existing queued response |
+| POST `/api/deployments/{id}/hard-redeploy` | 202 | `deployment.hard_redeploy_queued` | Hard re-deploy queued. | Existing queued response |
+| POST `/api/deployments/{id}/target` | 202 | `deployment.target_changed` | Target changed. Publication queued. | Existing queued response |
+| GET `/api/deployments/{id}/jobs` | 200 | `job.listed` | Jobs loaded. | Job array |
+| GET `/api/deployments/{id}/history` | 200 | `deployment.history_loaded` | Commit history loaded. | Existing commits, page, hasMore |
+| POST `/api/deployments/{id}/rollback` | 202 | `deployment.rollback_queued` | Rollback queued. | Existing queued response |
+| POST `/api/deployments/{id}/pause` | 200 | `deployment.paused` | Automatic deployment paused. | Existing `automationPaused` |
+| POST `/api/deployments/{id}/resume` | 202 | `deployment.resumed` | Automatic deployment resumed. Publication queued. | Existing automationPaused, jobId, status |
+| POST `/api/deployments/{id}/move` | 200 | `deployment.moved` | Publication path changed. | Existing `publicationPath` |
+| POST `/api/deployments/{id}/delete` | 200 | `deployment.deleted` | Deployment deleted. | `null` |
+| GET `/api/repository-keys` | 200 | `repository_key.listed` | Repository keys loaded. | Key array; never private material |
+| POST `/api/repository-keys` | 201 | `repository_key.created` | Repository key created. | Key; never private material |
+| POST `/api/repository-keys/{id}/delete` | 200 | `repository_key.deleted` | Repository key deleted. | `null` |
+| GET `/api/ssh-hosts` | 200 | `ssh_host.listed` | SSH hosts loaded. | Host array |
+| POST `/api/ssh-hosts/approve` | 200 | `ssh_host.approved` | SSH host approved. | `null` |
+| POST `/api/ssh-hosts/revoke` | 200 | `ssh_host.revoked` | SSH host trust revoked. | `null` |
+| POST `/webhooks/<provider>/{id}` | 200 | `webhook.accepted` | Webhook accepted. | `null` |
+
+Acknowledgement intentionally does not distinguish duplicate, ignored, and
+actionable webhook deliveries; it confirms durable handling, not publication.
+Cache clearing does not claim that a fresh clone was created. A successful
+WebSocket handshake is HTTP 101, not a JSON success; its first frame is
+`events.ready`.
+
+### Actionable failure status differences
+
+Errors use the same envelope and ordinarily carry `data: null`. Status depends
+on route and failure stage as follows; entries with alternatives are intentional.
+
+| Code | Status | Route-specific distinction / safe meaning |
+| --- | --- | --- |
+| `request.invalid_json` | 400 | Malformed JSON where decoding is distinguished from field validation. |
+| `request.invalid` | 400 | Invalid fields/confirmation; shared decoder may also classify oversized JSON this way. |
+| `request.policy_rejected` | 403 | Policy or confirmation rejected, including unsafe internal LFS destinations. |
+| `request.origin_rejected` | 403 | Request Origin is not allowed. |
+| `request.not_found` | 404 | Resource or application route not found. |
+| `request.method_not_allowed` | 405 | Unsupported method; preserves `Allow`. |
+| `request.too_large` | 413 or existing 400 | Explicit body bounds return 413; shared decoder can retain 400. |
+| `request.json_required` | 415 | JSON media type is required. |
+| `request.host_rejected` | 421 | Configured application Host mismatch. |
+| `request.https_required` | 426 or 403 | Dashboard/auth transport returns 426; webhook/protocol policy may return 403. |
+| `request.rate_limited` | 429 or 403 | Dashboard mutation limiter is 429; OPAQUE protocol/logout limiter is 403. |
+| `auth.session_required` | 401 | Missing, expired, or revoked session; do not claim which. |
+| `auth.login_failed` | 401 | Safe sign-in failure; no account/credential distinction. |
+| `auth.protocol_invalid` | 400 | Invalid OPAQUE exchange or request. |
+| `auth.registration_expired` | 410 | Registration grant/transaction unavailable; start again. |
+| `auth.registration_conflict` | 409 | Registration is no longer available. |
+| `auth.recent_login_required` | 401 | Re-authenticate before password change; not global session loss. |
+| `auth.capacity_exceeded` | 429 or 503 | Authentication/session capacity, route-specific status. |
+| `request.conflict` | 409 | State changed; refresh before retrying. |
+| `deployment.target_unchanged` | 409 | Selected target is unchanged. |
+| `deployment.already_resumed` | 409 | Automatic deployment is already enabled. |
+| `publication.path_conflict` | 409 | Destination occupied or expected path stale. |
+| `project.has_deployments` | 409 | Delete dependent deployments first. |
+| `repository_key.in_use` | 409 | Key is assigned to a project. |
+| `ssh_host.approval_required` | 409 or 502 | First unapproved host is 409; formerly trusted host becoming untrusted during refresh is 502. |
+| `ssh_host.observation_changed` | 409 | Host observation differs from reviewed details. |
+| `git.target_unavailable` | 400, 409, or 502 | Invalid target on create/refresh/deploy/target change is 400; unavailable rollback branch 409; unclassified remote refresh failure may remain 502. |
+| `git.authentication_failed` | 502 | Repository authentication failed. |
+| `operation.upstream_failed` | Existing upstream status | Classified transient Git HTTP refresh failure; message remains safe. |
+| `webhook.signature_invalid` | 401 | Webhook authentication failed. |
+| `webhook.not_configured` | 404 | Webhook is not configured. |
+| `operation.capacity_exceeded` | 413 or 503 | Repository cache/transfer capacity is 413; unavailable work queue is 503. |
+| `operation.cleanup_pending` | 503 | Accepted deletion; `data` is `{"operationAccepted":true,"recoveryRequired":true}`. |
+| `publication.recovery_required` | 503 | Inspect/reconcile state; do not automatically repeat. |
+| `project.cache_recovery_required` | 503 | Repository cache recovery is required. |
+| `service.maintenance_required` | 503 | Static maintenance result, independent of storage. |
+| `service.unavailable` | 503 | Service is temporarily unavailable. |
+| `service.internal_error` | 500 | Operation could not be completed; diagnostics are withheld. |
+
+Recovery-required results report accepted work only when acceptance is known.
+Otherwise `data` is `null` and callers must read state. Never infer “nothing
+changed” from non-2xx. Messages do not contain raw upstream, filesystem, parser,
+credential, or key diagnostics. SSH handshake library errors remain untyped at
+the adapter boundary, but are narrowed to a fixed safe HTTP outcome; the cause
+is never serialized.
+
 `project.deleted` and `webhook.accepted` are also used for durable completion
 and acknowledgement respectively; `operation.cleanup_pending` means deletion
 was accepted even though cleanup remains. Server errors use
@@ -681,6 +788,16 @@ compatibility guarantee. In particular, avoid assuming every error is JSON or
 every mutation is safely repeatable after a network failure.
 
 Useful behavior checks:
+
+The authenticated route assertions are intentionally spread over real fixtures:
+`outcome_contract_test.go` checks routing/security envelopes,
+`projects_smart_test.go` and `projects_test.go` cover project lifecycle,
+`automation_test.go`, `rollback_app_test.go`, and `tags_app_test.go` cover
+deployment/job/history actions, `repository_keys_test.go` and
+`ssh_projects_test.go` cover keys and trust, `lfs_test.go` covers LFS settings,
+`webhooks_test.go` / `gitea_webhooks_test.go` cover both provider contracts, and
+`registration_transaction_test.go` covers OPAQUE lifecycle. Keep concrete
+status/code/data assertions in these tests; this reference is not a substitute.
 
 | Area                                      | Tests                                                                                                                                                                                                      |
 | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

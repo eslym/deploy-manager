@@ -416,6 +416,39 @@ func TestDeploymentAndJobReadsUseOutcomeEnvelopes(t *testing.T) {
 	}
 }
 
+func TestDeploymentActionableFailuresKeepDistinctCodesAndStatuses(t *testing.T) {
+	f := newAutomationFixture(t)
+	id := f.createBranch(t, "actionable-failures")
+
+	for _, tc := range []struct {
+		name, path, body, code string
+		status                 int
+	}{
+		{
+			name: "unchanged target", path: "/api/deployments/" + id + "/target",
+			body: `{"targetKind":"branch","targetName":"feature/search"}`,
+			code: "deployment.target_unchanged", status: http.StatusConflict,
+		},
+		{
+			name: "already resumed", path: "/api/deployments/" + id + "/resume",
+			body: `{}`, code: "deployment.already_resumed", status: http.StatusConflict,
+		},
+		{
+			name: "unknown deployment", path: "/api/deployments/" + strings.Repeat("0", 32) + "/pause",
+			body: `{}`, code: "request.not_found", status: http.StatusNotFound,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, tc.path, tc.body)
+			defer response.Body.Close()
+			requireOutcome(t, response, tc.code, "null")
+			if response.StatusCode != tc.status {
+				t.Fatalf("status = %d, want %d", response.StatusCode, tc.status)
+			}
+		})
+	}
+}
+
 func TestBranchDeploymentRetriesTransientFetchesButNotAuthenticationFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
