@@ -157,14 +157,14 @@ func (a *App) listSSHHostWarnings(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	rows, err := a.store.SSHHostTrust.Query().Where(sshhosttrust.WarningNEQ("")).Order(sshhosttrust.ByID(), sshhosttrust.ByPort()).All(r.Context())
+	rows, err := a.store.SSHHostTrust.Query().Order(sshhosttrust.ByID(), sshhosttrust.ByPort()).All(r.Context())
 	if err != nil {
 		http.Error(w, "SSH host trust is temporarily unavailable", 500)
 		return
 	}
 	out := []sshHostWarning{}
 	for _, row := range rows {
-		out = append(out, sshHostWarning{Host: row.ID, Port: row.Port, Fingerprint: row.ObservedFingerprint, Warning: row.Warning, Trusted: len(row.TrustedKey) > 0})
+		out = append(out, sshHostWarning{Host: row.ID, Port: row.Port, Fingerprint: row.ObservedFingerprint, Warning: row.Warning, Trusted: len(row.TrustedKey) > 0 && row.Warning == ""})
 	}
 	writeJSON(w, out)
 }
@@ -211,6 +211,53 @@ func (a *App) approveSSHHost(w http.ResponseWriter, r *http.Request) {
 	}
 	if err = tx.Commit(); err != nil {
 		http.Error(w, "SSH host trust is temporarily unavailable", 500)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *App) revokeSSHHost(w http.ResponseWriter, r *http.Request) {
+	if !a.projectAuthorized(w, r, true) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 2048)
+	var input struct {
+		Host        string `json:"host"`
+		Port        int    `json:"port"`
+		Fingerprint string `json:"fingerprint"`
+		Confirm     bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil || !input.Confirm {
+		http.Error(w, "confirm revocation of this SSH host's trust", http.StatusBadRequest)
+		return
+	}
+	host, hostErr := normalizeSSHHostname(input.Host)
+	if hostErr != nil || input.Port < 1 || input.Port > 65535 || !strings.HasPrefix(input.Fingerprint, "SHA256:") {
+		http.Error(w, "invalid SSH host trust revocation", http.StatusBadRequest)
+		return
+	}
+	tx, err := a.store.Tx(r.Context())
+	if err != nil {
+		http.Error(w, "SSH host trust is temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	defer tx.Rollback()
+	row, err := tx.SSHHostTrust.Query().Where(sshhosttrust.IDEQ(host), sshhosttrust.PortEQ(input.Port), sshhosttrust.ObservedFingerprintEQ(input.Fingerprint), sshhosttrust.TrustedKeyNotNil()).Only(r.Context())
+	if err != nil || len(row.TrustedKey) == 0 {
+		http.Error(w, "the trusted SSH host changed or is no longer trusted; refresh the host list", http.StatusConflict)
+		return
+	}
+	res, err := tx.SSHHostTrust.Update().Where(sshhosttrust.IDEQ(host), sshhosttrust.PortEQ(input.Port), sshhosttrust.ObservedFingerprintEQ(input.Fingerprint), sshhosttrust.TrustedKeyEQ(row.TrustedKey)).ClearTrustedKey().SetWarning("SSH host trust was revoked; verify the fingerprint independently before approval").Save(r.Context())
+	if err != nil {
+		http.Error(w, "SSH host trust is temporarily unavailable", http.StatusInternalServerError)
+		return
+	}
+	if res != 1 {
+		http.Error(w, "the trusted SSH host changed; refresh the host list", http.StatusConflict)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		http.Error(w, "SSH host trust is temporarily unavailable", http.StatusInternalServerError)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

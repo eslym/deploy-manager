@@ -141,6 +141,10 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 		t.Fatalf("unknown host warning not persisted: %#v", warnings)
 	}
 	approveSSHHost(t, client, appServer.URL, cookie, warnings[0])
+	trustedHosts := readSSHWarnings(t, client, appServer.URL, cookie)
+	if len(trustedHosts) != 1 || !trustedHosts[0].Trusted || trustedHosts[0].Fingerprint != warnings[0].Fingerprint {
+		t.Fatalf("trusted SSH host missing from host list: %#v", trustedHosts)
+	}
 	createdResponse := create("approved host")
 	if createdResponse.StatusCode != http.StatusCreated {
 		t.Fatalf("approved SSH create status=%d body=%s", createdResponse.StatusCode, responseText(createdResponse))
@@ -154,6 +158,27 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	if len(refs) != 1 || refs[0].Name != "main" {
 		t.Fatalf("SSH refs: %#v", refs)
 	}
+	unconfirmedRevoke := projectPost(t, client, appServer.URL, cookie, "/api/ssh-hosts/revoke", fmt.Sprintf(`{"host":%q,"port":%d,"fingerprint":%q}`, trustedHosts[0].Host, trustedHosts[0].Port, trustedHosts[0].Fingerprint))
+	if unconfirmedRevoke.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unconfirmed SSH host revocation status=%d body=%s", unconfirmedRevoke.StatusCode, responseText(unconfirmedRevoke))
+	}
+	unconfirmedRevoke.Body.Close()
+	revokeSSHHost(t, client, appServer.URL, cookie, trustedHosts[0])
+	revokedHosts := readSSHWarnings(t, client, appServer.URL, cookie)
+	if len(revokedHosts) != 1 || revokedHosts[0].Trusted || revokedHosts[0].Fingerprint != trustedHosts[0].Fingerprint {
+		t.Fatalf("revoked SSH host did not remain listed as untrusted: %#v", revokedHosts)
+	}
+	revokedRefresh := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	revokedMessage := responseText(revokedRefresh)
+	if revokedRefresh.StatusCode != http.StatusBadGateway || !strings.Contains(strings.ToLower(revokedMessage), "ssh host key is not approved") {
+		t.Fatalf("SSH connection after revocation was not blocked: status=%d body=%s", revokedRefresh.StatusCode, revokedMessage)
+	}
+	revokedRefresh.Body.Close()
+	revokedHosts = readSSHWarnings(t, client, appServer.URL, cookie)
+	if len(revokedHosts) != 1 || revokedHosts[0].Trusted || !strings.Contains(revokedHosts[0].Warning, "not approved") {
+		t.Fatalf("revoked SSH host did not return to the unapproved warning state: %#v", revokedHosts)
+	}
+	approveSSHHost(t, client, appServer.URL, cookie, revokedHosts[0])
 	if err = app.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +208,7 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	}
 	changed.Body.Close()
 	changedWarnings := readSSHWarnings(t, client, appServer.URL, cookie)
-	if len(changedWarnings) != 1 || !strings.Contains(changedWarnings[0].Warning, "changed") {
+	if len(changedWarnings) != 1 || changedWarnings[0].Trusted || !strings.Contains(changedWarnings[0].Warning, "changed") {
 		t.Fatalf("changed SSH key warning missing: %#v", changedWarnings)
 	}
 	if refs := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID); !equalProjectRefs(refsBeforeChange, refs) {
@@ -417,6 +442,15 @@ func approveSSHHost(t *testing.T, c *http.Client, origin, cookie string, host ss
 	res := projectPost(t, c, origin, cookie, "/api/ssh-hosts/approve", fmt.Sprintf(`{"host":%q,"port":%d,"fingerprint":%q,"confirm":true}`, host.Host, host.Port, host.Fingerprint))
 	if res.StatusCode != http.StatusNoContent {
 		t.Fatalf("approve SSH host status=%d body=%s", res.StatusCode, responseText(res))
+	}
+	res.Body.Close()
+}
+
+func revokeSSHHost(t *testing.T, c *http.Client, origin, cookie string, host sshHostWarning) {
+	t.Helper()
+	res := projectPost(t, c, origin, cookie, "/api/ssh-hosts/revoke", fmt.Sprintf(`{"host":%q,"port":%d,"fingerprint":%q,"confirm":true}`, host.Host, host.Port, host.Fingerprint))
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("revoke SSH host status=%d body=%s", res.StatusCode, responseText(res))
 	}
 	res.Body.Close()
 }
