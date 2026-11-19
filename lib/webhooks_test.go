@@ -34,7 +34,7 @@ func TestGitHubWebhookValidatesRawSignatureAndDeduplicatesIgnoredDelivery(t *tes
 		group.Add(1)
 		go func() {
 			defer group.Done()
-			if response := sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+projectID, "delivery-one", "push", body, secret); response != http.StatusNoContent {
+			if response := sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+projectID, "delivery-one", "push", body, secret); response != http.StatusOK {
 				failures.Add(1)
 			}
 		}()
@@ -68,8 +68,8 @@ func TestGitHubWebhookValidatesRawSignatureAndDeduplicatesIgnoredDelivery(t *tes
 	if _, err = app.db.Exec(`INSERT INTO project_webhooks(project_id,secret,created_at) VALUES(?,?,?)`, secondProject, sealed, time.Now().UnixNano()); err != nil {
 		t.Fatal(err)
 	}
-	if status := sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+secondProject, "delivery-one", "push", body, secondSecret); status != http.StatusNoContent {
-		t.Fatalf("same delivery ID in a different project status = %d, want 204", status)
+	if status := sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+secondProject, "delivery-one", "push", body, secondSecret); status != http.StatusOK {
+		t.Fatalf("same delivery ID in a different project status = %d, want 200", status)
 	}
 	if status := sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+secondProject, "delivery-one", "push", body, secret); status != http.StatusUnauthorized {
 		t.Fatalf("project A secret authenticated project B request: status=%d", status)
@@ -148,10 +148,13 @@ func TestGitHubWebhookSetupIsProtectedAndRevealsSecretOnlyOnRotation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	var status map[string]any
+	var status struct {
+		Code string         `json:"code"`
+		Data map[string]any `json:"data"`
+	}
 	_ = json.NewDecoder(response.Body).Decode(&status)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK || status["configured"] != true || status["secret"] != nil {
+	if response.StatusCode != http.StatusOK || status.Code != "webhook.settings_loaded" || status.Data["configured"] != true || status.Data["secret"] != nil {
 		t.Fatalf("setup status response = %d %#v", response.StatusCode, status)
 	}
 	request, _ = http.NewRequest(http.MethodPost, urlPath, strings.NewReader(`{"rotate":true}`))
@@ -162,17 +165,20 @@ func TestGitHubWebhookSetupIsProtectedAndRevealsSecretOnlyOnRotation(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	var setup map[string]string
+	var setup struct {
+		Code string            `json:"code"`
+		Data map[string]string `json:"data"`
+	}
 	_ = json.NewDecoder(response.Body).Decode(&setup)
 	response.Body.Close()
-	if response.StatusCode != http.StatusCreated || len(setup["secret"]) != 64 || setup["url"] != "/webhooks/github/"+projectID {
+	if response.StatusCode != http.StatusCreated || setup.Code != "webhook.secret_rotated" || len(setup.Data["secret"]) != 64 || setup.Data["url"] != "/webhooks/github/"+projectID {
 		t.Fatalf("rotation response = %d %#v", response.StatusCode, setup)
 	}
 	var stored []byte
 	if err := app.db.QueryRow(`SELECT secret FROM project_webhooks WHERE project_id=?`, projectID).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(stored), setup["secret"]) {
+	if strings.Contains(string(stored), setup.Data["secret"]) {
 		t.Fatal("webhook secret was stored in plaintext")
 	}
 	request, _ = http.NewRequest(http.MethodGet, urlPath, nil)
@@ -204,10 +210,10 @@ func TestGitHubWebhookCrashWindowsAreDurableAcrossSubprocessRestart(t *testing.T
 				secret, _ := hex.DecodeString(parts[2])
 				client := &http.Client{Timeout: 5 * time.Second}
 				status := sendWebhookWithProxyHeader(client, "http://"+parts[0]+"/webhooks/github/"+parts[1], "after-ack", "push", []byte(`{"ref":"refs/heads/main","after":"`+strings.Repeat("a", 40)+`"}`), secret)
-				if status != http.StatusNoContent {
+				if status != http.StatusOK {
 					_ = cmd.Process.Kill()
 					_ = cmd.Wait()
-					t.Fatalf("delivery status = %d, want 204 before killing process", status)
+					t.Fatalf("delivery status = %d, want 200 before killing process", status)
 				}
 				_ = cmd.Process.Kill()
 				_ = cmd.Wait()
@@ -358,7 +364,25 @@ func sendWebhookWithProxyHeader(client *http.Client, url, id, event string, body
 		return 0
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusOK && !validWebhookAcceptedResponse(response) {
+		return 0
+	}
 	return response.StatusCode
+}
+
+func validWebhookAcceptedResponse(response *http.Response) bool {
+	if !strings.HasPrefix(response.Header.Get("Content-Type"), "application/json") {
+		return false
+	}
+	var outcome struct {
+		Code    string          `json:"code"`
+		Message string          `json:"message"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if json.NewDecoder(response.Body).Decode(&outcome) != nil {
+		return false
+	}
+	return outcome.Code == "webhook.accepted" && outcome.Message != "" && string(outcome.Data) == "null"
 }
 
 func webhookTestApp(t *testing.T, maxBody int64) (*App, string, []byte) {

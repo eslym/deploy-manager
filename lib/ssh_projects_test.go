@@ -255,6 +255,7 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	if staleApproval.StatusCode != http.StatusConflict {
 		t.Fatalf("stale SSH host-key approval status=%d", staleApproval.StatusCode)
 	}
+	requireOutcome(t, staleApproval, "ssh_host.observation_changed", "null")
 	staleApproval.Body.Close()
 	changedWarnings = readSSHWarnings(t, client, appServer.URL, cookie)
 	if len(changedWarnings) != 1 || changedWarnings[0].Fingerprint == "" {
@@ -295,6 +296,7 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	if blockedDelete.StatusCode != http.StatusConflict {
 		t.Fatalf("assigned shared key delete status=%d", blockedDelete.StatusCode)
 	}
+	requireOutcome(t, blockedDelete, "repository_key.in_use", "null")
 	blockedDelete.Body.Close()
 	replacement, err := app.createRepositoryKey("replacement", nil, true)
 	if err != nil {
@@ -308,10 +310,11 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 		assigned.Body.Close()
 	}
 	deleteResponse := projectPost(t, client, appServer.URL, cookie, "/api/repository-keys/"+key.ID+"/delete", `{}`)
-	deleteResponse.Body.Close()
-	if deleteResponse.StatusCode != http.StatusNoContent {
+	if deleteResponse.StatusCode != http.StatusOK {
 		t.Fatalf("assigned shared key delete status=%d", deleteResponse.StatusCode)
 	}
+	requireOutcome(t, deleteResponse, "repository_key.deleted", "null")
+	deleteResponse.Body.Close()
 	// A wrong managed signer is a clear authorization failure and never changes
 	// the project cache or cached ref list.
 	server.rejectAuth.Store(true)
@@ -454,26 +457,34 @@ func readSSHWarnings(t *testing.T, c *http.Client, origin, cookie string) []sshH
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	var out []sshHostWarning
-	if err = json.NewDecoder(res.Body).Decode(&out); err != nil {
+	var envelope struct {
+		Code string           `json:"code"`
+		Data []sshHostWarning `json:"data"`
+	}
+	if err = json.NewDecoder(res.Body).Decode(&envelope); err != nil {
 		t.Fatal(err)
 	}
-	return out
+	if envelope.Code != "ssh_host.listed" {
+		t.Fatalf("SSH host list outcome = %q", envelope.Code)
+	}
+	return envelope.Data
 }
 func approveSSHHost(t *testing.T, c *http.Client, origin, cookie string, host sshHostWarning) {
 	t.Helper()
 	res := projectPost(t, c, origin, cookie, "/api/ssh-hosts/approve", fmt.Sprintf(`{"host":%q,"port":%d,"fingerprint":%q,"confirm":true}`, host.Host, host.Port, host.Fingerprint))
-	if res.StatusCode != http.StatusNoContent {
+	if res.StatusCode != http.StatusOK {
 		t.Fatalf("approve SSH host status=%d body=%s", res.StatusCode, responseText(res))
 	}
+	requireOutcome(t, res, "ssh_host.approved", "null")
 	res.Body.Close()
 }
 
 func revokeSSHHost(t *testing.T, c *http.Client, origin, cookie string, host sshHostWarning) {
 	t.Helper()
 	res := projectPost(t, c, origin, cookie, "/api/ssh-hosts/revoke", fmt.Sprintf(`{"host":%q,"port":%d,"fingerprint":%q,"confirm":true}`, host.Host, host.Port, host.Fingerprint))
-	if res.StatusCode != http.StatusNoContent {
+	if res.StatusCode != http.StatusOK {
 		t.Fatalf("revoke SSH host status=%d body=%s", res.StatusCode, responseText(res))
 	}
+	requireOutcome(t, res, "ssh_host.revoked", "null")
 	res.Body.Close()
 }

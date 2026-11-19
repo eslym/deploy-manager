@@ -72,9 +72,17 @@ func TestRepositoryKeyHTTPPersistsOnlyCiphertextAndFailsClosed(t *testing.T) {
 		b, _ := io.ReadAll(resp.Body)
 		t.Fatalf("import status %d: %s", resp.StatusCode, b)
 	}
-	var key repositoryKey
-	if err = json.NewDecoder(resp.Body).Decode(&key); err != nil {
+	var created struct {
+		Code    string        `json:"code"`
+		Message string        `json:"message"`
+		Data    repositoryKey `json:"data"`
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&created); err != nil {
 		t.Fatal(err)
+	}
+	key := created.Data
+	if created.Code != "repository_key.created" || created.Message == "" {
+		t.Fatalf("unexpected creation outcome: %+v", created)
 	}
 	if key.PublicKey == "" || key.Fingerprint == "" || key.Algorithm != "Ed25519" {
 		t.Fatalf("incomplete public metadata: %+v", key)
@@ -110,11 +118,15 @@ func TestRepositoryKeyHTTPPersistsOnlyCiphertextAndFailsClosed(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	var keys []repositoryKey
-	e = json.NewDecoder(listed.Body).Decode(&keys)
+	var listedOutcome struct {
+		Code    string          `json:"code"`
+		Message string          `json:"message"`
+		Data    []repositoryKey `json:"data"`
+	}
+	e = json.NewDecoder(listed.Body).Decode(&listedOutcome)
 	listed.Body.Close()
-	if e != nil || len(keys) != 1 || keys[0].PublicKey != key.PublicKey {
-		t.Fatalf("public list mismatch: %+v (%v)", keys, e)
+	if e != nil || listedOutcome.Code != "repository_key.listed" || len(listedOutcome.Data) != 1 || listedOutcome.Data[0].PublicKey != key.PublicKey {
+		t.Fatalf("public list mismatch: %+v (%v)", listedOutcome, e)
 	}
 	challenge := []byte("repository key remains usable")
 	if !app.repositoryKeyCanSign(key.ID, challenge) {

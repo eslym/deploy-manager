@@ -55,21 +55,24 @@ func TestGiteaWebhookSetupIsProtectedAndProviderIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var settings map[string]any
+	var settings struct {
+		Code string         `json:"code"`
+		Data map[string]any `json:"data"`
+	}
 	_ = json.NewDecoder(response.Body).Decode(&settings)
 	response.Body.Close()
-	if response.StatusCode != 200 || settings["configured"] != true || settings["secret"] != nil {
+	if response.StatusCode != 200 || settings.Code != "webhook.settings_loaded" || settings.Data["configured"] != true || settings.Data["secret"] != nil {
 		t.Fatalf("settings = %d %#v", response.StatusCode, settings)
 	}
 	body := []byte(`{"ref":"refs/heads/main","after":"` + strings.Repeat("a", 40) + `"}`)
 	url := server.URL + "/webhooks/gitea/" + projectID
-	if status := sendGiteaWebhook(server.Client(), url, "delivery", "push", body, secret); status != 204 {
+	if status := sendGiteaWebhook(server.Client(), url, "delivery", "push", body, secret); status != 200 {
 		t.Fatalf("valid Gitea push = %d", status)
 	}
 	if status := sendGiteaWebhook(server.Client(), url, "delivery", "push", body, githubSecret); status != 401 {
 		t.Fatalf("GitHub secret accepted for Gitea: %d", status)
 	}
-	if status := sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+projectID, "delivery", "push", body, githubSecret); status != 204 {
+	if status := sendGitHubWebhook(server.Client(), server.URL+"/webhooks/github/"+projectID, "delivery", "push", body, githubSecret); status != 200 {
 		t.Fatalf("GitHub regression: %d", status)
 	}
 	rotated := setupProviderWebhook(t, server, cookie, projectID, "gitea")
@@ -79,23 +82,83 @@ func TestGiteaWebhookSetupIsProtectedAndProviderIsolated(t *testing.T) {
 	if status := sendGiteaWebhook(server.Client(), url, "delivery", "push", body, secret); status != 401 {
 		t.Fatalf("old secret still accepted: %d", status)
 	}
-	if status := sendGiteaWebhook(server.Client(), url, "delivery", "push", body, rotated); status != 204 {
+	if status := sendGiteaWebhook(server.Client(), url, "delivery", "push", body, rotated); status != 200 {
 		t.Fatalf("rotated secret = %d", status)
+	}
+}
+
+func TestProviderWebhookAcceptanceUsesStructuredOutcome(t *testing.T) {
+	app, projectID, githubSecret := webhookTestApp(t, 2048)
+	defer app.Close()
+	token := []byte(strings.Repeat("w", 32))
+	app.sessions[sha256.Sum256(token)] = sessionState{expires: time.Now().Add(time.Hour)}
+	cookie := base64.RawURLEncoding.EncodeToString(token)
+	server := httptest.NewTLSServer(app.Handler())
+	defer server.Close()
+	giteaSecret := setupProviderWebhook(t, server, cookie, projectID, "gitea")
+	body := []byte(`{"ref":"refs/heads/unmatched","after":"` + strings.Repeat("a", 40) + `"}`)
+
+	for _, tc := range []struct {
+		provider string
+		secret   []byte
+	}{
+		{provider: "github", secret: githubSecret},
+		{provider: "gitea", secret: giteaSecret},
+	} {
+		t.Run(tc.provider, func(t *testing.T) {
+			request, err := http.NewRequest(http.MethodPost, server.URL+"/webhooks/"+tc.provider+"/"+projectID, strings.NewReader(string(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := hmac.New(sha256.New, tc.secret)
+			_, _ = digest.Write(body)
+			if tc.provider == "github" {
+				request.Header.Set("X-GitHub-Delivery", "structured-"+tc.provider)
+				request.Header.Set("X-GitHub-Event", "push")
+				request.Header.Set("X-Hub-Signature-256", "sha256="+hex.EncodeToString(digest.Sum(nil)))
+			} else {
+				request.Header.Set("X-Gitea-Delivery", "structured-"+tc.provider)
+				request.Header.Set("X-Gitea-Event", "push")
+				request.Header.Set("X-Gitea-Signature", hex.EncodeToString(digest.Sum(nil)))
+			}
+			response, err := server.Client().Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			var outcome struct {
+				Code    string          `json:"code"`
+				Message string          `json:"message"`
+				Data    json.RawMessage `json:"data"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&outcome); err != nil {
+				t.Fatal(err)
+			}
+			if response.StatusCode != http.StatusOK || outcome.Code != "webhook.accepted" || outcome.Message == "" || string(outcome.Data) != "null" {
+				t.Fatalf("webhook outcome = %d %+v", response.StatusCode, outcome)
+			}
+		})
 	}
 }
 
 func setupProviderWebhook(t *testing.T, server *httptest.Server, cookie, projectID, provider string) []byte {
 	t.Helper()
 	response := projectPost(t, server.Client(), server.URL, cookie, "/api/projects/"+projectID+"/"+provider+"-webhook", `{"rotate":true}`)
-	var setup struct{ URL, Secret string }
+	var setup struct {
+		Code string `json:"code"`
+		Data struct {
+			URL    string `json:"url"`
+			Secret string `json:"secret"`
+		} `json:"data"`
+	}
 	err := json.NewDecoder(response.Body).Decode(&setup)
 	response.Body.Close()
-	if response.StatusCode != 201 || err != nil || setup.URL != "/webhooks/"+provider+"/"+projectID || len(setup.Secret) != 64 {
+	if response.StatusCode != 201 || err != nil || setup.Code != "webhook.secret_rotated" || setup.Data.URL != "/webhooks/"+provider+"/"+projectID || len(setup.Data.Secret) != 64 {
 		t.Fatalf("%s setup = %d %+v (%v)", provider, response.StatusCode, setup, err)
 	}
 	// Providers use the literal secret copied from the setup page as the HMAC
 	// key, not the bytes represented by its printable encoding.
-	return []byte(setup.Secret)
+	return []byte(setup.Data.Secret)
 }
 
 func sendGiteaWebhook(client *http.Client, url, id, event string, body, secret []byte) int {
@@ -110,6 +173,9 @@ func sendGiteaWebhook(client *http.Client, url, id, event string, body, secret [
 		return 0
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusOK && !validWebhookAcceptedResponse(response) {
+		return 0
+	}
 	return response.StatusCode
 }
 
@@ -129,10 +195,10 @@ func TestGiteaWebhookRejectsInvalidRequestsAndIgnoresNonBranchEvents(t *testing.
 		{"invalid-json", "push", `{`, 400},
 		{"invalid-ref", "push", `{"ref":"refs/heads/a..b","after":"` + strings.Repeat("a", 40) + `"}`, 400},
 		{"invalid-sha", "push", `{"ref":"refs/heads/main","after":"bad"}`, 400},
-		{"tag-push", "push", `{"ref":"refs/tags/v1","after":"` + strings.Repeat("a", 40) + `"}`, 204},
-		{"delete-push", "push", `{"ref":"refs/heads/main","after":"` + strings.Repeat("0", 40) + `"}`, 204},
-		{"delete-event", "delete", `{"ref":"main","ref_type":"branch"}`, 204},
-		{"unsupported", "issues", `{"action":"opened"}`, 204},
+		{"tag-push", "push", `{"ref":"refs/tags/v1","after":"` + strings.Repeat("a", 40) + `"}`, 200},
+		{"delete-push", "push", `{"ref":"refs/heads/main","after":"` + strings.Repeat("0", 40) + `"}`, 200},
+		{"delete-event", "delete", `{"ref":"main","ref_type":"branch"}`, 200},
+		{"unsupported", "issues", `{"action":"opened"}`, 200},
 		{"missing-id", "push", `{}`, 400},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -182,7 +248,7 @@ func TestGiteaWebhookAcceptedWorkSurvivesProcessLoss(t *testing.T) {
 					t.Fatal(err)
 				}
 				res.Body.Close()
-				if res.StatusCode != 204 {
+				if res.StatusCode != 200 {
 					t.Fatalf("before process loss acknowledgement = %d", res.StatusCode)
 				}
 				_ = child.Process.Kill()
@@ -216,7 +282,7 @@ func TestGiteaWebhookAcceptedWorkSurvivesProcessLoss(t *testing.T) {
 				return
 			}
 			body := []byte(`{"ref":"refs/heads/main","after":"` + strings.Repeat("a", 40) + `"}`)
-			if status := sendGiteaWebhook(server.Client(), server.URL+"/webhooks/gitea/"+projects[0].ID, "crash-window", "push", body, []byte("subprocess test webhook secret")); status != 204 {
+			if status := sendGiteaWebhook(server.Client(), server.URL+"/webhooks/gitea/"+projects[0].ID, "crash-window", "push", body, []byte("subprocess test webhook secret")); status != 200 {
 				t.Fatalf("retry after process loss = %d", status)
 			}
 			if after := publicDeploymentJobs(t, server, cookie, deploymentID); len(after) != len(before) {

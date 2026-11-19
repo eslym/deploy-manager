@@ -1,4 +1,7 @@
+import { createRepositoryOperations, type RepositoryOutcomeCode } from './repository';
+
 export type OutcomeCode =
+	| RepositoryOutcomeCode
 	| 'auth.registration_started'
 	| 'auth.registration_completed'
 	| 'auth.login_started'
@@ -44,7 +47,22 @@ const knownCodes = new Set<string>([
 	'request.origin_rejected',
 	'request.rate_limited',
 	'service.unavailable',
-	'service.internal_error'
+	'service.internal_error',
+	'repository_key.listed',
+	'repository_key.created',
+	'repository_key.deleted',
+	'repository_key.in_use',
+	'ssh_host.listed',
+	'ssh_host.approved',
+	'ssh_host.revoked',
+	'ssh_host.observation_changed',
+	'lfs.settings_loaded',
+	'lfs.settings_saved',
+	'webhook.settings_loaded',
+	'webhook.secret_rotated',
+	'webhook.accepted',
+	'webhook.signature_invalid',
+	'webhook.not_configured'
 ]);
 
 export interface Outcome<T> {
@@ -204,8 +222,10 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		isObject(value) && typeof value.value === 'string';
 	const isSession = (value: unknown): value is { authenticated: true } =>
 		isObject(value) && value.authenticated === true;
+	const repositoryOperations = createRepositoryOperations(request);
 
 	return {
+		...repositoryOperations,
 		auth: {
 			registerStart: (input: { grant: string; value: string }, signal?: AbortSignal) =>
 				request(
@@ -322,3 +342,5 @@ export const sdk = createBrowserSDK({
 	onSessionLost: () => dispatchSessionEvent('deploy-manager:session-lost'),
 	onSessionEnded: () => dispatchSessionEvent('deploy-manager:session-ended')
 });
+
+export default sdk;

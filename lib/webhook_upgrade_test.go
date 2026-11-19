@@ -62,8 +62,13 @@ func TestLegacyGitHubWebhookUsesDisplayedSecretAfterUpgrade(t *testing.T) {
 		t.Fatalf("undisplayed raw source authenticated: %d", status)
 	}
 	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/github-webhook", `{"rotate":true}`)
-	var rotated struct{ Secret string }
-	if response.StatusCode != http.StatusCreated || json.NewDecoder(response.Body).Decode(&rotated) != nil {
+	var rotated struct {
+		Code string `json:"code"`
+		Data struct {
+			Secret string `json:"secret"`
+		} `json:"data"`
+	}
+	if response.StatusCode != http.StatusCreated || json.NewDecoder(response.Body).Decode(&rotated) != nil || rotated.Code != "webhook.secret_rotated" {
 		t.Fatalf("rotation failed: %d", response.StatusCode)
 	}
 	response.Body.Close()
@@ -72,7 +77,7 @@ func TestLegacyGitHubWebhookUsesDisplayedSecretAfterUpgrade(t *testing.T) {
 	if status := sendGitHubWebhook(f.server.Client(), url, "legacy-after-rotation", "push", body, f.secret); status != http.StatusUnauthorized {
 		t.Fatalf("rotated legacy secret still authenticated: %d", status)
 	}
-	f.secret = []byte(rotated.Secret)
+	f.secret = []byte(rotated.Data.Secret)
 	latest = addSmartFixtureCommit(t, f.remoteDir, "rotated literal secret works")
 	f.push(t, "rotated-after-restart", latest)
 	jobs = f.waitJobs(t, id)

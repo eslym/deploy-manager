@@ -1304,12 +1304,18 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	clear(app.rate)
 	app.mu.Unlock()
 	setupResponse := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/projects/"+created.ID+"/github-webhook", `{"rotate":true}`)
-	var webhookSetup struct{ URL, Secret string }
-	if setupResponse.StatusCode != http.StatusCreated || json.NewDecoder(setupResponse.Body).Decode(&webhookSetup) != nil || len(webhookSetup.Secret) != 64 {
+	var webhookSetup struct {
+		Code string `json:"code"`
+		Data struct {
+			URL    string `json:"url"`
+			Secret string `json:"secret"`
+		} `json:"data"`
+	}
+	if setupResponse.StatusCode != http.StatusCreated || json.NewDecoder(setupResponse.Body).Decode(&webhookSetup) != nil || webhookSetup.Code != "webhook.secret_rotated" || len(webhookSetup.Data.Secret) != 64 {
 		t.Fatalf("GitHub webhook setup status %d: %s", setupResponse.StatusCode, responseText(setupResponse))
 	}
 	setupResponse.Body.Close()
-	webhookSecret := []byte(webhookSetup.Secret)
+	webhookSecret := []byte(webhookSetup.Data.Secret)
 	rollbackBeforePush := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/rollback", `{"commit":"`+featureAtCreate+`"}`)
 	var rollbackBeforePushJob struct{ JobID string }
 	if rollbackBeforePush.StatusCode != http.StatusAccepted || json.NewDecoder(rollbackBeforePush.Body).Decode(&rollbackBeforePushJob) != nil {
@@ -1336,10 +1342,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 	stalePush := []byte(`{"ref":"refs/heads/feature/search","after":"` + featureAfter + `","deleted":false}`)
-	webhookURL := branchServer.URL + webhookSetup.URL
+	webhookURL := branchServer.URL + webhookSetup.Data.URL
 	pauseWebhookFetch.Store(true)
-	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-delivery-1", "push", stalePush, webhookSecret); status != http.StatusNoContent {
-		t.Fatalf("signed push status = %d, want 204", status)
+	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-delivery-1", "push", stalePush, webhookSecret); status != http.StatusOK {
+		t.Fatalf("signed push status = %d, want 200", status)
 	}
 	select {
 	case <-webhookFetchStarted:
@@ -1347,8 +1353,8 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatal("webhook-triggered branch fetch did not reach the controlled pause")
 	}
 	for i := 2; i <= 9; i++ {
-		if status := sendGitHubWebhook(branchServer.Client(), webhookURL, fmt.Sprintf("github-burst-%d", i), "push", stalePush, webhookSecret); status != http.StatusNoContent {
-			t.Fatalf("burst delivery %d status = %d, want 204", i, status)
+		if status := sendGitHubWebhook(branchServer.Client(), webhookURL, fmt.Sprintf("github-burst-%d", i), "push", stalePush, webhookSecret); status != http.StatusOK {
+			t.Fatalf("burst delivery %d status = %d, want 200", i, status)
 		}
 	}
 	for _, deploymentID := range []string{branchDeployment.ID, mirrorID} {
@@ -1371,15 +1377,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-delivery-1", "push", stalePush, webhookSecret); status != http.StatusNoContent {
-		t.Fatalf("duplicate push status = %d, want 204", status)
+	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-delivery-1", "push", stalePush, webhookSecret); status != http.StatusOK {
+		t.Fatalf("duplicate push status = %d, want 200", status)
 	}
-	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-tag-event", "create", []byte(`{"ref":"v2.0","ref_type":"tag"}`), webhookSecret); status != http.StatusNoContent {
-		t.Fatalf("tag event status = %d, want 204", status)
+	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-tag-event", "create", []byte(`{"ref":"v2.0","ref_type":"tag"}`), webhookSecret); status != http.StatusOK {
+		t.Fatalf("tag event status = %d, want 200", status)
 	}
 	deletePush := []byte(`{"ref":"refs/heads/feature/search","after":"` + latestTip + `","deleted":true}`)
-	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-branch-deleted", "push", deletePush, webhookSecret); status != http.StatusNoContent {
-		t.Fatalf("branch deletion status = %d, want 204", status)
+	if status := sendGitHubWebhook(branchServer.Client(), webhookURL, "github-branch-deleted", "push", deletePush, webhookSecret); status != http.StatusOK {
+		t.Fatalf("branch deletion status = %d, want 200", status)
 	}
 	if after, identityErr := identity(independentPath); identityErr != nil || after != mainBefore {
 		t.Fatalf("unmatched branch/tag activity affected independent deployment: before=%+v after=%+v err=%v", mainBefore, after, identityErr)
@@ -1407,7 +1413,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 	// This delivery ID already exists for GitHub in this project.
-	if status := sendGiteaWebhook(branchServer.Client(), giteaURL, "github-delivery-1", "push", stalePush, giteaSecret); status != 204 {
+	if status := sendGiteaWebhook(branchServer.Client(), giteaURL, "github-delivery-1", "push", stalePush, giteaSecret); status != 200 {
 		t.Fatalf("cross-provider push = %d", status)
 	}
 	for _, deploymentID := range []string{branchDeployment.ID, mirrorID} {
@@ -1422,7 +1428,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		{"gitea-tag", "push", `{"ref":"refs/tags/v2","after":"` + giteaTip + `"}`},
 		{"gitea-unsupported", "issues", `{"action":"opened"}`},
 	} {
-		if status := sendGiteaWebhook(branchServer.Client(), giteaURL, event.id, event.event, []byte(event.body), giteaSecret); status != 204 {
+		if status := sendGiteaWebhook(branchServer.Client(), giteaURL, event.id, event.event, []byte(event.body), giteaSecret); status != 200 {
 			t.Fatalf("%s status = %d", event.id, status)
 		}
 	}
@@ -1452,7 +1458,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if err := source.Storer.SetReference(plumbing.NewHashReference(featureBranch, plumbing.NewHash(secondTip))); err != nil {
 		t.Fatal(err)
 	}
-	if status := sendGiteaWebhook(branchServer.Client(), branchServer.URL+"/webhooks/gitea/"+secondProject.ID, "github-delivery-1", "push", stalePush, secondSecret); status != 204 {
+	if status := sendGiteaWebhook(branchServer.Client(), branchServer.URL+"/webhooks/gitea/"+secondProject.ID, "github-delivery-1", "push", stalePush, secondSecret); status != 200 {
 		t.Fatalf("cross-project push = %d", status)
 	}
 	waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, secondDeployment.ID, "README.md"), "second Gitea project tip\n")

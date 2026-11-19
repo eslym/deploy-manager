@@ -134,12 +134,20 @@ func newAutomationFixture(t *testing.T, providers ...string) *automationFixture 
 	response.Body.Close()
 	f.projectID = project.ID
 	response = projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/"+f.provider+"-webhook", `{"rotate":true}`)
-	var setup struct{ Secret string }
+	var setup struct {
+		Code string `json:"code"`
+		Data struct {
+			Secret string `json:"secret"`
+		} `json:"data"`
+	}
 	if err = json.NewDecoder(response.Body).Decode(&setup); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	f.secret = []byte(setup.Secret)
+	if setup.Code != "webhook.secret_rotated" || setup.Data.Secret == "" {
+		t.Fatalf("webhook rotation outcome = %+v", setup)
+	}
+	f.secret = []byte(setup.Data.Secret)
 	return f
 }
 
@@ -423,13 +431,13 @@ func (f *automationFixture) action(t *testing.T, id, action, body string) string
 func (f *automationFixture) push(t *testing.T, delivery, commit string) {
 	t.Helper()
 	body := []byte(`{"ref":"refs/heads/feature/search","after":"` + commit + `"}`)
-	status := http.StatusNoContent
+	status := http.StatusOK
 	if f.provider == "gitea" {
 		status = sendGiteaWebhook(f.server.Client(), f.server.URL+"/webhooks/gitea/"+f.projectID, delivery, "push", body, f.secret)
 	} else {
 		status = sendGitHubWebhook(f.server.Client(), f.server.URL+"/webhooks/github/"+f.projectID, delivery, "push", body, f.secret)
 	}
-	if status != http.StatusNoContent {
+	if status != http.StatusOK {
 		t.Fatalf("push status=%d", status)
 	}
 }

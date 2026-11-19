@@ -98,17 +98,17 @@ func (a *App) providerWebhookSettings(w http.ResponseWriter, r *http.Request, pr
 		}
 		configured, err := a.webhookSettingsExist(r.Context(), provider, id)
 		if err != nil {
-			http.Error(w, "webhook settings are unavailable", http.StatusInternalServerError)
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 			return
 		}
 		if !configured {
 			exists, err := a.store.Project.Query().Where(projectmodel.ID(id)).Exist(r.Context())
 			if err != nil || !exists {
-				http.NotFound(w, r)
+				writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 				return
 			}
 		}
-		writeJSON(w, map[string]any{"configured": configured, "url": "/webhooks/" + provider + "/" + id})
+		writeOutcome(w, http.StatusOK, "webhook.settings_loaded", "Webhook settings loaded.", map[string]any{"configured": configured, "url": "/webhooks/" + provider + "/" + id})
 		return
 	}
 	if !a.projectAuthorized(w, r, true) {
@@ -121,16 +121,16 @@ func (a *App) providerWebhookSettings(w http.ResponseWriter, r *http.Request, pr
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&input) != nil || !input.Rotate {
-		http.Error(w, "request a secret rotation", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Request a webhook secret rotation.")
 		return
 	}
 	if err := r.Body.Close(); err != nil {
-		http.Error(w, "request could not be read", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid_json", "Invalid JSON request.")
 		return
 	}
 	secret := make([]byte, 32)
 	if _, err := rand.Read(secret); err != nil {
-		http.Error(w, "webhook secret could not be created", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	// Webhook providers sign with the literal value copied into their Secret
@@ -138,30 +138,30 @@ func (a *App) providerWebhookSettings(w http.ResponseWriter, r *http.Request, pr
 	printableSecret := hex.EncodeToString(secret)
 	sealed, err := a.sealProviderWebhookSecret(provider, id, []byte(printableSecret))
 	if err != nil {
-		http.Error(w, "webhook secret could not be protected", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "webhook secret could not be saved", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	exists, err := tx.Project.Query().Where(projectmodel.ID(id)).Exist(r.Context())
 	if err != nil || !exists {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if err = saveProviderWebhookSecret(r.Context(), tx, provider, id, sealed, a.cfg.Now().UnixNano()); err != nil {
-		http.Error(w, "webhook secret could not be saved", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "webhook secret could not be saved", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSONStatus(w, http.StatusCreated, map[string]string{"url": "/webhooks/" + provider + "/" + id, "secret": printableSecret})
+	writeOutcome(w, http.StatusCreated, "webhook.secret_rotated", "Webhook secret rotated.", map[string]string{"url": "/webhooks/" + provider + "/" + id, "secret": printableSecret})
 	clear(secret)
 }
 
@@ -181,43 +181,43 @@ func (a *App) giteaWebhook(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider string) {
 	if r.Method != http.MethodPost || !a.https(r) {
-		http.Error(w, "request rejected", http.StatusForbidden)
+		writeOutcomeError(w, http.StatusForbidden, "request.https_required", "HTTPS is required.")
 		return
 	}
 	projectID := r.PathValue("id")
 	if !validProjectID(projectID) {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	deliveryID, event, signature := providerWebhookHeaders(r, provider)
 	if !webhookDeliveryID.MatchString(deliveryID) || len(event) == 0 || len(event) > 64 || strings.ContainsAny(event, "\r\n\x00") {
-		http.Error(w, "invalid webhook headers", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Webhook headers are invalid.")
 		return
 	}
 	if provider == githubWebhookProvider {
 		if !strings.HasPrefix(signature, "sha256=") {
-			http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+			writeOutcomeError(w, http.StatusUnauthorized, "webhook.signature_invalid", "Webhook authentication failed.")
 			return
 		}
 		signature = strings.TrimPrefix(signature, "sha256=")
 	}
 	if len(signature) != 64 {
-		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "webhook.signature_invalid", "Webhook authentication failed.")
 		return
 	}
 	expectedSignature, err := hex.DecodeString(signature)
 	if err != nil || len(expectedSignature) != sha256.Size {
-		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "webhook.signature_invalid", "Webhook authentication failed.")
 		return
 	}
 	sealed, err := loadProviderWebhookSecret(r.Context(), a.store, provider, projectID)
 	if err != nil {
-		http.Error(w, "webhook is not configured", http.StatusNotFound)
+		writeOutcomeError(w, http.StatusNotFound, "webhook.not_configured", "Webhook is not configured.")
 		return
 	}
 	secret, err := a.openProviderWebhookSecret(provider, projectID, sealed)
 	if err != nil {
-		http.Error(w, "webhook is unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, a.cfg.WebhookMaxBodyBytes)
@@ -226,22 +226,22 @@ func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider s
 	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
-			http.Error(w, "webhook body is too large", http.StatusRequestEntityTooLarge)
+			writeOutcomeError(w, http.StatusRequestEntityTooLarge, "request.too_large", "Request exceeds the allowed limit.")
 		} else {
-			http.Error(w, "webhook body could not be read", http.StatusBadRequest)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Webhook request could not be read.")
 		}
 		return
 	}
 	secret, err = a.openProviderWebhookSecret(provider, projectID, sealed)
 	if err != nil {
-		http.Error(w, "webhook is unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write(body)
 	clear(secret)
 	if !hmac.Equal(mac.Sum(nil), expectedSignature) {
-		http.Error(w, "invalid webhook signature", http.StatusUnauthorized)
+		writeOutcomeError(w, http.StatusUnauthorized, "webhook.signature_invalid", "Webhook authentication failed.")
 		return
 	}
 	var push githubPush
@@ -249,7 +249,7 @@ func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider s
 	deleted := false
 	if event == "push" {
 		if err := json.Unmarshal(body, &push); err != nil || len(push.Ref) > 1024 || plumbing.ReferenceName(push.Ref).Validate() != nil || !validCommitTarget(push.After) || (!plumbing.ReferenceName(push.Ref).IsBranch() && !(provider == giteaWebhookProvider && plumbing.ReferenceName(push.Ref).IsTag())) {
-			http.Error(w, "invalid push event", http.StatusBadRequest)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Webhook event is invalid.")
 			return
 		}
 		if plumbing.ReferenceName(push.Ref).IsBranch() {
@@ -260,19 +260,19 @@ func (a *App) providerWebhook(w http.ResponseWriter, r *http.Request, provider s
 	clear(body)
 	if err := a.recordWebhookDelivery(provider, projectID, deliveryID, event, branch, deleted); err != nil {
 		if errors.Is(err, errWebhookQueueFull) {
-			http.Error(w, "webhook work queue is full", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "operation.capacity_exceeded", "Work capacity is unavailable. Try again later.")
 		} else {
-			http.Error(w, "webhook could not be durably accepted", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		}
 		return
 	}
 	if a.webhookFault != nil {
 		if err := a.webhookFault("before-ack"); err != nil {
-			http.Error(w, "delivery acknowledgement was interrupted", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 			return
 		}
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "webhook.accepted", "Webhook accepted.", nil)
 }
 
 var errWebhookQueueFull = errors.New("webhook queue full")

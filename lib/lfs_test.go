@@ -81,8 +81,12 @@ func TestLFSSettingsRequireAuthenticatedIndependentApprovalAndPersist(t *testing
 	if err := json.Unmarshal(emptyBody, &emptyShape); err != nil {
 		t.Fatalf("decode unconfigured settings response: %v", err)
 	}
+	var emptyData map[string]json.RawMessage
+	if err := json.Unmarshal(emptyShape["data"], &emptyData); err != nil {
+		t.Fatalf("decode unconfigured settings data: %v", err)
+	}
 	var emptySettings map[string]json.RawMessage
-	if err := json.Unmarshal(emptyShape["settings"], &emptySettings); err != nil {
+	if err := json.Unmarshal(emptyData["settings"], &emptySettings); err != nil {
 		t.Fatalf("decode unconfigured settings: %v", err)
 	}
 	if got := string(emptySettings["objectOrigins"]); got != "[]" {
@@ -108,10 +112,11 @@ func TestLFSSettingsRequireAuthenticatedIndependentApprovalAndPersist(t *testing
 		t.Fatalf("missing internal confirmation status = %d", missingInternalConfirmation.StatusCode)
 	}
 	approved := post(`{"endpoint":"https://127.0.0.1/info/lfs","objectOrigins":["https://127.0.0.1"],"allowInternal":true,"confirmation":"I independently verified these LFS destinations","internalConfirmation":"I independently verified these LFS destinations"}`)
-	approved.Body.Close()
-	if approved.StatusCode != http.StatusNoContent {
+	if approved.StatusCode != http.StatusOK {
 		t.Fatalf("approved settings status = %d", approved.StatusCode)
 	}
+	requireOutcome(t, approved, "lfs.settings_saved", "null")
+	approved.Body.Close()
 	getReq, _ := http.NewRequest(http.MethodGet, server.URL+"/api/projects/"+projectID+"/lfs", nil)
 	getReq.AddCookie(&http.Cookie{Name: sessionCookie, Value: base64.RawURLEncoding.EncodeToString(token)})
 	result, err := client.Do(getReq)
@@ -120,19 +125,22 @@ func TestLFSSettingsRequireAuthenticatedIndependentApprovalAndPersist(t *testing
 	}
 	defer result.Body.Close()
 	var response struct {
-		Settings  lfsProjectSettings `json:"settings"`
-		Suggested string             `json:"suggestedEndpoint"`
+		Code string `json:"code"`
+		Data struct {
+			Settings  lfsProjectSettings `json:"settings"`
+			Suggested string             `json:"suggestedEndpoint"`
+		} `json:"data"`
 	}
 	if result.StatusCode != http.StatusOK || json.NewDecoder(result.Body).Decode(&response) != nil {
 		t.Fatalf("settings GET status = %d", result.StatusCode)
 	}
-	if !response.Settings.AllowInternal || len(response.Settings.InternalAddresses["https://127.0.0.1"]) != 1 || response.Settings.InternalAddresses["https://127.0.0.1"][0] != "127.0.0.1" {
-		t.Fatalf("internal approval was not persisted: %#v", response.Settings)
+	if response.Code != "lfs.settings_loaded" || !response.Data.Settings.AllowInternal || len(response.Data.Settings.InternalAddresses["https://127.0.0.1"]) != 1 || response.Data.Settings.InternalAddresses["https://127.0.0.1"][0] != "127.0.0.1" {
+		t.Fatalf("internal approval was not persisted: %#v", response.Data.Settings)
 	}
-	if want := "https://git.example.test/repository.git/info/lfs"; response.Suggested != want {
-		t.Fatalf("suggested endpoint = %q, want %q", response.Suggested, want)
+	if want := "https://git.example.test/repository.git/info/lfs"; response.Data.Suggested != want {
+		t.Fatalf("suggested endpoint = %q, want %q", response.Data.Suggested, want)
 	}
-	if _, err := url.Parse(response.Settings.Endpoint); err != nil {
+	if _, err := url.Parse(response.Data.Settings.Endpoint); err != nil {
 		t.Fatal(err)
 	}
 }

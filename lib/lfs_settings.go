@@ -25,7 +25,7 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	storedProject, projectErr := a.store.Project.Get(r.Context(), id)
 	if projectErr != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	remote := storedProject.RemoteURL
@@ -34,16 +34,16 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 		stored, err := a.store.ProjectLFSSetting.Get(r.Context(), id)
 		if err == nil {
 			if json.Unmarshal([]byte(stored.ObjectOrigins), &settings.ObjectOrigins) != nil || json.Unmarshal([]byte(stored.InternalAddresses), &settings.InternalAddresses) != nil {
-				http.Error(w, "LFS settings are unavailable", http.StatusInternalServerError)
+				writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 				return
 			}
 			settings.Endpoint = stored.Endpoint
 			settings.AllowInternal = stored.AllowInternal != 0
 		} else if !ent.IsNotFound(err) {
-			http.Error(w, "LFS settings are unavailable", http.StatusInternalServerError)
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 			return
 		}
-		writeJSON(w, map[string]any{"settings": settings, "suggestedEndpoint": suggestedLFSEndpoint(remote)})
+		writeOutcome(w, http.StatusOK, "lfs.settings_loaded", "LFS settings loaded.", map[string]any{"settings": settings, "suggestedEndpoint": suggestedLFSEndpoint(remote)})
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 16<<10)
@@ -57,12 +57,12 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&input) != nil || input.Confirmation != lfsApprovalPhrase || len(input.ObjectOrigins) == 0 || len(input.ObjectOrigins) > 16 {
-		http.Error(w, "confirm independently verified HTTPS LFS destinations", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Confirm the approved HTTPS LFS destinations.")
 		return
 	}
 	endpoint, err := validateLFSEndpoint(input.Endpoint)
 	if err != nil {
-		http.Error(w, "enter an HTTPS LFS endpoint without credentials, query, or fragment", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Enter a valid HTTPS LFS endpoint.")
 		return
 	}
 	origins := make([]string, 0, len(input.ObjectOrigins))
@@ -70,23 +70,23 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 	for _, raw := range input.ObjectOrigins {
 		origin, e := validateLFSOrigin(raw)
 		if e != nil || seen[origin] {
-			http.Error(w, "enter unique HTTPS origins without paths or credentials", http.StatusBadRequest)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Enter unique HTTPS origins without paths or credentials.")
 			return
 		}
 		seen[origin] = true
 		origins = append(origins, origin)
 	}
 	if !seen[originOf(endpoint)] {
-		http.Error(w, "include the LFS endpoint origin in approved object origins", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Include the endpoint origin in approved object origins.")
 		return
 	}
 	if input.AllowInternal && input.InternalConfirm != lfsApprovalPhrase {
-		http.Error(w, "internal destinations require separate independent confirmation", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.policy_rejected", "Confirm internal destinations separately.")
 		return
 	}
 	internalIPs, err := approvedInternalAddresses(input.AllowInternal, append([]string{originOf(endpoint)}, origins...))
 	if err != nil {
-		http.Error(w, "internal destinations could not be safely resolved; verify the origins and try again", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.policy_rejected", "Destinations could not be verified. Review the origins and try again.")
 		return
 	}
 	encoded, _ := json.Marshal(origins)
@@ -100,10 +100,10 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 		err = lookupErr
 	}
 	if err != nil {
-		http.Error(w, "LFS settings could not be saved", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "lfs.settings_saved", "LFS settings saved.", nil)
 }
 
 func suggestedLFSEndpoint(raw string) string {

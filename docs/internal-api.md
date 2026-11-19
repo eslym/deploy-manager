@@ -54,15 +54,16 @@ Use [GLOSSARY.md](../GLOSSARY.md) for deployment/release terminology.
 
 ### Bodies, responses, and errors
 
-Send JSON bodies with `Content-Type: application/json`. Authentication routes
-listed below, authentication guards, and maintenance responses use an outcome
-envelope. Other application routes have not yet migrated and retain their
-existing response forms (including **204** where documented). Times are JSON
-RFC 3339 timestamps, not Unix integers. List responses are bare arrays unless
-stated otherwise. Optional fields marked below may be omitted.
+Send JSON bodies with `Content-Type: application/json`. Authentication,
+repository-key, SSH-host, LFS, webhook-settings, and webhook-ingestion routes,
+their authorization guards, and maintenance responses use an outcome envelope.
+Other application routes retain their existing response forms until their
+coordinated migration slice lands. Times are JSON RFC 3339 timestamps, not Unix
+integers. Unmigrated list responses are bare arrays unless stated otherwise.
+Optional fields marked below may be omitted.
 
 Unmigrated errors generally use Go's `http.Error`: `text/plain; charset=utf-8`
-with a trailing newline. The outcome envelope has exactly `code`, `message`,
+with a trailing newline. Migrated outcomes have exactly `code`, `message`,
 and `data`; `data` is `null` when the operation has no response data. Messages
 are for display, never branching. JSON outcomes use `application/json` and
 `Cache-Control: no-store`.
@@ -88,6 +89,23 @@ their shared rate check rejects a request. Many bounded JSON decoders report an
 oversized/invalid body as **400**, not **413**. Most mutation decoders reject
 unknown fields, but enforcement is not uniform; only OPAQUE and repository-key
 creation explicitly require a single JSON value with no trailing data.
+
+Repository-management outcomes use the stable semantic codes below. Messages are
+short display text; callers branch on code/status, not English wording.
+
+| Code | Status | Meaning |
+| --- | --- | --- |
+| `repository_key.in_use` | 409 | The key remains assigned to a project. |
+| `ssh_host.observation_changed` | 409 | The host observation no longer matches the reviewed fingerprint; refresh and verify again. |
+| `webhook.signature_invalid` | 401 | Provider signature validation failed. |
+| `webhook.not_configured` | 404 | No secret is configured for that project/provider. |
+| `operation.capacity_exceeded` | 503 | Durable webhook work could not be accepted because capacity is unavailable. |
+| `service.unavailable` | 503 | Durable acceptance or another service operation failed; inspect state before retrying a mutation. |
+
+Other validation failures use shared `request.invalid`, `request.invalid_json`,
+`request.json_required`, `request.too_large`, or `request.policy_rejected`
+outcomes as appropriate. Server errors use `service.internal_error` without
+exposing storage, parser, or upstream diagnostics.
 
 `/api/`, `/opaque/`, and `/webhooks/` responses have `Cache-Control: no-store`.
 Unknown backend paths never fall back to the SPA. Frontend shell fallback is
@@ -122,7 +140,7 @@ values, and trailing JSON are rejected.
 
 For example, success is `{"code":"auth.login_completed","message":"Signed in.","data":null}`. Errors use the same shape. Authentication codes include `auth.session_required` (401), `auth.login_failed` (401), `auth.protocol_invalid` (400), `auth.registration_expired` (410), `auth.registration_conflict` (409), `auth.recent_login_required` (401), and `auth.capacity_exceeded` (existing 429). Shared request and service codes are `request.https_required`, `request.json_required`, `request.policy_rejected`, `request.origin_rejected`, `request.rate_limited`, `service.unavailable`, and `service.internal_error`, retaining their existing statuses. Authentication errors do not disclose account existence, password validity, or grant-consumption details.
 
-### Browser SDK (implemented for authentication)
+### Browser SDK (authentication and repository management)
 
 Authentication callers and route guards use the framework-independent
 [`web/src/lib/sdk/index.ts`](../web/src/lib/sdk/index.ts) barrel. It owns
@@ -146,9 +164,14 @@ change flows. Do not import its crypto package from the SDK or ordinary
 dashboard modules. Authentication flows continue to remove setup/recovery
 grants from the URL before submission and never send them in URLs.
 
-This is the first migration slice only. Other dashboard routes still use their
-existing response shapes and callers; their conversion to named SDK methods and
-outcome envelopes remains planned, not implemented.
+Repository management operations are defined in
+[`web/src/lib/sdk/repository.ts`](../web/src/lib/sdk/repository.ts) and wired
+through the same barrel: `sdk.repositoryKeys.list/create/delete`,
+`sdk.sshHosts.list/approve/revoke`, `sdk.lfs.settings/save`, and
+`sdk.webhooks.settings/rotate`. These methods validate endpoint data, encode
+resource IDs, accept an optional `AbortSignal`, and never retry mutations.
+Webhook rotation returns its printable secret only in that authorized response;
+the settings read and live notifications never include it.
 
 ### Flow and state details
 
@@ -378,12 +401,12 @@ operational guidance.
 
 | Method and path | Request / success |
 | --- | --- |
-| GET `/api/repository-keys` | 200 Key[] |
-| POST `/api/repository-keys` | `{"name":"reader","generate":true}` **or** `{"name":"reader","privateKey":"<unprotected-key-text>"}`; 201 Key |
-| POST `/api/repository-keys/{id}/delete` | No body required; 204; 409 if assigned to any project |
-| GET `/api/ssh-hosts` | 200 Host[] |
-| POST `/api/ssh-hosts/approve` | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 204 |
-| POST `/api/ssh-hosts/revoke` | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 204 |
+| GET `/api/repository-keys` | 200 `repository_key.listed`; `data: Key[]` |
+| POST `/api/repository-keys` | `{"name":"reader","generate":true}` **or** `{"name":"reader","privateKey":"<unprotected-key-text>"}`; 201 `repository_key.created`; `data: Key` |
+| POST `/api/repository-keys/{id}/delete` | No body required; 200 `repository_key.deleted`; 409 `repository_key.in_use` if assigned |
+| GET `/api/ssh-hosts` | 200 `ssh_host.listed`; `data: Host[]` |
+| POST `/api/ssh-hosts/approve` | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 200 `ssh_host.approved`; stale observations return 409 `ssh_host.observation_changed` |
+| POST `/api/ssh-hosts/revoke` | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 200 `ssh_host.revoked`; stale observations return 409 `ssh_host.observation_changed` |
 
 **Key:** `id`, `name`, `algorithm`, `bits`, `fingerprint`, `publicKey`, `createdAt`.
 Private keys are never returned. Generation and import are mutually exclusive;
@@ -400,8 +423,8 @@ observation. Approval does not itself retry clone/fetch; retry the failed
 operation afterward.
 
 Revocation requires `confirm: true` and the currently displayed host, port, and
-fingerprint. It clears that host's trusted key and returns **204**; stale or
-already-untrusted entries return **409**. The host remains listed with a warning.
+fingerprint. It clears that host's trusted key; stale or already-untrusted
+entries return **409**. The host remains listed with a warning.
 Subsequent SSH connections are blocked until the observed fingerprint is
 independently verified and approved again.
 
@@ -412,8 +435,8 @@ Sources: [`lfs_settings.go`](../lib/lfs_settings.go),
 
 | Method and path | Request / success |
 | --- | --- |
-| GET `/api/projects/{id}/lfs` | 200 `{"settings":{"endpoint":"","objectOrigins":[],"allowInternal":false},"suggestedEndpoint":"<url-or-empty>"}` |
-| POST `/api/projects/{id}/lfs` | Body below (16 KiB limit); 204 |
+| GET `/api/projects/{id}/lfs` | 200 `lfs.settings_loaded`; `data: {"settings":{"endpoint":"","objectOrigins":[],"allowInternal":false},"suggestedEndpoint":"<url-or-empty>"}` |
+| POST `/api/projects/{id}/lfs` | Body below (16 KiB limit); 200 `lfs.settings_saved`; `data: null` |
 
 Existing settings may additionally include `internalAddresses`, a map of origins
 to approved internal IP-address arrays. `suggestedEndpoint` is a convenience
@@ -446,8 +469,8 @@ not an arbitrary provider parameter.
 
 | Method and path | Request / success |
 | --- | --- |
-| GET `/api/projects/{id}/{provider}-webhook` | 200 `{"configured":true,"url":"/webhooks/<provider>/<project-id>"}` (`configured` may be false) |
-| POST `/api/projects/{id}/{provider}-webhook` | `{"rotate":true}` (1 KiB limit); 201 `{"url":"/webhooks/<provider>/<project-id>","secret":"<new-secret>"}` |
+| GET `/api/projects/{id}/{provider}-webhook` | 200 `webhook.settings_loaded`; `data: {"configured":true,"url":"/webhooks/<provider>/<project-id>"}` (`configured` may be false) |
+| POST `/api/projects/{id}/{provider}-webhook` | `{"rotate":true}` (1 KiB limit); 201 `webhook.secret_rotated`; data contains URL and new secret |
 
 The URL is relative to the application origin. Rotation also initializes an
 unconfigured webhook. Each project/provider has an independent encrypted secret.
@@ -457,9 +480,10 @@ obtained by hex-decoding it. Update provider configuration after rotation.
 
 ### Provider ingestion (signature, no dashboard session/Origin)
 
-`POST /webhooks/github/{id}` and `POST /webhooks/gitea/{id}` return **204** after
-durable acceptance, including duplicate/ignored deliveries. HTTPS is required
-even in explicit HTTP-origin dashboard mode.
+`POST /webhooks/github/{id}` and `POST /webhooks/gitea/{id}` return **200**
+`webhook.accepted` with `data: null` after durable acceptance, including
+duplicate/ignored deliveries. This acknowledges handling, not publication.
+HTTPS is required even in explicit HTTP-origin dashboard mode.
 
 | Provider | Delivery ID | Event | HMAC-SHA256 signature over exact raw body |
 | --- | --- | --- | --- |
@@ -467,8 +491,9 @@ even in explicit HTTP-origin dashboard mode.
 | Gitea | `X-Gitea-Delivery` | `X-Gitea-Event` | `X-Gitea-Signature: <64-hex-digits>` |
 
 Body size is bounded by `WebhookMaxBodyBytes`. Invalid headers/push payloads
-return **400**, bad signatures **401**, unconfigured webhooks **404**, oversized
-bodies **413**, and queue/durable-acceptance failure **503**.
+return **400**, bad signatures `webhook.signature_invalid` (**401**),
+unconfigured webhooks `webhook.not_configured` (**404**), oversized bodies
+**413**, and queue/durable-acceptance failure **503**.
 
 Push bodies use `ref`, `after`, and `deleted`; extra provider fields are ignored.
 `after` must be a full SHA-1 ID, including the all-zero deletion marker.

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import sdk from '#lib/sdk/index.js';
 	let { projectId, provider }: { projectId: string; provider: 'github' | 'gitea' } = $props();
 	const uid = $props.id();
 	let providerName = $derived(provider === 'github' ? 'GitHub' : 'Gitea');
@@ -12,29 +13,12 @@
 	let copied = $state('');
 	let loadVersion = 0;
 
-	async function request(path: string, init?: RequestInit) {
-		const response = await fetch(path, {
-			...init,
-			credentials: 'same-origin',
-			headers: { 'Content-Type': 'application/json', ...init?.headers }
-		});
-		if (!response.ok) {
-			if (response.status === 401 || response.status === 403)
-				throw new Error('Your session may have expired. Sign in again.');
-			throw new Error(
-				response.status >= 500
-					? `${providerName} webhook settings could not be saved. Try again shortly.`
-					: 'The request was rejected. Refresh and try again.'
-			);
-		}
-		return response.status === 204 ? null : response.json();
-	}
-
 	async function load(id: string, version: number) {
 		loading = true;
 		error = '';
 		try {
-			const result: Settings = await request(`/api/projects/${id}/${provider}-webhook`);
+			const outcome = await sdk.webhooks.settings(id, provider);
+			const result: Settings = outcome.data;
 			if (version === loadVersion && id === projectId)
 				settings = { ...result, url: new URL(result.url, window.location.origin).toString() };
 		} catch (cause) {
@@ -61,10 +45,8 @@
 		copied = '';
 		error = '';
 		try {
-			const result: { url: string; secret: string } = await request(
-				`/api/projects/${id}/${provider}-webhook`,
-				{ method: 'POST', body: JSON.stringify({ rotate: true }) }
-			);
+			const outcome = await sdk.webhooks.rotate(id, provider);
+			const result: { url: string; secret: string } = outcome.data;
 			if (version !== loadVersion || id !== projectId) return;
 			secret = result.secret;
 			settings = { configured: true, url: new URL(result.url, window.location.origin).toString() };

@@ -159,14 +159,14 @@ func (a *App) listSSHHostWarnings(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := a.store.SSHHostTrust.Query().Order(sshhosttrust.ByID(), sshhosttrust.ByPort()).All(r.Context())
 	if err != nil {
-		http.Error(w, "SSH host trust is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	out := []sshHostWarning{}
 	for _, row := range rows {
 		out = append(out, sshHostWarning{Host: row.ID, Port: row.Port, Fingerprint: row.ObservedFingerprint, Warning: row.Warning, Trusted: len(row.TrustedKey) > 0 && row.Warning == ""})
 	}
-	writeJSON(w, out)
+	writeOutcome(w, http.StatusOK, "ssh_host.listed", "SSH hosts loaded.", out)
 }
 
 func (a *App) approveSSHHost(w http.ResponseWriter, r *http.Request) {
@@ -181,39 +181,39 @@ func (a *App) approveSSHHost(w http.ResponseWriter, r *http.Request) {
 		Confirm     bool   `json:"confirm"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil || !input.Confirm {
-		http.Error(w, "confirm independent verification before approving this SSH host key", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Verify the SSH fingerprint and confirm approval.")
 		return
 	}
 	host, hostErr := normalizeSSHHostname(input.Host)
 	if hostErr != nil || input.Port < 1 || input.Port > 65535 || !strings.HasPrefix(input.Fingerprint, "SHA256:") {
-		http.Error(w, "invalid SSH host key approval", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the SSH host details and try again.")
 		return
 	}
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "SSH host trust is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	row, err := tx.SSHHostTrust.Query().Where(sshhosttrust.IDEQ(host), sshhosttrust.PortEQ(input.Port), sshhosttrust.ObservedFingerprintEQ(input.Fingerprint), sshhosttrust.ObservedKeyNotNil()).Only(r.Context())
 	if err != nil {
-		http.Error(w, "the observed SSH key has changed; refresh the warning and verify it again", 409)
+		writeOutcomeError(w, http.StatusConflict, "ssh_host.observation_changed", "SSH host details changed. Review them again.")
 		return
 	}
 	res, err := tx.SSHHostTrust.Update().Where(sshhosttrust.IDEQ(host), sshhosttrust.PortEQ(input.Port), sshhosttrust.ObservedFingerprintEQ(input.Fingerprint), sshhosttrust.ObservedKeyEQ(row.ObservedKey)).SetTrustedKey(row.ObservedKey).SetWarning("").Save(r.Context())
 	if err != nil {
-		http.Error(w, "SSH host trust is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if res != 1 {
-		http.Error(w, "the observed SSH key has changed; refresh the warning and verify it again", 409)
+		writeOutcomeError(w, http.StatusConflict, "ssh_host.observation_changed", "SSH host details changed. Review them again.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "SSH host trust is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "ssh_host.approved", "SSH host approved.", nil)
 }
 
 func (a *App) revokeSSHHost(w http.ResponseWriter, r *http.Request) {
@@ -228,37 +228,37 @@ func (a *App) revokeSSHHost(w http.ResponseWriter, r *http.Request) {
 		Confirm     bool   `json:"confirm"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&input); err != nil || !input.Confirm {
-		http.Error(w, "confirm revocation of this SSH host's trust", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Confirm SSH host trust revocation.")
 		return
 	}
 	host, hostErr := normalizeSSHHostname(input.Host)
 	if hostErr != nil || input.Port < 1 || input.Port > 65535 || !strings.HasPrefix(input.Fingerprint, "SHA256:") {
-		http.Error(w, "invalid SSH host trust revocation", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the SSH host details and try again.")
 		return
 	}
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "SSH host trust is temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	row, err := tx.SSHHostTrust.Query().Where(sshhosttrust.IDEQ(host), sshhosttrust.PortEQ(input.Port), sshhosttrust.ObservedFingerprintEQ(input.Fingerprint), sshhosttrust.TrustedKeyNotNil()).Only(r.Context())
 	if err != nil || len(row.TrustedKey) == 0 {
-		http.Error(w, "the trusted SSH host changed or is no longer trusted; refresh the host list", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "ssh_host.observation_changed", "SSH host details changed. Review them again.")
 		return
 	}
 	res, err := tx.SSHHostTrust.Update().Where(sshhosttrust.IDEQ(host), sshhosttrust.PortEQ(input.Port), sshhosttrust.ObservedFingerprintEQ(input.Fingerprint), sshhosttrust.TrustedKeyEQ(row.TrustedKey)).ClearTrustedKey().SetWarning("SSH host trust was revoked; verify the fingerprint independently before approval").Save(r.Context())
 	if err != nil {
-		http.Error(w, "SSH host trust is temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if res != 1 {
-		http.Error(w, "the trusted SSH host changed; refresh the host list", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "ssh_host.observation_changed", "SSH host details changed. Review them again.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "SSH host trust is temporarily unavailable", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "ssh_host.revoked", "SSH host trust revoked.", nil)
 }

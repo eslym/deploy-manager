@@ -425,9 +425,18 @@ func testTemporaryRollbackPreservesPause(t *testing.T, client *http.Client, orig
 	assertPaused()
 	for _, provider := range []string{"github", "gitea"} {
 		response := projectPost(t, client, origin, cookie, "/api/projects/"+projectID+"/"+provider+"-webhook", `{"rotate":true}`)
-		var settings struct{ URL, Secret string }
+		var settings struct {
+			Code string `json:"code"`
+			Data struct {
+				URL    string `json:"url"`
+				Secret string `json:"secret"`
+			} `json:"data"`
+		}
 		if response.StatusCode != 201 || json.NewDecoder(response.Body).Decode(&settings) != nil {
 			t.Fatalf("paused rollback webhook settings %d", response.StatusCode)
+		}
+		if settings.Code != "webhook.secret_rotated" {
+			t.Fatalf("paused rollback webhook outcome %q", settings.Code)
 		}
 		response.Body.Close()
 		body := []byte(`{"ref":"refs/heads/feature/search","after":"` + commit + `"}`)
@@ -435,7 +444,7 @@ func testTemporaryRollbackPreservesPause(t *testing.T, client *http.Client, orig
 		if provider == "gitea" {
 			send = sendGiteaWebhook
 		}
-		if status := send(client, origin+settings.URL, "paused-temporary-rollback-"+provider, "push", body, []byte(settings.Secret)); status != 204 {
+		if status := send(client, origin+settings.Data.URL, "paused-temporary-rollback-"+provider, "push", body, []byte(settings.Data.Secret)); status != 200 {
 			t.Fatalf("paused %s webhook status %d", provider, status)
 		}
 		deadline := time.Now().Add(10 * time.Second)

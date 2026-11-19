@@ -273,14 +273,14 @@ func (a *App) listRepositoryKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	keys, err := a.store.RepositoryKey.Query().Order(repositorykey.ByCreatedAt(), repositorykey.ByID()).All(r.Context())
 	if err != nil {
-		http.Error(w, "repository keys are temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	out := []repositoryKey{}
 	for _, record := range keys {
 		out = append(out, repositoryKey{ID: record.ID, Name: record.Name, Algorithm: record.Algorithm, Bits: record.Bits, Fingerprint: record.Fingerprint, PublicKey: strings.TrimSpace(record.PublicKey), CreatedAt: time.Unix(0, record.CreatedAt).UTC()})
 	}
-	writeJSON(w, out)
+	writeOutcome(w, http.StatusOK, "repository_key.listed", "Repository keys loaded.", out)
 }
 
 func (a *App) addRepositoryKey(w http.ResponseWriter, r *http.Request) {
@@ -290,7 +290,7 @@ func (a *App) addRepositoryKey(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRepositoryPrivateKeyBytes+2048)
 	media, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
 	if err != nil || media != "application/json" {
-		http.Error(w, "JSON content type required", 415)
+		writeOutcomeError(w, http.StatusUnsupportedMediaType, "request.json_required", "JSON content type required.")
 		return
 	}
 	var input struct {
@@ -304,18 +304,18 @@ func (a *App) addRepositoryKey(w http.ResponseWriter, r *http.Request) {
 	if decodeErr != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(decodeErr, &tooLarge) {
-			http.Error(w, "private key request exceeds the size limit", http.StatusRequestEntityTooLarge)
+			writeOutcomeError(w, http.StatusRequestEntityTooLarge, "request.too_large", "Request exceeds the allowed limit.")
 			return
 		}
-		http.Error(w, "invalid key request", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid_json", "Invalid JSON request.")
 		return
 	}
 	if d.Decode(new(any)) != io.EOF || input.Generate == (input.PrivateKey != "") {
-		http.Error(w, "invalid key request", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	if len(input.PrivateKey) > maxRepositoryPrivateKeyBytes {
-		http.Error(w, "private key exceeds the 64 KiB limit", 413)
+		writeOutcomeError(w, http.StatusRequestEntityTooLarge, "request.too_large", "Request exceeds the allowed limit.")
 		return
 	}
 	var private []byte
@@ -325,10 +325,10 @@ func (a *App) addRepositoryKey(w http.ResponseWriter, r *http.Request) {
 	}
 	key, err := a.createRepositoryKey(input.Name, private, input.Generate)
 	if err != nil {
-		http.Error(w, err.Error(), 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
-	writeJSONStatus(w, http.StatusCreated, key)
+	writeOutcome(w, http.StatusCreated, "repository_key.created", "Repository key created.", key)
 }
 
 func (a *App) deleteRepositoryKey(w http.ResponseWriter, r *http.Request) {
@@ -342,32 +342,32 @@ func (a *App) deleteRepositoryKey(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "repository key is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	if _, err := tx.RepositoryKey.Get(r.Context(), id); err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	assignments, err := tx.ProjectSSHKey.Query().Where(projectsshkey.KeyIDEQ(id)).Count(r.Context())
 	if err != nil {
-		http.Error(w, "repository key is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if assignments > 0 {
-		http.Error(w, "remove this key from every SSH project before deleting it", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "repository_key.in_use", "Repository key is assigned to a project.")
 		return
 	}
 	if _, err = tx.RepositoryKey.Delete().Where(repositorykey.IDEQ(id)).Exec(r.Context()); err != nil {
-		http.Error(w, "repository key is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "repository key is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "repository_key.deleted", "Repository key deleted.", nil)
 }
 
 func (a *App) repositoryKeyCanSign(id string, challenge []byte) bool {
