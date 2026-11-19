@@ -321,29 +321,14 @@
 		busy = true;
 		error = '';
 		try {
-			const outcome = await sdk.deployments.remove(id);
-			if (outcome.code !== 'deployment.deleted') {
-				error =
-					'Could not confirm whether deletion completed. Refresh the deployment list before trying again.';
-				return;
-			}
+			await request(`/api/deployments/${id}/delete`, {
+				method: 'POST',
+				body: JSON.stringify({ confirm: true })
+			});
 			deleteConfirmation = false;
 			await goto(`/dashboard/projects/${projectId}`);
 		} catch (cause) {
-			if (
-				cause instanceof BrowserSDKError &&
-				cause.outcome.kind === 'server' &&
-				cause.outcome.status === 503
-			) {
-				error =
-					'Deletion is pending. The published files are protected while cleanup retries; try again later.';
-			} else {
-				error = mutationError(
-					cause,
-					'Could not delete the deployment.',
-					'Could not confirm whether deletion completed. Refresh the deployment list before trying again.'
-				);
-			}
+			error = cause instanceof Error ? cause.message : 'Could not delete the deployment.';
 		} finally {
 			busy = false;
 		}

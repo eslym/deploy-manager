@@ -11,7 +11,6 @@ export type DeploymentOutcomeCode =
 	| 'deployment.rollback_queued'
 	| 'deployment.paused'
 	| 'deployment.resumed'
-	| 'deployment.deleted'
 	| 'job.listed';
 
 export interface Deployment {
@@ -105,7 +104,6 @@ const arrayOf =
 	<T>(validate: (value: unknown) => value is T) =>
 	(value: unknown): value is T[] =>
 		Array.isArray(value) && value.every(validate);
-const nullData = (value: unknown): value is null => value === null;
 const queuedData = (value: unknown): value is { jobId: string; status: 'queued' } =>
 	object(value) && text(value.jobId) && value.status === 'queued';
 
@@ -236,14 +234,6 @@ export function createDeploymentSDK(send: Send) {
 					object(value) && value.automationPaused === false && queuedData(value),
 				signal,
 				'deployment.resumed'
-			),
-		remove: (id: string, signal?: AbortSignal) =>
-			mutate(
-				`/api/deployments/${encodeURIComponent(id)}/delete`,
-				{ confirm: true },
-				nullData,
-				signal,
-				'deployment.deleted'
 			)
 	};
 }

@@ -87,10 +87,10 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	a.cancelDeploymentJobs(id)
 	if err = a.finishDeploymentDeletion(id); err != nil {
-		writeOutcome(w, http.StatusServiceUnavailable, "operation.cleanup_pending", "Cleanup is pending. Refresh before taking further action.", map[string]bool{"operationAccepted": true, "recoveryRequired": true})
+		http.Error(w, "deletion is pending; cleanup is blocked and will be retried", http.StatusServiceUnavailable)
 		return
 	}
-	writeOutcome(w, http.StatusOK, "deployment.deleted", "Deployment deleted.", nil)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (a *App) resumeDeploymentDeletions() error {

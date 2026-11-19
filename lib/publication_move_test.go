@@ -365,15 +365,8 @@ func TestMoveLegacyPublicationPreservesReleaseAndFutureDeletion(t *testing.T) {
 		t.Fatalf("later deployment recreated old path: %v", err)
 	}
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+deployment.ID+"/delete", `{"confirm":true}`)
-	if response.StatusCode != http.StatusOK {
+	if response.StatusCode != http.StatusNoContent {
 		t.Fatalf("delete: %d %s", response.StatusCode, responseText(response))
-	}
-	var deleted struct {
-		Code string `json:"code"`
-		Data any    `json:"data"`
-	}
-	if err := json.NewDecoder(response.Body).Decode(&deleted); err != nil || deleted.Code != "deployment.deleted" || deleted.Data != nil {
-		t.Fatalf("unexpected deployment-delete outcome: %#v %v", deleted, err)
 	}
 	response.Body.Close()
 	if _, err := os.Lstat(newPath); !os.IsNotExist(err) {

@@ -66,17 +66,17 @@ route-specific legacy responses until #70. Other application routes retain
 their existing response forms until their coordinated migration slice lands.
 Times are JSON RFC 3339 timestamps, not Unix integers. Unmigrated list responses
 are bare arrays unless stated otherwise; migrated resource arrays are in
-envelope `data`.
-Optional fields marked below may be omitted.
+envelope `data`. Optional fields marked below may be omitted.
 
-Publication move is deliberately excluded from the typed deployment SDK and
-remains on its pre-migration contract: plain JSON success and plain-text
-failures, including the existing auth/Origin guards. Its atomic move,
+Publication move is deliberately excluded from the typed deployment SDK.
+Its route-specific outcomes remain on the pre-migration contract: plain JSON
+success and plain-text route-specific failures. Shared authorization, Origin,
+transport, and maintenance guards still use their migrated outcome envelopes.
+Its atomic move,
 confirmation, generation, and recovery protections are unchanged. #70 owns
-migrating that action and documenting its typed outcome/recovery behavior. The
-outcome conversion of rollback, pause/resume, and deletion does not complete
-#70's dedicated safety/recovery coverage for those lifecycle actions; that
-ticket still owns its specified handler/browser scenarios and recovery guidance.
+migrating that action and documenting its typed outcome/recovery behavior.
+Rollback and pause/resume outcomes have been converted, but #70 still owns their
+specified handler/browser safety coverage and recovery guidance.
 
 Unmigrated errors generally use Go's `http.Error`: `text/plain; charset=utf-8`
 with a trailing newline. Migrated outcomes have exactly `code`, `message`,
@@ -202,7 +202,8 @@ their separate migration ownership.
 
 Project routes remain on their existing response shapes and callers; their
 conversion to named SDK methods and outcome envelopes remains planned, not
-implemented. Publication move is likewise intentionally deferred to #70.
+implemented. Publication move and deployment deletion are likewise deferred to
+#70; their shared authorization/security guards are already envelope-based.
 
 ### Flow and state details
 
@@ -329,13 +330,15 @@ This confirms queue acceptance, not successful publication.
 | POST `/api/deployments/{id}/rollback` | `{"commit":"<full-sha1>","permanent":false}`; 202 `deployment.rollback_queued`; `data: Queued response` | Branch only; ancestry validation happens in the worker after fetching. |
 | POST `/api/deployments/{id}/pause` | No body required; 200 `deployment.paused`; `data: {"automationPaused":true}` | Branch only; repeated pause succeeds. |
 | POST `/api/deployments/{id}/resume` | No body required; 202 `deployment.resumed`; `data` contains `automationPaused`, `jobId`, and `status: "queued"` | Branch only; immediately queues latest tip; already enabled returns 409. |
-| POST `/api/deployments/{id}/delete` | `{"confirm":true}`; 200 `deployment.deleted`; `data: null` | Supersedes work and removes published files; blocked cleanup can return 503 `operation.cleanup_pending` with accepted/recovery flags. |
+| POST `/api/deployments/{id}/delete` | `{"confirm":true}`; 204 | Supersedes work and removes published files; blocked cleanup returns 503 after durable acceptance and retries cleanup. The route-specific response remains legacy until #70. |
 
 The deployment outcomes migration covers only list/root/create, target changes,
-Deploy, Hard re-deploy, jobs, history, rollback, pause/resume, and deletion.
-Publication move remains on its existing plain-JSON success / plain-text failure
-contract and is intentionally deferred to #70; it is not a typed SDK operation
-in this slice. Its durable move and confirmation safeguards are unchanged.
+Deploy, Hard re-deploy, jobs, history, rollback, and pause/resume. Deployment
+deletion and publication move remain on their existing route-specific response
+contracts and are intentionally deferred to #70; neither is a typed SDK
+operation in this slice. Their shared authorization and Origin guards continue
+to return outcome envelopes. Durable deletion cleanup and move safeguards are
+unchanged.
 
 Create body (8 KiB limit):
 
@@ -365,7 +368,8 @@ No path separators, traversal, symlinks, occupied paths, or reserved destination
 are allowed. Omission on create retains the historical ID-named destination.
 The display name is independent of the publication folder.
 
-Move body (4 KiB limit; legacy route contract, deferred to #70):
+Move body (4 KiB limit; route-specific legacy contract, deferred to #70;
+shared authorization and Origin guards use outcome envelopes):
 
 ```json
 {
