@@ -155,7 +155,7 @@ func (a *App) projectLFSHydrator(projectID string) (*lfsHydrator, error) {
 		return nil, errors.New("project repository configuration is unavailable")
 	}
 	remote := projectRecord.RemoteURL
-	if strings.HasPrefix(remote, "ssh://") {
+	if isSSHRemote(remote) {
 		if _, _, _, _, parseErr := safeSSHRemote(remote); parseErr != nil {
 			return nil, errors.New("private SSH LFS requires an assigned repository key")
 		}

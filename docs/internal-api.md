@@ -170,12 +170,15 @@ list again for measured sizes.
 | POST `/api/projects/{id}/cache/recreate` | `{"confirm":true}`; 204 | Clears Git and verified LFS caches; see limitation below. |
 | POST `/api/projects/{id}/delete` | `{"confirm":true}`; 204 | Blocked with 409 while deployments exist; removes project caches/settings. |
 
-Project creation accepts `keyId` for an `ssh://` URL and requires it for SSH.
+Project creation accepts `keyId` for an `ssh://` URL or conventional SCP-style
+SSH origin (for example, `git@github.com:owner/repo.git`) and requires it for SSH.
 HTTPS is anonymous only and rejects `keyId` and credential-bearing URLs.
-SCP-style shorthand, local/file URLs, and other unsupported Git transports are
-not accepted. Names must be nonblank and at most 100 bytes. Create bodies are
-limited to 8 KiB. Unknown/changed SSH keys block clone/fetch pending independent
-trust approval; creation may return **409** while recording a host warning.
+SCP-style origins use the default SSH port and preserve their relative repository
+path semantics for Git LFS authentication. Local/file URLs and other unsupported
+Git transports are not accepted. Names must be nonblank and at most 100 bytes.
+Create bodies are limited to 8 KiB. Unknown/changed SSH keys block clone/fetch
+pending independent trust approval; creation may return **409** while recording
+a host warning.
 
 **Cache-clearing limitation:** despite its route name, cache recreation currently
 clears caches without immediately cloning them again. A later branch fetch or
