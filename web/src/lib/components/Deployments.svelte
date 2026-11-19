@@ -12,7 +12,6 @@
 	import { onMount } from 'svelte';
 
 	type Ref = { kind: 'branch' | 'tag'; name: string; commit: string };
-	type Project = { id: string; lastFetched: string | null };
 	type Deployment = {
 		id: string;
 		projectId: string;
@@ -38,9 +37,7 @@
 	let refSearch = $state('');
 	let error = $state('');
 	let busy = $state(false);
-	let loadVersion = 0;
 	let viewVersion = 0;
-	let projectReadController: AbortController | undefined;
 	let refreshController: AbortController | undefined;
 	const key = (ref: Ref) => `${ref.kind}:${ref.name}`;
 	let filteredRefs = $derived(
@@ -71,57 +68,6 @@
 				);
 			}
 			throw cause;
-		}
-	}
-
-	async function load(id = projectId, currentView = viewVersion) {
-		projectReadController?.abort();
-		const controller = new AbortController();
-		projectReadController = controller;
-		const version = ++loadVersion;
-		try {
-			const [all, projects, cachedRefs, root]: [
-				Deployment[],
-				Project[],
-				Ref[],
-				{ publicationRoot: string }
-			] = await Promise.all([
-				listDeployments(),
-				sdk.projects.list(controller.signal).then((result) => result.data),
-				sdk.projects.refs(id, controller.signal).then((result) => result.data),
-				sdk.deployments.root().then((outcome) => outcome.data)
-			]);
-			if (
-				controller.signal.aborted ||
-				version !== loadVersion ||
-				currentView !== viewVersion ||
-				id !== projectId
-			)
-				return;
-			refs = cachedRefs;
-			refsLoaded = true;
-			lastFetched = projects.find((project) => project.id === id)?.lastFetched ?? null;
-			publicationRoot = root.publicationRoot;
-			deployments = all.filter((item) => item.projectId === id);
-			deploymentsLoaded = true;
-			error = '';
-		} catch (cause) {
-			if (
-				controller.signal.aborted ||
-				version !== loadVersion ||
-				currentView !== viewVersion ||
-				id !== projectId
-			)
-				return;
-			if (cause instanceof PublicationStatusUnavailableError) {
-				deployments = [];
-				deploymentsLoaded = false;
-				publicationRoot = '';
-			}
-			const message = cause instanceof Error ? cause.message : 'Could not load deployments.';
-			error = refsLoaded
-				? `${message} Refresh and try again. Your current branches and tags are still shown.`
-				: message;
 		}
 	}
 
@@ -173,8 +119,6 @@
 		error = '';
 		try {
 			await sdk.projects.refresh(projectId, controller.signal);
-			if (controller.signal.aborted) return;
-			await load();
 		} catch (cause) {
 			if (controller.signal.aborted) return;
 			const message = cause instanceof Error ? cause.message : 'Could not refresh targets.';
@@ -192,16 +136,75 @@
 	onMount(() => {
 		const id = projectId;
 		const version = ++viewVersion;
-		++loadVersion;
-		void load(id, version);
-		const unsubscribe = sdk.events.subscribe(() => {
-			if (version === viewVersion) void load(id, version);
-		});
+		const current = () => version === viewVersion && id === projectId;
+		const disposers = [
+			sdk.resources.subscribe({
+				identity: { kind: 'deployments' },
+				read: listDeployments,
+				onValue: (all, cause) => {
+					if (!current()) return;
+					if (cause) {
+						if (cause instanceof PublicationStatusUnavailableError) {
+							deployments = [];
+							deploymentsLoaded = false;
+							publicationRoot = '';
+						}
+						error = cause instanceof Error ? cause.message : 'Could not load deployments.';
+						return;
+					}
+					deployments = all!.filter((item) => item.projectId === id);
+					deploymentsLoaded = true;
+					error = '';
+				}
+			}),
+			sdk.resources.subscribe({
+				identity: { kind: 'projects' },
+				read: () => sdk.projects.list().then((result) => result.data),
+				onValue: (projects, cause) => {
+					if (!current()) return;
+					if (cause) {
+						error = cause instanceof Error ? cause.message : 'Could not load project details.';
+						return;
+					}
+					lastFetched = projects!.find((project) => project.id === id)?.lastFetched ?? null;
+				}
+			}),
+			sdk.resources.subscribe({
+				identity: { kind: 'refs', projectId: id },
+				read: () => sdk.projects.refs(id).then((result) => result.data),
+				onValue: (cachedRefs, cause) => {
+					if (!current()) return;
+					if (cause) {
+						const message = cause instanceof Error ? cause.message : 'Could not load targets.';
+						error = refsLoaded
+							? `${message} Refresh and try again. Your current branches and tags are still shown.`
+							: message;
+						return;
+					}
+					refs = cachedRefs!;
+					refsLoaded = true;
+				}
+			}),
+			sdk.resources.subscribe({
+				identity: { kind: 'root' },
+				read: () => sdk.deployments.root().then((outcome) => outcome.data),
+				onValue: (root, cause) => {
+					if (!current()) return;
+					if (cause) {
+						publicationRoot = '';
+						error =
+							cause instanceof PublicationStatusUnavailableError
+								? cause.message
+								: 'Could not load the publication root.';
+						return;
+					}
+					publicationRoot = root!.publicationRoot;
+				}
+			})
+		];
 		return () => {
-			unsubscribe();
+			for (const dispose of disposers) dispose();
 			++viewVersion;
-			++loadVersion;
-			projectReadController?.abort();
 			refreshController?.abort();
 		};
 	});

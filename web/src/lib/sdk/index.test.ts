@@ -284,6 +284,215 @@ describe('browser SDK authentication transport', () => {
 });
 
 describe('browser SDK live event ownership', () => {
+	it('scopes typed resource subscriptions and shares initial reads by complete identity', async () => {
+		const socket = new FakeEventSocket();
+		const api = createBrowserSDK({ webSocket: () => socket });
+		const read = vi.fn(async () => 'initial');
+		const first = vi.fn();
+		const second = vi.fn();
+		const unrelated = vi.fn();
+		const disposeFirst = api.resources.subscribe({
+			identity: { kind: 'deployment', projectId: 'p1', deploymentId: 'd1' },
+			read,
+			onValue: first
+		});
+		const disposeSecond = api.resources.subscribe({
+			identity: { kind: 'deployment', projectId: 'p1', deploymentId: 'd1' },
+			read,
+			onValue: second
+		});
+		api.resources.subscribe({
+			identity: { kind: 'deployment', projectId: 'p1', deploymentId: 'd2' },
+			read: vi.fn(async () => 'd2'),
+			onValue: unrelated
+		});
+		await vi.waitFor(() => {
+			expect(read).toHaveBeenCalledOnce();
+			expect(first).toHaveBeenCalledWith('initial');
+			expect(second).toHaveBeenCalledWith('initial');
+		});
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'epoch', sequence: 1, resources: [{ kind: 'jobs', deploymentId: 'd2' }] }
+			})
+		);
+		await vi.waitFor(() => expect(unrelated).toHaveBeenCalledTimes(3));
+		expect(first).toHaveBeenCalledTimes(2);
+		disposeFirst();
+		disposeSecond();
+	});
+
+	it('retains an invalidation received during a read and suppresses results after disposal', async () => {
+		const socket = new FakeEventSocket();
+		const api = createBrowserSDK({ webSocket: () => socket });
+		const resolvers: Array<(value: number) => void> = [];
+		const read = vi.fn(() => new Promise<number>((resolve) => resolvers.push(resolve)));
+		const receive = vi.fn();
+		const dispose = api.resources.subscribe({
+			identity: { kind: 'jobs', deploymentId: 'd1' },
+			read,
+			onValue: receive
+		});
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'epoch', sequence: 1, resources: [{ kind: 'jobs', deploymentId: 'd1' }] }
+			})
+		);
+		resolvers[0](1);
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+		dispose();
+		resolvers[1](2);
+		await Promise.resolve();
+		expect(receive).toHaveBeenCalledTimes(1);
+		expect(receive).toHaveBeenCalledWith(1);
+	});
+
+	it('refreshes matching reads while keeping history query identities independent', async () => {
+		const socket = new FakeEventSocket();
+		const api = createBrowserSDK({ webSocket: () => socket });
+		const firstHistory = vi.fn(async () => 'first page');
+		const secondHistory = vi.fn(async () => 'second page');
+		const firstValue = vi.fn();
+		const secondValue = vi.fn();
+		api.resources.subscribe({
+			identity: { kind: 'history', deploymentId: 'd1', search: 'main', page: 1, limit: 20 },
+			read: firstHistory,
+			onValue: firstValue
+		});
+		api.resources.subscribe({
+			identity: { kind: 'history', deploymentId: 'd1', search: 'main', page: 2, limit: 20 },
+			read: secondHistory,
+			onValue: secondValue
+		});
+		await vi.waitFor(() => {
+			expect(firstValue).toHaveBeenCalledOnce();
+			expect(secondValue).toHaveBeenCalledOnce();
+		});
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		await vi.waitFor(() => {
+			expect(firstHistory).toHaveBeenCalledTimes(2);
+			expect(secondHistory).toHaveBeenCalledTimes(2);
+		});
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'epoch', sequence: 1, resources: [{ kind: 'history', deploymentId: 'd1' }] }
+			})
+		);
+		await vi.waitFor(() => {
+			expect(firstHistory).toHaveBeenCalledTimes(3);
+			expect(secondHistory).toHaveBeenCalledTimes(3);
+		});
+	});
+
+	it('resynchronizes every active read on a sequence gap or epoch change', async () => {
+		const socket = new FakeEventSocket();
+		const api = createBrowserSDK({ webSocket: () => socket });
+		const firstRead = vi.fn(async () => 'first');
+		const secondRead = vi.fn(async () => 'second');
+		api.resources.subscribe({
+			identity: { kind: 'jobs', deploymentId: 'd1' },
+			read: firstRead,
+			onValue: vi.fn()
+		});
+		api.resources.subscribe({
+			identity: { kind: 'jobs', deploymentId: 'd2' },
+			read: secondRead,
+			onValue: vi.fn()
+		});
+		await vi.waitFor(() => {
+			expect(firstRead).toHaveBeenCalledOnce();
+			expect(secondRead).toHaveBeenCalledOnce();
+		});
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		await vi.waitFor(() => {
+			expect(firstRead).toHaveBeenCalledTimes(2);
+			expect(secondRead).toHaveBeenCalledTimes(2);
+		});
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'epoch', sequence: 2, resources: [{ kind: 'jobs', deploymentId: 'd1' }] }
+			})
+		);
+		await vi.waitFor(() => {
+			expect(firstRead).toHaveBeenCalledTimes(3);
+			expect(secondRead).toHaveBeenCalledTimes(3);
+		});
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'restarted', sequence: 1, resources: [{ kind: 'jobs', deploymentId: 'd1' }] }
+			})
+		);
+		await vi.waitFor(() => {
+			expect(firstRead).toHaveBeenCalledTimes(4);
+			expect(secondRead).toHaveBeenCalledTimes(4);
+		});
+	});
+
+	it('refreshes deployment collections when a job changes deployment state', async () => {
+		const socket = new FakeEventSocket();
+		const api = createBrowserSDK({ webSocket: () => socket });
+		const read = vi.fn(async () => []);
+		api.resources.subscribe({
+			identity: { kind: 'deployments' },
+			read,
+			onValue: vi.fn()
+		});
+		await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.invalidate',
+				data: { epoch: 'epoch', sequence: 1, resources: [{ kind: 'jobs', deploymentId: 'd1' }] }
+			})
+		);
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(3));
+	});
+
 	it('shares one connection, refreshes on ready and invalidation, and closes after the last disposal', () => {
 		const socket = new FakeEventSocket();
 		const webSocket = vi.fn(() => socket);
@@ -469,6 +678,33 @@ describe('browser SDK live event ownership', () => {
 });
 
 describe('browser SDK deployment outcomes', () => {
+	it('refreshes active jobs reads after a successful local deployment mutation', async () => {
+		const api = createBrowserSDK({
+			webSocket: () => new FakeEventSocket(),
+			fetch: vi.fn().mockResolvedValue(
+				response(
+					{
+						code: 'deployment.queued',
+						message: 'Deployment queued.',
+						data: { jobId: 'job-1', status: 'queued' }
+					},
+					202
+				)
+			)
+		});
+		const read = vi.fn(async () => []);
+		api.resources.subscribe({
+			identity: { kind: 'jobs', deploymentId: 'd1' },
+			read,
+			onValue: vi.fn()
+		});
+		await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+
+		await api.deployments.deploy('d1');
+
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(2));
+	});
+
 	it('keeps queue acceptance distinct from the published deployment state', async () => {
 		const send = vi.fn().mockResolvedValue(
 			response(

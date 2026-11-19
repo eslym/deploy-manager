@@ -128,6 +128,37 @@ interface EventSocket {
 	close(): void;
 }
 
+export type EventResource =
+	| { kind: 'projects' }
+	| { kind: 'refs' | 'lfs_settings' | 'webhook_settings'; projectId: string }
+	| { kind: 'deployments'; projectId?: string; deploymentId?: string }
+	| { kind: 'jobs' | 'history'; deploymentId: string }
+	| { kind: 'repository_keys' | 'ssh_hosts' };
+
+export type ResourceIdentity =
+	| { kind: 'deployments' }
+	| { kind: 'deployment'; projectId: string; deploymentId: string }
+	| { kind: 'root' }
+	| { kind: 'projects' }
+	| { kind: 'refs'; projectId: string }
+	| { kind: 'jobs'; deploymentId: string }
+	| { kind: 'history'; deploymentId: string; search: string; page: number; limit: number };
+
+export interface ResourceSubscription<T> {
+	identity: ResourceIdentity;
+	read: () => Promise<T>;
+	onValue: (value: T | undefined, error?: unknown) => void;
+}
+
+interface ResourceReadEntry {
+	identity: ResourceIdentity;
+	read: () => Promise<unknown>;
+	listeners: Set<ResourceSubscription<unknown>['onValue']>;
+	reading: boolean;
+	dirty: boolean;
+	generation: number;
+}
+
 interface SDKAdapters {
 	fetch?: typeof fetch;
 	onSessionLost?: () => void;
@@ -165,6 +196,31 @@ const safeServerMessage = (value: unknown): value is string =>
 	!/[\u0000-\u001f\u007f]/.test(value);
 const isObject = (value: unknown): value is Record<string, unknown> =>
 	typeof value === 'object' && value !== null && !Array.isArray(value);
+const isEventResource = (value: unknown): value is EventResource => {
+	if (!isObject(value) || typeof value.kind !== 'string') return false;
+	switch (value.kind) {
+		case 'projects':
+		case 'repository_keys':
+		case 'ssh_hosts':
+			return true;
+		case 'refs':
+		case 'lfs_settings':
+		case 'webhook_settings':
+			return typeof value.projectId === 'string' && value.projectId.length > 0;
+		case 'jobs':
+		case 'history':
+			return typeof value.deploymentId === 'string' && value.deploymentId.length > 0;
+		case 'deployments':
+			return (
+				(value.projectId === undefined ||
+					(typeof value.projectId === 'string' && value.projectId.length > 0)) &&
+				(value.deploymentId === undefined ||
+					(typeof value.deploymentId === 'string' && value.deploymentId.length > 0))
+			);
+		default:
+			return false;
+	}
+};
 const isOutcome = (value: unknown): value is Outcome<unknown> =>
 	isObject(value) &&
 	typeof value.code === 'string' &&
@@ -179,7 +235,8 @@ function cancelled(cause: unknown): boolean {
 export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	const transport: typeof fetch = adapters.fetch ?? ((input, init) => fetch(input, init));
 	let sessionLossReported = false;
-	const subscribers = new Set<() => void>();
+	const subscribers = new Set<(resources?: EventResource[]) => void>();
+	const resourceReads = new Map<string, ResourceReadEntry>();
 	let eventSocket: EventSocket | undefined;
 	let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	let healthyTimer: ReturnType<typeof setTimeout> | undefined;
@@ -193,8 +250,156 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	const unschedule = adapters.clearTimeout ?? ((timer) => clearTimeout(timer));
 	const random = adapters.random ?? Math.random;
 
-	function notifyInvalidation(): void {
-		for (const listener of [...subscribers]) listener();
+	function notifyInvalidation(resources?: EventResource[]): void {
+		for (const listener of [...subscribers]) listener(resources);
+		for (const entry of resourceReads.values()) {
+			if (!resources || resources.some((resource) => resourceMatches(entry.identity, resource))) {
+				invalidateRead(entry);
+			}
+		}
+	}
+
+	function identityKey(identity: ResourceIdentity): string {
+		switch (identity.kind) {
+			case 'deployments':
+			case 'deployment':
+			case 'root':
+			case 'projects':
+				return identity.kind === 'deployment'
+					? JSON.stringify([identity.kind, identity.projectId, identity.deploymentId])
+					: JSON.stringify([identity.kind]);
+			case 'refs':
+				return JSON.stringify([identity.kind, identity.projectId]);
+			case 'jobs':
+				return JSON.stringify([identity.kind, identity.deploymentId]);
+			case 'history':
+				return JSON.stringify([
+					identity.kind,
+					identity.deploymentId,
+					identity.search,
+					identity.page,
+					identity.limit
+				]);
+		}
+	}
+
+	function resourceMatches(identity: ResourceIdentity, resource: EventResource): boolean {
+		switch (identity.kind) {
+			case 'deployments':
+				return resource.kind === 'deployments' || resource.kind === 'jobs';
+			case 'deployment':
+				return (
+					(resource.kind === 'deployments' &&
+						(resource.deploymentId === undefined ||
+							resource.deploymentId === identity.deploymentId) &&
+						(resource.projectId === undefined || resource.projectId === identity.projectId)) ||
+					(resource.kind === 'jobs' && resource.deploymentId === identity.deploymentId)
+				);
+			case 'root':
+				return false;
+			case 'projects':
+				return resource.kind === 'projects' || resource.kind === 'refs';
+			case 'refs':
+				return resource.kind === 'refs' && resource.projectId === identity.projectId;
+			case 'jobs':
+				return resource.kind === 'jobs' && resource.deploymentId === identity.deploymentId;
+			case 'history':
+				return resource.kind === 'history' && resource.deploymentId === identity.deploymentId;
+		}
+	}
+
+	function invalidateRead(entry: ResourceReadEntry): void {
+		if (entry.reading) {
+			entry.dirty = true;
+			return;
+		}
+		void readResource(entry);
+	}
+
+	async function readResource(entry: ResourceReadEntry): Promise<void> {
+		if (entry.reading || entry.listeners.size === 0) return;
+		entry.reading = true;
+		entry.dirty = false;
+		const generation = entry.generation;
+		try {
+			const value = await entry.read();
+			if (entry.generation === generation) {
+				for (const listener of [...entry.listeners]) listener(value);
+			}
+		} catch (error) {
+			if (entry.generation === generation) {
+				for (const listener of [...entry.listeners]) listener(undefined, error);
+			}
+		} finally {
+			entry.reading = false;
+			if (entry.dirty && entry.listeners.size > 0) void readResource(entry);
+			else if (entry.listeners.size === 0) resourceReads.delete(identityKey(entry.identity));
+		}
+	}
+
+	function subscribeResource<T>(subscription: ResourceSubscription<T>): () => void {
+		const key = identityKey(subscription.identity);
+		let entry = resourceReads.get(key);
+		if (!entry) {
+			entry = {
+				identity: subscription.identity,
+				read: subscription.read,
+				listeners: new Set(),
+				reading: false,
+				dirty: false,
+				generation: 0
+			};
+			resourceReads.set(key, entry);
+		}
+		const listener: ResourceSubscription<unknown>['onValue'] = (value, error) =>
+			error === undefined
+				? subscription.onValue(value as T | undefined)
+				: subscription.onValue(value as T | undefined, error);
+		entry.listeners.add(listener);
+		if (!entry.reading) void readResource(entry);
+		const disposeEvents = subscribeToInvalidations(() => {});
+		return () => {
+			entry!.listeners.delete(listener);
+			disposeEvents();
+			if (entry!.listeners.size === 0) {
+				entry!.generation++;
+				entry!.dirty = entry!.reading;
+				if (!entry!.reading) resourceReads.delete(key);
+			}
+		};
+	}
+
+	function refreshResources(identity?: ResourceIdentity): void {
+		for (const entry of resourceReads.values()) {
+			if (!identity || identityKey(entry.identity) === identityKey(identity)) {
+				invalidateRead(entry);
+			}
+		}
+	}
+
+	function invalidateAfterMutation(path: string): void {
+		const projectRefresh = path.match(/^\/api\/projects\/([^/]+)\/refresh$/);
+		if (projectRefresh) {
+			notifyInvalidation([
+				{ kind: 'projects' },
+				{ kind: 'refs', projectId: decodeURIComponent(projectRefresh[1]) }
+			]);
+			return;
+		}
+		if (path === '/api/deployments') {
+			notifyInvalidation([{ kind: 'deployments' }]);
+			return;
+		}
+		const match = path.match(
+			/^\/api\/deployments\/([^/]+)\/(deploy|hard-redeploy|target|rollback|resume|pause|move|delete)$/
+		);
+		if (!match) return;
+		const deploymentId = decodeURIComponent(match[1]);
+		const resources: EventResource[] = [{ kind: 'deployments', deploymentId }];
+		if (['deploy', 'hard-redeploy', 'target', 'rollback', 'resume', 'delete'].includes(match[2])) {
+			resources.push({ kind: 'jobs', deploymentId });
+		}
+		notifyInvalidation(resources);
 	}
 
 	function reportEventSessionLoss(): void {
@@ -284,21 +489,16 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 					!Number.isSafeInteger(frame.data.sequence) ||
 					(frame.data.sequence as number) < 1 ||
 					!Array.isArray(frame.data.resources) ||
-					!frame.data.resources.every(
-						(resource) =>
-							isObject(resource) &&
-							typeof resource.kind === 'string' &&
-							resource.kind.length > 0 &&
-							(resource.projectId === undefined || typeof resource.projectId === 'string') &&
-							(resource.deploymentId === undefined || typeof resource.deploymentId === 'string')
-					)
+					!frame.data.resources.every(isEventResource)
 				) {
 					socket.close();
 					return;
 				}
 				const sequence = frame.data.sequence as number;
 				if (frame.data.epoch === eventEpoch && sequence <= eventSequence) return;
-				notifyInvalidation();
+				const epochChanged = frame.data.epoch !== eventEpoch;
+				const sequenceGap = !epochChanged && sequence > eventSequence + 1;
+				notifyInvalidation(epochChanged || sequenceGap ? undefined : frame.data.resources);
 				eventEpoch = frame.data.epoch;
 				eventSequence = sequence;
 				return;
@@ -342,7 +542,9 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		}, delay);
 	}
 
-	function subscribeToInvalidations(onInvalidate: () => void): () => void {
+	function subscribeToInvalidations(
+		onInvalidate: (resources?: EventResource[]) => void
+	): () => void {
 		subscribers.add(onInvalidate);
 		disposedEvents = false;
 		connectEvents();
@@ -378,7 +580,9 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 				body: body === undefined ? undefined : JSON.stringify(body),
 				signal
 			});
+			if (method === 'POST') invalidateAfterMutation(path);
 		} catch (cause) {
+			if (method === 'POST') invalidateAfterMutation(path);
 			const isCancelled = signal?.aborted || cancelled(cause);
 			if (isCancelled) {
 				throw new BrowserSDKError({
@@ -442,7 +646,8 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 				message: safeFallback
 			});
 		}
-		return { code: parsed.code, message: parsed.message, data: parsed.data };
+		const outcome = { code: parsed.code, message: parsed.message, data: parsed.data };
+		return outcome;
 	}
 
 	const isNull = (value: unknown): value is null => value === null;
@@ -459,6 +664,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 	return {
 		...repositoryOperations,
 		events: { subscribe: subscribeToInvalidations },
+		resources: { subscribe: subscribeResource, refresh: refreshResources },
 		deployments: createDeploymentSDK(request),
 		auth: {
 			registerStart: (input: { grant: string; value: string }, signal?: AbortSignal) =>

@@ -62,9 +62,7 @@
 	let reservedMovePath = $derived(isReservedPublicationFolder(movePath));
 	let validMovePath = $derived(isValidPublicationFolder(movePath));
 	let movePreview = $derived(publicationFolderPreview(publicationRoot, movePath));
-	let loadVersion = 0;
 	let viewVersion = 0;
-	let projectReadController: AbortController | undefined;
 	let refreshController: AbortController | undefined;
 	const key = (ref: Ref) => `${ref.kind}:${ref.name}`;
 	let matchingRefs = $derived(
@@ -110,100 +108,8 @@
 		return cause instanceof Error ? cause.message : fallback;
 	}
 
-	async function load(id = projectId, deployment = deploymentId, currentView = viewVersion) {
-		if (!id || !deployment) return;
-		projectReadController?.abort();
-		const controller = new AbortController();
-		projectReadController = controller;
-		const version = ++loadVersion;
-		const current = () =>
-			!controller.signal.aborted &&
-			version === loadVersion &&
-			currentView === viewVersion &&
-			id === projectId &&
-			deployment === deploymentId;
-		try {
-			const [all, projects]: [Deployment[], Project[]] = await Promise.all([
-				listDeployments(),
-				sdk.projects.list(controller.signal).then((result) => result.data)
-			]);
-			if (!current()) return;
-			publicationStatusError = '';
-			const foundProject = projects.find((candidate) => candidate.id === id);
-			const found = all.find(
-				(candidate) => candidate.id === deployment && candidate.projectId === id
-			);
-			if (!foundProject || !found) {
-				project = null;
-				item = null;
-				missing = true;
-				loading = false;
-				jobs = null;
-				return;
-			}
-			project = foundProject;
-			const previousTarget = item && `${item.targetKind}:${item.targetName ?? ''}`;
-			if (item?.publicationPath && item.publicationPath !== found.publicationPath)
-				moveConfirmation = null;
-			item = found;
-			if (!targetSelection || previousTarget !== `${found.targetKind}:${found.targetName ?? ''}`)
-				targetSelection =
-					(found.targetKind === 'branch' || found.targetKind === 'tag') && found.targetName
-						? `${found.targetKind}:${found.targetName}`
-						: `commit:${found.commit}`;
-			loading = false;
-			missing = false;
-			// Only fetch deployment-scoped data after the project/deployment association is verified.
-			const [refsResult, jobsResult, rootResult] = await Promise.allSettled([
-				sdk.projects.refs(id, controller.signal).then((result) => result.data),
-				sdk.deployments.jobs(deployment).then((outcome) => outcome.data) as Promise<Job[]>,
-				sdk.deployments.root().then((outcome) => outcome.data)
-			]);
-			if (!current()) return;
-			if (refsResult.status === 'fulfilled') {
-				refs = refsResult.value;
-				refsLoaded = true;
-				refsError = '';
-			} else {
-				const message =
-					refsResult.reason instanceof Error
-						? refsResult.reason.message
-						: 'Could not load targets.';
-				refsError = refsLoaded
-					? `${message} Refresh and try again. Your current branches and tags are still shown.`
-					: message;
-			}
-			if (jobsResult.status === 'fulfilled') {
-				jobs = jobsResult.value;
-				historyStatus = 'loaded';
-				historyError = '';
-			} else {
-				historyStatus = 'error';
-				historyError = 'The history could not be refreshed. Try again shortly.';
-			}
-			if (rootResult.status === 'fulfilled') {
-				publicationRoot = rootResult.value.publicationRoot;
-				moveRootError = '';
-			} else {
-				publicationRoot = '';
-				moveRootError =
-					'Could not load the publication root. Refresh the page to move this deployment.';
-			}
-		} catch (cause) {
-			if (!current()) return;
-			loading = false;
-			if (cause instanceof PublicationStatusUnavailableError) {
-				item = null;
-				jobs = null;
-				publicationRoot = '';
-				moveConfirmation = null;
-				moveOpen = false;
-				publicationStatusError = cause.message;
-				error = '';
-			} else {
-				error = cause instanceof Error ? cause.message : 'Could not load deployment.';
-			}
-		}
+	function refreshActiveReads() {
+		sdk.resources.refresh();
 	}
 
 	async function refreshRefs() {
@@ -217,7 +123,7 @@
 		try {
 			await sdk.projects.refresh(projectId, controller.signal);
 			if (controller.signal.aborted) return;
-			await load();
+			refreshActiveReads();
 		} catch (cause) {
 			if (controller.signal.aborted) return;
 			const message = cause instanceof Error ? cause.message : 'Could not refresh targets.';
@@ -247,7 +153,7 @@
 					'Could not confirm whether this action was accepted. Check Latest deployment before trying again.';
 				return;
 			}
-			await load();
+			refreshActiveReads();
 		} catch (cause) {
 			error = mutationError(
 				cause,
@@ -296,7 +202,7 @@
 					'Could not confirm whether the target change was accepted. Refresh deployment details before trying again.';
 				return;
 			}
-			await load();
+			refreshActiveReads();
 		} catch (cause) {
 			error = mutationError(
 				cause,
@@ -371,7 +277,7 @@
 			moveConfirmation = null;
 			movePath = '';
 			moveOpen = false;
-			await load();
+			refreshActiveReads();
 		} catch (cause) {
 			if (!isCurrent()) return;
 			moveConfirmation = null;
@@ -389,17 +295,18 @@
 		}
 	}
 
-	let unsubscribeEvents: (() => void) | undefined;
+	let resourceDisposers: Array<() => void> = [];
+	let scopedDisposers: Array<() => void> = [];
 	afterNavigate(() => {
 		const id = projectId;
 		const deployment = deploymentId;
 		const version = ++viewVersion;
-		++loadVersion;
-		projectReadController?.abort();
 		refreshController?.abort();
 		refreshController = undefined;
-		unsubscribeEvents?.();
-		unsubscribeEvents = undefined;
+		for (const dispose of resourceDisposers) dispose();
+		resourceDisposers = [];
+		for (const dispose of scopedDisposers) dispose();
+		scopedDisposers = [];
 		project = null;
 		item = null;
 		refs = [];
@@ -420,16 +327,154 @@
 		moveConfirmation = null;
 		publicationRoot = '';
 		moveRootError = '';
-		void load(id, deployment, version);
-		unsubscribeEvents = sdk.events.subscribe(() => {
-			if (version === viewVersion) void load(id, deployment, version);
-		});
+		if (!id || !deployment) {
+			loading = false;
+			missing = true;
+			return;
+		}
+		let projects: Project[] | undefined;
+		let deployments: Deployment[] | undefined;
+		let scopedKey = '';
+		const current = () =>
+			version === viewVersion && id === projectId && deployment === deploymentId;
+		const reconcile = () => {
+			if (!current() || !projects || !deployments) return;
+			const foundProject = projects.find((candidate) => candidate.id === id);
+			const found = deployments.find(
+				(candidate) => candidate.id === deployment && candidate.projectId === id
+			);
+			if (!foundProject || !found) {
+				for (const dispose of scopedDisposers) dispose();
+				scopedDisposers = [];
+				scopedKey = '';
+				project = null;
+				item = null;
+				missing = true;
+				loading = false;
+				jobs = null;
+				return;
+			}
+			project = foundProject;
+			const previousTarget = item && `${item.targetKind}:${item.targetName ?? ''}`;
+			if (item?.publicationPath && item.publicationPath !== found.publicationPath)
+				moveConfirmation = null;
+			item = found;
+			if (!targetSelection || previousTarget !== `${found.targetKind}:${found.targetName ?? ''}`)
+				targetSelection =
+					(found.targetKind === 'branch' || found.targetKind === 'tag') && found.targetName
+						? `${found.targetKind}:${found.targetName}`
+						: `commit:${found.commit}`;
+			loading = false;
+			missing = false;
+			publicationStatusError = '';
+			const nextKey = `${id}:${deployment}`;
+			if (scopedKey === nextKey) return;
+			scopedKey = nextKey;
+			scopedDisposers.push(
+				sdk.resources.subscribe({
+					identity: { kind: 'refs', projectId: id },
+					read: () => sdk.projects.refs(id).then((result) => result.data),
+					onValue: (value, cause) => {
+						if (!current()) return;
+						if (cause) {
+							const message = cause instanceof Error ? cause.message : 'Could not load targets.';
+							refsError = refsLoaded
+								? `${message} Refresh and try again. Your current branches and tags are still shown.`
+								: message;
+							return;
+						}
+						refs = value!;
+						refsLoaded = true;
+						refsError = '';
+					}
+				}),
+				sdk.resources.subscribe({
+					identity: { kind: 'jobs', deploymentId: deployment },
+					read: () => sdk.deployments.jobs(deployment).then((outcome) => outcome.data),
+					onValue: (value, cause) => {
+						if (!current()) return;
+						if (cause) {
+							historyStatus = 'error';
+							historyError = 'The history could not be refreshed. Try again shortly.';
+							return;
+						}
+						jobs = value!;
+						historyStatus = 'loaded';
+						historyError = '';
+					}
+				}),
+				sdk.resources.subscribe({
+					identity: { kind: 'root' },
+					read: () => sdk.deployments.root().then((outcome) => outcome.data),
+					onValue: (value, cause) => {
+						if (!current()) return;
+						if (cause) {
+							publicationRoot = '';
+							moveRootError =
+								'Could not load the publication root. Refresh the page to move this deployment.';
+							return;
+						}
+						publicationRoot = value!.publicationRoot;
+						moveRootError = '';
+					}
+				})
+			);
+		};
+		resourceDisposers.push(
+			sdk.resources.subscribe({
+				identity: { kind: 'deployment', projectId: id, deploymentId: deployment },
+				read: listDeployments,
+				onValue: (value, cause) => {
+					if (!current()) return;
+					if (cause) {
+						if (cause instanceof PublicationStatusUnavailableError) {
+							publicationStatusError = cause.message;
+							deployments = undefined;
+							for (const dispose of scopedDisposers) dispose();
+							scopedDisposers = [];
+							scopedKey = '';
+							project = null;
+							item = null;
+							refs = [];
+							refsLoaded = false;
+							refsError = '';
+							jobs = null;
+							publicationRoot = '';
+							missing = false;
+							moveConfirmation = null;
+							moveOpen = false;
+							movePath = '';
+							error = '';
+						} else {
+							error = cause instanceof Error ? cause.message : 'Could not load deployment.';
+						}
+						loading = false;
+						return;
+					}
+					deployments = value!;
+					reconcile();
+				}
+			}),
+			sdk.resources.subscribe({
+				identity: { kind: 'projects' },
+				read: () => sdk.projects.list().then((result) => result.data),
+				onValue: (value, cause) => {
+					if (!current()) return;
+					if (cause) {
+						error = cause instanceof Error ? cause.message : 'Could not load project.';
+						loading = false;
+						return;
+					}
+					projects = value!;
+					reconcile();
+				}
+			})
+		);
 	});
 	onDestroy(() => {
 		++viewVersion;
-		++loadVersion;
-		unsubscribeEvents?.();
-		projectReadController?.abort();
+		for (const dispose of resourceDisposers) dispose();
+		for (const dispose of scopedDisposers) dispose();
 		refreshController?.abort();
 	});
 </script>
@@ -683,7 +728,7 @@
 						deploymentName={item.name}
 						branch={item.targetName}
 						bind:busy
-						onqueued={() => load()}
+						onqueued={refreshActiveReads}
 					/>
 				{/key}
 			{/if}
