@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { dashboardRequest } from '#lib/dashboard-request.js';
 	import { BrowserSDKError, sdk } from '#lib/sdk/index.js';
 	import {
 		isReservedPublicationFolder,
@@ -47,12 +46,6 @@
 	let reservedPublicationPath = $derived(isReservedPublicationFolder(publicationPath));
 	let validPublicationPath = $derived(isValidPublicationFolder(publicationPath));
 	let publicationPreview = $derived(publicationFolderPreview(publicationRoot, publicationPath));
-
-	async function request(path: string, init?: RequestInit) {
-		return dashboardRequest(path, init, () => {
-			return new Error('The request could not be completed. Refresh and try again.');
-		});
-	}
 
 	async function listDeployments() {
 		try {

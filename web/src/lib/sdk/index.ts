@@ -25,11 +25,17 @@ export type OutcomeCode =
 	| 'auth.capacity_exceeded'
 	| 'request.https_required'
 	| 'request.json_required'
+	| 'request.invalid_json'
+	| 'request.too_large'
+	| 'request.conflict'
 	| 'request.policy_rejected'
+	| 'request.host_rejected'
 	| 'request.origin_rejected'
 	| 'request.rate_limited'
+	| 'request.method_not_allowed'
 	| 'service.unavailable'
 	| 'service.internal_error'
+	| 'service.maintenance_required'
 	| 'project.listed'
 	| 'project.created'
 	| 'project.refs_listed'
@@ -69,11 +75,16 @@ const knownCodes = new Set<string>([
 	'auth.capacity_exceeded',
 	'request.https_required',
 	'request.json_required',
+	'request.invalid_json',
+	'request.too_large',
+	'request.conflict',
 	'request.policy_rejected',
+	'request.host_rejected',
 	'request.origin_rejected',
 	'request.rate_limited',
 	'service.unavailable',
 	'service.internal_error',
+	'service.maintenance_required',
 	...repositoryOutcomeCodes,
 	'project.listed',
 	'project.created',
@@ -94,6 +105,9 @@ const knownCodes = new Set<string>([
 	'operation.cleanup_pending',
 	'publication.recovery_required',
 	'publication.path_conflict',
+	'deployment.already_resumed',
+	'deployment.target_unchanged',
+	'request.method_not_allowed',
 	'deployment.listed',
 	'deployment.root_loaded',
 	'deployment.created',

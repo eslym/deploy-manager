@@ -13,6 +13,8 @@ export type DeploymentOutcomeCode =
 	| 'deployment.resumed'
 	| 'deployment.moved'
 	| 'deployment.deleted'
+	| 'deployment.target_unchanged'
+	| 'deployment.already_resumed'
 	| 'job.listed';
 
 export interface Deployment {

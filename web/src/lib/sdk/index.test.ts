@@ -266,6 +266,22 @@ describe('browser SDK authentication transport', () => {
 		expect(onSessionEnded).not.toHaveBeenCalled();
 	});
 
+	it('treats every server success code as known when checking endpoint contracts', async () => {
+		const api = createBrowserSDK({
+			fetch: vi.fn().mockResolvedValue(
+				response({
+					code: 'deployment.target_unchanged',
+					message: 'The target is unchanged.',
+					data: { jobId: 'job-1', status: 'queued' }
+				})
+			)
+		});
+
+		await expect(api.deployments.deploy('deployment-1')).rejects.toMatchObject({
+			outcome: { kind: 'invalid_response' }
+		});
+	});
+
 	it('accepts an unknown valid outcome without treating it as the expected success', async () => {
 		const onSessionEnded = vi.fn();
 		const api = createBrowserSDK({

@@ -52,9 +52,15 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	var rootData struct{ PublicationRoot string }
-	if rootRes.StatusCode != http.StatusOK || json.NewDecoder(rootRes.Body).Decode(&rootData) != nil || rootData.PublicationRoot != app.cfg.DeploymentRoot {
-		t.Fatalf("root response: status=%d value=%q", rootRes.StatusCode, rootData.PublicationRoot)
+	var rootOutcome struct {
+		Code string `json:"code"`
+		Data struct {
+			PublicationRoot string `json:"publicationRoot"`
+		} `json:"data"`
+	}
+	if rootRes.StatusCode != http.StatusOK || json.NewDecoder(rootRes.Body).Decode(&rootOutcome) != nil ||
+		rootOutcome.Code != "deployment.root_loaded" || rootOutcome.Data.PublicationRoot != app.cfg.DeploymentRoot {
+		t.Fatalf("root response: status=%d outcome=%+v", rootRes.StatusCode, rootOutcome)
 	}
 	rootRes.Body.Close()
 	response := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments", `{"projectId":"`+projectID+`","name":"site","publicationPath":"production-site","commit":"`+firstCommit+`"}`)
@@ -62,16 +68,23 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 		t.Fatalf("create status=%d: %s", response.StatusCode, responseText(response))
 	}
 	var created struct {
-		ID, JobID string
+		Code string `json:"code"`
+		Data struct {
+			ID    string `json:"id"`
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err = json.NewDecoder(response.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
+	if created.Code != "deployment.created" || created.Data.ID == "" || created.Data.JobID == "" {
+		t.Fatalf("deployment creation outcome = %+v", created)
+	}
 	path := filepath.Join(app.cfg.DeploymentRoot, "production-site")
 	assertPublication := func(jobID, contents string) dirIdentity {
 		t.Helper()
-		waitForDeploymentJob(t, server.Client(), server.URL, cookie, created.ID, jobID, "succeeded")
+		waitForDeploymentJob(t, server.Client(), server.URL, cookie, created.Data.ID, jobID, "succeeded")
 		request, _ := http.NewRequest(http.MethodGet, server.URL+"/api/deployments", nil)
 		request.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
 		res, e := server.Client().Do(request)
@@ -79,11 +92,14 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 			t.Fatal(e)
 		}
 		defer res.Body.Close()
-		var listed []deployment
-		if e = json.NewDecoder(res.Body).Decode(&listed); e != nil {
-			t.Fatal(e)
+		var listed struct {
+			Code string       `json:"code"`
+			Data []deployment `json:"data"`
 		}
-		if len(listed) != 1 || listed[0].Publication != path {
+		if e = json.NewDecoder(res.Body).Decode(&listed); e != nil || listed.Code != "deployment.listed" {
+			t.Fatalf("deployment list outcome = %+v, decode error = %v", listed, e)
+		}
+		if len(listed.Data) != 1 || listed.Data[0].Publication != path {
 			t.Fatalf("publication path changed: %+v; want %s", listed, path)
 		}
 		if data, e := os.ReadFile(filepath.Join(path, "README.md")); e != nil || string(data) != contents {
@@ -95,7 +111,7 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 		}
 		return id
 	}
-	firstIdentity := assertPublication(created.JobID, "searchable feature\n")
+	firstIdentity := assertPublication(created.Data.JobID, "searchable feature\n")
 	for _, choice := range []struct {
 		name string
 		code int
@@ -103,7 +119,7 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 		{"production-site", http.StatusConflict},
 		{"../escape", http.StatusBadRequest},
 		{"sub/site", http.StatusBadRequest},
-		{".deployment-lock-" + created.ID, http.StatusBadRequest},
+		{".deployment-lock-" + created.Data.ID, http.StatusBadRequest},
 		{strings.Repeat("a", 32), http.StatusBadRequest},
 	} {
 		res := projectPost(t, server.Client(), server.URL, cookie, "/api/deployments", `{"projectId":"`+projectID+`","name":"other","publicationPath":"`+choice.name+`","commit":"`+firstCommit+`"}`)
@@ -127,10 +143,10 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 	if err := os.Remove(link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = app.db.Exec(`UPDATE deployments SET commit_id=?,generation=2,status='queued' WHERE id=?`, secondCommit, created.ID); err != nil {
+	if _, err = app.db.Exec(`UPDATE deployments SET commit_id=?,generation=2,status='queued' WHERE id=?`, secondCommit, created.Data.ID); err != nil {
 		t.Fatal(err)
 	}
-	jobID, err := app.enqueueDeployment(created.ID, secondCommit, 2)
+	jobID, err := app.enqueueDeployment(created.Data.ID, secondCommit, 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,23 +174,38 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 	if legacy.StatusCode != http.StatusCreated {
 		t.Fatalf("legacy create status=%d: %s", legacy.StatusCode, responseText(legacy))
 	}
-	var legacyCreated struct{ ID, JobID, PublicationPath string }
+	var legacyCreated struct {
+		Code string `json:"code"`
+		Data struct {
+			ID              string `json:"id"`
+			JobID           string `json:"jobId"`
+			PublicationPath string `json:"publicationPath"`
+		} `json:"data"`
+	}
 	if err := json.NewDecoder(legacy.Body).Decode(&legacyCreated); err != nil {
 		t.Fatal(err)
 	}
 	legacy.Body.Close()
-	legacyPath := filepath.Join(app.cfg.DeploymentRoot, legacyCreated.ID)
-	if legacyCreated.PublicationPath != legacyPath {
-		t.Fatalf("legacy destination=%q, want %q", legacyCreated.PublicationPath, legacyPath)
+	if legacyCreated.Code != "deployment.created" || legacyCreated.Data.ID == "" || legacyCreated.Data.JobID == "" {
+		t.Fatalf("legacy creation outcome = %+v", legacyCreated)
 	}
-	waitForDeploymentJob(t, server.Client(), server.URL, cookie, legacyCreated.ID, legacyCreated.JobID, "succeeded")
+	legacyPath := filepath.Join(app.cfg.DeploymentRoot, legacyCreated.Data.ID)
+	if legacyCreated.Data.PublicationPath != legacyPath {
+		t.Fatalf("legacy destination=%q, want %q", legacyCreated.Data.PublicationPath, legacyPath)
+	}
+	waitForDeploymentJob(t, server.Client(), server.URL, cookie, legacyCreated.Data.ID, legacyCreated.Data.JobID, "succeeded")
 	if data, e := os.ReadFile(filepath.Join(legacyPath, "README.md")); e != nil || string(data) != "searchable feature\n" {
 		t.Fatalf("legacy publication changed: %q %v", data, e)
 	}
-	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+created.ID+"/delete", `{"confirm":true}`)
+	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+created.Data.ID+"/delete", `{"confirm":true}`)
+	var deleted struct {
+		Code string `json:"code"`
+		Data any    `json:"data"`
+	}
+	err = json.NewDecoder(response.Body).Decode(&deleted)
 	response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		t.Fatalf("delete status=%d", response.StatusCode)
+	if response.StatusCode != http.StatusOK || err != nil || deleted.Code != "deployment.deleted" || deleted.Data != nil {
+		t.Fatalf("delete outcome: status=%d outcome=%+v decodeErr=%v", response.StatusCode, deleted, err)
 	}
 	if _, err = os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("published path survived deletion: %v", err)

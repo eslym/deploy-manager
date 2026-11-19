@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { dashboardRequest } from '#lib/dashboard-request.js';
 	import { sdk, serverErrorCode } from '#lib/sdk/index.js';
 	import { formatBytes } from '#lib/format-bytes.js';
 	import { onMount } from 'svelte';
@@ -30,62 +29,6 @@
 		warning?: string;
 		trusted: boolean;
 	};
-	async function request(
-		path: string,
-		init?: RequestInit,
-		options?: {
-			sshCreate?: boolean;
-			sshApproval?: boolean;
-			sshRefresh?: boolean;
-			deletion?: boolean;
-		}
-	) {
-		return dashboardRequest(path, init, async (response) => {
-			const status = Number.isInteger(response.status) ? ` (HTTP ${response.status})` : '';
-			const responseText = await response.text();
-			if (options?.deletion && response.status === 409)
-				return new Error(`Remove the project's deployments before deleting it.${status}`);
-			if (options?.deletion && response.status === 503)
-				return new Error(
-					`Project deletion is pending. Remaining cache files are protected while cleanup retries.${status}`
-				);
-			if (options?.sshApproval && response.status === 409)
-				return new Error(
-					'The host key changed. The refreshed fingerprint shown here must be independently reviewed before approving again.'
-				);
-			if (options?.sshCreate && response.status === 409) {
-				return new Error(
-					'Host key not approved. Verify the fingerprint in SSH host warnings independently before approving it.'
-				);
-			}
-			if (options?.sshRefresh && response.status === 502) {
-				return new Error('SSH connection failed. Check the repository key and SSH host warnings.');
-			}
-			if (response.status === 409)
-				return new Error(
-					'This change is out of date or the key is assigned. Refresh the page, then choose a key that is not assigned to another project.' +
-						status
-				);
-			const message =
-				response.status === 401 || response.status === 403
-					? 'Your session may have expired. Sign in again.'
-					: response.status === 404
-						? 'The requested item was not found. Refresh the page and try again.'
-						: response.status === 413
-							? 'This repository has too much data or too many branches and tags. Reduce it and try again.'
-							: response.status === 429
-								? 'The server is handling too many requests. Wait briefly and try again.'
-								: response.status === 502
-									? 'The repository could not be fetched. Check public HTTPS access and try again.'
-									: response.status >= 500
-										? 'The server could not complete the request. Try again shortly.'
-										: 'The request could not be completed. Check your input and try again.';
-			const safeBackendText = responseText.trim().slice(0, 400);
-			return new Error(
-				`${(options?.sshCreate || options?.sshRefresh) && safeBackendText ? safeBackendText : message}${status}`
-			);
-		});
-	}
 	let projects = $state<Project[]>([]);
 	let repositoryKeys = $state<RepositoryKey[]>([]);
 	let name = $state('');

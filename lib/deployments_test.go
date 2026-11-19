@@ -741,16 +741,22 @@ func TestRestartReconcilesCompletedFirstDirectorySwitchByIdentity(t *testing.T) 
 				t.Fatalf("create status %d: %s", response.StatusCode, responseText(response))
 			}
 			var created struct {
-				ID string `json:"id"`
+				Code string `json:"code"`
+				Data struct {
+					ID string `json:"id"`
+				} `json:"data"`
 			}
 			if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
 				t.Fatal(err)
 			}
 			response.Body.Close()
+			if created.Code != "deployment.created" || created.Data.ID == "" {
+				t.Fatalf("deployment creation outcome = %+v", created)
+			}
 			deadline := time.Now().Add(5 * time.Second)
 			for {
 				var status string
-				_ = app.db.QueryRow(`SELECT status FROM deployment_jobs WHERE deployment_id=?`, created.ID).Scan(&status)
+				_ = app.db.QueryRow(`SELECT status FROM deployment_jobs WHERE deployment_id=?`, created.Data.ID).Scan(&status)
 				if status == "failed" || status == "succeeded" {
 					break
 				}
@@ -760,7 +766,7 @@ func TestRestartReconcilesCompletedFirstDirectorySwitchByIdentity(t *testing.T) 
 				time.Sleep(10 * time.Millisecond)
 			}
 			setPublicationFaultPoint(previousFault)
-			path := app.deploymentPath(created.ID)
+			path := app.deploymentPath(created.Data.ID)
 			_, beforeRestartErr := os.Stat(path)
 			server.Close()
 			if err := app.Close(); err != nil {
@@ -773,10 +779,10 @@ func TestRestartReconcilesCompletedFirstDirectorySwitchByIdentity(t *testing.T) 
 			defer app.Close()
 			defer func() { setPublicationFaultPoint(previousFault) }()
 			var liveCommit, status, jobStatus string
-			if err := app.db.QueryRow(`SELECT live_commit,status FROM deployments WHERE id=?`, created.ID).Scan(&liveCommit, &status); err != nil {
+			if err := app.db.QueryRow(`SELECT live_commit,status FROM deployments WHERE id=?`, created.Data.ID).Scan(&liveCommit, &status); err != nil {
 				t.Fatal(err)
 			}
-			if err := app.db.QueryRow(`SELECT status FROM deployment_jobs WHERE deployment_id=?`, created.ID).Scan(&jobStatus); err != nil {
+			if err := app.db.QueryRow(`SELECT status FROM deployment_jobs WHERE deployment_id=?`, created.Data.ID).Scan(&jobStatus); err != nil {
 				t.Fatal(err)
 			}
 			shouldBeLive := faultAt == "after-exchange" || faultAt == "after-directory-fsync" || faultAt == "before-state" || faultAt == "after-state"
@@ -795,7 +801,7 @@ func TestRestartReconcilesCompletedFirstDirectorySwitchByIdentity(t *testing.T) 
 				t.Fatal("publication before the switch unexpectedly created live files")
 			}
 			var intents int
-			if err := app.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, created.ID).Scan(&intents); err != nil || intents != 0 {
+			if err := app.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, created.Data.ID).Scan(&intents); err != nil || intents != 0 {
 				t.Fatalf("remaining intents=%d err=%v", intents, err)
 			}
 		})

@@ -54,17 +54,16 @@ Use [GLOSSARY.md](../GLOSSARY.md) for deployment/release terminology.
 
 ### Bodies, responses, and errors
 
-Send JSON bodies with `Content-Type: application/json`. Authentication,
-repository-key, SSH-host, LFS, webhook-settings, webhook-ingestion, project
-routes, and the migrated deployment/job route handlers listed below use an
-outcome envelope. Shared authorization/security guards and maintenance
-responses also use outcome envelopes, including on routes whose handler-specific
-success and failure responses have not migrated. Deployment outcome conversion
-covers list/root/create, target change, Deploy, Hard re-deploy, job reads,
-history, rollback, pause/resume, move, and deletion. Other application routes retain
-their existing response forms until their coordinated migration slice lands.
-Times are JSON RFC 3339 timestamps, not Unix integers. Unmigrated list responses
-are bare arrays unless stated otherwise; migrated resource arrays are in
+Send JSON bodies with `Content-Type: application/json`. Every registered
+authentication, dashboard, webhook-configuration, and webhook-ingestion handler
+uses the outcome envelope, as do shared authorization/security guards and
+maintenance responses. Unknown paths under `/api/`, `/opaque/`, and
+`/webhooks/` return `request.not_found` (404); unsupported methods on a
+registered path return `request.method_not_allowed` (405) with `Allow`.
+`HEAD` follows the matching `GET` route, including its status and headers, while
+the HTTP server suppresses the response body. Frontend shell errors and requests
+outside those application prefixes retain ordinary HTTP error responses.
+Times are JSON RFC 3339 timestamps, not Unix integers. Resource arrays are in
 envelope `data`. Optional fields marked below may be omitted.
 
 Lifecycle mutations use named typed SDK operations and require explicit
@@ -75,11 +74,9 @@ deletion was accepted and cleanup remains pending; `publication.recovery_require
 means inspect authoritative state and do not repeat the move automatically.
 Callers may refresh status but must not automatically resubmit mutations.
 
-Unmigrated errors generally use Go's `http.Error`: `text/plain; charset=utf-8`
-with a trailing newline. Migrated outcomes have exactly `code`, `message`,
-and `data`; `data` is `null` when the operation has no response data. Messages
-are for display, never branching. JSON outcomes use `application/json` and
-`Cache-Control: no-store`.
+Outcomes have exactly `code`, `message`, and `data`; `data` is `null` when the
+operation has no response data. Messages are for display, never branching.
+JSON outcomes use `application/json` and `Cache-Control: no-store`.
 
 | Status          | Typical meaning                                                                                                  |
 | --------------- | ---------------------------------------------------------------------------------------------------------------- |
@@ -96,29 +93,57 @@ are for display, never branching. JSON outcomes use `application/json` and
 | 429             | Dashboard mutation rate limit or login/session capacity limit                                                    |
 | 500 / 502 / 503 | Internal failure / upstream authentication failure in Git operations / unavailable capacity or recovery required |
 
-These are shared categories, not a guarantee that every handler uses each code.
-For example, OPAQUE's shared decoder and logout return **403**, not **429**, when
-their shared rate check rejects a request. Many bounded JSON decoders report an
-oversized/invalid body as **400**, not **413**. Most mutation decoders reject
-unknown fields, but enforcement is not uniform; only OPAQUE and repository-key
-creation explicitly require a single JSON value with no trailing data.
+The status belongs to the outcome, not its message. In particular, handler
+validation may use `request.invalid` (400) for malformed or oversized JSON,
+whereas explicitly bounded uploads can return `request.too_large` (413).
+OPAQUE's shared decoder and logout use **403** for their shared request-rate
+limit; protected dashboard mutations use **429**. Unknown-field and trailing
+JSON validation is route-specific.
 
-Repository-management outcomes use the stable semantic codes below. Messages are
-short display text; callers branch on code/status, not English wording.
+The following is the complete implemented semantic-code inventory. Statuses
+shown with multiple values depend on the route or failure stage; `message` is
+display text, never a control-flow value.
 
-| Code                           | Status | Meaning                                                                                           |
-| ------------------------------ | ------ | ------------------------------------------------------------------------------------------------- |
-| `repository_key.in_use`        | 409    | The key remains assigned to a project.                                                            |
-| `ssh_host.observation_changed` | 409    | The host observation no longer matches the reviewed fingerprint; refresh and verify again.        |
-| `webhook.signature_invalid`    | 401    | Provider signature validation failed.                                                             |
-| `webhook.not_configured`       | 404    | No secret is configured for that project/provider.                                                |
-| `operation.capacity_exceeded`  | 503    | Durable webhook work could not be accepted because capacity is unavailable.                       |
-| `service.unavailable`          | 503    | Durable acceptance or another service operation failed; inspect state before retrying a mutation. |
+| Codes                                                                                                                                                                                                                                                                                                            | Status                                                                |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `auth.registration_started`, `auth.registration_completed`, `auth.login_started`, `auth.login_completed`, `auth.session_valid`, `auth.logged_out`, `auth.password_change_started`, `auth.password_changed`                                                                                                       | 200                                                                   |
+| `auth.session_required`, `auth.login_failed`, `auth.recent_login_required`                                                                                                                                                                                                                                       | 401                                                                   |
+| `auth.protocol_invalid`                                                                                                                                                                                                                                                                                          | 400                                                                   |
+| `auth.registration_expired`                                                                                                                                                                                                                                                                                      | 410                                                                   |
+| `auth.registration_conflict`                                                                                                                                                                                                                                                                                     | 409                                                                   |
+| `auth.capacity_exceeded`                                                                                                                                                                                                                                                                                         | 429                                                                   |
+| `deployment.listed`, `deployment.root_loaded`, `deployment.paused`, `deployment.moved`, `deployment.deleted`                                                                                                                                                                                                     | 200                                                                   |
+| `deployment.created`                                                                                                                                                                                                                                                                                             | 201                                                                   |
+| `deployment.queued`, `deployment.hard_redeploy_queued`, `deployment.target_changed`, `deployment.rollback_queued`, `deployment.resumed`                                                                                                                                                                          | 202                                                                   |
+| `deployment.history_loaded`, `job.listed`, `project.listed`, `project.refs_listed`, `project.refreshed`, `project.key_assigned`, `project.cache_cleared`, `ssh_host.listed`, `ssh_host.approved`, `ssh_host.revoked`, `lfs.settings_loaded`, `lfs.settings_saved`, `webhook.settings_loaded`, `webhook.accepted` | 200                                                                   |
+| `deployment.target_unchanged`, `deployment.already_resumed`, `project.has_deployments`, `repository_key.in_use`, `ssh_host.observation_changed`, `publication.path_conflict`, `request.conflict`                                                                                                                 | 409                                                                   |
+| `project.created`, `repository_key.created`                                                                                                                                                                                                                                                                      | 201                                                                   |
+| `project.deleted`, `repository_key.deleted`                                                                                                                                                                                                                                                                      | 200                                                                   |
+| `git.target_unavailable`                                                                                                                                                                                                                                                                                         | 400 or 409; upstream ref failures may be 502                          |
+| `git.authentication_failed`, `operation.upstream_failed`, `ssh_host.approval_required`                                                                                                                                                                                                                           | 409 or 502, depending on operation stage                              |
+| `webhook.signature_invalid`                                                                                                                                                                                                                                                                                      | 401                                                                   |
+| `webhook.not_configured`, `request.not_found`                                                                                                                                                                                                                                                                    | 404                                                                   |
+| `webhook.secret_rotated`                                                                                                                                                                                                                                                                                         | 201                                                                   |
+| `request.invalid`, `request.invalid_json`, `auth.protocol_invalid`                                                                                                                                                                                                                                               | 400                                                                   |
+| `request.policy_rejected`                                                                                                                                                                                                                                                                                        | 400                                                                   |
+| `request.json_required`                                                                                                                                                                                                                                                                                          | 415                                                                   |
+| `request.too_large`                                                                                                                                                                                                                                                                                              | 413                                                                   |
+| `request.method_not_allowed`                                                                                                                                                                                                                                                                                     | 405                                                                   |
+| `request.https_required`                                                                                                                                                                                                                                                                                         | 403 for webhook ingestion; 426 for dashboard/authentication transport |
+| `request.origin_rejected`                                                                                                                                                                                                                                                                                        | 403                                                                   |
+| `request.host_rejected`                                                                                                                                                                                                                                                                                          | 421                                                                   |
+| `request.rate_limited`                                                                                                                                                                                                                                                                                           | 403 or 429                                                            |
+| `operation.capacity_exceeded`                                                                                                                                                                                                                                                                                    | 413 or 503, depending on the resource limit/queue                     |
+| `operation.cleanup_pending`, `publication.recovery_required`, `project.cache_recovery_required`, `service.maintenance_required`                                                                                                                                                                                  | 503                                                                   |
+| `service.unavailable`                                                                                                                                                                                                                                                                                            | 503                                                                   |
+| `service.internal_error`                                                                                                                                                                                                                                                                                         | 500                                                                   |
 
-Other validation failures use shared `request.invalid`, `request.invalid_json`,
-`request.json_required`, `request.too_large`, or `request.policy_rejected`
-outcomes as appropriate. Server errors use `service.internal_error` without
-exposing storage, parser, or upstream diagnostics.
+`project.deleted` and `webhook.accepted` are also used for durable completion
+and acknowledgement respectively; `operation.cleanup_pending` means deletion
+was accepted even though cleanup remains. Server errors use
+`service.internal_error` without exposing storage, parser, or upstream
+diagnostics. The browser SDK additionally defines local-only `sdk.network`,
+`sdk.invalid_response`, and `sdk.cancelled`; these are not server codes.
 
 `/api/`, `/opaque/`, and `/webhooks/` responses have `Cache-Control: no-store`.
 Unknown backend paths never fall back to the SPA. Frontend shell fallback is
@@ -214,14 +239,29 @@ failure.
 The server sends a ready frame after registering the socket:
 
 ```json
-{"code":"events.ready","message":"Live updates connected.","data":{"epoch":"<daemon-id>","sequence":0}}
+{
+  "code": "events.ready",
+  "message": "Live updates connected.",
+  "data": { "epoch": "<daemon-id>", "sequence": 0 }
+}
 ```
 
 Committed deployment/job changes send invalidation frames, never resource
 bodies or logs:
 
 ```json
-{"code":"events.invalidate","message":"Dashboard data changed.","data":{"epoch":"<daemon-id>","sequence":1,"resources":[{"kind":"jobs","deploymentId":"<id>"},{"kind":"deployments","deploymentId":"<id>"}]}}
+{
+  "code": "events.invalidate",
+  "message": "Dashboard data changed.",
+  "data": {
+    "epoch": "<daemon-id>",
+    "sequence": 1,
+    "resources": [
+      { "kind": "jobs", "deploymentId": "<id>" },
+      { "kind": "deployments", "deploymentId": "<id>" }
+    ]
+  }
+}
 ```
 
 The daemon-wide sequence increases per committed batch. It is diagnostic only;
@@ -269,6 +309,13 @@ forward `Upgrade` and `Connection: upgrade`, preserve the browser `Origin` and
 canonical `Host`, and set their WebSocket idle/read timeout longer than the
 25-second ping interval (60 seconds or more is recommended). Do not weaken
 canonical Host, trusted-proxy, or Origin validation to accommodate a proxy.
+
+For ordinary HTTP traffic, proxy `/api/`, `/opaque/`, and `/webhooks/` to the
+same Go origin without path rewriting or caching; preserve `Host` and browser
+`Origin`, and provide `X-Forwarded-Proto: https` only from a trusted TLS
+terminator. Permit the configured webhook and OPAQUE request body limits.
+Forward WebSocket upgrades on `/api/events` as above. Do not expose an alternate
+origin that bypasses canonical Host, Origin, transport, or session checks.
 
 ### Flow and state details
 
@@ -480,8 +527,9 @@ the configured branch. Omitted `permanent` defaults to false.
 
 The queued outcome confirms durable acceptance, not successful publication.
 Read deployments and jobs through `sdk.deployments.list` and
-`sdk.deployments.jobs`; existing polling may remain until live updates replace
-it. There is no job-by-ID route. Jobs use `queued` → `running` and terminal `succeeded`, `noop`,
+`sdk.deployments.jobs`; WebSocket invalidations refresh active HTTP reads, with
+visibility-aware fallback polling only while the socket is unavailable. There
+is no job-by-ID route. Jobs use `queued` → `running` and terminal `succeeded`, `noop`,
 `failed`, or `superseded`. A paused automatic fetch may finish as `noop` without
 publishing. Deployment statuses include `queued`, `publishing`, `live`, `failed`,
 `recovery_required`, `deleting`, and `deletion_failed`; these are distinct from

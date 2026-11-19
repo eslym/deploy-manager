@@ -214,8 +214,14 @@ func TestBranchFetchAndCacheRecreationCompleteWithoutUsingPartialCache(t *testin
 		if result.err != nil {
 			t.Fatalf("cache recreation request failed: %v", result.err)
 		}
-		if result.response.StatusCode != http.StatusNoContent {
-			t.Fatalf("cache recreation status=%d body=%q", result.response.StatusCode, responseText(result.response))
+		var cleared struct {
+			Code string `json:"code"`
+			Data any    `json:"data"`
+		}
+		err := json.NewDecoder(result.response.Body).Decode(&cleared)
+		if result.response.StatusCode != http.StatusOK || err != nil ||
+			cleared.Code != "project.cache_cleared" || cleared.Data != nil {
+			t.Fatalf("cache recreation outcome: status=%d outcome=%+v err=%v", result.response.StatusCode, cleared, err)
 		}
 		result.response.Body.Close()
 	case <-time.After(10 * time.Second):
@@ -325,13 +331,22 @@ func (f *automationFixture) createBranch(t *testing.T, name string) string {
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %d %s", response.StatusCode, responseText(response))
 	}
-	var created struct{ ID, JobID string }
+	var created struct {
+		Code string `json:"code"`
+		Data struct {
+			ID    string `json:"id"`
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, created.ID, created.JobID, "succeeded")
-	return created.ID
+	if created.Code != "deployment.created" || created.Data.ID == "" || created.Data.JobID == "" {
+		t.Fatalf("deployment creation outcome = %+v", created)
+	}
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, created.Data.ID, created.Data.JobID, "succeeded")
+	return created.Data.ID
 }
 
 func TestDeploymentAndJobReadsUseOutcomeEnvelopes(t *testing.T) {
@@ -460,12 +475,16 @@ func TestJobHistoryRetentionExpiresTerminalWorkButPreservesActiveAndCleanupWork(
 		if response.StatusCode != http.StatusOK {
 			t.Fatalf("job history response = %d: %s", response.StatusCode, responseText(response))
 		}
-		var jobs []deploymentJob
-		err = json.NewDecoder(response.Body).Decode(&jobs)
-		response.Body.Close()
-		if err != nil {
-			t.Fatal(err)
+		var outcome struct {
+			Code string          `json:"code"`
+			Data []deploymentJob `json:"data"`
 		}
+		err = json.NewDecoder(response.Body).Decode(&outcome)
+		response.Body.Close()
+		if err != nil || outcome.Code != "job.listed" {
+			t.Fatalf("job list outcome = %+v, decode error = %v", outcome, err)
+		}
+		jobs := outcome.Data
 		present := map[string]bool{}
 		for _, job := range jobs {
 			present[job.ID] = true
@@ -485,11 +504,27 @@ func (f *automationFixture) action(t *testing.T, id, action, body string) string
 		t.Fatalf("%s: %d %s", action, response.StatusCode, responseText(response))
 	}
 	defer response.Body.Close()
-	var result struct{ JobID string }
+	var result struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	return result.JobID
+	expectedCode := map[string]string{
+		"deploy":        "deployment.queued",
+		"hard-redeploy": "deployment.hard_redeploy_queued",
+		"rollback":      "deployment.rollback_queued",
+		"pause":         "deployment.paused",
+		"resume":        "deployment.resumed",
+		"target":        "deployment.target_changed",
+	}[action]
+	if result.Code != expectedCode {
+		t.Fatalf("%s outcome code = %q, want %q", action, result.Code, expectedCode)
+	}
+	return result.Data.JobID
 }
 
 func (f *automationFixture) push(t *testing.T, delivery, commit string) {
@@ -516,12 +551,16 @@ func (f *automationFixture) waitJobs(t *testing.T, id string) []deploymentJob {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var jobs []deploymentJob
-		err = json.NewDecoder(response.Body).Decode(&jobs)
-		response.Body.Close()
-		if err != nil {
-			t.Fatal(err)
+		var outcome struct {
+			Code string          `json:"code"`
+			Data []deploymentJob `json:"data"`
 		}
+		err = json.NewDecoder(response.Body).Decode(&outcome)
+		response.Body.Close()
+		if err != nil || outcome.Code != "job.listed" {
+			t.Fatalf("job list outcome = %+v, decode error = %v", outcome, err)
+		}
+		jobs := outcome.Data
 		settled := len(jobs) > 0
 		for _, job := range jobs {
 			if job.Status == "queued" || job.Status == "running" {
@@ -652,12 +691,16 @@ func testPausedWebhookDoesNotExportOrHydrateUnpublishableTree(t *testing.T, prov
 	if err != nil {
 		t.Fatal(err)
 	}
-	var deployments []deployment
-	err = json.NewDecoder(response.Body).Decode(&deployments)
-	response.Body.Close()
-	if err != nil {
-		t.Fatal(err)
+	var outcome struct {
+		Code string       `json:"code"`
+		Data []deployment `json:"data"`
 	}
+	err = json.NewDecoder(response.Body).Decode(&outcome)
+	response.Body.Close()
+	if err != nil || outcome.Code != "deployment.listed" {
+		t.Fatalf("deployment list outcome = %+v, decode error = %v", outcome, err)
+	}
+	deployments := outcome.Data
 	if len(deployments) != 1 || deployments[0].Error == "" {
 		t.Fatal("paused webhook erased failed manual publication warning")
 	}
@@ -880,14 +923,17 @@ func assertAutomationPaused(t *testing.T, server *httptest.Server, cookie, id st
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
-	var deployments []struct {
-		ID     string `json:"id"`
-		Paused bool   `json:"automationPaused"`
+	var deployments struct {
+		Code string `json:"code"`
+		Data []struct {
+			ID     string `json:"id"`
+			Paused bool   `json:"automationPaused"`
+		} `json:"data"`
 	}
 	if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
 		t.Fatal(err)
 	}
-	for _, d := range deployments {
+	for _, d := range deployments.Data {
 		if d.ID == id {
 			if d.Paused != want {
 				t.Fatalf("paused=%t, want %t", d.Paused, want)

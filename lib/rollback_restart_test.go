@@ -103,7 +103,10 @@ func TestPermanentRollbackCrashRestartRaceChild(t *testing.T) {
 		t.Fatalf("rollback request status=%d body=%s", response.StatusCode, responseText(response))
 	}
 	var accepted struct {
-		JobID string `json:"jobId"`
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&accepted); err != nil {
 		t.Fatal(err)
@@ -115,7 +118,7 @@ func TestPermanentRollbackCrashRestartRaceChild(t *testing.T) {
 		t.Fatal("rollback worker did not block before publication")
 	}
 	assertAutomationPaused(t, f.server, f.cookie, id, true)
-	data, err := json.Marshal(map[string]string{"deploymentId": id, "jobId": accepted.JobID, "livePath": livePath, "liveContent": string(live)})
+	data, err := json.Marshal(map[string]string{"deploymentId": id, "jobId": accepted.Data.JobID, "livePath": livePath, "liveContent": string(live)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,12 +141,17 @@ func TestPermanentRollbackPausesAtRequestEvenWhenPublicationFails(t *testing.T) 
 	if response.StatusCode != http.StatusAccepted {
 		t.Fatalf("permanent rollback request: %d %s", response.StatusCode, responseText(response))
 	}
-	var queued struct{ JobID string }
+	var queued struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if err = json.NewDecoder(response.Body).Decode(&queued); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, queued.JobID, "failed")
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, queued.Data.JobID, "failed")
 	assertAutomationPaused(t, f.server, f.cookie, id, true)
 	if after, err := identity(f.app.deploymentPath(id)); err != nil || after != before {
 		t.Fatalf("failed permanent rollback changed live publication: %v", err)
@@ -203,7 +211,12 @@ func TestPermanentRollbackPauseIsVisibleBeforePublicationWork(t *testing.T) {
 	if response.StatusCode != http.StatusAccepted {
 		t.Fatalf("permanent rollback request: %d %s", response.StatusCode, responseText(response))
 	}
-	var queued struct{ JobID string }
+	var queued struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if err = json.NewDecoder(response.Body).Decode(&queued); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +228,7 @@ func TestPermanentRollbackPauseIsVisibleBeforePublicationWork(t *testing.T) {
 	}
 	assertAutomationPaused(t, f.server, f.cookie, id, true)
 	unblock()
-	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, queued.JobID, "failed")
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, id, queued.Data.JobID, "failed")
 	assertAutomationPaused(t, f.server, f.cookie, id, true)
 	request, _ := http.NewRequest(http.MethodGet, f.server.URL+"/api/deployments", nil)
 	request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
@@ -223,9 +236,12 @@ func TestPermanentRollbackPauseIsVisibleBeforePublicationWork(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var deployments []struct {
-		ID    string `json:"id"`
-		Error string `json:"error"`
+	var deployments struct {
+		Code string `json:"code"`
+		Data []struct {
+			ID    string `json:"id"`
+			Error string `json:"error"`
+		} `json:"data"`
 	}
 	if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
 		response.Body.Close()
@@ -233,7 +249,7 @@ func TestPermanentRollbackPauseIsVisibleBeforePublicationWork(t *testing.T) {
 	}
 	response.Body.Close()
 	errorVisible := false
-	for _, deployment := range deployments {
+	for _, deployment := range deployments.Data {
 		if deployment.ID == id {
 			if deployment.Error == "" {
 				t.Fatal("failed permanent rollback did not expose an error in deployment state")
@@ -354,11 +370,14 @@ func TestPermanentRollbackFailuresKeepPauseTargetAndLiveFiles(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			var deployments []struct {
-				ID         string `json:"id"`
-				TargetKind string `json:"targetKind"`
-				TargetName string `json:"targetName"`
-				Error      string `json:"error"`
+			var deployments struct {
+				Code string `json:"code"`
+				Data []struct {
+					ID         string `json:"id"`
+					TargetKind string `json:"targetKind"`
+					TargetName string `json:"targetName"`
+					Error      string `json:"error"`
+				} `json:"data"`
 			}
 			if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
 				response.Body.Close()
@@ -366,7 +385,7 @@ func TestPermanentRollbackFailuresKeepPauseTargetAndLiveFiles(t *testing.T) {
 			}
 			response.Body.Close()
 			found := false
-			for _, deployment := range deployments {
+			for _, deployment := range deployments.Data {
 				if deployment.ID == id {
 					target.TargetKind, target.TargetName, target.Error = deployment.TargetKind, deployment.TargetName, deployment.Error
 					found = true
@@ -417,15 +436,18 @@ func TestPermanentRollbackIsSupersededByBranchTargetChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var deployments []struct {
-		ID, TargetKind, TargetName string
+	var deployments struct {
+		Code string `json:"code"`
+		Data []struct {
+			ID, TargetKind, TargetName string
+		} `json:"data"`
 	}
 	if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
 		response.Body.Close()
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	for _, deployment := range deployments {
+	for _, deployment := range deployments.Data {
 		if deployment.ID == id {
 			found = deployment.TargetKind == "branch" && deployment.TargetName == "main"
 		}

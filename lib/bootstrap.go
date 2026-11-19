@@ -647,7 +647,7 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/ssh-hosts/approve", a.approveSSHHost)
 	m.HandleFunc("POST /api/ssh-hosts/revoke", a.revokeSSHHost)
 	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		applicationPath := strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/webhooks/")
+		applicationPath := isApplicationPath(r.URL.Path)
 		if a.cfg.CanonicalOrigin != "" {
 			origin, _ := url.Parse(a.cfg.CanonicalOrigin)
 			if !strings.EqualFold(r.Host, origin.Host) {
@@ -670,20 +670,54 @@ func (a *App) Handler() http.Handler {
 			http.Error(w, "HTTPS is required", http.StatusUpgradeRequired)
 			return
 		}
-		if strings.HasPrefix(r.URL.Path, "/opaque/") || strings.HasPrefix(r.URL.Path, "/webhooks/") || strings.HasPrefix(r.URL.Path, "/api/") {
+		if applicationPath {
 			if r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/") {
 				tracked := &mutationResponseWriter{ResponseWriter: w}
-				m.ServeHTTP(tracked, r)
+				serveApplicationRoute(tracked, r, m)
 				if tracked.status >= 200 && tracked.status < 300 {
 					a.invalidateMutation(r)
 				}
 			} else {
-				m.ServeHTTP(w, r)
+				serveApplicationRoute(w, r, m)
 			}
 			return
 		}
 		serveSPA(w, r, m)
 	}))
+}
+
+func isApplicationPath(p string) bool {
+	for _, prefix := range []string{"/api", "/opaque", "/webhooks"} {
+		if p == prefix || strings.HasPrefix(p, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func serveApplicationRoute(w http.ResponseWriter, r *http.Request, mux *http.ServeMux) {
+	if _, pattern := mux.Handler(r); pattern != "" {
+		mux.ServeHTTP(w, r)
+		return
+	}
+
+	allowed := make([]string, 0, 2)
+	for _, method := range []string{http.MethodGet, http.MethodPost} {
+		probe := r.Clone(r.Context())
+		probe.Method = method
+		if _, pattern := mux.Handler(probe); pattern != "" {
+			allowed = append(allowed, method)
+			if method == http.MethodGet {
+				allowed = append(allowed, http.MethodHead)
+			}
+		}
+	}
+	if len(allowed) > 0 {
+		w.Header().Set("Allow", strings.Join(allowed, ", "))
+		writeOutcomeError(w, http.StatusMethodNotAllowed, "request.method_not_allowed", "Method not allowed.")
+		return
+	}
+	writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 }
 
 type mutationResponseWriter struct {

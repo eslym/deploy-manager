@@ -276,27 +276,36 @@ func TestProjectCacheSizesAndExplicitRecreationOverHTTP(t *testing.T) {
 	}
 
 	type concurrentResult struct {
-		status int
-		body   []byte
+		status       int
+		body         []byte
+		expectedCode string
 	}
 	results := make(chan concurrentResult, 4)
-	for _, operation := range []struct{ method, path, body string }{
-		{http.MethodGet, "/api/projects", ""},
-		{http.MethodPost, "/api/projects/" + projectID + "/cache/recreate", `{"confirm":true}`},
-		{http.MethodGet, "/api/projects", ""},
-		{http.MethodPost, "/api/projects/" + projectID + "/cache/recreate", `{"confirm":true}`},
+	for _, operation := range []struct{ method, path, body, expectedCode string }{
+		{http.MethodGet, "/api/projects", "", "project.listed"},
+		{http.MethodPost, "/api/projects/" + projectID + "/cache/recreate", `{"confirm":true}`, "project.cache_cleared"},
+		{http.MethodGet, "/api/projects", "", "project.listed"},
+		{http.MethodPost, "/api/projects/" + projectID + "/cache/recreate", `{"confirm":true}`, "project.cache_cleared"},
 	} {
-		go func(operation struct{ method, path, body string }) {
+		go func(operation struct{ method, path, body, expectedCode string }) {
 			response := request(operation.method, operation.path, operation.body)
 			body, _ := io.ReadAll(response.Body)
 			response.Body.Close()
-			results <- concurrentResult{status: response.StatusCode, body: body}
+			results <- concurrentResult{status: response.StatusCode, body: body, expectedCode: operation.expectedCode}
 		}(operation)
 	}
 	for range 4 {
 		result := <-results
-		if result.status != http.StatusOK && result.status != http.StatusNoContent {
+		var outcome struct {
+			Code string `json:"code"`
+			Data any    `json:"data"`
+		}
+		if err := json.Unmarshal(result.body, &outcome); result.status != http.StatusOK ||
+			err != nil || outcome.Code != result.expectedCode {
 			t.Fatalf("concurrent cache operation status=%d body=%q", result.status, result.body)
+		}
+		if result.expectedCode == "project.cache_cleared" && outcome.Data != nil {
+			t.Fatalf("cache recreation data = %#v, want null", outcome.Data)
 		}
 	}
 	if _, err := app.store.Project.Get(context.Background(), projectID); err != nil {
@@ -311,7 +320,16 @@ func TestProjectCacheSizesAndExplicitRecreationOverHTTP(t *testing.T) {
 	missingCommit := request(http.MethodPost, "/api/deployments", fmt.Sprintf(`{"projectId":%q,"name":"old commit","commit":%q}`, projectID, oldCommit))
 	missingBody, _ := io.ReadAll(missingCommit.Body)
 	missingCommit.Body.Close()
-	if missingCommit.StatusCode != http.StatusBadRequest || !strings.Contains(string(missingBody), "commit is not available") {
+	var missingOutcome struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Data    any    `json:"data"`
+	}
+	if missingCommit.StatusCode != http.StatusBadRequest ||
+		json.Unmarshal(missingBody, &missingOutcome) != nil ||
+		missingOutcome.Code != "git.target_unavailable" ||
+		missingOutcome.Message != "Selected Git target is unavailable." ||
+		missingOutcome.Data != nil {
 		t.Fatalf("deployment using a commit removed by recreation got status=%d body=%q", missingCommit.StatusCode, missingBody)
 	}
 }
@@ -408,14 +426,23 @@ func TestRecreatedLFSCacheFailureIsVisibleThroughDeploymentApplication(t *testin
 	if created.StatusCode != http.StatusCreated {
 		t.Fatalf("create LFS deployment: %d %s", created.StatusCode, responseText(created))
 	}
-	var deployment struct{ ID, JobID string }
+	var deployment struct {
+		Code string `json:"code"`
+		Data struct {
+			ID    string `json:"id"`
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if err = json.NewDecoder(created.Body).Decode(&deployment); err != nil {
 		created.Body.Close()
 		t.Fatal(err)
 	}
 	created.Body.Close()
-	deploymentID := deployment.ID
-	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, deploymentID, deployment.JobID, "succeeded")
+	if deployment.Code != "deployment.created" || deployment.Data.ID == "" || deployment.Data.JobID == "" {
+		t.Fatalf("deployment creation outcome = %+v", deployment)
+	}
+	deploymentID := deployment.Data.ID
+	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, deploymentID, deployment.Data.JobID, "succeeded")
 	livePath := f.app.deploymentPath(deploymentID)
 	func() {
 		for {

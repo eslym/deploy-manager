@@ -63,13 +63,19 @@ func TestLegacyGitHubWebhookUsesDisplayedSecretAfterUpgrade(t *testing.T) {
 	}
 	response := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/projects/"+f.projectID+"/github-webhook", `{"rotate":true}`)
 	var rotated struct {
-		Code string `json:"code"`
-		Data struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+		Data    struct {
+			URL    string `json:"url"`
 			Secret string `json:"secret"`
 		} `json:"data"`
 	}
-	if response.StatusCode != http.StatusCreated || json.NewDecoder(response.Body).Decode(&rotated) != nil || rotated.Code != "webhook.secret_rotated" {
-		t.Fatalf("rotation failed: %d", response.StatusCode)
+	decodeErr := json.NewDecoder(response.Body).Decode(&rotated)
+	if response.StatusCode != http.StatusCreated || decodeErr != nil ||
+		rotated.Code != "webhook.secret_rotated" || rotated.Message == "" ||
+		!strings.HasPrefix(rotated.Data.URL, "/webhooks/github/") ||
+		len(rotated.Data.Secret) != 64 {
+		t.Fatalf("rotation failed: status=%d outcome=%+v decodeErr=%v", response.StatusCode, rotated, decodeErr)
 	}
 	response.Body.Close()
 	restart()
