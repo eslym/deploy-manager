@@ -178,6 +178,7 @@ try {
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByLabel("Project name").fill("SSH fixture site");
   await page.getByLabel("Repository URL").fill("git@host.example:owner/site.git");
+  await page.getByRole("link", { name: "review SSH host warnings" }).waitFor();
   const sshKeySelect = page.getByLabel("SSH key");
   await sshKeySelect.locator("option").nth(1).waitFor({ state: "attached" });
   await sshKeySelect.selectOption({ index: 1 });
@@ -192,16 +193,21 @@ try {
   const projectRequests = [];
   let approvalAttempts = 0;
   let latestWarning = observedHost;
+  let hideWarningAfterApprovalFailure = false;
+  let warningDisappearsAfterApprovalFailure = false;
   await page.route("**/api/ssh-hosts", async route => {
     if (route.request().method() === "GET") {
+      const hosts = [
+        { host: observedHost.host, port: observedHost.port, fingerprint: "SHA256:trusted-key", warning: "", trusted: true },
+        { ...latestWarning, host: "other.example", port: 22 },
+        latestWarning
+      ];
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify([
-          { host: observedHost.host, port: observedHost.port, fingerprint: "SHA256:trusted-key", warning: "", trusted: true },
-          { ...latestWarning, host: "other.example", port: 22 },
-          latestWarning
-        ])
+        body: JSON.stringify(warningDisappearsAfterApprovalFailure
+          ? hosts.filter(host => host.host !== observedHost.host || !host.warning)
+          : hosts)
       });
       return;
     }
@@ -211,6 +217,7 @@ try {
     approvalAttempts++;
     if (approvalAttempts === 1) {
       latestWarning = { ...observedHost, fingerprint: "SHA256:replacement-key-fingerprint" };
+      if (hideWarningAfterApprovalFailure) warningDisappearsAfterApprovalFailure = true;
       await route.fulfill({ status: 409, body: "the observed SSH key has changed; refresh the warning and verify it again" });
       return;
     }
@@ -253,6 +260,27 @@ try {
   if (projectAttempts !== 3 || approvalAttempts !== 2) throw new Error(`approval did not retry project creation: projects=${projectAttempts}, approvals=${approvalAttempts}`);
   if (projectRequests.some(body => body.name !== "SSH fixture site" || body.url !== "git@host.example:owner/site.git" || body.keyId !== "fixture-key")) {
     throw new Error(`approval retry did not preserve the project form: ${JSON.stringify(projectRequests)}`);
+  }
+  milestone("dismiss stale host approval when warning disappears");
+  await page.goto(`https://${appListen}/dashboard/projects`, { waitUntil: "domcontentloaded" });
+  await page.getByLabel("Project name").fill("SSH fixture site");
+  await page.getByLabel("Repository URL").fill("git@host.example:owner/site.git");
+  await page.getByLabel("SSH key").selectOption({ index: 1 });
+  projectAttempts = 0;
+  approvalAttempts = 0;
+  latestWarning = observedHost;
+  hideWarningAfterApprovalFailure = true;
+  warningDisappearsAfterApprovalFailure = false;
+  await page.getByRole("button", { name: "Add repository" }).click();
+  const staleApprovalDialog = page.getByRole("dialog");
+  await staleApprovalDialog.waitFor();
+  if (projectAttempts !== 1) throw new Error("SSH create did not first request the project before showing host approval");
+  await staleApprovalDialog.getByRole("button", { name: /Approve/ }).click();
+  await page.getByRole("alert").filter({ hasText: /host warning is no longer available/i }).waitFor();
+  if (await page.getByRole("dialog").count()) throw new Error("stale host fingerprint remained approvable after its warning disappeared");
+  if (approvalAttempts !== 1 || projectAttempts !== 1) throw new Error(`missing-warning recovery retried approval or project creation: projects=${projectAttempts}, approvals=${approvalAttempts}`);
+  if (await page.getByLabel("Project name").inputValue() !== "SSH fixture site" || await page.getByLabel("Repository URL").inputValue() !== "git@host.example:owner/site.git") {
+    throw new Error("missing-warning recovery cleared the project form");
   }
   await page.unroute("**/api/projects");
   await page.unroute("**/api/repository-keys");
