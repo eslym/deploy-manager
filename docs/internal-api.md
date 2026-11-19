@@ -345,6 +345,7 @@ operational guidance.
 | POST `/api/repository-keys/{id}/delete` | No body required; 204; 409 if assigned to any project |
 | GET `/api/ssh-hosts` | 200 Host[] |
 | POST `/api/ssh-hosts/approve` | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 204 |
+| POST `/api/ssh-hosts/revoke` | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 204 |
 
 **Key:** `id`, `name`, `algorithm`, `bits`, `fingerprint`, `publicKey`, `createdAt`.
 Private keys are never returned. Generation and import are mutually exclusive;
@@ -352,11 +353,19 @@ imports have a 64 KiB private-key limit (request limit 64 KiB + 2048 bytes).
 Creation requires JSON media type and rejects unknown/trailing fields/data.
 Private keys are encrypted at rest with an external master key.
 
-**Host:** `host`, `port`, `fingerprint`, `warning`, `trusted`. The list reflects
-stored host observations/trust, not a live SSH scan. Approve only after verifying
-the fingerprint independently. Trust is hostname-and-port scoped; **409** means
-the observed key changed or no longer matches the reviewed observation. Approval
-does not itself retry clone/fetch; retry the failed operation afterward.
+**Host:** `host`, `port`, `fingerprint`, `warning`, `trusted`. The list includes
+stored trusted hosts and hosts with warnings; it reflects observations/trust, not
+a live SSH scan. `warning` may be empty for an approved host. Approve only after
+verifying the fingerprint independently. Trust is hostname-and-port scoped;
+**409** means the observed key changed or no longer matches the reviewed
+observation. Approval does not itself retry clone/fetch; retry the failed
+operation afterward.
+
+Revocation requires `confirm: true` and the currently displayed host, port, and
+fingerprint. It clears that host's trusted key and returns **204**; stale or
+already-untrusted entries return **409**. The host remains listed with a warning.
+Subsequent SSH connections are blocked until the observed fingerprint is
+independently verified and approved again.
 
 ## LFS destination settings
 

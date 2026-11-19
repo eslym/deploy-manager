@@ -638,6 +638,7 @@ func (a *App) Handler() http.Handler {
 	m.HandleFunc("POST /api/repository-keys/{id}/delete", a.deleteRepositoryKey)
 	m.HandleFunc("GET /api/ssh-hosts", a.listSSHHostWarnings)
 	m.HandleFunc("POST /api/ssh-hosts/approve", a.approveSSHHost)
+	m.HandleFunc("POST /api/ssh-hosts/revoke", a.revokeSSHHost)
 	return securityHeaders(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if a.cfg.CanonicalOrigin != "" {
 			origin, _ := url.Parse(a.cfg.CanonicalOrigin)

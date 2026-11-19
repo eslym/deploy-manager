@@ -44,6 +44,29 @@
 			hostError = cause instanceof Error ? cause.message : 'Could not approve the host key.';
 		}
 	}
+	async function revokeHost(host: (typeof sshHosts)[number]) {
+		if (
+			!window.confirm(
+				`Revoke approval for ${host.host}:${host.port}?\n\nFuture SSH connections to this host will be blocked until its key is independently verified and approved again.`
+			)
+		)
+			return;
+		hostError = '';
+		try {
+			await request('/api/ssh-hosts/revoke', {
+				method: 'POST',
+				body: JSON.stringify({
+					host: host.host,
+					port: host.port,
+					fingerprint: host.fingerprint,
+					confirm: true
+				})
+			});
+			await loadSshHosts();
+		} catch (cause) {
+			hostError = cause instanceof Error ? cause.message : 'Could not revoke the host key.';
+		}
+	}
 	onMount(() => {
 		void loadSshHosts();
 	});
@@ -71,6 +94,24 @@
 					<button
 						class="mt-3 rounded-lg border border-[#aeb9ae] px-3 py-2 text-sm"
 						onclick={() => approveHost(host)}>Approve verified host key</button
+					>
+				</div>
+			{/each}
+		{/if}
+	</section>
+	<section class="mt-6 rounded-xl border border-[#e1e6df] bg-white p-5">
+		<h2 class="m-0 text-xl font-semibold text-[#243528]">Approved SSH hosts</h2>
+		{#if sshHosts.filter((host) => host.trusted).length === 0}
+			<p class="mt-2 text-sm text-[#58645b]">No approved SSH hosts.</p>
+		{:else}
+			{#each sshHosts.filter((host) => host.trusted) as host (`${host.host}:${host.port}:${host.fingerprint}`)}
+				<div class="mt-4 rounded-lg border border-[#e1e6df] p-4">
+					<p class="font-semibold">{host.host}:{host.port}</p>
+					<p class="mt-1 text-sm text-[#58645b]">Fingerprint</p>
+					<p class="font-mono text-xs break-all">{host.fingerprint}</p>
+					<button
+						class="mt-3 rounded-lg border border-red-300 px-3 py-2 text-sm text-red-800"
+						onclick={() => revokeHost(host)}>Revoke approval</button
 					>
 				</div>
 			{/each}
