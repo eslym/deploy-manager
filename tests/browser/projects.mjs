@@ -27,6 +27,10 @@ function milestone(label) {
   console.log(`[projects-browser] ${label}`);
 }
 
+function outcome(code, message, data = null) {
+  return { code, message, data };
+}
+
 async function withDeadline(promise, label, milliseconds = 10000) {
   let timer;
   try {
@@ -225,17 +229,17 @@ try {
     if (approval.fingerprint !== latestWarning.fingerprint || approval.host !== observedHost.host || approval.port !== observedHost.port || approval.confirm !== true) {
       throw new Error(`approval did not match the reviewed observation: ${JSON.stringify(approval)}`);
     }
-    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "ssh_host.approved", message: "SSH host approved.", data: null }) });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(outcome("ssh_host.approved", "SSH host approved.")) });
   });
   await page.route("**/api/projects", async route => {
     if (route.request().method() !== "POST") return route.continue();
     projectAttempts++;
     projectRequests.push(route.request().postDataJSON());
     if (projectAttempts <= 2) {
-      await route.fulfill({ status: 409, body: "SSH host key is not approved" });
+      await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify(outcome("ssh_host.approval_required", "Verify and approve the SSH host first.")) });
       return;
     }
-    await route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ id: "ssh-browser-project", name: "SSH fixture site", url: "git@host.example:owner/site.git", keyId: "fixture-key", lastFetched: null, gitCacheBytes: 0, lfsCacheBytes: 0 }) });
+    await route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify(outcome("project.created", "Project created.", { id: "ssh-browser-project", name: "SSH fixture site", url: "git@host.example:owner/site.git", keyId: "fixture-key", lastFetched: null, gitCacheBytes: 0, lfsCacheBytes: 0 })) });
   });
   const createButton = page.getByRole("button", { name: "Add repository" });
   await createButton.click();
@@ -311,7 +315,9 @@ try {
   await page.getByRole("button", { name: "Add repository" }).click();
   const created = await createResponse;
   if (created.status() !== 201) throw new Error(`project creation returned ${created.status()}: ${await created.text()}\n${appOutput}`);
-  const id = (await created.json()).id;
+  const createdOutcome = await created.json();
+  if (createdOutcome.code !== "project.created") throw new Error(`project creation returned ${JSON.stringify(createdOutcome)}`);
+  const id = createdOutcome.data.id;
   await page.waitForURL(`**/dashboard/projects/${id}`);
   await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
   if (!(await page.title()).includes("Fixture site")) throw new Error("project detail lacks its own page title");
@@ -358,9 +364,13 @@ try {
   await page.getByRole("button", { name: "Add repository" }).click();
   const ordinaryCreated = await ordinaryCreateResponse;
   if (ordinaryCreated.status() !== 201) throw new Error(`ordinary project creation returned ${ordinaryCreated.status()}: ${await ordinaryCreated.text()}`);
-  const ordinaryProject = await ordinaryCreated.json();
+  const ordinaryOutcome = await ordinaryCreated.json();
+  if (ordinaryOutcome.code !== "project.created") throw new Error(`ordinary project creation returned ${JSON.stringify(ordinaryOutcome)}`);
+  const ordinaryProject = ordinaryOutcome.data;
   await page.waitForURL(`**/dashboard/projects/${ordinaryProject.id}`);
-  const ordinaryRefs = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/refs`)).json(), ordinaryProject.id);
+  const ordinaryRefsOutcome = await page.evaluate(async projectID => (await (await fetch(`/api/projects/${projectID}/refs`)).json()), ordinaryProject.id);
+  if (ordinaryRefsOutcome.code !== "project.refs_listed") throw new Error(`cached refs returned ${JSON.stringify(ordinaryRefsOutcome)}`);
+  const ordinaryRefs = ordinaryRefsOutcome.data;
   if (!ordinaryRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("ordinary fixture repository did not have a main branch");
   await page.getByLabel("LFS server URL").waitFor();
   const ordinarySettings = await page.evaluate(async projectID => (await (await fetch(`/api/projects/${projectID}/lfs`)).json()).data, ordinaryProject.id);
@@ -497,7 +507,7 @@ try {
   await page.getByText(`Full path: ${publishedPath}`, { exact: true }).waitFor();
   try { await page.locator('option[value="branch:feature/search"]').waitFor({ state: "attached" }); } catch {
     const options = await page.locator("form select").first().innerHTML();
-    const cached = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/refs`)).json(), id);
+    const cached = await page.evaluate(async projectID => (await (await fetch(`/api/projects/${projectID}/refs`)).json()).data, id);
     throw new Error(`deployment targets missing feature branch: ${options}; cached refs: ${JSON.stringify(cached)}`);
   }
   await page.locator("form").locator("select").selectOption("branch:feature/search");
@@ -610,8 +620,8 @@ try {
   await stableHistory.getByText("Succeeded", { exact: true }).first().waitFor();
   if (await stableHistory.locator("ul > li").count() !== 2) throw new Error("successful history recovery did not retain the visible job list");
   await page.unroute(`**/api/deployments/${deploymentID}/jobs`);
-  const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
-  const featureCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
+  const mainCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data.find(ref => ref.kind === "branch" && ref.name === "main").commit, id);
+  const featureCommit = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data.find(ref => ref.kind === "branch" && ref.name === "feature/search").commit, id);
   milestone("open rollback history");
   await page.getByRole("button", { name: "Rollback", exact: true }).click();
   const history = page.getByRole("region", { name: "Rollback history for Production site" });
@@ -755,7 +765,7 @@ try {
 
   await page.getByRole("link", { name: "Fixture site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${id}`);
-  const initialTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
+  const initialTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id).lastFetched, id);
   const search = page.getByLabel("Search branches and tags");
   await search.fill("feature/search");
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
@@ -798,9 +808,9 @@ try {
   const refreshResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
   await refreshButton.click();
   const refreshed = await refreshResponse;
-  if (refreshed.status() !== 200) throw new Error(`successful refresh returned ${refreshed.status()}`);
+  if (refreshed.status() !== 200 || (await refreshed.json()).code !== "project.refreshed") throw new Error(`successful refresh did not return project.refreshed (${refreshed.status()})`);
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
-  const refreshedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
+  const refreshedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id).lastFetched, id);
   if (!refreshedTimestamp || refreshedTimestamp === initialTimestamp) throw new Error("successful refresh did not update the last-fetch timestamp");
 
   await page.route("**/api/projects", async route => {
@@ -821,20 +831,20 @@ try {
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   if ((await page.locator("body").innerText()).includes("SENSITIVE INTERNAL RESPONSE DETAIL")) throw new Error("dashboard exposed an HTTP response body");
   await page.unroute("**/api/projects");
-  const timestampAfterReloadFailure = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
+  const timestampAfterReloadFailure = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id).lastFetched, id);
   if (!timestampAfterReloadFailure || timestampAfterReloadFailure === refreshedTimestamp) throw new Error("server did not record the successful refresh before the failed list reload");
 
   const failFixture = await httpsRequestStatus("127.0.0.1", 18441, "/__fixture/fail", "POST");
   if (failFixture !== 204) throw new Error(`fixture fail control returned ${failFixture}`);
-  const cachedRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), id);
+  const cachedRefs = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, id);
   const failedRefreshResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/refresh`));
   await page.getByRole("button", { name: "Refresh branches and tags", exact: true }).click();
   const failedRefresh = await failedRefreshResponse;
-  if (failedRefresh.status() !== 502) throw new Error(`failed refresh returned ${failedRefresh.status()}`);
+  if (failedRefresh.status() !== 502 || (await failedRefresh.json()).code !== "operation.upstream_failed") throw new Error(`failed refresh did not return an actionable upstream outcome (${failedRefresh.status()})`);
   await page.getByText(/Your current branches and tags are still shown/).waitFor();
-  const retainedRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), id);
+  const retainedRefs = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, id);
   if (JSON.stringify(retainedRefs) !== JSON.stringify(cachedRefs)) throw new Error("failed refresh changed the cached refs");
-  const failedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).lastFetched, id);
+  const failedTimestamp = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id).lastFetched, id);
   if (failedTimestamp !== timestampAfterReloadFailure) throw new Error("failed refresh changed last successful fetch time");
 
   milestone("create SSH key, approve host, create SSH project");
@@ -892,9 +902,11 @@ try {
   await page.getByRole("button", { name: "Add repository" }).click();
   const sshCreated = await sshCreateResponse;
   if (sshCreated.status() !== 201) throw new Error(`approved SSH project creation returned ${sshCreated.status()}: ${await sshCreated.text()}`);
-  const sshProject = await sshCreated.json();
+  const sshCreateOutcome = await sshCreated.json();
+  if (sshCreateOutcome.code !== "project.created") throw new Error(`SSH project creation returned ${JSON.stringify(sshCreateOutcome)}`);
+  const sshProject = sshCreateOutcome.data;
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
-  const sshRefs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/refs`)).json(), sshProject.id);
+  const sshRefs = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
   await page.getByRole("link", { name: "Repository keys", exact: true }).click();
   await page.waitForURL("**/dashboard/keys");
@@ -908,11 +920,14 @@ try {
   await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "SSH fixture site", exact: true }).waitFor();
   await page.getByLabel("SSH key").selectOption(replacementKeyId);
+  const assignKeyResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/key`));
   await page.getByRole("button", { name: "Change SSH key" }).click();
-  await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id)?.keyId, sshProject.id)) === replacementKeyId, "project key assignment");
+  const assignedKeyOutcome = await assignKeyResponse;
+  if (assignedKeyOutcome.status() !== 200 || (await assignedKeyOutcome.json()).code !== "project.key_assigned") throw new Error(`SSH key assignment returned an unexpected outcome (${assignedKeyOutcome.status()})`);
+  await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id)?.keyId, sshProject.id)) === replacementKeyId, "project key assignment");
   await page.getByLabel("SSH key").selectOption(sshKeyId);
   await page.getByRole("button", { name: "Change SSH key" }).click();
-  await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id)?.keyId, sshProject.id)) === sshKeyId, "restored project key assignment");
+  await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id)?.keyId, sshProject.id)) === sshKeyId, "restored project key assignment");
   milestone("configure private LFS and publish SSH deployment");
   let oldProjectHistoryPolls = 0;
   await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
@@ -1074,7 +1089,7 @@ try {
   const blockedProjectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/delete`));
   await page.getByRole("button", { name: "Confirm delete" }).click();
   if ((await blockedProjectDelete).status() !== 409) throw new Error("project deletion was not blocked while a deployment existed");
-  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id))) throw new Error("blocked project deletion removed the project");
+  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.some(project => project.id === id), sshProject.id))) throw new Error("blocked project deletion removed the project");
   await page.getByRole("link", { name: "SSH published site", exact: true }).click();
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}/deployments/${sshDeployment.body.id}`);
   await page.getByRole("button", { name: "Delete", exact: true }).click();
@@ -1087,13 +1102,13 @@ try {
   await page.getByRole("button", { name: "Delete project" }).click();
   await page.getByText(/Projects with deployments cannot be deleted/).waitFor();
   await page.getByRole("button", { name: "Cancel", exact: true }).click();
-  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id))) throw new Error("cancelling project deletion changed the project");
+  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.some(project => project.id === id), sshProject.id))) throw new Error("cancelling project deletion changed the project");
   await page.getByRole("button", { name: "Delete project" }).click();
   const projectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/delete`));
   await page.getByRole("button", { name: "Confirm delete" }).click();
   const confirmedProjectDelete = await projectDelete;
   if (confirmedProjectDelete.status() !== 204) throw new Error(`confirmed project deletion returned ${confirmedProjectDelete.status()}: ${await confirmedProjectDelete.text()}`);
-  if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
+  if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
   try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }
   milestone("deleted and missing project routes");
   await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
@@ -1126,14 +1141,15 @@ try {
   await cacheConfirmation.getByText(/server can no longer provide/).waitFor();
   await cacheSection.getByRole("button", { name: "Cancel" }).click();
   await page.waitForFunction(() => document.activeElement?.id === "cache-recreate-trigger");
-  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id).gitCacheBytes > 0, id))) throw new Error("cancelling cache recreation changed the Git cache");
+  if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id).gitCacheBytes > 0, id))) throw new Error("cancelling cache recreation changed the Git cache");
   const liveBeforeCacheRecreation = await readFile(join(publishedPath, "index.html"), "utf8");
   await cacheSection.getByRole("button", { name: "Clear cache…" }).click();
   const cacheRecreation = page.waitForResponse(response => response.url().endsWith(`/api/projects/${id}/cache/recreate`));
   await cacheSection.getByRole("button", { name: "Clear cache", exact: true }).click();
-  if ((await cacheRecreation).status() !== 204) throw new Error("confirmed cache recreation did not finish");
+  const cacheRecreationResponse = await cacheRecreation;
+  if (cacheRecreationResponse.status() !== 200 || (await cacheRecreationResponse.json()).code !== "project.cache_cleared") throw new Error(`confirmed cache clearing returned an unexpected outcome (${cacheRecreationResponse.status()})`);
   await page.waitForFunction(() => document.activeElement?.id === "cache-recreate-trigger");
-  const recreatedProject = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).find(project => project.id === id), id);
+  const recreatedProject = await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id), id);
   if (recreatedProject.gitCacheBytes !== 0 || recreatedProject.lfsCacheBytes !== 0) throw new Error(`cache sizes after recreation are not zero: ${JSON.stringify(recreatedProject)}`);
   await cacheSection.getByText("Git cache: 0 bytes · LFS cache: 0 bytes").waitFor();
   if ((await readFile(join(publishedPath, "index.html"), "utf8")) !== liveBeforeCacheRecreation) throw new Error("cache recreation changed live published content");
