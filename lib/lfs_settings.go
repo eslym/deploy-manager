@@ -81,12 +81,12 @@ func (a *App) lfsSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if input.AllowInternal && input.InternalConfirm != lfsApprovalPhrase {
-		writeOutcomeError(w, http.StatusBadRequest, "request.policy_rejected", "Confirm internal destinations separately.")
+		writeOutcomeError(w, http.StatusForbidden, "request.policy_rejected", "Confirm internal destinations separately.")
 		return
 	}
 	internalIPs, err := approvedInternalAddresses(input.AllowInternal, append([]string{originOf(endpoint)}, origins...))
 	if err != nil {
-		writeOutcomeError(w, http.StatusBadRequest, "request.policy_rejected", "Destinations could not be verified. Review the origins and try again.")
+		writeOutcomeError(w, http.StatusForbidden, "request.policy_rejected", "Destinations could not be verified. Review the origins and try again.")
 		return
 	}
 	encoded, _ := json.Marshal(origins)

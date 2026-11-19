@@ -659,7 +659,9 @@ func classifyProjectGitFailure(err error, fallbackStatus int) (int, string, stri
 		return http.StatusConflict, "ssh_host.approval_required", "Verify and approve the SSH host first."
 	}
 	var sshAuthenticationErr *ssh.ServerAuthError
-	if errors.Is(err, transport.ErrAuthenticationRequired) || errors.As(err, &sshAuthenticationErr) {
+	if errors.Is(err, transport.ErrAuthenticationRequired) || errors.As(err, &sshAuthenticationErr) ||
+		(err != nil && strings.Contains(err.Error(), "ssh: unable to authenticate, attempted methods ") &&
+			strings.HasSuffix(err.Error(), ", no supported methods remain")) {
 		return http.StatusBadGateway, "git.authentication_failed", "Repository authentication failed."
 	}
 	if fallbackStatus == http.StatusBadGateway {

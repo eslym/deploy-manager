@@ -2,9 +2,12 @@ package lib
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -98,5 +101,123 @@ func TestApplicationPathRecognizesReservedRootsAndDescendants(t *testing.T) {
 		if isApplicationPath(path) {
 			t.Errorf("%q was incorrectly routed as an application path", path)
 		}
+	}
+}
+
+func TestApplicationRouteOutcomeMatrixUsesSafeCodesAndHeaders(t *testing.T) {
+	dir := t.TempDir()
+	app, err := New(Config{DatabasePath: filepath.Join(dir, "state.db"), OPAQUEKeyPath: filepath.Join(dir, "opaque.key")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	server := httptest.NewTLSServer(app.Handler())
+	defer server.Close()
+
+	const resource = "0123456789abcdef0123456789abcdef"
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{http.MethodGet, "/api/session"},
+		{http.MethodPost, "/api/logout"},
+		{http.MethodGet, "/api/projects"},
+		{http.MethodPost, "/api/projects"},
+		{http.MethodGet, "/api/projects/" + resource + "/refs"},
+		{http.MethodPost, "/api/projects/" + resource + "/refresh"},
+		{http.MethodPost, "/api/projects/" + resource + "/key"},
+		{http.MethodPost, "/api/projects/" + resource + "/cache/recreate"},
+		{http.MethodPost, "/api/projects/" + resource + "/delete"},
+		{http.MethodGet, "/api/projects/" + resource + "/lfs"},
+		{http.MethodPost, "/api/projects/" + resource + "/lfs"},
+		{http.MethodGet, "/api/projects/" + resource + "/github-webhook"},
+		{http.MethodPost, "/api/projects/" + resource + "/github-webhook"},
+		{http.MethodGet, "/api/projects/" + resource + "/gitea-webhook"},
+		{http.MethodPost, "/api/projects/" + resource + "/gitea-webhook"},
+		{http.MethodGet, "/api/deployments"},
+		{http.MethodGet, "/api/deployments/root"},
+		{http.MethodPost, "/api/deployments"},
+		{http.MethodPost, "/api/deployments/" + resource + "/deploy"},
+		{http.MethodGet, "/api/deployments/" + resource + "/history"},
+		{http.MethodPost, "/api/deployments/" + resource + "/rollback"},
+		{http.MethodPost, "/api/deployments/" + resource + "/pause"},
+		{http.MethodPost, "/api/deployments/" + resource + "/resume"},
+		{http.MethodPost, "/api/deployments/" + resource + "/hard-redeploy"},
+		{http.MethodPost, "/api/deployments/" + resource + "/delete"},
+		{http.MethodPost, "/api/deployments/" + resource + "/move"},
+		{http.MethodPost, "/api/deployments/" + resource + "/target"},
+		{http.MethodGet, "/api/deployments/" + resource + "/jobs"},
+		{http.MethodGet, "/api/repository-keys"},
+		{http.MethodPost, "/api/repository-keys"},
+		{http.MethodPost, "/api/repository-keys/" + resource + "/delete"},
+		{http.MethodGet, "/api/ssh-hosts"},
+		{http.MethodPost, "/api/ssh-hosts/approve"},
+		{http.MethodPost, "/api/ssh-hosts/revoke"},
+		{http.MethodGet, "/api/events"},
+		{http.MethodPost, "/opaque/register/start"},
+		{http.MethodPost, "/opaque/register/finish"},
+		{http.MethodPost, "/opaque/login/start"},
+		{http.MethodPost, "/opaque/login/finish"},
+		{http.MethodPost, "/opaque/password/change/start"},
+		{http.MethodPost, "/opaque/password/change/finish"},
+		{http.MethodPost, "/webhooks/github/" + resource},
+		{http.MethodPost, "/webhooks/gitea/" + resource},
+	}
+	type expectation struct {
+		status int
+		code   string
+	}
+	special := map[string]expectation{
+		"POST /api/logout":                    {http.StatusOK, "auth.logged_out"},
+		"GET /api/events":                     {http.StatusBadRequest, "request.invalid"},
+		"POST /opaque/password/change/start":  {http.StatusBadRequest, "auth.protocol_invalid"},
+		"POST /opaque/password/change/finish": {http.StatusBadRequest, "auth.protocol_invalid"},
+		"POST /webhooks/github/" + resource:   {http.StatusNotFound, "webhook.not_configured"},
+		"POST /webhooks/gitea/" + resource:    {http.StatusNotFound, "webhook.not_configured"},
+	}
+	for _, route := range []string{
+		"POST /opaque/register/start", "POST /opaque/register/finish",
+		"POST /opaque/login/start", "POST /opaque/login/finish",
+	} {
+		special[route] = expectation{http.StatusBadRequest, "auth.protocol_invalid"}
+	}
+	for _, route := range routes {
+		t.Run(fmt.Sprintf("%s %s", route.method, route.path), func(t *testing.T) {
+			req, err := http.NewRequest(route.method, server.URL+route.path, strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if route.method == http.MethodPost {
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Origin", server.URL)
+			}
+			if strings.HasPrefix(route.path, "/webhooks/") {
+				req.Header.Set("X-GitHub-Delivery", "delivery-1")
+				req.Header.Set("X-GitHub-Event", "push")
+				req.Header.Set("X-Hub-Signature-256", "sha256="+strings.Repeat("0", 64))
+				req.Header.Set("X-Gitea-Delivery", "delivery-1")
+				req.Header.Set("X-Gitea-Event", "push")
+				req.Header.Set("X-Gitea-Signature", strings.Repeat("0", 64))
+			}
+			wantStatus, wantCode := http.StatusUnauthorized, "auth.session_required"
+			if expectation, ok := special[route.method+" "+route.path]; ok {
+				wantStatus, wantCode = expectation.status, expectation.code
+				if route.path == "/api/events" {
+					req.Header.Set("Origin", server.URL)
+				}
+			}
+			response, err := server.Client().Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			requireOutcome(t, response, wantCode, "null")
+			if response.StatusCode != wantStatus ||
+				response.Header.Get("X-Content-Type-Options") != "nosniff" ||
+				response.Header.Get("Referrer-Policy") != "no-referrer" ||
+				response.Header.Get("Content-Security-Policy") == "" {
+				t.Fatalf("protected route contract status=%d headers=%v", response.StatusCode, response.Header)
+			}
+		})
 	}
 }

@@ -480,13 +480,21 @@ func TestRecreatedLFSCacheFailureIsVisibleThroughDeploymentApplication(t *testin
 	if target.StatusCode != http.StatusAccepted {
 		t.Fatalf("set recovery deployment target: %d %s", target.StatusCode, responseText(target))
 	}
-	var targetJob struct{ JobID string }
+	var targetJob struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if err = json.NewDecoder(target.Body).Decode(&targetJob); err != nil {
 		target.Body.Close()
 		t.Fatal(err)
 	}
 	target.Body.Close()
-	jobID := targetJob.JobID
+	if targetJob.Code != "deployment.target_changed" || targetJob.Data.JobID == "" {
+		t.Fatalf("target change outcome = %+v", targetJob)
+	}
+	jobID := targetJob.Data.JobID
 	waitForDeploymentJob(t, f.server.Client(), f.server.URL, f.cookie, deploymentID, jobID, "failed")
 	jobs := f.waitJobs(t, deploymentID)
 	var failed *deploymentJob

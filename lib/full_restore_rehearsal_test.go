@@ -48,6 +48,11 @@ func TestDocumentedFullInstallationRestoreRehearsal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() {
+		if app != nil {
+			_ = app.Close()
+		}
+	})
 	const origin = "https://manager.example"
 	const initialPassword = "full-restore initial password"
 	setup, err := app.IssueRegistrationGrant()
@@ -97,11 +102,7 @@ func TestDocumentedFullInstallationRestoreRehearsal(t *testing.T) {
 	if created.StatusCode != http.StatusCreated {
 		t.Fatalf("approved SSH project create status=%d body=%s", created.StatusCode, responseText(created))
 	}
-	var projectRecord project
-	if err := json.NewDecoder(created.Body).Decode(&projectRecord); err != nil {
-		created.Body.Close()
-		t.Fatal(err)
-	}
+	projectRecord := decodeProjectOutcome(t, created.Body)
 	created.Body.Close()
 	if refs := projectRefsFromAPI(t, client, appServer.URL, adminCookie, projectRecord.ID); len(refs) != 3 {
 		t.Fatalf("SSH refs before snapshot: %#v", refs)
