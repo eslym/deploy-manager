@@ -487,19 +487,19 @@ try {
   if (!firstGiteaSecret) throw new Error("Gitea setup did not show a signing secret");
   await giteaWebhook.getByText(`https://${appListen}/webhooks/gitea/${id}`, { exact: true }).waitFor();
   const giteaStatus = await page.evaluate(async path => await (await fetch(path)).json(), giteaSettingsPath);
-  if (!giteaStatus.configured || "secret" in giteaStatus) throw new Error("Gitea settings did not hide its configured secret");
+  if (!giteaStatus.data.configured || "secret" in giteaStatus.data) throw new Error("Gitea settings did not hide its configured secret");
   async function sendGitea(secret, delivery) {
     const body = JSON.stringify({ ref: "refs/heads/browser-unmatched", after: "a".repeat(40), deleted: false });
     return httpsRequestStatus("127.0.0.1", 18440, `/webhooks/gitea/${id}`, "POST", body, { "Content-Type": "application/json", "X-Gitea-Delivery": delivery, "X-Gitea-Event": "push", "X-Gitea-Signature": createHmac("sha256", secret).update(body).digest("hex") });
   }
-  if (await sendGitea(firstGiteaSecret, "browser-gitea-initial") !== 204) throw new Error("initial Gitea secret did not authenticate a push");
+  if (await sendGitea(firstGiteaSecret, "browser-gitea-initial") !== 200) throw new Error("initial Gitea secret did not authenticate a push");
   page.once("dialog", dialog => dialog.accept());
   await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).click();
   await waitFor(async () => (await webhookSecret()) !== firstGiteaSecret, "rotated Gitea secret");
   const rotatedGiteaSecret = await webhookSecret();
   if (!rotatedGiteaSecret) throw new Error("Gitea rotation did not show a new secret");
   if (await sendGitea(firstGiteaSecret, "browser-gitea-old") !== 401) throw new Error("old Gitea secret still authenticated after rotation");
-  if (await sendGitea(rotatedGiteaSecret, "browser-gitea-new") !== 204) throw new Error("rotated Gitea secret did not authenticate a push");
+  if (await sendGitea(rotatedGiteaSecret, "browser-gitea-new") !== 200) throw new Error("rotated Gitea secret did not authenticate a push");
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
   await giteaWebhook.getByRole("button", { name: "Rotate secret", exact: true }).waitFor();
