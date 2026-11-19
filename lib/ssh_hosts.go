@@ -28,6 +28,8 @@ type sshHostWarning struct {
 	Trusted     bool   `json:"trusted"`
 }
 
+var errSSHHostApprovalRequired = errors.New("SSH host approval is required")
+
 func init() {
 	// The application deliberately supports only the repository URL's explicit
 	// host, port, and user. Do not inherit host aliases, proxies, agents, or
@@ -109,7 +111,7 @@ func (a *App) projectSSHHostKeyCallback(host string, port int) ssh.HostKeyCallba
 		if writeErr != nil {
 			return errors.New("SSH host key could not be verified because trust storage is unavailable")
 		}
-		return errors.New("SSH host key is not approved")
+		return errSSHHostApprovalRequired
 	}
 }
 

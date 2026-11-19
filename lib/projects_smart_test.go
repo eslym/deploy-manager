@@ -792,6 +792,34 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr != nil || string(content) != "race branch tip\n" {
 		t.Fatalf("failed branch fetch changed live content: %q, err=%v", content, readErr)
 	}
+	failStatus.Store(http.StatusUnauthorized)
+	failRequests.Store(true)
+	authenticatedRefresh := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	authenticatedRefreshMessage := responseText(authenticatedRefresh)
+	authenticatedRefresh.Body.Close()
+	var authenticatedRefreshOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(authenticatedRefreshMessage), &authenticatedRefreshOutcome); err != nil ||
+		authenticatedRefresh.StatusCode != http.StatusBadGateway || authenticatedRefreshOutcome.Code != "git.authentication_failed" {
+		t.Fatalf("authentication failure did not produce an actionable refresh outcome: status=%d body=%s", authenticatedRefresh.StatusCode, authenticatedRefreshMessage)
+	}
+	failRequests.Store(false)
+	failStatus.Store(0)
+	failStatus.Store(http.StatusServiceUnavailable)
+	failRequests.Store(true)
+	upstreamRefresh := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
+	upstreamRefreshMessage := responseText(upstreamRefresh)
+	upstreamRefresh.Body.Close()
+	var upstreamRefreshOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(upstreamRefreshMessage), &upstreamRefreshOutcome); err != nil ||
+		upstreamRefresh.StatusCode != http.StatusBadGateway || upstreamRefreshOutcome.Code != "operation.upstream_failed" {
+		t.Fatalf("temporary upstream outage was mistaken for cache recovery: status=%d body=%s", upstreamRefresh.StatusCode, upstreamRefreshMessage)
+	}
+	failRequests.Store(false)
+	failStatus.Store(0)
 	oversized := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/refresh", `{}`)
 	if oversized.StatusCode != http.StatusBadGateway {
 		t.Fatalf("oversized pack refresh status %d: %s", oversized.StatusCode, responseText(oversized))

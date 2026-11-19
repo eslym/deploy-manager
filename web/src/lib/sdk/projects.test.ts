@@ -106,4 +106,51 @@ describe('project SDK operations', () => {
 			expect.objectContaining({ signal: controller.signal })
 		);
 	});
+
+	it('preserves actionable project outcomes for refresh, key assignment, and cache clearing', async () => {
+		const fetch = vi
+			.fn()
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						code: 'ssh_host.approval_required',
+						message: 'Verify and approve the SSH host first.',
+						data: null
+					}),
+					{ status: 502 }
+				)
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						code: 'project.key_assigned',
+						message: 'Repository key assigned.',
+						data: null
+					})
+				)
+			)
+			.mockResolvedValueOnce(
+				new Response(
+					JSON.stringify({
+						code: 'project.cache_cleared',
+						message: 'Repository caches cleared.',
+						data: null
+					})
+				)
+			);
+		const api = createBrowserSDK({ fetch });
+
+		await expect(api.projects.refresh('project-id')).rejects.toMatchObject({
+			outcome: { kind: 'server', status: 502, code: 'ssh_host.approval_required', data: null }
+		});
+		await expect(api.projects.assignKey('project-id', { keyId: 'key-id' })).resolves.toMatchObject({
+			code: 'project.key_assigned',
+			data: null
+		});
+		await expect(api.projects.clearCache('project-id')).resolves.toMatchObject({
+			code: 'project.cache_cleared',
+			data: null
+		});
+		expect(fetch).toHaveBeenCalledTimes(3);
+	});
 });

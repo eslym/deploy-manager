@@ -106,6 +106,7 @@
 	let projectReadController: AbortController | undefined;
 	let refreshController: AbortController | undefined;
 	let cacheReadController: AbortController | undefined;
+	let actionController: AbortController | undefined;
 	let selected = $derived(page.params.id ?? '');
 	let project = $derived(projects.find((item) => item.id === selected));
 	let loading = $state(true);
@@ -140,18 +141,27 @@
 		}
 	}
 	async function loadSshHosts() {
+		const controller = refreshController;
 		try {
-			sshHosts = (await sdk.sshHosts.list()).data;
+			const result = (await sdk.sshHosts.list(controller?.signal)).data;
+			if (controller && !controller.signal.aborted && selected === refreshControllerProject)
+				sshHosts = result;
 		} catch {
 			/* Keep the original project error visible. */
 		}
 	}
+	let refreshControllerProject = '';
 	async function assignKey(project: Project) {
+		actionController?.abort();
+		const controller = new AbortController();
+		actionController = controller;
+		const projectId = project.id;
 		error = '';
 		try {
-			await sdk.projects.assignKey(project.id, { keyId: keyAssignments[project.id] });
+			await sdk.projects.assignKey(projectId, { keyId: keyAssignments[projectId] }, controller.signal);
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not assign the key.';
+			if (!controller.signal.aborted && selected === projectId)
+				error = cause instanceof Error ? cause.message : 'Could not assign the key.';
 		}
 	}
 	async function loadLfsSettings(id: string) {
@@ -224,6 +234,7 @@
 		refreshController?.abort();
 		const controller = new AbortController();
 		refreshController = controller;
+		refreshControllerProject = project.id;
 		busy = true;
 		try {
 			await sdk.projects.refresh(project.id, controller.signal);
@@ -296,7 +307,7 @@
 		cacheRecreateNotice = '';
 		let storageCleared = false;
 		try {
-			await sdk.projects.clearCache(project.id);
+			await sdk.projects.clearCache(project.id, readController.signal);
 			storageCleared = true;
 			const refreshedProjects: Project[] = (await sdk.projects.list(readController.signal)).data;
 			if (readController.signal.aborted || selected !== project.id) return;
@@ -365,6 +376,8 @@
 		projectReadController?.abort();
 		cacheReadController?.abort();
 		refreshController?.abort();
+		actionController?.abort();
+		actionController = undefined;
 		refreshController = undefined;
 		busy = false;
 		const controller = new AbortController();
@@ -416,6 +429,8 @@
 		projectReadController?.abort();
 		cacheReadController?.abort();
 		refreshController?.abort();
+		actionController?.abort();
+		actionController = undefined;
 	});
 </script>
 

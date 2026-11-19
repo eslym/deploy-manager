@@ -46,6 +46,7 @@ func (p *projectManager) refreshProjectCache(requestCtx context.Context, id, rem
 	defer func() {
 		if cleanupErr := p.cleanupStage(stage); cleanupErr != nil {
 			result = fail(http.StatusServiceUnavailable, cleanupErr.Error())
+			result.cause = errProjectCacheRecoveryRequired
 		}
 	}()
 	if err := copyGitCache(p.repoPath(id), stage, p.maxCacheBytes); err != nil {
@@ -96,7 +97,9 @@ func (p *projectManager) refreshProjectCache(requestCtx context.Context, id, rem
 		if errors.As(err, &lifecycleErr) {
 			status = lifecycleErr.status
 		}
-		return fail(status, err.Error())
+		result = fail(status, err.Error())
+		result.cause = err
+		return result
 	}
 	result.fetchedAt = now
 	result.warning = warning

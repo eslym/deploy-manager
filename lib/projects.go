@@ -33,6 +33,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	gitclient "github.com/go-git/go-git/v5/plumbing/transport/client"
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
+	"golang.org/x/crypto/ssh"
 )
 
 type projectManager struct {
@@ -69,6 +70,7 @@ var errGitUnsupportedSmartHTTP = errors.New("server does not provide a supported
 var errGitUnsupportedSHA256 = errors.New("SHA-256 Git repositories are not supported")
 var errGitIncompleteRepository = errors.New("repository is incomplete or uses an unsupported partial clone")
 var errGitTooManyRefs = errors.New("repository has more references than the configured limit")
+var errProjectCacheRecoveryRequired = errors.New("project cache recovery is required")
 
 type gitHTTPPolicyKey struct{}
 
@@ -508,21 +510,8 @@ func (a *App) createProject(w http.ResponseWriter, r *http.Request) {
 			writeOutcomeError(w, http.StatusRequestEntityTooLarge, "operation.capacity_exceeded", "Repository cache capacity was exceeded.")
 			return
 		}
-		status := http.StatusBadRequest
-		code := "git.target_unavailable"
-		if strings.Contains(strings.ToLower(err.Error()), "ssh host key is not approved") {
-			status = http.StatusConflict
-			code = "ssh_host.approval_required"
-		}
-		if strings.Contains(strings.ToLower(err.Error()), "unable to authenticate") || strings.Contains(strings.ToLower(err.Error()), "authentication failed") {
-			status = http.StatusBadGateway
-			code = "git.authentication_failed"
-		}
-		writeOutcomeError(w, status, code, map[string]string{
-			"git.target_unavailable":     "Selected Git target is unavailable.",
-			"ssh_host.approval_required": "Verify and approve the SSH host first.",
-			"git.authentication_failed":  "Repository authentication failed.",
-		}[code])
+		status, code, message := classifyProjectGitFailure(err, http.StatusBadRequest)
+		writeOutcomeError(w, status, code, message)
 		return
 	}
 	if size, sizeErr := directorySize(p.root, p.maxCacheBytes); sizeErr != nil || size > p.maxCacheBytes {
@@ -642,32 +631,38 @@ func (a *App) refreshProject(w http.ResponseWriter, r *http.Request) {
 	}
 	refresh := p.refreshProjectCache(r.Context(), id, remote, sshAuth)
 	if refresh.message != "" {
-		code := "operation.upstream_failed"
-		message := "Repository operation failed."
-		switch {
-		case refresh.status == http.StatusRequestEntityTooLarge:
-			code = "operation.capacity_exceeded"
-			message = "Repository cache capacity was exceeded."
-		case refresh.cause != nil && (strings.Contains(strings.ToLower(refresh.cause.Error()), "limit") || strings.Contains(strings.ToLower(refresh.cause.Error()), "too large")):
-			code = "operation.capacity_exceeded"
-			message = "Repository cache capacity was exceeded."
-		case refresh.status == http.StatusServiceUnavailable:
+		_, code, message := classifyProjectGitFailure(refresh.cause, refresh.status)
+		var lifecycleErr *refreshLifecycleError
+		if errors.Is(refresh.cause, errProjectCacheRecoveryRequired) ||
+			(errors.As(refresh.cause, &lifecycleErr) && lifecycleErr.status == http.StatusServiceUnavailable) {
 			code = "project.cache_recovery_required"
 			message = "Repository cache recovery is required."
-		case refresh.cause != nil && (strings.Contains(strings.ToLower(refresh.cause.Error()), "ssh host key is not approved")):
-			code = "ssh_host.approval_required"
-			message = "Verify and approve the SSH host first."
-		case refresh.cause != nil && (strings.Contains(strings.ToLower(refresh.cause.Error()), "unable to authenticate") || strings.Contains(strings.ToLower(refresh.cause.Error()), "authentication failed")):
-			code = "git.authentication_failed"
-			message = "Repository authentication failed."
-		case refresh.status == http.StatusBadGateway:
-			code = "git.target_unavailable"
-			message = "Selected Git target is unavailable."
 		}
 		writeOutcomeError(w, refresh.status, code, message)
 		return
 	}
 	writeOutcome(w, http.StatusOK, "project.refreshed", "Repository refreshed.", map[string]any{"lastFetched": refresh.fetchedAt, "warning": refresh.warning})
+}
+
+func classifyProjectGitFailure(err error, fallbackStatus int) (int, string, string) {
+	if fallbackStatus == http.StatusRequestEntityTooLarge || errors.Is(err, errGitCacheLimit) || errors.Is(err, errGitTransferTooLarge) {
+		return http.StatusRequestEntityTooLarge, "operation.capacity_exceeded", "Repository cache capacity was exceeded."
+	}
+	var upstreamErr transientGitHTTPError
+	if errors.As(err, &upstreamErr) {
+		return fallbackStatus, "operation.upstream_failed", "Repository operation failed."
+	}
+	if errors.Is(err, errSSHHostApprovalRequired) {
+		return http.StatusConflict, "ssh_host.approval_required", "Verify and approve the SSH host first."
+	}
+	var sshAuthenticationErr *ssh.ServerAuthError
+	if errors.Is(err, transport.ErrAuthenticationRequired) || errors.As(err, &sshAuthenticationErr) {
+		return http.StatusBadGateway, "git.authentication_failed", "Repository authentication failed."
+	}
+	if fallbackStatus == http.StatusBadGateway {
+		return fallbackStatus, "git.target_unavailable", "Selected Git target is unavailable."
+	}
+	return fallbackStatus, "git.target_unavailable", "Selected Git target is unavailable."
 }
 
 func (a *App) assignProjectKey(w http.ResponseWriter, r *http.Request) {

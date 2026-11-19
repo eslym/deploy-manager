@@ -155,8 +155,13 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 		return projectPost(t, client, appServer.URL, cookie, "/api/projects", fmt.Sprintf(`{"name":%q,"url":%q,"keyId":%q}`, name, url, key.ID))
 	}
 	first := create("unknown host")
-	if first.StatusCode != http.StatusConflict {
-		t.Fatalf("unknown SSH host status=%d body=%s", first.StatusCode, responseText(first))
+	firstMessage := responseText(first)
+	var firstOutcome struct {
+		Code string `json:"code"`
+	}
+	if err := json.Unmarshal([]byte(firstMessage), &firstOutcome); err != nil ||
+		first.StatusCode != http.StatusConflict || firstOutcome.Code != "ssh_host.approval_required" {
+		t.Fatalf("unknown SSH host did not produce an approval outcome: status=%d body=%s", first.StatusCode, firstMessage)
 	}
 	first.Body.Close()
 	warnings := readSSHWarnings(t, client, appServer.URL, cookie)
@@ -174,6 +179,15 @@ func TestAuthenticatedSSHProjectRequiresApprovedHostKey(t *testing.T) {
 	}
 	created := decodeProjectOutcome(t, createdResponse.Body)
 	createdResponse.Body.Close()
+	reassign := projectPost(t, client, appServer.URL, cookie, "/api/projects/"+created.ID+"/key", fmt.Sprintf(`{"keyId":%q}`, key.ID))
+	var assignmentOutcome struct {
+		Code string `json:"code"`
+		Data any    `json:"data"`
+	}
+	if err := json.NewDecoder(reassign.Body).Decode(&assignmentOutcome); err != nil || reassign.StatusCode != http.StatusOK || assignmentOutcome.Code != "project.key_assigned" || assignmentOutcome.Data != nil {
+		t.Fatalf("key assignment outcome status=%d body=%s", reassign.StatusCode, responseText(reassign))
+	}
+	reassign.Body.Close()
 	refs := projectRefsFromAPI(t, client, appServer.URL, cookie, created.ID)
 	if len(refs) != 1 || refs[0].Name != "main" {
 		t.Fatalf("SSH refs: %#v", refs)
