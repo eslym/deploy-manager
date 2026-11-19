@@ -334,6 +334,73 @@ func (f *automationFixture) createBranch(t *testing.T, name string) string {
 	return created.ID
 }
 
+func TestDeploymentAndJobReadsUseOutcomeEnvelopes(t *testing.T) {
+	f := newAutomationFixture(t)
+	createdResponse := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments", `{"projectId":"`+f.projectID+`","name":"deployment-outcome","targetKind":"branch","targetName":"feature/search"}`)
+	if createdResponse.StatusCode != http.StatusCreated {
+		t.Fatalf("create deployment: %d %s", createdResponse.StatusCode, responseText(createdResponse))
+	}
+	var created struct {
+		Code string `json:"code"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(createdResponse.Body).Decode(&created); err != nil {
+		t.Fatal(err)
+	}
+	createdResponse.Body.Close()
+	id := created.Data.ID
+	if created.Code != "deployment.created" || id == "" {
+		t.Fatalf("create outcome = %+v", created)
+	}
+	queuedResponse := projectPost(t, f.server.Client(), f.server.URL, f.cookie, "/api/deployments/"+id+"/deploy", `{}`)
+	if queuedResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf("deploy status = %d: %s", queuedResponse.StatusCode, responseText(queuedResponse))
+	}
+	var queued struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID  string `json:"jobId"`
+			Status string `json:"status"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(queuedResponse.Body).Decode(&queued); err != nil {
+		t.Fatal(err)
+	}
+	queuedResponse.Body.Close()
+	if queued.Code != "deployment.queued" || queued.Data.JobID == "" || queued.Data.Status != "queued" {
+		t.Fatalf("deploy acceptance outcome = %+v", queued)
+	}
+
+	for _, tc := range []struct {
+		path string
+		code string
+	}{
+		{path: "/api/deployments", code: "deployment.listed"},
+		{path: "/api/deployments/root", code: "deployment.root_loaded"},
+		{path: "/api/deployments/" + id + "/jobs", code: "job.listed"},
+		{path: "/api/deployments/" + strings.Repeat("0", 32) + "/jobs", code: "job.listed"},
+	} {
+		request, _ := http.NewRequest(http.MethodGet, f.server.URL+tc.path, nil)
+		request.AddCookie(&http.Cookie{Name: sessionCookie, Value: f.cookie})
+		response, err := f.server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var result struct {
+			Code    string          `json:"code"`
+			Message string          `json:"message"`
+			Data    json.RawMessage `json:"data"`
+		}
+		decodeErr := json.NewDecoder(response.Body).Decode(&result)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK || decodeErr != nil || result.Code != tc.code || result.Message == "" || len(result.Data) == 0 {
+			t.Fatalf("GET %s returned status=%d outcome=%+v decodeErr=%v", tc.path, response.StatusCode, result, decodeErr)
+		}
+	}
+}
+
 func TestBranchDeploymentRetriesTransientFetchesButNotAuthenticationFailures(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

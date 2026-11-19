@@ -79,30 +79,30 @@ func (a *App) controlDeploymentAutomation(w http.ResponseWriter, r *http.Request
 		var ok bool
 		slot, ok = a.reserveDeploymentSlot()
 		if !ok {
-			http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "operation.capacity_exceeded", "Work capacity is unavailable. Try again later.")
 			return
 		}
 		defer slot.release()
 		var err error
 		jobID, err = randomID()
 		if err != nil {
-			http.Error(w, "publication could not be queued", 500)
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 			return
 		}
 	}
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "automatic deployment could not be updated", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	d, err := tx.Deployment.Get(r.Context(), id)
 	if err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if d.TargetKind != "branch" || d.Status == "deleting" || d.Status == "deletion_failed" {
-		http.Error(w, "automatic deployment is available only for active branch targets", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	now := a.cfg.Now().UnixNano()
@@ -114,13 +114,13 @@ func (a *App) controlDeploymentAutomation(w http.ResponseWriter, r *http.Request
 		}
 	} else {
 		if d.AutomationPaused == 0 {
-			http.Error(w, "automatic deployment is already enabled", http.StatusConflict)
+			writeOutcomeError(w, http.StatusConflict, "deployment.already_resumed", "Automatic deployment is already enabled.")
 			return
 		}
 		var changed int
 		changed, err = tx.Deployment.Update().Where(deploymentmodel.IDEQ(id), deploymentmodel.AutomationPausedEQ(1)).SetAutomationPaused(0).AddAutomationEpoch(1).SetStatus("queued").SetError("").SetUpdatedAt(now).Save(r.Context())
 		if err == nil && changed != 1 {
-			http.Error(w, "automatic deployment is already enabled", http.StatusConflict)
+			writeOutcomeError(w, http.StatusConflict, "deployment.already_resumed", "Automatic deployment is already enabled.")
 			return
 		}
 		if err == nil {
@@ -128,17 +128,17 @@ func (a *App) controlDeploymentAutomation(w http.ResponseWriter, r *http.Request
 		}
 	}
 	if err != nil {
-		http.Error(w, "automatic deployment could not be updated", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "automatic deployment could not be updated", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if pause {
-		writeJSON(w, map[string]any{"automationPaused": true})
+		writeOutcome(w, http.StatusOK, "deployment.paused", "Automatic deployment paused.", map[string]any{"automationPaused": true})
 		return
 	}
 	slot.enqueue(jobID)
-	writeJSONStatus(w, http.StatusAccepted, map[string]any{"automationPaused": false, "jobId": jobID, "status": "queued"})
+	writeOutcome(w, http.StatusAccepted, "deployment.resumed", "Automatic deployment resumed. Publication queued.", map[string]any{"automationPaused": false, "jobId": jobID, "status": "queued"})
 }

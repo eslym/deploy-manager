@@ -4,6 +4,7 @@ import {
 	type RepositoryOutcomeCode
 } from './repository';
 import { createProjectOperations } from './projects';
+import { createDeploymentSDK } from './deployments';
 
 export type OutcomeCode =
 	| RepositoryOutcomeCode
@@ -42,7 +43,8 @@ export type OutcomeCode =
 	| 'request.not_found'
 	| 'operation.capacity_exceeded'
 	| 'operation.upstream_failed'
-	| 'project.cache_recovery_required';
+	| 'project.cache_recovery_required'
+	| import('./deployments').DeploymentOutcomeCode;
 
 const knownCodes = new Set<string>([
 	'auth.registration_started',
@@ -81,7 +83,18 @@ const knownCodes = new Set<string>([
 	'request.not_found',
 	'operation.capacity_exceeded',
 	'operation.upstream_failed',
-	'project.cache_recovery_required'
+	'project.cache_recovery_required',
+	'deployment.listed',
+	'deployment.root_loaded',
+	'deployment.created',
+	'deployment.queued',
+	'deployment.hard_redeploy_queued',
+	'deployment.target_changed',
+	'deployment.history_loaded',
+	'deployment.rollback_queued',
+	'deployment.paused',
+	'deployment.resumed',
+	'job.listed'
 ]);
 
 export interface Outcome<T> {
@@ -150,7 +163,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		validate: (data: unknown) => data is T,
 		signal?: AbortSignal,
 		protectedRequest = false,
-		expectedCode?: OutcomeCode
+		expectedCode?: string
 	): Promise<Outcome<T>> {
 		let response: Response;
 		try {
@@ -245,6 +258,8 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 
 	return {
 		...repositoryOperations,
+		projects: createProjectOperations(request),
+		deployments: createDeploymentSDK(request),
 		auth: {
 			registerStart: (input: { grant: string; value: string }, signal?: AbortSignal) =>
 				request(

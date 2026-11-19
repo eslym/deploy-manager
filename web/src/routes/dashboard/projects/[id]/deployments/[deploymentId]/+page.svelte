@@ -1,16 +1,13 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
-	import { sdk } from '#lib/sdk/index.js';
+	import { BrowserSDKError, sdk } from '#lib/sdk/index.js';
 	import {
 		isReservedPublicationFolder,
 		isValidPublicationFolder,
 		publicationFolderPattern,
 		publicationFolderPreview
 	} from '#lib/publication-folder.js';
-	import {
-		PublicationStatusUnavailableError,
-		publicationStatusUnavailable
-	} from '#lib/publication-status.js';
+	import { PublicationStatusUnavailableError } from '#lib/publication-status.js';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import { onDestroy } from 'svelte';
@@ -24,7 +21,7 @@
 		name: string;
 		targetKind: string;
 		automationPaused: boolean;
-		targetName: string;
+		targetName?: string;
 		commit: string;
 		liveCommit?: string;
 		status: string;
@@ -88,23 +85,38 @@
 				}[job.status] ?? job.status);
 
 	async function request(path: string, init?: RequestInit) {
-		return dashboardRequest(path, init, (response) => {
-			if (path === '/api/deployments' && response.status === 503)
-				return publicationStatusUnavailable(response);
-			if (path.endsWith('/move') && response.status === 409)
-				return new Error(
-					'The publication may have changed or the destination is unavailable. Refresh and review the move before trying again.'
+		return dashboardRequest(
+			path,
+			init,
+			() => new Error('The request could not be completed. Refresh and try again.')
+		);
+	}
+
+	async function listDeployments() {
+		try {
+			return (await sdk.deployments.list()).data;
+		} catch (cause) {
+			if (
+				cause instanceof BrowserSDKError &&
+				cause.outcome.kind === 'server' &&
+				cause.outcome.status === 503
+			) {
+				throw new PublicationStatusUnavailableError(
+					'Publication status is unavailable. Do not rely on a previously shown document root until status can be verified. Try again shortly.'
 				);
-			if (path.endsWith('/delete') && response.status === 503)
-				return new Error(
-					'Deletion is pending. The published files are protected while cleanup retries; try again later.'
-				);
-			return new Error(
-				response.status >= 500
-					? 'The request could not be completed. Try again shortly.'
-					: 'The request was rejected. Refresh and try again.'
-			);
-		});
+			}
+			throw cause;
+		}
+	}
+
+	function mutationError(cause: unknown, fallback: string, uncertain: string) {
+		if (cause instanceof BrowserSDKError) {
+			if (cause.outcome.kind !== 'server') return uncertain;
+			if (cause.outcome.status >= 500) return uncertain;
+			if (cause.outcome.status === 409 && cause.outcome.code === 'request.conflict')
+				return 'The deployment changed while you were editing it. Refresh and review before trying again.';
+		}
+		return cause instanceof Error ? cause.message : fallback;
 	}
 
 	async function load(id = projectId, deployment = deploymentId, currentView = viewVersion) {
@@ -121,7 +133,7 @@
 			deployment === deploymentId;
 		try {
 			const [all, projects]: [Deployment[], Project[]] = await Promise.all([
-				request('/api/deployments'),
+				listDeployments(),
 				sdk.projects.list(controller.signal).then((result) => result.data)
 			]);
 			if (!current()) return;
@@ -139,13 +151,13 @@
 				return;
 			}
 			project = foundProject;
-			const previousTarget = item && `${item.targetKind}:${item.targetName}`;
+			const previousTarget = item && `${item.targetKind}:${item.targetName ?? ''}`;
 			if (item?.publicationPath && item.publicationPath !== found.publicationPath)
 				moveConfirmation = null;
 			item = found;
-			if (!targetSelection || previousTarget !== `${found.targetKind}:${found.targetName}`)
+			if (!targetSelection || previousTarget !== `${found.targetKind}:${found.targetName ?? ''}`)
 				targetSelection =
-					found.targetKind === 'branch' || found.targetKind === 'tag'
+					(found.targetKind === 'branch' || found.targetKind === 'tag') && found.targetName
 						? `${found.targetKind}:${found.targetName}`
 						: `commit:${found.commit}`;
 			loading = false;
@@ -153,8 +165,8 @@
 			// Only fetch deployment-scoped data after the project/deployment association is verified.
 			const [refsResult, jobsResult, rootResult] = await Promise.allSettled([
 				sdk.projects.refs(id, controller.signal).then((result) => result.data),
-				request(`/api/deployments/${deployment}/jobs`) as Promise<Job[]>,
-				request('/api/deployments/root') as Promise<{ publicationRoot: string }>
+				sdk.deployments.jobs(deployment).then((outcome) => outcome.data) as Promise<Job[]>,
+				sdk.deployments.root().then((outcome) => outcome.data)
 			]);
 			if (!current()) return;
 			if (refsResult.status === 'fulfilled') {
@@ -229,32 +241,51 @@
 		}
 	}
 
-	async function runDeploymentAction(path: string, fallbackError: string) {
+	async function runDeploymentAction(
+		action: () => Promise<{ code: string }>,
+		expectedCode: string,
+		fallbackError: string
+	) {
 		if (busy || !item || !project) return;
 		busy = true;
 		error = '';
 		try {
-			await request(path, { method: 'POST', body: '{}' });
+			const outcome = await action();
+			if (outcome.code !== expectedCode) {
+				error =
+					'Could not confirm whether this action was accepted. Check Latest deployment before trying again.';
+				return;
+			}
 			await load();
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : fallbackError;
+			error = mutationError(
+				cause,
+				fallbackError,
+				'Could not confirm whether this action was accepted. Check Latest deployment before trying again.'
+			);
 		} finally {
 			busy = false;
 		}
 	}
 	async function deploy(id: string) {
-		return runDeploymentAction(`/api/deployments/${id}/deploy`, 'Could not start deployment.');
+		return runDeploymentAction(
+			() => sdk.deployments.deploy(id),
+			'deployment.queued',
+			'Could not start deployment.'
+		);
 	}
 	async function hardRedeploy(id: string) {
 		return runDeploymentAction(
-			`/api/deployments/${id}/hard-redeploy`,
+			() => sdk.deployments.hardRedeploy(id),
+			'deployment.hard_redeploy_queued',
 			'Could not start hard re-deploy.'
 		);
 	}
 	async function setAutomationPaused(id: string, paused: boolean) {
 		if (item?.targetKind !== 'branch') return;
 		return runDeploymentAction(
-			`/api/deployments/${id}/${paused ? 'pause' : 'resume'}`,
+			() => (paused ? sdk.deployments.pause(id) : sdk.deployments.resume(id)),
+			paused ? 'deployment.paused' : 'deployment.resumed',
 			'Could not update automatic deployment.'
 		);
 	}
@@ -264,17 +295,23 @@
 		busy = true;
 		error = '';
 		try {
-			await request(`/api/deployments/${id}/target`, {
-				method: 'POST',
-				body: JSON.stringify({
-					targetKind: target.kind,
-					targetName: target.name,
-					commit: target.commit
-				})
+			const outcome = await sdk.deployments.changeTarget(id, {
+				targetKind: target.kind as 'branch' | 'tag',
+				targetName: target.name,
+				commit: target.commit
 			});
+			if (outcome.code !== 'deployment.target_changed') {
+				error =
+					'Could not confirm whether the target change was accepted. Refresh deployment details before trying again.';
+				return;
+			}
 			await load();
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not change the deployment target.';
+			error = mutationError(
+				cause,
+				'Could not change the deployment target.',
+				'Could not confirm whether the target change was accepted. Refresh deployment details before trying again.'
+			);
 		} finally {
 			busy = false;
 		}
@@ -284,14 +321,29 @@
 		busy = true;
 		error = '';
 		try {
-			await request(`/api/deployments/${id}/delete`, {
-				method: 'POST',
-				body: JSON.stringify({ confirm: true })
-			});
+			const outcome = await sdk.deployments.remove(id);
+			if (outcome.code !== 'deployment.deleted') {
+				error =
+					'Could not confirm whether deletion completed. Refresh the deployment list before trying again.';
+				return;
+			}
 			deleteConfirmation = false;
 			await goto(`/dashboard/projects/${projectId}`);
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not delete the deployment.';
+			if (
+				cause instanceof BrowserSDKError &&
+				cause.outcome.kind === 'server' &&
+				cause.outcome.status === 503
+			) {
+				error =
+					'Deletion is pending. The published files are protected while cleanup retries; try again later.';
+			} else {
+				error = mutationError(
+					cause,
+					'Could not delete the deployment.',
+					'Could not confirm whether deletion completed. Refresh the deployment list before trying again.'
+				);
+			}
 		} finally {
 			busy = false;
 		}
@@ -312,21 +364,32 @@
 		busy = true;
 		error = '';
 		try {
-			await request(`/api/deployments/${id}/move`, {
-				method: 'POST',
-				body: JSON.stringify({
-					publicationPath: movePath,
-					expectedPublicationPath: confirmation.oldPath,
-					confirm: true
-				})
+			const outcome = await sdk.deployments.move(id, {
+				publicationPath: movePath,
+				expectedPublicationPath: confirmation.oldPath,
+				confirm: true
 			});
+			if (outcome.code !== 'deployment.moved') {
+				error =
+					'Could not confirm whether the move completed. Refresh deployment details before trying again.';
+				return;
+			}
 			moveConfirmation = null;
 			movePath = '';
 			moveOpen = false;
 			await load();
 		} catch (cause) {
 			moveConfirmation = null;
-			error = cause instanceof Error ? cause.message : 'Could not move the deployment.';
+			error =
+				cause instanceof BrowserSDKError &&
+				cause.outcome.kind === 'server' &&
+				cause.outcome.status === 409
+					? 'The publication may have changed or the destination is unavailable. Refresh and review the move before trying again.'
+					: mutationError(
+							cause,
+							'Could not move the deployment.',
+							'Could not confirm whether the move completed. Refresh deployment details before trying again.'
+						);
 		} finally {
 			busy = false;
 		}
@@ -580,7 +643,7 @@
 				</p>{/if}
 			<p class="mt-1 text-sm text-[#58645b]">
 				{#if item.targetKind === 'branch' || item.targetKind === 'tag'}
-					Target {item.targetKind}: {item.targetName}
+					Target {item.targetKind}: {item.targetName ?? item.commit}
 				{:else}
 					Target commit: {item.commit}
 				{/if}
@@ -604,7 +667,7 @@
 										.includes(targetSearch.toLowerCase()))}<option value={targetSelection} disabled
 								>{item.targetKind === 'commit'
 									? `Current commit · ${item.commit}`
-									: `Current target · ${item.targetName}`}</option
+									: `Current target · ${item.targetName ?? item.commit}`}</option
 							>{/if}
 						{#each matchingRefs as ref (key(ref))}<option value={key(ref)}
 								>{ref.kind}: {ref.name}</option
@@ -616,10 +679,10 @@
 					onclick={() => item && changeTarget(item.id)}
 					disabled={busy ||
 						!refs.some((ref) => key(ref) === targetSelection) ||
-						targetSelection === `${item.targetKind}:${item.targetName}`}>Change target</button
+						targetSelection === `${item.targetKind}:${item.targetName ?? ''}`}>Change target</button
 				>
 			</div>
-			{#if item.targetKind === 'branch' && !['deleting', 'deletion_failed', 'recovery_required'].includes(item.status)}
+			{#if item.targetKind === 'branch' && item.targetName && !['deleting', 'deletion_failed', 'recovery_required'].includes(item.status)}
 				{#key `${item.id}:${item.targetName}`}
 					<RollbackHistory
 						deploymentId={item.id}

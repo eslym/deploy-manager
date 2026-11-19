@@ -29,49 +29,49 @@ func (a *App) rollbackHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	d, err := a.store.Deployment.Get(r.Context(), r.PathValue("id"))
 	if err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if d.TargetKind != "branch" {
-		http.Error(w, "rollback requires a branch target", 409)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	page, limit := 1, 20
 	if value := r.URL.Query().Get("page"); value != "" {
 		page, err = strconv.Atoi(value)
 		if err != nil || page < 1 || page > 100000 {
-			http.Error(w, "invalid history page", 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 			return
 		}
 	}
 	if value := r.URL.Query().Get("limit"); value != "" {
 		limit, err = strconv.Atoi(value)
 		if err != nil || limit < 1 || limit > 100 {
-			http.Error(w, "invalid history page size", 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 			return
 		}
 	}
 	search := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("search")))
 	if len(search) > 256 {
-		http.Error(w, "history search is too long", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	a.projects.cacheMu.RLock()
 	defer a.projects.cacheMu.RUnlock()
 	if err := a.projects.ensureCacheReady(); err != nil {
-		http.Error(w, "repository recovery is required", 409)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), a.cfg.DeployTimeout)
 	defer cancel()
 	repo, err := git.PlainOpen(a.projects.repoPath(d.ProjectID))
 	if err != nil {
-		http.Error(w, "repository unavailable", 409)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	ref, err := repo.Reference(plumbing.NewRemoteReferenceName("origin", d.TargetName), true)
 	if err != nil {
-		http.Error(w, "configured branch is missing; refresh the repository", 409)
+		writeOutcomeError(w, http.StatusConflict, "git.target_unavailable", "Selected Git target is unavailable.")
 		return
 	}
 	out := []rollbackCommit{}
@@ -79,16 +79,16 @@ func (a *App) rollbackHistory(w http.ResponseWriter, r *http.Request) {
 	id := ref.Hash()
 	for id != plumbing.ZeroHash {
 		if ctx.Err() != nil {
-			http.Error(w, "history lookup timed out; narrow your search", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 			return
 		}
 		if size, err := repo.Storer.EncodedObjectSize(id); err != nil || size > maxGitCommitObjectBytes {
-			http.Error(w, "history commit is unavailable or too large", 409)
+			writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 			return
 		}
 		commit, err := repo.CommitObject(id)
 		if err != nil {
-			http.Error(w, "history objects unavailable", 409)
+			writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 			return
 		}
 		subject := strings.SplitN(commit.Message, "\n", 2)[0]
@@ -110,7 +110,7 @@ func (a *App) rollbackHistory(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		out = out[:limit]
 	}
-	writeJSON(w, map[string]any{"commits": out, "page": page, "hasMore": hasMore})
+	writeOutcome(w, http.StatusOK, "deployment.history_loaded", "Commit history loaded.", map[string]any{"commits": out, "page": page, "hasMore": hasMore})
 }
 
 // Eligibility traverses all parents, independently of first-parent browsing.
@@ -167,34 +167,34 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&in) != nil || !validCommitTarget(in.Commit) {
-		http.Error(w, "choose a full 40-character commit ID", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	slot, ok := a.reserveDeploymentSlot()
 	if !ok {
-		http.Error(w, "publication queue is full", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "operation.capacity_exceeded", "Work capacity is unavailable. Try again later.")
 		return
 	}
 	defer slot.release()
 	id := r.PathValue("id")
 	job, err := randomID()
 	if err != nil {
-		http.Error(w, "rollback could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "rollback could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	d, err := tx.Deployment.Get(r.Context(), id)
 	if err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if d.TargetKind != "branch" || d.Status == "deleting" || d.Status == "deletion_failed" || d.Status == "recovery_required" {
-		http.Error(w, "rollback requires an available branch deployment", 409)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	now := a.cfg.Now().UnixNano()
@@ -213,7 +213,7 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 	var changed int
 	changed, err = update.Save(r.Context())
 	if err == nil && changed != 1 {
-		http.Error(w, "rollback was superseded by a newer deployment change", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	if err == nil {
@@ -238,10 +238,10 @@ func (a *App) temporaryRollback(w http.ResponseWriter, r *http.Request) {
 		_, err = tx.DeploymentJob.Create().SetID(job).SetDeploymentID(id).SetCommitID(in.Commit).SetRollbackCommit(in.Commit).SetGeneration(newGeneration).SetStatus("queued").SetLog(logText).SetCreatedAt(now).SetUpdatedAt(now).SetDurable(1).Save(r.Context())
 	}
 	if err != nil || tx.Commit() != nil {
-		http.Error(w, "rollback could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	a.cancelDeploymentJobsBefore(id, newGeneration)
 	slot.enqueue(job)
-	writeJSONStatus(w, 202, map[string]string{"jobId": job, "status": "queued"})
+	writeOutcome(w, http.StatusAccepted, "deployment.rollback_queued", "Rollback queued.", map[string]string{"jobId": job, "status": "queued"})
 }

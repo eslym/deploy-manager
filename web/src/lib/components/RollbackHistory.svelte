@@ -1,6 +1,7 @@
 <script lang="ts">
-	type Commit = { id: string; shortId: string; subject: string; author: string; date: string };
-	type History = { commits: Commit[]; page: number; hasMore: boolean };
+	import { BrowserSDKError, sdk } from '#lib/sdk/index.js';
+	import type { DeploymentHistory, DeploymentHistoryCommit } from '#lib/sdk/deployments.js';
+
 	let {
 		deploymentId,
 		deploymentName,
@@ -18,12 +19,12 @@
 	let open = $state(false);
 	let search = $state('');
 	let activeSearch = $state('');
-	let history = $state.raw<History | null>(null);
+	let history = $state.raw<DeploymentHistory | null>(null);
 	let loading = $state(false);
 	let historyError = $state('');
 	let rollbackError = $state('');
 	let queued = $state('');
-	let selected = $state.raw<Commit | null>(null);
+	let selected = $state.raw<DeploymentHistoryCommit | null>(null);
 	let permanent = $state(false);
 	let requestedPage = 1;
 	let requestedSearch = '';
@@ -37,12 +38,13 @@
 		requestedPage = page;
 		requestedSearch = query;
 		try {
-			const params = new URLSearchParams({ search: query, page: String(page), limit: '20' });
-			const response = await fetch(`/api/deployments/${deploymentId}/history?${params}`, {
-				credentials: 'same-origin'
-			});
-			if (!response.ok) throw new Error('Could not load commit history. Try again.');
-			history = (await response.json()) as History;
+			history = (
+				await sdk.deployments.history(deploymentId, {
+					search: query,
+					page,
+					limit: 20
+				})
+			).data;
 			activeSearch = query;
 		} catch {
 			historyError =
@@ -70,30 +72,19 @@
 		rollbackError = '';
 		queued = '';
 		try {
-			const response = await fetch(`/api/deployments/${deploymentId}/rollback`, {
-				method: 'POST',
-				credentials: 'same-origin',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ commit: commit.id, permanent })
+			const outcome = await sdk.deployments.rollback(deploymentId, {
+				commit: commit.id,
+				permanent
 			});
-			if (!response.ok) {
+			if (outcome.code !== 'deployment.rollback_queued') {
 				throw new Error(
-					response.status >= 500
-						? 'Could not queue rollback. Try again shortly.'
-						: 'Rollback was rejected. Refresh branches and tags, then search the history again before retrying.'
+					'Could not confirm whether rollback was accepted. Check Latest deployment before trying again.'
 				);
 			}
-			// Complete the accepted request before refreshing deployment state.
-			const accepted: unknown = await response.json().catch(() => null);
-			if (
-				!accepted ||
-				typeof accepted !== 'object' ||
-				!('jobId' in accepted) ||
-				typeof accepted.jobId !== 'string' ||
-				!accepted.jobId.trim()
-			) {
+			const accepted = outcome.data;
+			if (!accepted.jobId || accepted.status !== 'queued') {
 				throw new Error(
-					'Could not confirm the rollback request. Check Latest deployment before retrying.'
+					'Could not confirm the rollback request. Check Latest deployment before trying again.'
 				);
 			}
 			queued = permanent
@@ -102,7 +93,12 @@
 			selected = null;
 		} catch (cause) {
 			rollbackError =
-				cause instanceof Error ? cause.message : 'Could not queue rollback. Try again.';
+				cause instanceof BrowserSDKError &&
+				(cause.outcome.kind !== 'server' || cause.outcome.status >= 500)
+					? 'Could not confirm whether rollback was accepted. Check Latest deployment before trying again.'
+					: cause instanceof Error
+						? cause.message
+						: 'Could not queue rollback.';
 		} finally {
 			busy = false;
 		}

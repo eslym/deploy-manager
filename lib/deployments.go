@@ -1480,12 +1480,12 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 	}
 	var unresolved int
 	if err := a.db.QueryRow(`SELECT count(*) FROM publication_moves`).Scan(&unresolved); err != nil || unresolved != 0 {
-		http.Error(w, "publication move unresolved; document roots unavailable until recovery", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	rows, err := a.db.Query(`SELECT d.id,d.project_id,d.name,d.commit_id,d.target_kind,d.target_name,d.live_commit,d.status,COALESCE(NULLIF(d.error,''),(SELECT last_error FROM publication_cleanup c WHERE c.deployment_id=d.id ORDER BY c.not_before LIMIT 1),(SELECT last_error FROM deployment_deletions x WHERE x.deployment_id=d.id),''),d.created_at,d.updated_at,d.automation_paused,d.publication_name FROM deployments d ORDER BY d.created_at,d.id`)
 	if err != nil {
-		http.Error(w, "deployments are temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer rows.Close()
@@ -1495,7 +1495,7 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 		var publicationName string
 		var c, u int64
 		if err = rows.Scan(&d.ID, &d.ProjectID, &d.Name, &d.Commit, &d.TargetKind, &d.TargetName, &d.LiveCommit, &d.Status, &d.Error, &c, &u, &d.AutomationPaused, &publicationName); err != nil || !validStoredPublicationName(publicationName, d.ID) {
-			http.Error(w, "deployments are temporarily unavailable", 500)
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 			return
 		}
 		d.CreatedAt = time.Unix(0, c).UTC()
@@ -1505,17 +1505,17 @@ func (a *App) listDeployments(w http.ResponseWriter, r *http.Request) {
 		out = append(out, d)
 	}
 	if rows.Err() != nil {
-		http.Error(w, "deployments are temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
-	writeJSON(w, out)
+	writeOutcome(w, http.StatusOK, "deployment.listed", "Deployments loaded.", out)
 }
 
 func (a *App) deploymentRoot(w http.ResponseWriter, r *http.Request) {
 	if !a.projectAuthorized(w, r, false) {
 		return
 	}
-	writeJSON(w, map[string]string{"publicationRoot": a.cfg.DeploymentRoot})
+	writeOutcome(w, http.StatusOK, "deployment.root_loaded", "Publication root loaded.", map[string]string{"publicationRoot": a.cfg.DeploymentRoot})
 }
 
 func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
@@ -1539,38 +1539,38 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if dec.Decode(&in) != nil || !validProjectID(in.ProjectID) || strings.TrimSpace(in.Name) == "" || len(in.Name) > 100 {
-		http.Error(w, "enter a deployment name and project", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	if in.PublicationPath != "" && !validPublicationName(in.PublicationPath) {
-		http.Error(w, "choose a single safe folder name under the publication root", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	if err := a.assertPublicationRoot(); err != nil {
-		http.Error(w, "publication root is unavailable", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		return
 	}
 	if in.TargetKind == "" {
 		in.TargetKind = "commit"
 	}
 	if in.TargetKind != "branch" && in.TargetKind != "tag" && in.TargetKind != "commit" {
-		http.Error(w, "choose a branch, tag, or commit target", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	if in.TargetKind == "branch" || in.TargetKind == "tag" {
 		kind := in.TargetKind
 		if in.TargetName == "" || len(in.TargetName) > 255 {
-			http.Error(w, "choose a cached Git target", 400)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 			return
 		}
 		commit, refErr := a.cachedProjectRef(r.Context(), in.ProjectID, kind, in.TargetName)
 		if refErr != nil {
-			http.Error(w, "the selected target is not in the cached refs", 400)
+			writeOutcomeError(w, http.StatusBadRequest, "git.target_unavailable", "Selected Git target is unavailable.")
 			return
 		}
 		in.Commit = commit
 	} else if !validCommitTarget(in.Commit) {
-		http.Error(w, "enter a full 40-character commit ID", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	pm := a.projects
@@ -1585,12 +1585,12 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	pm.cacheMu.RUnlock()
 	if err != nil {
-		http.Error(w, "the selected commit is not available in this project", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "git.target_unavailable", "Selected Git target is unavailable.")
 		return
 	}
 	id, err := randomID()
 	if err != nil {
-		http.Error(w, "deployment could not be saved", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if in.PublicationPath == "" {
@@ -1601,44 +1601,44 @@ func (a *App) createDeployment(w http.ResponseWriter, r *http.Request) {
 	path, err := a.availablePublicationPath(owner, in.PublicationPath)
 	if err != nil {
 		if errors.Is(err, errPublicationOccupied) {
-			http.Error(w, "publication destination is already occupied", http.StatusConflict)
+			writeOutcomeError(w, http.StatusConflict, "publication.path_conflict", "Publication path is unavailable or changed.")
 		} else {
-			http.Error(w, "publication destination cannot be inspected", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		}
 		return
 	}
 	slot, ok := a.reserveDeploymentSlot()
 	if !ok {
-		http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "operation.capacity_exceeded", "Work capacity is unavailable. Try again later.")
 		return
 	}
 	defer slot.release()
 	job, err := randomID()
 	if err != nil {
-		http.Error(w, "deployment could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	now := a.cfg.Now().UTC()
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "deployment could not be saved", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	if _, err = tx.Deployment.Create().SetID(id).SetProjectID(in.ProjectID).SetName(strings.TrimSpace(in.Name)).SetPublicationName(in.PublicationPath).SetCommitID(in.Commit).SetTargetKind(in.TargetKind).SetTargetName(in.TargetName).SetGeneration(1).SetCreatedAt(now.UnixNano()).SetUpdatedAt(now.UnixNano()).Save(r.Context()); err != nil {
-		http.Error(w, "a deployment with this name already exists or could not be saved", 409)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	if _, err = tx.DeploymentJob.Create().SetID(job).SetDeploymentID(id).SetCommitID(in.Commit).SetGeneration(1).SetStatus("queued").SetLog("Publication queued").SetCreatedAt(now.UnixNano()).SetUpdatedAt(now.UnixNano()).Save(r.Context()); err != nil {
-		http.Error(w, "deployment could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "deployment could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	slot.enqueue(job)
-	writeJSONStatus(w, 201, map[string]any{"id": id, "jobId": job, "status": "queued", "publicationPath": path})
+	writeOutcome(w, http.StatusCreated, "deployment.created", "Deployment created. Publication queued.", map[string]any{"id": id, "jobId": job, "status": "queued", "publicationPath": path})
 }
 
 func (a *App) deploymentJobs(w http.ResponseWriter, r *http.Request) {
@@ -1648,14 +1648,14 @@ func (a *App) deploymentJobs(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	jobs, err := a.store.DeploymentJob.Query().Where(jobmodel.DeploymentIDEQ(id)).Order(ent.Desc(jobmodel.FieldCreatedAt)).Limit(100).All(r.Context())
 	if err != nil {
-		http.Error(w, "publication history is unavailable", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	out := make([]deploymentJob, 0, len(jobs))
 	for _, row := range jobs {
 		out = append(out, deploymentJob{ID: row.ID, DeploymentID: row.DeploymentID, Commit: row.CommitID, Status: row.Status, Log: row.Log, CreatedAt: time.Unix(0, row.CreatedAt).UTC(), UpdatedAt: time.Unix(0, row.UpdatedAt).UTC(), Force: row.ForceRedeploy != 0})
 	}
-	writeJSON(w, out)
+	writeOutcome(w, http.StatusOK, "job.listed", "Jobs loaded.", out)
 }
 
 func (a *App) deployNow(w http.ResponseWriter, r *http.Request) {
@@ -1665,23 +1665,23 @@ func (a *App) deployNow(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	deployment, err := a.store.Deployment.Get(r.Context(), id)
 	if err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if deployment.Status == "deleting" || deployment.Status == "deletion_failed" {
-		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	job, err := a.enqueueDeployment(id, deployment.CommitID, deployment.Generation)
 	if err != nil {
 		if strings.Contains(err.Error(), "queue is full") {
-			http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "operation.capacity_exceeded", "Work capacity is unavailable. Try again later.")
 		} else {
-			http.Error(w, "publication could not be queued", 500)
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		}
 		return
 	}
-	writeJSONStatus(w, 202, map[string]string{"jobId": job, "status": "queued"})
+	writeOutcome(w, http.StatusAccepted, "deployment.queued", "Deployment queued.", map[string]string{"jobId": job, "status": "queued"})
 }
 
 func (a *App) hardRedeploy(w http.ResponseWriter, r *http.Request) {
@@ -1691,50 +1691,50 @@ func (a *App) hardRedeploy(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	slot, ok := a.reserveDeploymentSlot()
 	if !ok {
-		http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "operation.capacity_exceeded", "Work capacity is unavailable. Try again later.")
 		return
 	}
 	defer slot.release()
 	jobID, err := randomID()
 	if err != nil {
-		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	now := a.cfg.Now().UnixNano()
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	current, err := tx.Deployment.Get(r.Context(), id)
 	if err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if current.Status == "deleting" || current.Status == "deletion_failed" {
-		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	generationUpdate, updateErr := tx.Deployment.Update().Where(deploymentmodel.ID(id), deploymentmodel.Generation(current.Generation), deploymentmodel.StatusNotIn("deleting", "deletion_failed")).AddGeneration(1).SetStatus("queued").SetError("").SetUpdatedAt(now).Save(r.Context())
 	if updateErr != nil {
-		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if generationUpdate != 1 {
-		http.Error(w, "deployment target changed; refresh and try again", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	if _, err = tx.DeploymentJob.Create().SetID(jobID).SetDeploymentID(id).SetCommitID(current.CommitID).SetGeneration(current.Generation + 1).SetStatus("queued").SetLog("Hard re-deploy queued; configured target will be refreshed").SetCreatedAt(now).SetUpdatedAt(now).SetForceRedeploy(1).Save(r.Context()); err != nil {
-		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "publication could not be queued", http.StatusInternalServerError)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	slot.enqueue(jobID)
-	writeJSONStatus(w, http.StatusAccepted, map[string]string{"jobId": jobID, "status": "queued"})
+	writeOutcome(w, http.StatusAccepted, "deployment.hard_redeploy_queued", "Hard re-deploy queued.", map[string]string{"jobId": jobID, "status": "queued"})
 }
 
 func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
@@ -1750,13 +1750,13 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&input) != nil {
-		http.Error(w, "choose a branch or full commit ID", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	id := r.PathValue("id")
 	currentDeployment, err := a.store.Deployment.Get(r.Context(), id)
 	if err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	projectID := currentDeployment.ProjectID
@@ -1766,21 +1766,21 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	if input.TargetKind == "branch" || input.TargetKind == "tag" {
 		kind := input.TargetKind
 		if input.TargetName == "" || len(input.TargetName) > 255 {
-			http.Error(w, "choose a target from the cached refs", http.StatusBadRequest)
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 			return
 		}
 		commit, refErr := a.cachedProjectRef(r.Context(), projectID, kind, input.TargetName)
 		if refErr != nil {
-			http.Error(w, "choose a target from the cached refs", http.StatusBadRequest)
+			writeOutcomeError(w, http.StatusBadRequest, "git.target_unavailable", "Selected Git target is unavailable.")
 			return
 		}
 		input.Commit = commit
 	} else if input.TargetKind != "commit" || !validCommitTarget(input.Commit) {
-		http.Error(w, "choose a branch, tag, or full commit ID", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Check the request and try again.")
 		return
 	}
 	if err := a.assertPublicationRoot(); err != nil {
-		http.Error(w, "publication is temporarily blocked pending recovery", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	a.projects.cacheMu.RLock()
@@ -1794,38 +1794,38 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	a.projects.cacheMu.RUnlock()
 	if err != nil {
-		http.Error(w, "the selected commit is not available in this project", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "git.target_unavailable", "Selected Git target is unavailable.")
 		return
 	}
 	slot, ok := a.reserveDeploymentSlot()
 	if !ok {
-		http.Error(w, "the publication queue is full; try again shortly", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "operation.capacity_exceeded", "Work capacity is unavailable. Try again later.")
 		return
 	}
 	defer slot.release()
 	jobID, err := randomID()
 	if err != nil {
-		http.Error(w, "publication could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	now := a.cfg.Now().UnixNano()
 	tx, err := a.store.Tx(r.Context())
 	if err != nil {
-		http.Error(w, "publication could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	defer tx.Rollback()
 	current, err := tx.Deployment.Query().Where(deploymentmodel.ID(id), deploymentmodel.ProjectID(projectID)).Only(r.Context())
 	if err != nil {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if current.Status == "deleting" || current.Status == "deletion_failed" {
-		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	if current.TargetKind == input.TargetKind && current.TargetName == input.TargetName && current.CommitID == input.Commit {
-		http.Error(w, "this deployment already has that target", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "deployment.target_unchanged", "The selected target is unchanged.")
 		return
 	}
 	update := tx.Deployment.Update().Where(deploymentmodel.ID(id), deploymentmodel.Generation(current.Generation), deploymentmodel.StatusNotIn("deleting", "deletion_failed")).SetCommitID(input.Commit).SetTargetKind(input.TargetKind).SetTargetName(input.TargetName).AddGeneration(1).SetStatus("queued").SetError("").SetUpdatedAt(now)
@@ -1834,21 +1834,21 @@ func (a *App) updateDeploymentTarget(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := update.Save(r.Context())
 	if err != nil {
-		http.Error(w, "deployment target could not be saved", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if res != 1 {
-		http.Error(w, "deployment deletion is in progress", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "request.conflict", "State changed. Refresh and try again.")
 		return
 	}
 	if _, err = tx.DeploymentJob.Create().SetID(jobID).SetDeploymentID(id).SetCommitID(input.Commit).SetGeneration(current.Generation + 1).SetStatus("queued").SetLog("Commit target changed; publication queued").SetCreatedAt(now).SetUpdatedAt(now).Save(r.Context()); err != nil {
-		http.Error(w, "publication could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "publication could not be queued", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	slot.enqueue(jobID)
-	writeJSONStatus(w, http.StatusAccepted, map[string]string{"jobId": jobID, "status": "queued"})
+	writeOutcome(w, http.StatusAccepted, "deployment.target_changed", "Target changed. Publication queued.", map[string]string{"jobId": jobID, "status": "queued"})
 }

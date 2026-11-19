@@ -55,13 +55,25 @@ Use [GLOSSARY.md](../GLOSSARY.md) for deployment/release terminology.
 ### Bodies, responses, and errors
 
 Send JSON bodies with `Content-Type: application/json`. Authentication,
-repository-key, SSH-host, LFS, webhook-settings, webhook-ingestion, and project
-routes, their authorization guards, and maintenance responses use an outcome
-envelope. Other application routes retain their existing response forms until
-their coordinated migration slice lands. Times are JSON RFC 3339 timestamps,
-not Unix integers. Unmigrated list responses are bare arrays unless stated
-otherwise; migrated resource arrays are in envelope `data`.
+repository-key, SSH-host, LFS, webhook-settings, webhook-ingestion, project
+routes, and the migrated deployment/job route handlers listed below use an
+outcome envelope. Shared authorization/security guards and maintenance
+responses also use outcome envelopes, including on routes whose handler-specific
+success and failure responses have not migrated. Deployment outcome conversion
+covers list/root/create, target change, Deploy, Hard re-deploy, job reads,
+history, rollback, and pause/resume. Deployment deletion and move remain
+route-specific legacy responses until #70. Other application routes retain
+their existing response forms until their coordinated migration slice lands.
+Times are JSON RFC 3339 timestamps, not Unix integers. Unmigrated list responses
+are bare arrays unless stated otherwise; migrated resource arrays are in
+envelope `data`.
 Optional fields marked below may be omitted.
+
+Publication move is deliberately excluded from the typed deployment SDK and
+remains on its pre-migration contract: plain JSON success and plain-text
+failures, including the existing auth/Origin guards. Its atomic move,
+confirmation, generation, and recovery protections are unchanged. #70 owns
+migrating that action and documenting its typed outcome/recovery behavior.
 
 Unmigrated errors generally use Go's `http.Error`: `text/plain; charset=utf-8`
 with a trailing newline. Migrated outcomes have exactly `code`, `message`,
@@ -141,19 +153,23 @@ values, and trailing JSON are rejected.
 
 For example, success is `{"code":"auth.login_completed","message":"Signed in.","data":null}`. Errors use the same shape. Authentication codes include `auth.session_required` (401), `auth.login_failed` (401), `auth.protocol_invalid` (400), `auth.registration_expired` (410), `auth.registration_conflict` (409), `auth.recent_login_required` (401), and `auth.capacity_exceeded` (existing 429). Shared request and service codes are `request.https_required`, `request.json_required`, `request.policy_rejected`, `request.origin_rejected`, `request.rate_limited`, `service.unavailable`, and `service.internal_error`, retaining their existing statuses. Authentication errors do not disclose account existence, password validity, or grant-consumption details.
 
-### Browser SDK (authentication, project, and repository operations)
+### Browser SDK (authentication, project, repository, and deployment operations)
 
-Authentication callers and route guards use the framework-independent
+Authentication and deployment callers use the framework-independent
 [`web/src/lib/sdk/index.ts`](../web/src/lib/sdk/index.ts) barrel. It owns
 same-origin credentials, JSON encoding, envelope and endpoint-data validation,
 safe fallback errors, cancellation, and session-required signaling. Named
 operations such as `sdk.auth.loginStart`, `sdk.auth.session`,
-`sdk.auth.recoveryFinish`, and `sdk.auth.passwordChangeFinish` accept an optional `AbortSignal`.
+`sdk.auth.recoveryFinish`, and `sdk.auth.passwordChangeFinish` accept an optional
+`AbortSignal`.
 Project operations are grouped under `sdk.projects`: `list`, `create`,
 `refs(id)`, `refresh(id)`, `assignKey(id, { keyId })`, and `clearCache(id)`.
 They return the validated outcome envelope; callers read resource payloads from
 `data` and may pass an `AbortSignal`. Project paths and full IDs are handled by
-the SDK. Mutations, including OPAQUE exchanges, are never retried automatically. SDK errors are
+the SDK. Deployment operations such as `sdk.deployments.list`,
+`sdk.deployments.deploy`, and `sdk.deployments.jobs` also accept an optional
+`AbortSignal`. Mutations, including OPAQUE exchanges, are never retried
+automatically. SDK errors are
 discriminated as `server`, `network`, `invalid_response`, or `cancelled`;
 proxy HTML and raw exception text are not displayed as trusted messages.
 Only server outcomes carry server-returned codes. SDK-local failures carry
@@ -180,6 +196,10 @@ the settings read and live notifications never include it.
 Project and repository routes use named SDK operations and outcome envelopes.
 Deployment, webhook ingestion/settings, and destructive project deletion retain
 their separate migration ownership.
+
+Project routes remain on their existing response shapes and callers; their
+conversion to named SDK methods and outcome envelopes remains planned, not
+implemented. Publication move is likewise intentionally deferred to #70.
 
 ### Flow and state details
 
@@ -295,19 +315,19 @@ This confirms queue acceptance, not successful publication.
 
 | Method and path | Request / success | Important behavior |
 | --- | --- | --- |
-| GET `/api/deployments` | 200 Deployment[] | All deployments; no project filter or pagination. |
-| GET `/api/deployments/root` | 200 `{"publicationRoot":"<server-path>"}` | Configured publication root for folder selection. |
-| POST `/api/deployments` | Create body below; 201 `{"id":"<id>","jobId":"<job-id>","status":"queued","publicationPath":"<server-path>"}` | Saves deployment and automatically queues initial publication. |
-| POST `/api/deployments/{id}/deploy` | No body required; 202 Queued response | Ordinary Deploy; branch fetches latest, tag/commit uses saved commit. |
-| POST `/api/deployments/{id}/hard-redeploy` | No body required; 202 Queued response | Fetches; resolves branch/tag again; forces recreation even if already live. Commit targets stay fixed. |
-| POST `/api/deployments/{id}/target` | Target body below; 202 Queued response | Changes configuration and queues publication; unchanged target returns 409. |
-| GET `/api/deployments/{id}/jobs` | 200 Job[] | Newest first, at most 100; no pagination. Unknown deployment IDs currently yield an empty array. |
-| GET `/api/deployments/{id}/history` | Query below; 200 `{"commits":[...],"page":1,"hasMore":false}` | Branch only; cached first-parent history, no fetch. |
-| POST `/api/deployments/{id}/rollback` | `{"commit":"<full-sha1>","permanent":false}`; 202 Queued response | Branch only; ancestry validation happens in the worker after fetching. |
-| POST `/api/deployments/{id}/pause` | No body required; 200 `{"automationPaused":true}` | Branch only; repeated pause succeeds. |
-| POST `/api/deployments/{id}/resume` | No body required; 202 `{"automationPaused":false,"jobId":"<job-id>","status":"queued"}` | Branch only; immediately queues latest tip; already enabled returns 409. |
-| POST `/api/deployments/{id}/move` | Move body below; 200 `{"publicationPath":"<new-server-path>"}` | Changes destination, not Git target/content; synchronous durable move, no job. |
-| POST `/api/deployments/{id}/delete` | `{"confirm":true}`; 204 | Supersedes work and removes published files; blocked cleanup can return 503. |
+| GET `/api/deployments` | 200 `deployment.listed`; `data: Deployment[]` | All deployments; no project filter or pagination. |
+| GET `/api/deployments/root` | 200 `deployment.root_loaded`; `data: {"publicationRoot":"<server-path>"}` | Configured publication root for folder selection. |
+| POST `/api/deployments` | Create body below; 201 `deployment.created`; `data` contains `id`, `jobId`, `status: "queued"`, and `publicationPath` | Saves deployment and automatically queues initial publication. |
+| POST `/api/deployments/{id}/deploy` | No body required; 202 `deployment.queued`; `data: Queued response` | Ordinary Deploy; branch fetches latest, tag/commit uses saved commit. |
+| POST `/api/deployments/{id}/hard-redeploy` | No body required; 202 `deployment.hard_redeploy_queued`; `data: Queued response` | Fetches; resolves branch/tag again; forces recreation even if already live. Commit targets stay fixed. |
+| POST `/api/deployments/{id}/target` | Target body below; 202 `deployment.target_changed`; `data: Queued response` | Changes configuration and queues publication; unchanged target returns `deployment.target_unchanged` / 409. |
+| GET `/api/deployments/{id}/jobs` | 200 `job.listed`; `data: Job[]` | Newest first, at most 100; no pagination. Unknown deployment IDs currently yield an empty array. |
+| GET `/api/deployments/{id}/history` | Query below; 200 `deployment.history_loaded`; `data` contains commits/page/hasMore | Branch only; cached first-parent history, no fetch. |
+| POST `/api/deployments/{id}/rollback` | `{"commit":"<full-sha1>","permanent":false}`; 202 `deployment.rollback_queued`; `data: Queued response` | Branch only; ancestry validation happens in the worker after fetching. |
+| POST `/api/deployments/{id}/pause` | No body required; 200 `deployment.paused`; `data: {"automationPaused":true}` | Branch only; repeated pause succeeds. |
+| POST `/api/deployments/{id}/resume` | No body required; 202 `deployment.resumed`; `data` contains `automationPaused`, `jobId`, and `status: "queued"` | Branch only; immediately queues latest tip; already enabled returns 409. |
+| POST `/api/deployments/{id}/move` | Move body below; 200 `deployment.moved`; `data: {"publicationPath":"<new-server-path>"}` | Changes destination, not Git target/content; synchronous durable move, no job. |
+| POST `/api/deployments/{id}/delete` | `{"confirm":true}`; 200 `deployment.deleted`; `data: null` | Supersedes work and removes published files; blocked cleanup can return 503 `operation.cleanup_pending` with accepted/recovery flags. |
 
 Create body (8 KiB limit):
 
@@ -383,8 +403,10 @@ the configured branch. Omitted `permanent` defaults to false.
 
 ### Job lifecycle and publication guarantees
 
-Poll jobs and deployments after a queued response; there is no SSE/WebSocket or
-job-by-ID route. Jobs use `queued` → `running` and terminal `succeeded`, `noop`,
+The queued outcome confirms durable acceptance, not successful publication.
+Read deployments and jobs through `sdk.deployments.list` and
+`sdk.deployments.jobs`; existing polling may remain until live updates replace
+it. There is no job-by-ID route. Jobs use `queued` → `running` and terminal `succeeded`, `noop`,
 `failed`, or `superseded`. A paused automatic fetch may finish as `noop` without
 publishing. Deployment statuses include `queued`, `publishing`, `live`, `failed`,
 `recovery_required`, `deleting`, and `deletion_failed`; these are distinct from

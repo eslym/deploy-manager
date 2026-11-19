@@ -221,7 +221,7 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "deployment changed", 409)
 			return
 		}
-		writeJSON(w, map[string]string{"publicationPath": destination})
+		writeOutcome(w, http.StatusOK, "deployment.moved", "Publication path changed.", map[string]string{"publicationPath": destination})
 		return
 	}
 	// Commit the intent before touching the namespace. UNIQUE destination and
@@ -312,5 +312,5 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "move state unavailable; reconciliation required", 503)
 		return
 	}
-	writeJSON(w, map[string]string{"publicationPath": destination})
+	writeOutcome(w, http.StatusOK, "deployment.moved", "Publication path changed.", map[string]string{"publicationPath": destination})
 }

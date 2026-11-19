@@ -214,3 +214,68 @@ describe('browser SDK authentication transport', () => {
 		expect(onSessionEnded).not.toHaveBeenCalled();
 	});
 });
+
+describe('browser SDK deployment outcomes', () => {
+	it('keeps queue acceptance distinct from the published deployment state', async () => {
+		const send = vi.fn().mockResolvedValue(
+			response(
+				{
+					code: 'deployment.queued',
+					message: 'Deployment queued.',
+					data: { jobId: 'job-1', status: 'queued' }
+				},
+				202
+			)
+		);
+		const api = createBrowserSDK({ fetch: send });
+
+		const outcome = await api.deployments.deploy('deployment/1');
+
+		expect(outcome).toMatchObject({
+			code: 'deployment.queued',
+			data: { jobId: 'job-1', status: 'queued' }
+		});
+		expect(send).toHaveBeenCalledWith(
+			'/api/deployments/deployment%2F1/deploy',
+			expect.objectContaining({ method: 'POST', credentials: 'same-origin' })
+		);
+	});
+
+	it('validates deployment reads and keeps the unknown-deployment jobs response as an array', async () => {
+		const send = vi
+			.fn()
+			.mockResolvedValue(response({ code: 'job.listed', message: 'Jobs loaded.', data: [] }));
+		const api = createBrowserSDK({ fetch: send });
+
+		await expect(api.deployments.jobs('missing')).resolves.toMatchObject({
+			code: 'job.listed',
+			data: []
+		});
+	});
+
+	it('rejects malformed typed deployment history instead of trusting response JSON', async () => {
+		const api = createBrowserSDK({
+			fetch: vi.fn().mockResolvedValue(
+				response({
+					code: 'deployment.history_loaded',
+					message: 'Commit history loaded.',
+					data: { commits: [{ id: 'not-a-commit-object' }], page: 1, hasMore: false }
+				})
+			)
+		});
+
+		await expect(api.deployments.history('deployment-1')).rejects.toMatchObject({
+			outcome: { kind: 'invalid_response' }
+		});
+	});
+
+	it('does not replay mutations after an ambiguous transport failure', async () => {
+		const send = vi.fn().mockRejectedValue(new TypeError('private transport detail'));
+		const api = createBrowserSDK({ fetch: send });
+
+		await expect(api.deployments.hardRedeploy('deploy-1')).rejects.toMatchObject({
+			outcome: { kind: 'network', message: 'The request could not be completed. Try again.' }
+		});
+		expect(send).toHaveBeenCalledTimes(1);
+	});
+});

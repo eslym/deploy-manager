@@ -1,16 +1,13 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
-	import { sdk } from '#lib/sdk/index.js';
+	import { BrowserSDKError, sdk } from '#lib/sdk/index.js';
 	import {
 		isReservedPublicationFolder,
 		isValidPublicationFolder,
 		publicationFolderPattern,
 		publicationFolderPreview
 	} from '#lib/publication-folder.js';
-	import {
-		PublicationStatusUnavailableError,
-		publicationStatusUnavailable
-	} from '#lib/publication-status.js';
+	import { PublicationStatusUnavailableError } from '#lib/publication-status.js';
 	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
@@ -22,7 +19,7 @@
 		name: string;
 		publicationPath: string;
 		targetKind: string;
-		targetName: string;
+		targetName?: string;
 		commit: string;
 		liveCommit?: string;
 		status: string;
@@ -55,15 +52,26 @@
 	let publicationPreview = $derived(publicationFolderPreview(publicationRoot, publicationPath));
 
 	async function request(path: string, init?: RequestInit) {
-		return dashboardRequest(path, init, (response) => {
-			if (path === '/api/deployments' && response.status === 503)
-				return publicationStatusUnavailable(response);
-			return new Error(
-				response.status >= 500
-					? 'The request could not be completed. Try again shortly.'
-					: 'The request was rejected. Refresh and try again.'
-			);
+		return dashboardRequest(path, init, () => {
+			return new Error('The request could not be completed. Refresh and try again.');
 		});
+	}
+
+	async function listDeployments() {
+		try {
+			return (await sdk.deployments.list()).data;
+		} catch (cause) {
+			if (
+				cause instanceof BrowserSDKError &&
+				cause.outcome.kind === 'server' &&
+				cause.outcome.status === 503
+			) {
+				throw new PublicationStatusUnavailableError(
+					'Publication status is unavailable. Do not rely on a previously shown document root until status can be verified. Try again shortly.'
+				);
+			}
+			throw cause;
+		}
 	}
 
 	async function load(id = projectId, currentView = viewVersion) {
@@ -78,10 +86,10 @@
 				Ref[],
 				{ publicationRoot: string }
 			] = await Promise.all([
-				request('/api/deployments'),
+				listDeployments(),
 				sdk.projects.list(controller.signal).then((result) => result.data),
 				sdk.projects.refs(id, controller.signal).then((result) => result.data),
-				request('/api/deployments/root')
+				sdk.deployments.root().then((outcome) => outcome.data)
 			]);
 			if (
 				controller.signal.aborted ||
@@ -123,21 +131,34 @@
 		busy = true;
 		error = '';
 		try {
-			const result: { id: string } = await request('/api/deployments', {
-				method: 'POST',
-				body: JSON.stringify({
-					targetKind: selectedTarget.kind,
-					targetName: selectedTarget.name,
-					commit: selectedTarget.commit,
-					projectId,
-					name,
-					publicationPath
-				})
+			const outcome = await sdk.deployments.create({
+				targetKind: selectedTarget.kind,
+				targetName: selectedTarget.name,
+				commit: selectedTarget.commit,
+				projectId,
+				name,
+				publicationPath
 			});
-			if (!result?.id) throw new Error('Could not confirm the new deployment. Refresh the page.');
+			if (outcome.code !== 'deployment.created') {
+				throw new Error(
+					'Could not confirm whether the deployment was accepted. Refresh the deployment list before trying again.'
+				);
+			}
+			const result = outcome.data;
+			if (!result.id || result.status !== 'queued' || !result.jobId) {
+				throw new Error(
+					'Could not confirm the new deployment. Refresh the page before trying again.'
+				);
+			}
 			await goto(`/dashboard/projects/${projectId}/deployments/${result.id}`);
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not create deployment.';
+			error =
+				cause instanceof BrowserSDKError &&
+				(cause.outcome.kind !== 'server' || cause.outcome.status >= 500)
+					? 'Could not confirm whether the deployment was accepted. Refresh the deployment list before trying again.'
+					: cause instanceof Error
+						? cause.message
+						: 'Could not create deployment.';
 		} finally {
 			busy = false;
 		}
@@ -291,7 +312,7 @@
 					{item.status === 'live' ? 'Live' : item.status} · Target {item.targetKind}: {item.targetKind ===
 					'commit'
 						? item.commit
-						: item.targetName}
+						: (item.targetName ?? item.commit)}
 				</p>
 				{#if item.targetKind === 'branch'}<p class="mt-1 text-sm text-[#354238]">
 						{item.automationPaused ? 'Automatic deployment paused' : 'Automatic deployment enabled'}
