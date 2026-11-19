@@ -114,7 +114,11 @@
 		error = '';
 		try {
 			await sdk.projects.assignKey(projectId, { keyId }, controller.signal);
-			if (!controller.signal.aborted && selected === projectId) {
+			if (
+				!controller.signal.aborted &&
+				selected === projectId &&
+				keyAssignments[projectId] === keyId
+			) {
 				dirtyKeyAssignments.delete(projectId);
 				keyAssignments[projectId] = keyId;
 			}

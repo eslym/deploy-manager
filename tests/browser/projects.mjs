@@ -23,9 +23,13 @@ let browser;
 let appOutput = "";
 let releasePauseFailure;
 let currentStep = "initialization";
+const suiteStartedAt = Date.now();
 function milestone(label) {
   currentStep = label;
-  console.log(`[projects-browser] ${label}`);
+  console.log(`[projects-browser +${Date.now() - suiteStartedAt}ms] ${label}`);
+}
+function trace(label) {
+  console.log(`[projects-browser +${Date.now() - suiteStartedAt}ms] ${label}`);
 }
 
 function outcome(code, message, data = null) {
@@ -1098,6 +1102,7 @@ try {
   const importedKey = page.locator("li").filter({ hasText: "Imported browser key" });
   await importedKey.getByRole("button", { name: "Remove key" }).click();
   await page.getByText("Imported browser key", { exact: true }).waitFor({ state: "detached" });
+  trace("SSH key create/import/remove complete");
   await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
   await page.waitForURL("**/dashboard/projects");
   await page.getByLabel("Project name").fill("SSH fixture site");
@@ -1107,6 +1112,7 @@ try {
   await page.getByRole("button", { name: "Add repository" }).click();
   const blockedCreate = await blockedCreateResponse;
   if (blockedCreate.status() !== 409) throw new Error(`unknown SSH host was not blocked (${blockedCreate.status()})`);
+  trace("unapproved SSH project creation blocked");
   await page.getByRole("link", { name: "SSH hosts", exact: true }).click();
   await page.waitForURL("**/dashboard/ssh-hosts");
   await page.reload({ waitUntil: "domcontentloaded" });
@@ -1117,9 +1123,11 @@ try {
   page.once("dialog", dialog => dialog.dismiss());
   await page.getByRole("button", { name: "Approve verified host key" }).click();
   await hostTrust.getByText(/SHA256:/).waitFor();
+  trace("SSH host approval cancellation verified");
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Approve verified host key" }).click();
   await hostTrust.getByText("No SSH host warnings.").waitFor();
+  trace("SSH host approval confirmed");
   await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
   await page.waitForURL("**/dashboard/projects");
   await page.getByLabel("Project name").fill("SSH fixture site");
@@ -1132,6 +1140,7 @@ try {
   const sshCreateOutcome = await sshCreated.json();
   if (sshCreateOutcome.code !== "project.created") throw new Error(`SSH project creation returned ${JSON.stringify(sshCreateOutcome)}`);
   const sshProject = sshCreateOutcome.data;
+  trace(`SSH project creation completed (${sshCreated.status()})`);
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
   const sshRefs = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
@@ -1167,6 +1176,72 @@ try {
   const restoredKeyOutcome = await restoreKeyResponse;
   if (restoredKeyOutcome.status() !== 200 || (await restoredKeyOutcome.json()).code !== "project.key_assigned") throw new Error(`restoring SSH key returned an unexpected outcome (${restoredKeyOutcome.status()})`);
   await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id)?.keyId, sshProject.id)) === sshKeyId, "restored project key assignment");
+  trace("initial SSH key replacement/restoration complete");
+  let releaseKeyAssignment;
+  let interceptedKeyAssignment;
+  let releaseProjectRefresh;
+  let interceptedProjectRefresh;
+  let holdProjectRefresh = false;
+  const delayedKeyAssignment = new Promise(resolveAssignment => { releaseKeyAssignment = resolveAssignment; });
+  const keyAssignmentIntercepted = new Promise(resolveIntercepted => { interceptedKeyAssignment = resolveIntercepted; });
+  const projectRefreshIntercepted = new Promise(resolveIntercepted => { interceptedProjectRefresh = resolveIntercepted; });
+  const delayedProjectRefresh = new Promise(resolveRefresh => { releaseProjectRefresh = resolveRefresh; });
+  await page.route("**/api/projects", async route => {
+    if (route.request().method() === "GET" && holdProjectRefresh) {
+      holdProjectRefresh = false;
+      interceptedProjectRefresh(route);
+      await delayedProjectRefresh;
+      return route.continue();
+    }
+    await route.continue();
+  });
+  await page.route(`**/api/projects/${sshProject.id}/key`, async route => {
+    if (route.request().method() === "POST") {
+      interceptedKeyAssignment(route);
+      await delayedKeyAssignment;
+      holdProjectRefresh = true;
+      return route.continue();
+    }
+    await route.continue();
+  });
+  await page.getByLabel("SSH key").selectOption(replacementKeyId);
+  const racedKeyResponse = page.waitForResponse(response =>
+    response.url().endsWith(`/api/projects/${sshProject.id}/key`) && response.request().method() === "POST"
+  );
+  await page.getByRole("button", { name: "Change SSH key" }).click();
+  await withDeadline(keyAssignmentIntercepted, "key assignment request interception", 2500);
+  await page.getByLabel("SSH key").selectOption(sshKeyId);
+  releaseKeyAssignment();
+  const racedKeyOutcome = await withDeadline(racedKeyResponse, "held key assignment response", 2500);
+  if (racedKeyOutcome.status() !== 200) throw new Error(`held key assignment returned ${racedKeyOutcome.status()}`);
+  await withDeadline(projectRefreshIntercepted, "post-assignment project refresh", 2500);
+  const selectedAfterKeyResponse = await page.getByLabel("SSH key").inputValue();
+  const keyChangeButton = page.getByRole("button", { name: "Change SSH key" });
+  const keyChangeEnabledAfterResponse = await keyChangeButton.isEnabled();
+  const projectRefreshResponse = page.waitForResponse(response =>
+    response.url().endsWith("/api/projects") && response.request().method() === "GET"
+  );
+  releaseProjectRefresh();
+  await withDeadline(projectRefreshResponse, "post-assignment project refresh response", 2500);
+  await page.evaluate(() => new Promise(resolveFrame => requestAnimationFrame(() => requestAnimationFrame(resolveFrame))));
+  if (selectedAfterKeyResponse !== sshKeyId) throw new Error("a completed key assignment overwrote a newer selection");
+  if (!keyChangeEnabledAfterResponse) throw new Error("the newer repository-key selection became unavailable");
+  if (await page.getByLabel("SSH key").inputValue() !== sshKeyId) {
+    throw new Error("a later project refresh overwrote a newer unsaved selection after its dirty marker was cleared");
+  }
+  await page.unroute("**/api/projects");
+  await page.unroute(`**/api/projects/${sshProject.id}/key`);
+  const finalKeyResponse = page.waitForResponse(response =>
+    response.url().endsWith(`/api/projects/${sshProject.id}/key`) && response.request().method() === "POST"
+  );
+  await keyChangeButton.click();
+  if ((await finalKeyResponse).status() !== 200) throw new Error("the newer repository-key selection could not be assigned");
+  await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id)?.keyId, sshProject.id)) === sshKeyId, "newer project key assignment");
+  trace("held-response SSH key selection regression passed");
+  if (process.env.PROJECT_KEY_ASSIGNMENT_RACE_ONLY === "true") {
+    console.log("held-response project key assignment regression passed");
+    throw focusedOutcomesComplete;
+  }
   milestone("configure private LFS and publish SSH deployment");
   let oldProjectHistoryPolls = 0;
   await page.route(`**/api/deployments/${deploymentID}/jobs`, async route => {
@@ -1353,8 +1428,54 @@ try {
   if (!(await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.some(project => project.id === id), sshProject.id))) throw new Error("cancelling project deletion changed the project");
   await page.getByRole("button", { name: "Delete project" }).click();
   const projectDelete = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/delete`));
-  await page.getByRole("button", { name: "Confirm delete" }).click();
-  const confirmedProjectDelete = await projectDelete;
+  const deleteStartedAt = Date.now();
+  let deleteRequestSeen = false;
+  const observeDeleteRequest = request => {
+    if (request.url().endsWith(`/api/projects/${sshProject.id}/delete`)) {
+      deleteRequestSeen = true;
+      console.log(`[projects-browser +${Date.now() - suiteStartedAt}ms] project delete request observed (${request.method()})`);
+    }
+  };
+  page.on("request", observeDeleteRequest);
+  const confirmDeleteButton = page.getByRole("button", { name: "Confirm delete" });
+  const preDeleteState = {
+    url: page.url(),
+    confirmCount: await confirmDeleteButton.count(),
+    confirmEnabled: await confirmDeleteButton.isEnabled().catch(() => false),
+    confirmationCount: await page.getByLabel("Confirm project deletion").count(),
+    dialogCount: await page.getByRole("dialog").count()
+  };
+  console.log(`[projects-browser +${Date.now() - suiteStartedAt}ms] project delete confirmation state ${JSON.stringify(preDeleteState)}`);
+  let confirmedProjectDelete;
+  const projectDeleteRequest = page.waitForRequest(request =>
+    request.url().endsWith(`/api/projects/${sshProject.id}/delete`)
+  );
+  const boundedProjectDeleteRequest = withDeadline(projectDeleteRequest, "project delete request", 2500);
+  const boundedProjectDelete = withDeadline(projectDelete, "project delete response", 30000);
+  try {
+    const [, , response] = await Promise.all([
+      withDeadline(confirmDeleteButton.click({ timeout: 2500 }), "project delete confirmation click", 2500),
+      boundedProjectDeleteRequest,
+      boundedProjectDelete
+    ]);
+    confirmedProjectDelete = response;
+  } catch (error) {
+    const state = {
+      elapsedMs: Date.now() - deleteStartedAt,
+      requestSeen: deleteRequestSeen,
+      url: page.url(),
+      confirmCount: await confirmDeleteButton.count(),
+      confirmEnabled: await confirmDeleteButton.isEnabled().catch(() => false),
+      confirmationCount: await page.getByLabel("Confirm project deletion").count(),
+      dialogCount: await page.getByRole("dialog").count(),
+      alertCount: await page.getByRole("alert").count()
+    };
+    console.log(`[projects-browser +${Date.now() - suiteStartedAt}ms] project delete diagnostic ${JSON.stringify(state)}`);
+    throw new Error(`${error.message}; project delete diagnostic captured`);
+  } finally {
+    page.off("request", observeDeleteRequest);
+  }
+  console.log(`[projects-browser +${Date.now() - suiteStartedAt}ms] project delete response ${confirmedProjectDelete.status()} in ${Date.now() - deleteStartedAt}ms`);
   if (confirmedProjectDelete.status() !== 200) throw new Error(`confirmed project deletion returned ${confirmedProjectDelete.status()}: ${await confirmedProjectDelete.text()}`);
   if (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.some(project => project.id === id), sshProject.id)) throw new Error("deleted project remained visible");
   try { await stat(join(dir, "state.sqlite.projects", sshProject.id)); throw new Error("project cache remains after deletion"); } catch (error) { if (error.message === "project cache remains after deletion") throw error; }

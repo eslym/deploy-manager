@@ -53,6 +53,14 @@ To run the full projects browser scenario without repeating the Go suite:
 docker compose -f tests/compose.yaml run --build --rm -e PROJECT_BROWSER_ONLY=true test
 ```
 
+The projects browser scenario has a measured aggregate budget of 300 seconds:
+the complete multi-step project scenario has taken about 209 seconds, and its
+project-deletion step about 20 seconds. The previous 180-second outer limit
+could therefore kill a healthy full run. This suite budget is separate from
+the 2.5-second bounds on individual immediate UI mutations and alerts; project
+deletion's request and response are also bounded independently for fast,
+diagnostic failures.
+
 CLI behavior tests build one shared executable per package run; each scenario
 still uses isolated installation data and runs outside the source directory.
 The live-update slice exercises a real authenticated browser session, forced
