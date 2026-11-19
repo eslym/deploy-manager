@@ -169,6 +169,96 @@ try {
   await page.getByText(/You’re signed in/).waitFor({ timeout: 30000 });
   await page.getByRole("navigation", { name: "Dashboard" }).getByRole("link", { name: "Projects", exact: true }).click();
   await page.waitForURL("**/dashboard/projects");
+  milestone("approve SSH host while adding a repository");
+  await page.route("**/api/repository-keys", route => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify([{ id: "fixture-key", name: "Fixture key", algorithm: "ed25519", bits: 256, fingerprint: "SHA256:test", publicKey: "ssh-ed25519 test", createdAt: new Date().toISOString() }])
+  }));
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.getByLabel("Project name").fill("SSH fixture site");
+  await page.getByLabel("Repository URL").fill("git@host.example:owner/site.git");
+  const sshKeySelect = page.getByLabel("SSH key");
+  await sshKeySelect.locator("option").nth(1).waitFor({ state: "attached" });
+  await sshKeySelect.selectOption({ index: 1 });
+  const observedHost = {
+    host: "host.example",
+    port: 22,
+    fingerprint: "SHA256:observed-key-fingerprint",
+    warning: "SSH host key is not approved; verify the fingerprint independently before approval",
+    trusted: false
+  };
+  let projectAttempts = 0;
+  const projectRequests = [];
+  let approvalAttempts = 0;
+  let latestWarning = observedHost;
+  await page.route("**/api/ssh-hosts", async route => {
+    if (route.request().method() === "GET") {
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify([
+          { host: observedHost.host, port: observedHost.port, fingerprint: "SHA256:trusted-key", warning: "", trusted: true },
+          { ...latestWarning, host: "other.example", port: 22 },
+          latestWarning
+        ])
+      });
+      return;
+    }
+    await route.continue();
+  });
+  await page.route("**/api/ssh-hosts/approve", async route => {
+    approvalAttempts++;
+    if (approvalAttempts === 1) {
+      latestWarning = { ...observedHost, fingerprint: "SHA256:replacement-key-fingerprint" };
+      await route.fulfill({ status: 409, body: "the observed SSH key has changed; refresh the warning and verify it again" });
+      return;
+    }
+    const approval = route.request().postDataJSON();
+    if (approval.fingerprint !== latestWarning.fingerprint || approval.host !== observedHost.host || approval.port !== observedHost.port || approval.confirm !== true) {
+      throw new Error(`approval did not match the reviewed observation: ${JSON.stringify(approval)}`);
+    }
+    await route.fulfill({ status: 204 });
+  });
+  await page.route("**/api/projects", async route => {
+    if (route.request().method() !== "POST") return route.continue();
+    projectAttempts++;
+    projectRequests.push(route.request().postDataJSON());
+    if (projectAttempts <= 2) {
+      await route.fulfill({ status: 409, body: "SSH host key is not approved" });
+      return;
+    }
+    await route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify({ id: "ssh-browser-project", name: "SSH fixture site", url: "git@host.example:owner/site.git", keyId: "fixture-key", lastFetched: null, gitCacheBytes: 0, lfsCacheBytes: 0 }) });
+  });
+  const createButton = page.getByRole("button", { name: "Add repository" });
+  await createButton.click();
+  const approvalDialog = page.getByRole("dialog");
+  await approvalDialog.waitFor();
+  await approvalDialog.getByText("host.example", { exact: true }).waitFor();
+  await approvalDialog.getByText("22", { exact: true }).waitFor();
+  await approvalDialog.getByText(observedHost.fingerprint, { exact: true }).waitFor();
+  await approvalDialog.getByText(/independently/i).waitFor();
+  await approvalDialog.getByRole("button", { name: "Cancel" }).click();
+  if (projectAttempts !== 1 || approvalAttempts !== 0) throw new Error("canceling host approval created a project or approved a key");
+  if (await page.getByLabel("Project name").inputValue() !== "SSH fixture site" || await page.getByLabel("Repository URL").inputValue() !== "git@host.example:owner/site.git") {
+    throw new Error("canceling host approval cleared the project form");
+  }
+  await createButton.click();
+  await page.getByRole("dialog").getByRole("button", { name: /Approve/ }).click();
+  await page.getByRole("dialog").getByText("SHA256:replacement-key-fingerprint", { exact: true }).waitFor();
+  await page.getByRole("dialog").getByRole("alert").filter({ hasText: /changed.*independently/i }).waitFor();
+  if (projectAttempts !== 2) throw new Error("project creation retried before the changed fingerprint was reviewed");
+  await page.getByRole("dialog").getByRole("button", { name: /Approve/ }).click();
+  await page.waitForURL("**/dashboard/projects/ssh-browser-project");
+  if (projectAttempts !== 3 || approvalAttempts !== 2) throw new Error(`approval did not retry project creation: projects=${projectAttempts}, approvals=${approvalAttempts}`);
+  if (projectRequests.some(body => body.name !== "SSH fixture site" || body.url !== "git@host.example:owner/site.git" || body.keyId !== "fixture-key")) {
+    throw new Error(`approval retry did not preserve the project form: ${JSON.stringify(projectRequests)}`);
+  }
+  await page.unroute("**/api/projects");
+  await page.unroute("**/api/repository-keys");
+  await page.unroute("**/api/ssh-hosts");
+  await page.unroute("**/api/ssh-hosts/approve");
+  await page.goto(`https://${appListen}/dashboard/projects`, { waitUntil: "domcontentloaded" });
   const sessionCookie = (await context.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session")?.value;
   if (!sessionCookie) throw new Error("authenticated browser session cookie is missing");
   const crossOriginMutation = await httpsRequestStatus("127.0.0.1", 18440, "/api/ssh-hosts/approve", "POST", JSON.stringify({ host: "127.0.0.1", port: 18442, fingerprint: "SHA256:invalid", confirm: true }), { Cookie: `__Host-deploy-manager-session=${sessionCookie}`, Origin: "https://attacker.example", "Content-Type": "application/json" });

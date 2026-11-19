@@ -22,10 +22,22 @@
 		publicKey: string;
 		createdAt: string;
 	};
+	type SshHost = {
+		host: string;
+		port: number;
+		fingerprint: string;
+		warning?: string;
+		trusted: boolean;
+	};
 	async function request(
 		path: string,
 		init?: RequestInit,
-		options?: { sshCreate?: boolean; sshRefresh?: boolean; deletion?: boolean }
+		options?: {
+			sshCreate?: boolean;
+			sshApproval?: boolean;
+			sshRefresh?: boolean;
+			deletion?: boolean;
+		}
 	) {
 		return dashboardRequest(path, init, async (response) => {
 			const status = Number.isInteger(response.status) ? ` (HTTP ${response.status})` : '';
@@ -35,6 +47,10 @@
 			if (options?.deletion && response.status === 503)
 				return new Error(
 					`Project deletion is pending. Remaining cache files are protected while cleanup retries.${status}`
+				);
+			if (options?.sshApproval && response.status === 409)
+				return new Error(
+					'The host key changed. The refreshed fingerprint shown here must be independently reviewed before approving again.'
 				);
 			if (options?.sshCreate && response.status === 409) {
 				return new Error(
@@ -76,6 +92,38 @@
 	let keyId = $state('');
 	let error = $state('');
 	let busy = $state(false);
+	let pendingCreate = $state<{ name: string; url: string; keyId: string } | null>(null);
+	let observedHost = $state<SshHost | null>(null);
+	let approvalError = $state('');
+	function parseSshOrigin(repositoryUrl: string) {
+		const sshScheme = /^ssh:\/\//i.test(repositoryUrl);
+		try {
+			const parsed = new URL(repositoryUrl);
+			if (parsed.protocol === 'ssh:' && parsed.hostname) {
+				return {
+					isSsh: true,
+					host: parsed.hostname.toLowerCase(),
+					port: Number(parsed.port || 22)
+				};
+			}
+		} catch {
+			// SCP-style origins are not valid URLs; parse those below.
+		}
+		const scp = repositoryUrl.match(/^[^@\s/:]+@([a-zA-Z0-9.-]+):(.+)$/);
+		if (scp) return { isSsh: true, host: scp[1].toLowerCase(), port: 22 };
+		return { isSsh: sshScheme, host: null, port: null };
+	}
+	async function findObservedHost(repositoryUrl: string) {
+		const address = parseSshOrigin(repositoryUrl);
+		if (!address.isSsh || !address.host || address.port === null) return null;
+		const hosts: SshHost[] = await request('/api/ssh-hosts');
+		return (
+			hosts.find(
+				(host) =>
+					host.warning && host.host.toLowerCase() === address.host && host.port === address.port
+			) ?? null
+		);
+	}
 	async function loadProjects() {
 		try {
 			projects = await request('/api/projects');
@@ -95,21 +143,84 @@
 		if (busy) return;
 		busy = true;
 		error = '';
+		const sshOrigin = parseSshOrigin(url);
+		const createValues = { name, url, keyId: sshOrigin.isSsh ? keyId : '' };
 		try {
 			const created: Project = await request(
 				'/api/projects',
 				{
 					method: 'POST',
-					body: JSON.stringify({ name, url, keyId: url.startsWith('ssh://') ? keyId : '' })
+					body: JSON.stringify(createValues)
 				},
-				{ sshCreate: url.startsWith('ssh://') }
+				{ sshCreate: sshOrigin.isSsh }
 			);
 			await goto(`/dashboard/projects/${encodeURIComponent(created.id)}`);
 		} catch (cause) {
+			if (sshOrigin.isSsh) {
+				try {
+					const observed = await findObservedHost(url);
+					if (observed) {
+						pendingCreate = createValues;
+						observedHost = observed;
+						error = '';
+						return;
+					}
+				} catch {
+					// Preserve the original create error if host details cannot be loaded.
+				}
+			}
 			error = cause instanceof Error ? cause.message : 'Could not add repository.';
 		} finally {
 			busy = false;
 		}
+	}
+	async function approveObservedHost() {
+		if (!observedHost || !pendingCreate || busy) return;
+		const createSnapshot = pendingCreate;
+		busy = true;
+		approvalError = '';
+		try {
+			await request(
+				'/api/ssh-hosts/approve',
+				{
+					method: 'POST',
+					body: JSON.stringify({
+						host: observedHost.host,
+						port: observedHost.port,
+						fingerprint: observedHost.fingerprint,
+						confirm: true
+					})
+				},
+				{ sshApproval: true }
+			);
+			const approvedCreate = createSnapshot;
+			const created: Project = await request(
+				'/api/projects',
+				{
+					method: 'POST',
+					body: JSON.stringify(approvedCreate)
+				},
+				{ sshCreate: true }
+			);
+			pendingCreate = null;
+			observedHost = null;
+			await goto(`/dashboard/projects/${encodeURIComponent(created.id)}`);
+		} catch (cause) {
+			approvalError = cause instanceof Error ? cause.message : 'Could not approve this host key.';
+			try {
+				const refreshed = await findObservedHost(createSnapshot.url);
+				if (refreshed) observedHost = refreshed;
+			} catch {
+				// Keep the fingerprint currently under review.
+			}
+		} finally {
+			busy = false;
+		}
+	}
+	function cancelHostApproval() {
+		pendingCreate = null;
+		observedHost = null;
+		approvalError = '';
 	}
 	onMount(() => {
 		void loadProjects();
@@ -159,7 +270,7 @@
 					required
 				/></label
 			>
-			{#if url.startsWith('ssh://')}
+			{#if parseSshOrigin(url).isSsh}
 				<p class="text-sm text-[#58645b] sm:col-span-2">
 					Need a key? <a class="font-semibold text-[#214c30] underline" href="/dashboard/keys"
 						>Manage repository keys</a
@@ -188,6 +299,48 @@
 			>
 		</form>
 	</section>
+	{#if observedHost && pendingCreate}
+		<dialog
+			open
+			class="mt-4 w-full max-w-none rounded-xl border border-amber-400 bg-amber-50 p-5 text-left"
+			aria-labelledby="host-approval-title"
+		>
+			<h2 id="host-approval-title" class="m-0 text-lg font-semibold text-[#243528]">
+				Verify this SSH host
+			</h2>
+			<p class="mt-2 text-sm text-[#354238]">
+				Only approve this key after checking its fingerprint through an independent, trusted source.
+			</p>
+			<dl class="mt-3 grid gap-2 text-sm">
+				<div>
+					<dt class="font-semibold">Host</dt>
+					<dd>{observedHost.host}</dd>
+				</div>
+				<div>
+					<dt class="font-semibold">Port</dt>
+					<dd>{observedHost.port}</dd>
+				</div>
+				<div>
+					<dt class="font-semibold">Fingerprint</dt>
+					<dd class="font-mono break-all">{observedHost.fingerprint}</dd>
+				</div>
+			</dl>
+			{#if observedHost.warning}<p class="mt-2 text-sm">{observedHost.warning}</p>{/if}
+			{#if approvalError}<p role="alert" class="mt-3 text-sm text-red-800">{approvalError}</p>{/if}
+			<div class="mt-4 flex gap-3">
+				<button
+					class="min-h-10 rounded-lg bg-[#214c30] px-4 font-semibold text-white disabled:opacity-60"
+					onclick={approveObservedHost}
+					disabled={busy}>Approve and add repository</button
+				>
+				<button
+					class="min-h-10 rounded-lg border border-[#aeb9ae] px-4"
+					onclick={cancelHostApproval}
+					disabled={busy}>Cancel</button
+				>
+			</div>
+		</dialog>
+	{/if}
 	<section class="mt-8">
 		<h2 class="text-xl font-semibold text-[#243528]">Your projects</h2>
 		{#if projects.length === 0}<p class="text-[#58645b]">No projects yet.</p>{:else}
