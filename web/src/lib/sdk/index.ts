@@ -547,6 +547,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		}
 		eventSocket = socket;
 		eventReady = false;
+		let unknownEventResyncRequested = false;
 		socket.addEventListener('message', (event) => {
 			if (eventSocket !== socket || typeof (event as MessageEvent).data !== 'string') return;
 			let frame: unknown;
@@ -608,7 +609,11 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 				return;
 			}
 			// Future event codes are not understood, so synchronize from HTTP.
-			notifyInvalidation();
+			if (!unknownEventResyncRequested) {
+				unknownEventResyncRequested = true;
+				notifyInvalidation();
+				socket.close();
+			}
 		});
 		socket.addEventListener('close', (event) => {
 			if (eventSocket === socket) eventSocket = undefined;

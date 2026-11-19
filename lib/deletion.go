@@ -455,7 +455,6 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	p.lfsCacheMu.Unlock()
-	a.invalidateDeletedProject(id)
 	if err = a.finishProjectDeletion(id, cacheID, lfsCacheID); err != nil {
 		writeOutcome(w, http.StatusServiceUnavailable, "operation.cleanup_pending", "Cleanup is pending. Refresh before taking further action.", map[string]bool{"operationAccepted": true, "recoveryRequired": true})
 		return

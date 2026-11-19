@@ -537,22 +537,51 @@ describe('browser SDK live event ownership', () => {
 		expect(socket.closed).toBe(true);
 	});
 
-	it('resynchronizes unknown event codes and closes a malformed stream', () => {
+	it('resynchronizes once for repeated unknown events and closes the stream for backoff recovery', () => {
 		const socket = new FakeEventSocket();
-		const api = createBrowserSDK({ webSocket: () => socket });
+		const replacement = new FakeEventSocket();
+		const timers = new Map<number, { callback: () => void; delay: number }>();
+		let nextTimer = 0;
+		const api = createBrowserSDK({
+			webSocket: vi.fn().mockReturnValueOnce(socket).mockReturnValueOnce(replacement),
+			random: () => 0,
+			isOnline: () => true,
+			setTimeout: (callback, delay) => {
+				const id = ++nextTimer;
+				timers.set(id, { callback, delay });
+				return id as unknown as ReturnType<typeof setTimeout>;
+			},
+			clearTimeout: (timer) => timers.delete(timer as unknown as number)
+		});
 		const refresh = vi.fn();
 		api.events.subscribe(refresh);
 
+		socket.emit(
+			'message',
+			JSON.stringify({
+				code: 'events.ready',
+				data: { epoch: 'epoch', sequence: 0 }
+			})
+		);
+		refresh.mockClear();
 		socket.emit('message', JSON.stringify({ code: 'events.future', data: null }));
 		expect(refresh).toHaveBeenCalledOnce();
-		socket.emit(
+		socket.emit('message', JSON.stringify({ code: 'events.future', data: null }));
+		expect(refresh).toHaveBeenCalledOnce();
+		expect(socket.closed).toBe(true);
+		socket.closeWith(1006);
+		const reconnect = [...timers.values()].find((timer) => timer.delay === 1000);
+		expect(reconnect).toBeDefined();
+		reconnect!.callback();
+		expect(replacement.closed).toBe(false);
+		replacement.emit(
 			'message',
 			JSON.stringify({
 				code: 'events.invalidate',
 				data: { epoch: 'epoch', sequence: 'invalid', resources: [] }
 			})
 		);
-		expect(socket.closed).toBe(true);
+		expect(replacement.closed).toBe(true);
 	});
 
 	it('reconnects after an established socket closes and disposes the pending timer', () => {

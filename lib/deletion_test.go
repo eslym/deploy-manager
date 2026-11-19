@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -15,6 +16,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
+	"github.com/coder/websocket/wsjson"
 )
 
 type deletionCacheFS struct {
@@ -75,6 +79,7 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 	}
 	server := httptest.NewTLSServer(app.Handler())
 	defer server.Close()
+	app.cfg.CanonicalOrigin = server.URL
 	token := []byte(strings.Repeat("t", 32))
 	digest := sha256.Sum256(token)
 	app.mu.Lock()
@@ -190,6 +195,24 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 	}
 	cacheFS := &deletionCacheFS{fail: true}
 	app.projects.cacheFS = cacheFS
+	socketURL := strings.Replace(server.URL, "https://", "wss://", 1) + "/api/events"
+	socket, _, err := websocket.Dial(context.Background(), socketURL, &websocket.DialOptions{
+		HTTPClient: server.Client(),
+		HTTPHeader: http.Header{
+			"Origin": {server.URL},
+			"Cookie": {app.cookieName() + "=" + cookie},
+		},
+	})
+	if err != nil {
+		t.Fatalf("connect deletion event client: %v", err)
+	}
+	defer socket.Close(websocket.StatusNormalClosure, "")
+	var ready struct {
+		Code string `json:"code"`
+	}
+	if err = wsjson.Read(context.Background(), socket, &ready); err != nil || ready.Code != "events.ready" {
+		t.Fatalf("read events ready frame: %+v, %v", ready, err)
+	}
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/projects/"+projectID+"/delete", `{"confirm":true}`)
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("project cleanup failure status=%d", response.StatusCode)
@@ -198,6 +221,18 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 		!strings.Contains(outcome, `"operationAccepted":true`) {
 		t.Fatalf("project cleanup outcome=%s", outcome)
 	}
+	var pendingEvent struct {
+		Code string `json:"code"`
+		Data struct {
+			Resources []eventResource `json:"resources"`
+		} `json:"data"`
+	}
+	if err = wsjson.Read(context.Background(), socket, &pendingEvent); err != nil {
+		t.Fatalf("read pending cleanup invalidation: %v", err)
+	}
+	if pendingEvent.Code != "events.invalidate" || len(pendingEvent.Data.Resources) != 1 || pendingEvent.Data.Resources[0].Kind != "projects" {
+		t.Fatalf("cleanup-pending event claimed deleted resources: %+v", pendingEvent)
+	}
 	cacheFS.fail = false
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/projects/"+projectID+"/delete", `{"confirm":true}`)
 	if response.StatusCode != http.StatusOK {
@@ -205,6 +240,18 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 	}
 	if outcome := responseText(response); !strings.Contains(outcome, `"code":"project.deleted"`) {
 		t.Fatalf("project deletion outcome=%s", outcome)
+	}
+	var deletedEvent struct {
+		Code string `json:"code"`
+		Data struct {
+			Resources []eventResource `json:"resources"`
+		} `json:"data"`
+	}
+	if err = wsjson.Read(context.Background(), socket, &deletedEvent); err != nil {
+		t.Fatalf("read committed deletion invalidation: %v", err)
+	}
+	if deletedEvent.Code != "events.invalidate" || len(deletedEvent.Data.Resources) != 5 {
+		t.Fatalf("committed deletion did not invalidate deleted-resource reads: %+v", deletedEvent)
 	}
 	if _, err = os.Stat(cache); !os.IsNotExist(err) {
 		t.Fatalf("project cache remains after deletion: %v", err)
