@@ -15,6 +15,7 @@ const fixtureListen = "127.0.0.1:18441";
 const fixtureOrigin = `https://${fixtureListen}`;
 const fixtureURL = `${fixtureOrigin}/repo.git`;
 const password = "Project browser test password 2026!";
+const focusedOutcomesComplete = Symbol("focused deployment outcomes complete");
 let app;
 let fixture;
 let sshFixture;
@@ -524,8 +525,8 @@ try {
     const response = await fetch("/api/deployments/root");
     return { status: response.status, body: await response.json() };
   });
-  if (publicationRootResponse.status !== 200 || publicationRootResponse.body.publicationRoot !== join(dir, "state.sqlite.publications")) throw new Error(`unexpected publication root: ${JSON.stringify(publicationRootResponse)}`);
-  const publishedPath = join(publicationRootResponse.body.publicationRoot, "production-site");
+  if (publicationRootResponse.status !== 200 || publicationRootResponse.body.code !== "deployment.root_loaded" || publicationRootResponse.body.data.publicationRoot !== join(dir, "state.sqlite.publications")) throw new Error(`unexpected publication root outcome: ${JSON.stringify(publicationRootResponse)}`);
+  const publishedPath = join(publicationRootResponse.body.data.publicationRoot, "production-site");
   await page.getByLabel("Publication folder").fill("production-site");
   await page.getByText(`Full path: ${publishedPath}`, { exact: true }).waitFor();
   try { await page.locator('option[value="branch:feature/search"]').waitFor({ state: "attached" }); } catch {
@@ -540,12 +541,13 @@ try {
   if (deploymentCreated.status() !== 201) throw new Error(`deployment creation returned ${deploymentCreated.status()}: ${await deploymentCreated.text()}`);
   if (deploymentCreated.request().postDataJSON().publicationPath !== "production-site") throw new Error("dashboard did not submit the chosen publication folder");
   const createdDeployment = await deploymentCreated.json();
-  const deploymentID = createdDeployment.id;
-  if (createdDeployment.publicationPath !== publishedPath) throw new Error(`creation returned a different publication path: ${JSON.stringify(createdDeployment)}`);
+  if (createdDeployment.code !== "deployment.created" || createdDeployment.data.status !== "queued" || !createdDeployment.data.jobId) throw new Error(`deployment creation did not report queued acceptance: ${JSON.stringify(createdDeployment)}`);
+  const deploymentID = createdDeployment.data.id;
+  if (createdDeployment.data.publicationPath !== publishedPath) throw new Error(`creation returned a different publication path: ${JSON.stringify(createdDeployment)}`);
   await page.waitForURL(`**/dashboard/projects/${id}/deployments/${deploymentID}`);
   await page.getByRole("heading", { name: "Production site", exact: true }).waitFor();
   await page.getByText(`Publication path: ${publishedPath}`, { exact: true }).waitFor();
-  const listedDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).find(item => item.id === id), deploymentID);
+  const listedDeployment = await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).data.find(item => item.id === id), deploymentID);
   if (listedDeployment?.publicationPath !== publishedPath) throw new Error(`deployment list returned a different publication path: ${JSON.stringify(listedDeployment)}`);
   if (await httpsRequestStatus("127.0.0.1", 18440, "/api/deployments", "GET") !== 401) throw new Error("deployment list was accessible without a session");
   if (await httpsRequestStatus("127.0.0.1", 18440, `/api/deployments/${deploymentID}/jobs`, "GET") !== 401) throw new Error("deployment history was accessible without a session");
@@ -555,7 +557,7 @@ try {
   await productionHistory.getByText("Loading history…", { exact: true }).waitFor();
   if (await productionHistory.getByText("No deployment history yet.", { exact: true }).count()) throw new Error("pending deployment history was shown as empty");
   finishJobHistory();
-  await delayedHistoryRoute.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+  await delayedHistoryRoute.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "job.listed", message: "Jobs loaded.", data: [] }) });
   await productionHistory.getByText("No deployment history yet.", { exact: true }).waitFor();
   if (await productionHistory.getByText("No deployment jobs recorded yet.", { exact: true }).count()) throw new Error("outdated deployment history empty message remained visible");
   let failHistoryRoute;
@@ -576,8 +578,35 @@ try {
       } catch { return false; }
     }, "published deployment files");
   } catch (error) {
+    if (error === focusedOutcomesComplete) throw error;
     const state = await page.evaluate(async id => ({ deployment: await (await fetch("/api/deployments")).text(), jobs: await (await fetch(`/api/deployments/${id}/jobs`)).text() }), deploymentID);
     throw new Error(`${error.message}; state: ${JSON.stringify(state)}`);
+  }
+  const completedOutcome = await page.evaluate(async id => {
+    const [deployments, jobs] = await Promise.all([
+      fetch("/api/deployments").then(response => response.json()),
+      fetch(`/api/deployments/${id}/jobs`).then(response => response.json())
+    ]);
+    return { deployment: deployments.data.find(item => item.id === id), job: jobs.data[0] };
+  }, deploymentID);
+  if (completedOutcome.deployment.liveCommit !== completedOutcome.job.commit || completedOutcome.job.status !== "succeeded") {
+    throw new Error(`queue acceptance was confused with completed publication: ${JSON.stringify(completedOutcome)}`);
+  }
+  const safeFailure = await page.evaluate(async id => {
+    const response = await fetch(`/api/deployments/${id}/target`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetKind: "branch", targetName: "not-cached" })
+    });
+    return { status: response.status, body: await response.json() };
+  }, deploymentID);
+  if (safeFailure.status !== 400 || safeFailure.body.code !== "git.target_unavailable" || safeFailure.body.data !== null ||
+      /SENSITIVE|private|filesystem|repository path/i.test(safeFailure.body.message)) {
+    throw new Error(`target failure was not a safe semantic outcome: ${JSON.stringify(safeFailure)}`);
+  }
+  if (process.env.DEPLOYMENT_OUTCOMES_ONLY) {
+    console.log("combined-binary deployment acceptance, completion, and safe failure assertions passed");
+    throw focusedOutcomesComplete;
   }
   await page.getByText("Live", { exact: true }).waitFor();
   await page.reload({ waitUntil: "domcontentloaded" });
@@ -1241,8 +1270,12 @@ try {
   console.log("combined-binary authenticated project workflow passed: readable publication folders, legacy move and deletion, private SSH/LFS publication, cache size/recreation warning and confirmation, restart-safe cache lifecycle, host trust, cross-origin mutation rejection, and cached-ref retention");
   }
 } catch (error) {
+  if (error === focusedOutcomesComplete) {
+    // The focused run completed; the shared finally block still cleans up fixtures.
+  } else {
   console.error(`[projects-browser] failed during: ${currentStep}`);
   throw error;
+  }
 } finally {
   releasePauseFailure?.();
   // A broken browser action or route must not prevent fixture termination.

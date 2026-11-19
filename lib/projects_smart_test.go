@@ -1611,13 +1611,15 @@ func waitForDeploymentJob(t *testing.T, client *http.Client, origin, cookie, dep
 		if err != nil {
 			t.Fatal(err)
 		}
-		var jobs []deploymentJob
-		err = json.NewDecoder(response.Body).Decode(&jobs)
+		var outcome struct {
+			Data []deploymentJob `json:"data"`
+		}
+		err = json.NewDecoder(response.Body).Decode(&outcome)
 		response.Body.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
-		for _, job := range jobs {
+		for _, job := range outcome.Data {
 			if job.ID == jobID {
 				last = job.Status + ": " + job.Log
 			}

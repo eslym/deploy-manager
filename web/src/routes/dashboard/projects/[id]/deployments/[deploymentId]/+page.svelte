@@ -364,32 +364,34 @@
 		busy = true;
 		error = '';
 		try {
-			const outcome = await sdk.deployments.move(id, {
-				publicationPath: movePath,
-				expectedPublicationPath: confirmation.oldPath,
-				confirm: true
-			});
-			if (outcome.code !== 'deployment.moved') {
-				error =
-					'Could not confirm whether the move completed. Refresh deployment details before trying again.';
-				return;
-			}
+			await dashboardRequest(
+				`/api/deployments/${id}/move`,
+				{
+					method: 'POST',
+					body: JSON.stringify({
+						publicationPath: movePath,
+						expectedPublicationPath: confirmation.oldPath,
+						confirm: true
+					})
+				},
+				(response) =>
+					response.status === 409
+						? new Error(
+								'The publication may have changed or the destination is unavailable. Refresh and review the move before trying again.'
+							)
+						: new Error(
+								response.status >= 500
+									? 'The request could not be completed. Try again shortly.'
+									: 'The request was rejected. Refresh and try again.'
+							)
+			);
 			moveConfirmation = null;
 			movePath = '';
 			moveOpen = false;
 			await load();
 		} catch (cause) {
 			moveConfirmation = null;
-			error =
-				cause instanceof BrowserSDKError &&
-				cause.outcome.kind === 'server' &&
-				cause.outcome.status === 409
-					? 'The publication may have changed or the destination is unavailable. Refresh and review the move before trying again.'
-					: mutationError(
-							cause,
-							'Could not move the deployment.',
-							'Could not confirm whether the move completed. Refresh deployment details before trying again.'
-						);
+			error = cause instanceof Error ? cause.message : 'Could not move the deployment.';
 		} finally {
 			busy = false;
 		}

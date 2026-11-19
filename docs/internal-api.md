@@ -326,8 +326,13 @@ This confirms queue acceptance, not successful publication.
 | POST `/api/deployments/{id}/rollback` | `{"commit":"<full-sha1>","permanent":false}`; 202 `deployment.rollback_queued`; `data: Queued response` | Branch only; ancestry validation happens in the worker after fetching. |
 | POST `/api/deployments/{id}/pause` | No body required; 200 `deployment.paused`; `data: {"automationPaused":true}` | Branch only; repeated pause succeeds. |
 | POST `/api/deployments/{id}/resume` | No body required; 202 `deployment.resumed`; `data` contains `automationPaused`, `jobId`, and `status: "queued"` | Branch only; immediately queues latest tip; already enabled returns 409. |
-| POST `/api/deployments/{id}/move` | Move body below; 200 `deployment.moved`; `data: {"publicationPath":"<new-server-path>"}` | Changes destination, not Git target/content; synchronous durable move, no job. |
 | POST `/api/deployments/{id}/delete` | `{"confirm":true}`; 200 `deployment.deleted`; `data: null` | Supersedes work and removes published files; blocked cleanup can return 503 `operation.cleanup_pending` with accepted/recovery flags. |
+
+The deployment outcomes migration covers only list/root/create, target changes,
+Deploy, Hard re-deploy, jobs, history, rollback, pause/resume, and deletion.
+Publication move remains on its existing plain-JSON success / plain-text failure
+contract and is intentionally deferred to #70; it is not a typed SDK operation
+in this slice. Its durable move and confirmation safeguards are unchanged.
 
 Create body (8 KiB limit):
 
@@ -357,7 +362,7 @@ No path separators, traversal, symlinks, occupied paths, or reserved destination
 are allowed. Omission on create retains the historical ID-named destination.
 The display name is independent of the publication folder.
 
-Move body (4 KiB limit):
+Move body (4 KiB limit; legacy route contract, deferred to #70):
 
 ```json
 {

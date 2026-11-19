@@ -273,11 +273,17 @@ func TestMoveLegacyPublicationPreservesReleaseAndFutureDeletion(t *testing.T) {
 	if created.StatusCode != http.StatusCreated {
 		t.Fatalf("create: %s", responseText(created))
 	}
-	var deployment struct{ ID, JobID string }
-	if err := json.NewDecoder(created.Body).Decode(&deployment); err != nil {
+	var createdOutcome struct {
+		Data struct {
+			ID    string `json:"id"`
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(created.Body).Decode(&createdOutcome); err != nil {
 		t.Fatal(err)
 	}
 	created.Body.Close()
+	deployment := createdOutcome.Data
 	waitForDeploymentJob(t, server.Client(), server.URL, cookie, deployment.ID, deployment.JobID, "succeeded")
 	old := filepath.Join(app.cfg.DeploymentRoot, deployment.ID)
 	newPath := filepath.Join(app.cfg.DeploymentRoot, "readable-site")
@@ -310,6 +316,13 @@ func TestMoveLegacyPublicationPreservesReleaseAndFutureDeletion(t *testing.T) {
 	response := move("readable-site", true)
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("move status %d: %s", response.StatusCode, responseText(response))
+	}
+	var moved map[string]string
+	if err := json.NewDecoder(response.Body).Decode(&moved); err != nil {
+		t.Fatalf("decode legacy move response: %v", err)
+	}
+	if moved["publicationPath"] != newPath || moved["code"] != "" {
+		t.Fatalf("move route unexpectedly changed contract: %#v", moved)
 	}
 	response.Body.Close()
 	if got, err := identity(newPath); err != nil || got != oldID {
@@ -352,8 +365,15 @@ func TestMoveLegacyPublicationPreservesReleaseAndFutureDeletion(t *testing.T) {
 		t.Fatalf("later deployment recreated old path: %v", err)
 	}
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+deployment.ID+"/delete", `{"confirm":true}`)
-	if response.StatusCode != http.StatusNoContent {
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("delete: %d %s", response.StatusCode, responseText(response))
+	}
+	var deleted struct {
+		Code string `json:"code"`
+		Data any    `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&deleted); err != nil || deleted.Code != "deployment.deleted" || deleted.Data != nil {
+		t.Fatalf("unexpected deployment-delete outcome: %#v %v", deleted, err)
 	}
 	response.Body.Close()
 	if _, err := os.Lstat(newPath); !os.IsNotExist(err) {
