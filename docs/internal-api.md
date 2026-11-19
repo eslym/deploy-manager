@@ -73,7 +73,10 @@ Publication move is deliberately excluded from the typed deployment SDK and
 remains on its pre-migration contract: plain JSON success and plain-text
 failures, including the existing auth/Origin guards. Its atomic move,
 confirmation, generation, and recovery protections are unchanged. #70 owns
-migrating that action and documenting its typed outcome/recovery behavior.
+migrating that action and documenting its typed outcome/recovery behavior. The
+outcome conversion of rollback, pause/resume, and deletion does not complete
+#70's dedicated safety/recovery coverage for those lifecycle actions; that
+ticket still owns its specified handler/browser scenarios and recovery guidance.
 
 Unmigrated errors generally use Go's `http.Error`: `text/plain; charset=utf-8`
 with a trailing newline. Migrated outcomes have exactly `code`, `message`,
