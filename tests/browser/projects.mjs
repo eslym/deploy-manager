@@ -1235,7 +1235,7 @@ try {
     response.url().endsWith(`/api/projects/${sshProject.id}/key`) && response.request().method() === "POST"
   );
   await keyChangeButton.click();
-  if ((await finalKeyResponse).status() !== 200) throw new Error("the newer repository-key selection could not be assigned");
+  if ((await withDeadline(finalKeyResponse, "newer key assignment response", 2500)).status() !== 200) throw new Error("the newer repository-key selection could not be assigned");
   await waitFor(async () => (await page.evaluate(async id => (await (await fetch("/api/projects")).json()).data.find(project => project.id === id)?.keyId, sshProject.id)) === sshKeyId, "newer project key assignment");
   trace("held-response SSH key selection regression passed");
   if (process.env.PROJECT_KEY_ASSIGNMENT_RACE_ONLY === "true") {
