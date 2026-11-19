@@ -9,6 +9,49 @@ function response(body: unknown, status = 200): Response {
 }
 
 describe('browser SDK authentication transport', () => {
+	it('uses named lifecycle operations and does not retry destructive mutations', async () => {
+		const send = vi
+			.fn()
+			.mockResolvedValueOnce(
+				response({
+					code: 'deployment.moved',
+					message: 'Publication path changed.',
+					data: { publicationPath: '/srv/sites/new-site' }
+				})
+			)
+			.mockResolvedValueOnce(
+				response({ code: 'deployment.deleted', message: 'Deployment deleted.', data: null })
+			)
+			.mockResolvedValueOnce(
+				response({ code: 'project.deleted', message: 'Project deleted.', data: null })
+			);
+		const api = createBrowserSDK({ fetch: send });
+
+		const moved = await api.deployments.move('deploy/1', {
+			publicationPath: 'new-site',
+			expectedPublicationPath: '/srv/sites/old-site',
+			confirm: true
+		});
+		await api.deployments.delete('deployment-1');
+		await api.projects.delete('project-1');
+
+		expect(moved.data.publicationPath).toBe('/srv/sites/new-site');
+		expect(send.mock.calls.map(([path]) => path)).toEqual([
+			'/api/deployments/deploy%2F1/move',
+			'/api/deployments/deployment-1/delete',
+			'/api/projects/project-1/delete'
+		]);
+		expect(send).toHaveBeenCalledTimes(3);
+		expect(send.mock.calls[0][1]).toMatchObject({
+			method: 'POST',
+			body: JSON.stringify({
+				publicationPath: 'new-site',
+				expectedPublicationPath: '/srv/sites/old-site',
+				confirm: true
+			})
+		});
+	});
+
 	it('validates the endpoint payload and uses same-origin credentials without retrying mutations', async () => {
 		const send = vi.fn().mockResolvedValue(
 			response({

@@ -31,30 +31,30 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 		Confirm bool `json:"confirm"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&input) != nil || !input.Confirm {
-		http.Error(w, "explicit deletion confirmation is required", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Explicit deletion confirmation is required.")
 		return
 	}
 	id := r.PathValue("id")
 	if !validProjectID(id) {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	now := a.cfg.Now().UnixNano()
 	ctx := r.Context()
 	tx, err := a.store.Tx(ctx)
 	if err != nil {
-		http.Error(w, "deployment deletion is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		return
 	}
 	deployment, err := tx.Deployment.Get(ctx, id)
 	if ent.IsNotFound(err) {
 		_ = tx.Rollback()
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if err != nil {
 		_ = tx.Rollback()
-		http.Error(w, "deployment deletion is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		return
 	}
 	deletionExists, err := tx.DeploymentDeletion.Query().Where(deploymentdeletion.IDEQ(id)).Exist(ctx)
@@ -76,21 +76,21 @@ func (a *App) deleteDeployment(w http.ResponseWriter, r *http.Request) {
 			_, err = tx.DeploymentJob.UpdateOneID(job.ID).SetStatus("superseded").SetLog(appendJobLog(job.Log, "Deployment deletion requested")).SetUpdatedAt(now).Save(ctx)
 		}
 	}
-	if err == nil {
-		err = tx.Commit()
-	} else {
-		_ = tx.Rollback()
-	}
 	if err != nil {
-		http.Error(w, "deployment deletion could not be recorded", 500)
+		_ = tx.Rollback()
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	a.cancelDeploymentJobs(id)
 	if err = a.finishDeploymentDeletion(id); err != nil {
-		http.Error(w, "deletion is pending; cleanup is blocked and will be retried", http.StatusServiceUnavailable)
+		writeOutcome(w, http.StatusServiceUnavailable, "operation.cleanup_pending", "Cleanup is pending. Refresh before taking further action.", map[string]bool{"operationAccepted": true, "recoveryRequired": true})
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "deployment.deleted", "Deployment deleted.", nil)
 }
 
 func (a *App) resumeDeploymentDeletions() error {
@@ -369,7 +369,7 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 		Confirm bool `json:"confirm"`
 	}
 	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&in) != nil || !in.Confirm {
-		http.Error(w, "explicit deletion confirmation is required", 400)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Explicit deletion confirmation is required.")
 		return
 	}
 	p := a.projects
@@ -379,7 +379,7 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 	defer p.lfsAuthMu.Unlock()
 	id := r.PathValue("id")
 	if !validProjectID(id) {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	p.cacheMu.Lock()
@@ -387,28 +387,28 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	tx, err := a.store.Tx(ctx)
 	if err != nil {
-		http.Error(w, "project deletion is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		return
 	}
 	defer tx.Rollback()
 	count, err := tx.Deployment.Query().Where(deploymentmodel.ProjectID(id)).Count(ctx)
 	if err != nil {
-		http.Error(w, "project deletion is temporarily unavailable", 500)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		return
 	}
 	if count != 0 {
-		http.Error(w, "remove this project's deployments before deleting the project", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "project.has_deployments", "Delete this project's deployments first.")
 		return
 	}
 	exists, err := tx.Project.Query().Where(projectmodel.IDEQ(id)).Exist(ctx)
 	if err != nil || !exists {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	cache := p.repoPath(id)
 	cacheID, err := identity(cache)
 	if err != nil {
-		http.Error(w, "project cache identity could not be verified; deletion is blocked", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	p.lfsCacheMu.Lock()
@@ -424,7 +424,7 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		p.lfsCacheMu.Unlock()
-		http.Error(w, "project LFS cache identity could not be verified; deletion is blocked", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	now := a.cfg.Now().UnixNano()
@@ -436,20 +436,20 @@ func (a *App) deleteProject(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		p.lfsCacheMu.Unlock()
-		http.Error(w, "project deletion could not be recorded", 500)
+		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
 		p.lfsCacheMu.Unlock()
-		http.Error(w, "project deletion could not be recorded", 500)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
 	p.lfsCacheMu.Unlock()
 	if err = a.finishProjectDeletion(id, cacheID, lfsCacheID); err != nil {
-		http.Error(w, "project deletion is pending; cache cleanup will retry", http.StatusServiceUnavailable)
+		writeOutcome(w, http.StatusServiceUnavailable, "operation.cleanup_pending", "Cleanup is pending. Refresh before taking further action.", map[string]bool{"operationAccepted": true, "recoveryRequired": true})
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	writeOutcome(w, http.StatusOK, "project.deleted", "Project deleted.", nil)
 }
 
 func (a *App) finishProjectDeletion(id string, want, wantLFS dirIdentity) error {

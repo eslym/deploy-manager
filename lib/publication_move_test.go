@@ -69,7 +69,7 @@ func TestPublicationMoveReconcilesInterruptedRename(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			if response.StatusCode != http.StatusServiceUnavailable || !strings.Contains(responseText(response), "move") {
+			if response.StatusCode != http.StatusServiceUnavailable || !strings.Contains(responseText(response), `"code":"publication.recovery_required"`) {
 				t.Fatalf("unresolved move exposed a document root: HTTP %d", response.StatusCode)
 			}
 			var name string
@@ -317,12 +317,15 @@ func TestMoveLegacyPublicationPreservesReleaseAndFutureDeletion(t *testing.T) {
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("move status %d: %s", response.StatusCode, responseText(response))
 	}
-	var moved map[string]string
-	if err := json.NewDecoder(response.Body).Decode(&moved); err != nil {
-		t.Fatalf("decode legacy move response: %v", err)
+	var moved struct {
+		Code string            `json:"code"`
+		Data map[string]string `json:"data"`
 	}
-	if moved["publicationPath"] != newPath || moved["code"] != "" {
-		t.Fatalf("move route unexpectedly changed contract: %#v", moved)
+	if err := json.NewDecoder(response.Body).Decode(&moved); err != nil {
+		t.Fatalf("decode move outcome: %v", err)
+	}
+	if moved.Data["publicationPath"] != newPath || moved.Code != "deployment.moved" {
+		t.Fatalf("move outcome=%#v", moved)
 	}
 	response.Body.Close()
 	if got, err := identity(newPath); err != nil || got != oldID {
@@ -365,7 +368,7 @@ func TestMoveLegacyPublicationPreservesReleaseAndFutureDeletion(t *testing.T) {
 		t.Fatalf("later deployment recreated old path: %v", err)
 	}
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+deployment.ID+"/delete", `{"confirm":true}`)
-	if response.StatusCode != http.StatusNoContent {
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("delete: %d %s", response.StatusCode, responseText(response))
 	}
 	response.Body.Close()

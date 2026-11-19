@@ -27,38 +27,53 @@ func createAndTestTagDeployment(t *testing.T, client *http.Client, origin, cooki
 	if response.StatusCode != http.StatusCreated {
 		t.Fatalf("tag deployment creation status %d: %s", response.StatusCode, responseText(response))
 	}
-	var created struct{ ID, JobID string }
+	var created struct {
+		Code string `json:"code"`
+		Data struct {
+			ID    string `json:"id"`
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if err := json.NewDecoder(response.Body).Decode(&created); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, created.ID, created.JobID, "succeeded")
+	if created.Code != "deployment.created" {
+		t.Fatalf("tag deployment outcome=%#v", created)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, created.Data.ID, created.Data.JobID, "succeeded")
 	var frozen string
-	if err := app.db.QueryRow(`SELECT commit_id FROM deployments WHERE id=?`, created.ID).Scan(&frozen); err != nil || frozen != tagRef.Commit {
+	if err := app.db.QueryRow(`SELECT commit_id FROM deployments WHERE id=?`, created.Data.ID).Scan(&frozen); err != nil || frozen != tagRef.Commit {
 		t.Fatalf("created tag target resolution=%q, cached tag=%q, err=%v", frozen, tagRef.Commit, err)
 	}
-	path := filepath.Join(app.cfg.DeploymentRoot, created.ID)
+	path := filepath.Join(app.cfg.DeploymentRoot, created.Data.ID)
 	identityBefore, err := identity(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ordinary := projectPost(t, client, origin, cookie, "/api/deployments/"+created.ID+"/deploy", `{}`)
+	ordinary := projectPost(t, client, origin, cookie, "/api/deployments/"+created.Data.ID+"/deploy", `{}`)
 	if ordinary.StatusCode != http.StatusAccepted {
 		t.Fatalf("ordinary tag Deploy status %d: %s", ordinary.StatusCode, responseText(ordinary))
 	}
 	var ordinaryJob struct {
-		JobID string `json:"jobId"`
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(ordinary.Body).Decode(&ordinaryJob); err != nil {
 		t.Fatal(err)
 	}
 	ordinary.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, created.ID, ordinaryJob.JobID, "noop")
+	if ordinaryJob.Code != "deployment.queued" {
+		t.Fatalf("ordinary Deploy outcome=%#v", ordinaryJob)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, created.Data.ID, ordinaryJob.Data.JobID, "noop")
 	if after, identityErr := identity(path); identityErr != nil || after != identityBefore {
 		t.Fatalf("ordinary tag Deploy recreated unchanged live content: before=%+v after=%+v err=%v", identityBefore, after, identityErr)
 	}
-	hardJob := hardRedeployAndWait(t, client, origin, cookie, created.ID, path, nil)
-	return tagDeploymentFixture{ID: created.ID, JobID: hardJob, FrozenCommit: frozen, Path: path, Identity: identityBefore}
+	hardJob := hardRedeployAndWait(t, client, origin, cookie, created.Data.ID, path, nil)
+	return tagDeploymentFixture{ID: created.Data.ID, JobID: hardJob, FrozenCommit: frozen, Path: path, Identity: identityBefore}
 }
 
 func hardRedeployAndWait(t *testing.T, client *http.Client, origin, cookie, deploymentID, path string, fetchCount *atomic.Int32) string {
@@ -76,20 +91,26 @@ func hardRedeployAndWait(t *testing.T, client *http.Client, origin, cookie, depl
 		t.Fatalf("Hard re-deploy status %d: %s", response.StatusCode, responseText(response))
 	}
 	var queued struct {
-		JobID string `json:"jobId"`
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&queued); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, deploymentID, queued.JobID, "succeeded")
+	if queued.Code != "deployment.hard_redeploy_queued" {
+		t.Fatalf("Hard re-deploy outcome=%#v", queued)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, deploymentID, queued.Data.JobID, "succeeded")
 	if fetchCount != nil && fetchCount.Load() <= baseline {
 		t.Fatal("Hard re-deploy did not fetch the repository")
 	}
 	if after, identityErr := identity(path); identityErr != nil || after == before {
 		t.Fatalf("Hard re-deploy did not recreate the publication: before=%+v after=%+v err=%v", before, after, identityErr)
 	}
-	return queued.JobID
+	return queued.Data.JobID
 }
 
 func moveAnnotatedTagAndTestHardRefresh(t *testing.T, client *http.Client, origin, cookie string, app *App, fixtureRepo *git.Repository, failRequests *atomic.Bool, deployment tagDeploymentFixture, newCommit string, contents []byte) string {
@@ -105,13 +126,19 @@ func moveAnnotatedTagAndTestHardRefresh(t *testing.T, client *http.Client, origi
 		t.Fatalf("ordinary Deploy for moved upstream tag status %d: %s", ordinary.StatusCode, responseText(ordinary))
 	}
 	var ordinaryJob struct {
-		JobID string `json:"jobId"`
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(ordinary.Body).Decode(&ordinaryJob); err != nil {
 		t.Fatal(err)
 	}
 	ordinary.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, deployment.ID, ordinaryJob.JobID, "noop")
+	if ordinaryJob.Code != "deployment.queued" {
+		t.Fatalf("ordinary Deploy outcome=%#v", ordinaryJob)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, deployment.ID, ordinaryJob.Data.JobID, "noop")
 	assertSavedTagResolution(t, app, deployment.ID, deployment.FrozenCommit)
 	identityBeforeFailure, err := identity(deployment.Path)
 	if err != nil {
@@ -124,13 +151,19 @@ func moveAnnotatedTagAndTestHardRefresh(t *testing.T, client *http.Client, origi
 		t.Fatalf("failed-refresh Hard re-deploy queue status %d: %s", failed.StatusCode, responseText(failed))
 	}
 	var failedJob struct {
-		JobID string `json:"jobId"`
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(failed.Body).Decode(&failedJob); err != nil {
 		t.Fatal(err)
 	}
 	failed.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, deployment.ID, failedJob.JobID, "failed")
+	if failedJob.Code != "deployment.hard_redeploy_queued" {
+		t.Fatalf("failed Hard re-deploy acceptance outcome=%#v", failedJob)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, deployment.ID, failedJob.Data.JobID, "failed")
 	failRequests.Store(false)
 	if after, identityErr := identity(deployment.Path); identityErr != nil || after != identityBeforeFailure {
 		t.Fatalf("failed tag refresh changed live directory identity: before=%+v after=%+v err=%v", identityBeforeFailure, after, identityErr)
@@ -169,13 +202,16 @@ func assertTagDeploymentRestarted(t *testing.T, client *http.Client, origin, coo
 	if err != nil {
 		t.Fatal(err)
 	}
-	var jobs []deploymentJob
-	if err := json.NewDecoder(response.Body).Decode(&jobs); err != nil {
+	var jobsOutcome struct {
+		Code string          `json:"code"`
+		Data []deploymentJob `json:"data"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&jobsOutcome); err != nil {
 		response.Body.Close()
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	for _, item := range jobs {
+	for _, item := range jobsOutcome.Data {
 		if item.ID == hardJobID && item.Force && item.Status == "failed" {
 			if after, identityErr := identity(tag.Path); identityErr != nil || after != liveIdentity {
 				t.Fatalf("restart after interrupted hard re-deploy changed live publication: before=%+v after=%+v err=%v", liveIdentity, after, identityErr)

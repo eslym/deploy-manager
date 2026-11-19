@@ -148,65 +148,65 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&input) != nil || !input.Confirm || !validPublicationName(input.PublicationPath) {
-		http.Error(w, "choose a safe folder name and explicitly confirm the external web server document root may need updating", http.StatusBadRequest)
+		writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Choose a safe folder name and confirm the publication path change.")
 		return
 	}
 	id := r.PathValue("id")
 	if !validProjectID(id) {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	unlock, err := a.lockDeployment(id)
 	if err != nil {
-		http.Error(w, "publication root is unavailable", http.StatusServiceUnavailable)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	defer unlock()
 	ctx := context.Background() // A disconnected client cannot cancel a durable filesystem move.
 	current, err := a.store.Deployment.Get(ctx, id)
 	if ent.IsNotFound(err) {
-		http.NotFound(w, r)
+		writeOutcomeError(w, http.StatusNotFound, "request.not_found", "Resource not found.")
 		return
 	}
 	if err != nil {
-		http.Error(w, "deployment unavailable", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "service.unavailable", "Service is temporarily unavailable.")
 		return
 	}
 	if current.Status == "deleting" || current.Status == "deletion_failed" || current.PublicationName == input.PublicationPath {
-		http.Error(w, "deployment is being deleted or destination is unchanged", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "publication.path_conflict", "Publication path is unavailable or changed.")
 		return
 	}
 	if !validStoredPublicationName(current.PublicationName, id) {
-		http.Error(w, "publication binding is invalid", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if input.ExpectedPublicationPath != a.publicationPaths(id).live() {
-		http.Error(w, "publication path changed since review; review the current document root before moving", http.StatusConflict)
+		writeOutcomeError(w, http.StatusConflict, "publication.path_conflict", "Publication path changed. Review the current path before moving.")
 		return
 	}
 	if pending, e := a.movePending(id); e != nil || pending {
-		http.Error(w, "a previous move requires reconciliation", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	var publicationIntent int
 	if err = a.db.QueryRow(`SELECT count(*) FROM publication_intents WHERE deployment_id=?`, id).Scan(&publicationIntent); err != nil || publicationIntent != 0 {
-		http.Error(w, "publication requires reconciliation before moving", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	owner := a.publicationPaths(id)
 	destination, err := a.availablePublicationPath(owner, input.PublicationPath)
 	if err != nil {
 		if errors.Is(err, errPublicationOccupied) {
-			http.Error(w, "publication destination is occupied or reserved", 409)
+			writeOutcomeError(w, http.StatusConflict, "publication.path_conflict", "Publication path is unavailable or changed.")
 		} else {
-			http.Error(w, "destination cannot be inspected", 503)
+			writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		}
 		return
 	}
 	source := owner.live()
 	old, live, err := owner.checkLive(current.LiveCommit, dirIdentity{uint64(current.LiveDev), uint64(current.LiveIno)})
 	if err != nil {
-		http.Error(w, "live publication cannot be verified", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if !live {
@@ -214,31 +214,31 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 		// deployment lock keeps waiting workers from observing a partial edit.
 		result, e := a.db.Exec(`UPDATE deployments SET publication_name=?,updated_at=? WHERE id=? AND publication_name=? AND status NOT IN ('deleting','deletion_failed')`, input.PublicationPath, a.cfg.Now().UnixNano(), id, current.PublicationName)
 		if e != nil {
-			http.Error(w, "destination was reserved concurrently", 409)
+			writeOutcomeError(w, http.StatusConflict, "publication.path_conflict", "Publication path is unavailable or changed.")
 			return
 		}
 		if count, _ := result.RowsAffected(); count != 1 {
-			http.Error(w, "deployment changed", 409)
+			writeOutcomeError(w, http.StatusConflict, "publication.path_conflict", "Publication path is unavailable or changed.")
 			return
 		}
-		writeJSON(w, map[string]string{"publicationPath": destination})
+		writeOutcome(w, http.StatusOK, "deployment.moved", "Publication path changed.", map[string]string{"publicationPath": destination})
 		return
 	}
 	// Commit the intent before touching the namespace. UNIQUE destination and
 	// the insert trigger guard against concurrent deployment creation.
 	inserted, err := a.db.Exec(`INSERT INTO publication_moves(deployment_id,source_name,destination_name,old_dev,old_ino,created_at) SELECT ?,?,?,?,?,? WHERE NOT EXISTS(SELECT 1 FROM deployments WHERE publication_name=?)`, id, current.PublicationName, input.PublicationPath, old.Dev, old.Ino, a.cfg.Now().UnixNano(), input.PublicationPath)
 	if err != nil {
-		http.Error(w, "publication destination is reserved", 409)
+		writeOutcomeError(w, http.StatusConflict, "publication.path_conflict", "Publication path is unavailable or changed.")
 		return
 	}
 	if count, _ := inserted.RowsAffected(); count != 1 {
-		http.Error(w, "publication destination is reserved", 409)
+		writeOutcomeError(w, http.StatusConflict, "publication.path_conflict", "Publication path is unavailable or changed.")
 		return
 	}
 	// SQLite write ownership spans the rename and the durable state update.
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
-		http.Error(w, "move requires reconciliation", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	defer tx.Rollback()
@@ -248,69 +248,69 @@ func (a *App) moveDeployment(w http.ResponseWriter, r *http.Request) {
 		count, err = result.RowsAffected()
 	}
 	if err != nil || count != 1 {
-		http.Error(w, "move requires reconciliation", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if same, e := sameIdentity(source, old); e != nil || !same {
-		http.Error(w, "source identity changed; move blocked", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if _, e := os.Lstat(destination); !os.IsNotExist(e) {
-		http.Error(w, "destination became occupied; move blocked", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = fault("before-move-rename"); err != nil {
-		http.Error(w, "move interrupted; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = unix.Renameat2(unix.AT_FDCWD, source, unix.AT_FDCWD, destination, unix.RENAME_NOREPLACE); err != nil {
-		http.Error(w, "atomic move failed; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = fault("after-move-rename"); err != nil {
-		http.Error(w, "move interrupted; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = fault("before-move-directory-sync"); err != nil {
-		http.Error(w, "move directory sync failed; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = syncDirectory(a.cfg.DeploymentRoot); err != nil {
-		http.Error(w, "move directory sync failed; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = fault("after-move-sync"); err != nil {
-		http.Error(w, "move interrupted; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	verified, verifyErr := sameIdentity(destination, old)
 	if verifyErr != nil || !verified {
-		http.Error(w, "move outcome ambiguous; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if _, verifyErr = os.Lstat(source); !os.IsNotExist(verifyErr) {
-		http.Error(w, "move outcome ambiguous; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = fault("after-move-verify"); err != nil {
-		http.Error(w, "move verification interrupted; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE deployments SET publication_name=?,updated_at=? WHERE id=? AND publication_name=?`, input.PublicationPath, a.cfg.Now().UnixNano(), id, current.PublicationName); err != nil {
-		http.Error(w, "move state unavailable; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM publication_moves WHERE deployment_id=?`, id); err != nil {
-		http.Error(w, "move state unavailable; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = fault("before-move-state"); err != nil {
-		http.Error(w, "move interrupted; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
 	if err = tx.Commit(); err != nil {
-		http.Error(w, "move state unavailable; reconciliation required", 503)
+		writeOutcomeError(w, http.StatusServiceUnavailable, "publication.recovery_required", "Publication recovery is required.")
 		return
 	}
-	writeJSON(w, map[string]string{"publicationPath": destination})
+	writeOutcome(w, http.StatusOK, "deployment.moved", "Publication path changed.", map[string]string{"publicationPath": destination})
 }

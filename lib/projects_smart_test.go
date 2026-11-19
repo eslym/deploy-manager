@@ -492,11 +492,16 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("deployment creation status %d: %s", deploymentResponse.StatusCode, responseText(deploymentResponse))
 	}
 	var deploymentCreated struct {
-		ID string `json:"id"`
+		Code string `json:"code"`
+		ID   string `json:"-"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(deploymentResponse.Body).Decode(&deploymentCreated); err != nil {
 		t.Fatal(err)
 	}
+	deploymentCreated.ID = deploymentCreated.Data.ID
 	deploymentResponse.Body.Close()
 	// Creation fetch must survive a one-shot smart-HTTP 503 and publish normally.
 	transientFailures.Store(1)
@@ -505,12 +510,19 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("branch deployment creation status %d: %s", branchDeploymentResponse.StatusCode, responseText(branchDeploymentResponse))
 	}
 	var branchDeployment struct {
-		ID    string `json:"id"`
-		JobID string `json:"jobId"`
+		Code  string `json:"code"`
+		ID    string `json:"-"`
+		JobID string `json:"-"`
+		Data  struct {
+			ID    string `json:"id"`
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(branchDeploymentResponse.Body).Decode(&branchDeployment); err != nil {
 		t.Fatal(err)
 	}
+	branchDeployment.ID = branchDeployment.Data.ID
+	branchDeployment.JobID = branchDeployment.Data.JobID
 	branchDeploymentResponse.Body.Close()
 	targetRequest, _ := http.NewRequest(http.MethodGet, appServer.URL+"/api/deployments", nil)
 	targetRequest.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
@@ -518,22 +530,25 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var listed []deployment
+	var listed struct {
+		Code string       `json:"code"`
+		Data []deployment `json:"data"`
+	}
 	if err = json.NewDecoder(targetResponse.Body).Decode(&listed); err != nil {
 		targetResponse.Body.Close()
 		t.Fatal(err)
 	}
 	targetResponse.Body.Close()
 	foundTarget := false
-	for _, item := range listed {
-		if item.ID == branchDeployment.ID && item.TargetKind == "branch" && item.TargetName == "feature/search" {
+	for _, item := range listed.Data {
+		if item.ID == branchDeployment.Data.ID && item.TargetKind == "branch" && item.TargetName == "feature/search" {
 			foundTarget = true
 		}
 	}
 	if !foundTarget {
 		t.Fatal("branch target was not returned by the deployments API")
 	}
-	branchPath := filepath.Join(app.cfg.DeploymentRoot, branchDeployment.ID)
+	branchPath := filepath.Join(app.cfg.DeploymentRoot, branchDeployment.Data.ID)
 	branchDeadline := time.Now().Add(5 * time.Second)
 	for {
 		if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr == nil && string(content) == "searchable feature\n" {
@@ -548,12 +563,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	noopResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/deploy", `{}`)
+	noopResponse := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+branchDeployment.Data.ID+"/deploy", `{}`)
 	if noopResponse.StatusCode != http.StatusAccepted {
 		t.Fatalf("branch no-op deploy status %d: %s", noopResponse.StatusCode, responseText(noopResponse))
 	}
 	var noopJob struct {
-		JobID string `json:"jobId"`
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(noopResponse.Body).Decode(&noopJob); err != nil {
 		t.Fatal(err)
@@ -561,21 +579,24 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	noopResponse.Body.Close()
 	noopDeadline := time.Now().Add(5 * time.Second)
 	for {
-		jobsRequest, _ := http.NewRequest(http.MethodGet, appServer.URL+"/api/deployments/"+branchDeployment.ID+"/jobs", nil)
+		jobsRequest, _ := http.NewRequest(http.MethodGet, appServer.URL+"/api/deployments/"+branchDeployment.Data.ID+"/jobs", nil)
 		jobsRequest.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
 		jobsResponse, requestErr := client.Do(jobsRequest)
 		if requestErr != nil {
 			t.Fatal(requestErr)
 		}
-		var recorded []deploymentJob
+		var recorded struct {
+			Code string          `json:"code"`
+			Data []deploymentJob `json:"data"`
+		}
 		decodeErr := json.NewDecoder(jobsResponse.Body).Decode(&recorded)
 		jobsResponse.Body.Close()
 		if decodeErr != nil {
 			t.Fatal(decodeErr)
 		}
 		finished := false
-		for _, job := range recorded {
-			if job.ID == noopJob.JobID && job.Status == "noop" {
+		for _, job := range recorded.Data {
+			if job.ID == noopJob.Data.JobID && job.Status == "noop" {
 				finished = true
 			}
 		}
@@ -590,7 +611,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if after, identityErr := identity(branchPath); identityErr != nil || after != branchIdentity {
 		t.Fatalf("no-op recreated the live directory: before=%+v after=%+v err=%v", branchIdentity, after, identityErr)
 	}
-	hardRedeployAndWait(t, client, appServer.URL, cookie, branchDeployment.ID, branchPath, nil)
+	hardRedeployAndWait(t, client, appServer.URL, cookie, branchDeployment.Data.ID, branchPath, nil)
 	if transientFailures.Load() != 0 {
 		t.Fatal("creation fetch did not reach the controlled transient failure")
 	}
@@ -605,15 +626,17 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("independent branch deployment status %d: %s", independentResponse.StatusCode, responseText(independentResponse))
 	}
 	var independentDeployment struct {
-		ID    string `json:"id"`
-		JobID string `json:"jobId"`
+		Data struct {
+			ID    string `json:"id"`
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(independentResponse.Body).Decode(&independentDeployment); err != nil {
 		t.Fatal(err)
 	}
 	independentResponse.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, independentDeployment.ID, independentDeployment.JobID, "succeeded")
-	independentPath := filepath.Join(app.cfg.DeploymentRoot, independentDeployment.ID)
+	waitForDeploymentJob(t, client, appServer.URL, cookie, independentDeployment.Data.ID, independentDeployment.Data.JobID, "succeeded")
+	independentPath := filepath.Join(app.cfg.DeploymentRoot, independentDeployment.Data.ID)
 	independentDeadline := time.Now().Add(5 * time.Second)
 	for {
 		if content, readErr := os.ReadFile(filepath.Join(independentPath, "README.md")); readErr == nil && string(content) == "main content\n" {
@@ -649,7 +672,9 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("racing branch deploy status %d: %s", staleRequest.StatusCode, responseText(staleRequest))
 	}
 	var staleJob struct {
-		JobID string `json:"jobId"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(staleRequest.Body).Decode(&staleJob); err != nil {
 		t.Fatal(err)
@@ -660,7 +685,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		var jobStatus, jobLog, targetKind, targetName, live, branchTip string
 		var queued int
-		_ = app.db.QueryRow(`SELECT status,log FROM deployment_jobs WHERE id=?`, staleJob.JobID).Scan(&jobStatus, &jobLog)
+		_ = app.db.QueryRow(`SELECT status,log FROM deployment_jobs WHERE id=?`, staleJob.Data.JobID).Scan(&jobStatus, &jobLog)
 		_ = app.db.QueryRow(`SELECT target_kind,target_name,live_commit FROM deployments WHERE id=?`, branchDeployment.ID).Scan(&targetKind, &targetName, &live)
 		_ = app.db.QueryRow(`SELECT commit_id FROM project_refs WHERE project_id=? AND kind='branch' AND name='feature/search'`, created.ID).Scan(&branchTip)
 		_ = app.db.QueryRow(`SELECT count(*) FROM deployment_jobs WHERE status IN ('queued','running')`).Scan(&queued)
@@ -674,7 +699,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	changed.Body.Close()
 	resume()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, branchDeployment.ID, staleJob.JobID, "superseded")
+	waitForDeploymentJob(t, client, appServer.URL, cookie, branchDeployment.ID, staleJob.Data.JobID, "superseded")
 	mainDeadline := time.Now().Add(5 * time.Second)
 	for {
 		content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md"))
@@ -692,13 +717,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("restoring branch target status %d: %s", restoreBranch.StatusCode, responseText(restoreBranch))
 	}
 	var restoreJob struct {
-		JobID string `json:"jobId"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(restoreBranch.Body).Decode(&restoreJob); err != nil {
 		t.Fatal(err)
 	}
 	restoreBranch.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, branchDeployment.ID, restoreJob.JobID, "succeeded")
+	waitForDeploymentJob(t, client, appServer.URL, cookie, branchDeployment.ID, restoreJob.Data.JobID, "succeeded")
 	if content, readErr := os.ReadFile(filepath.Join(branchPath, "README.md")); readErr != nil || string(content) != "race branch tip\n" {
 		t.Fatalf("restored branch target content=%q err=%v", content, readErr)
 	}
@@ -772,13 +799,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("branch deploy after remote update status %d: %s", failedFetch.StatusCode, responseText(failedFetch))
 	}
 	var failedFetchJob struct {
-		JobID string `json:"jobId"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(failedFetch.Body).Decode(&failedFetchJob); err != nil {
 		t.Fatal(err)
 	}
 	failedFetch.Body.Close()
-	waitForDeploymentJob(t, client, appServer.URL, cookie, branchDeployment.ID, failedFetchJob.JobID, "failed")
+	waitForDeploymentJob(t, client, appServer.URL, cookie, branchDeployment.ID, failedFetchJob.Data.JobID, "failed")
 	failRequests.Store(false)
 	failStatus.Store(0)
 	if delta := gitRequests.Load() - requestsBeforeAuthenticationFailure; delta != 1 {
@@ -1010,7 +1039,9 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("cancellable branch deployment status %d: %s", cancelledCreate.StatusCode, responseText(cancelledCreate))
 	}
 	var cancelledDeployment struct {
-		ID string `json:"id"`
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(cancelledCreate.Body).Decode(&cancelledDeployment); err != nil {
 		t.Fatal(err)
@@ -1019,7 +1050,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	initialDeadline := time.Now().Add(15 * time.Second)
 	for {
 		var status string
-		_ = app.db.QueryRow(`SELECT status FROM deployments WHERE id=?`, cancelledDeployment.ID).Scan(&status)
+		_ = app.db.QueryRow(`SELECT status FROM deployments WHERE id=?`, cancelledDeployment.Data.ID).Scan(&status)
 		if status == "live" {
 			break
 		}
@@ -1035,10 +1066,10 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	}
 	pauseBranchFetch.Store(true)
 	var cancelledGeneration int64
-	if err := app.db.QueryRow(`SELECT generation FROM deployments WHERE id=?`, cancelledDeployment.ID).Scan(&cancelledGeneration); err != nil {
+	if err := app.db.QueryRow(`SELECT generation FROM deployments WHERE id=?`, cancelledDeployment.Data.ID).Scan(&cancelledGeneration); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := app.enqueueDeployment(cancelledDeployment.ID, mainRef.Commit, cancelledGeneration); err != nil {
+	if _, err := app.enqueueDeployment(cancelledDeployment.Data.ID, mainRef.Commit, cancelledGeneration); err != nil {
 		t.Fatalf("queue branch fetch before deletion: %v", err)
 	}
 	select {
@@ -1049,12 +1080,12 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	app.mu.Lock()
 	clear(app.rate)
 	app.mu.Unlock()
-	deleted := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+cancelledDeployment.ID+"/delete", `{"confirm":true}`)
-	if deleted.StatusCode != http.StatusNoContent {
+	deleted := projectPost(t, client, appServer.URL, cookie, "/api/deployments/"+cancelledDeployment.Data.ID+"/delete", `{"confirm":true}`)
+	if deleted.StatusCode != http.StatusOK {
 		t.Fatalf("delete during branch fetch status %d: %s", deleted.StatusCode, responseText(deleted))
 	}
 	deleted.Body.Close()
-	if _, err := os.Stat(app.deploymentPath(cancelledDeployment.ID)); !os.IsNotExist(err) {
+	if _, err := os.Stat(app.deploymentPath(cancelledDeployment.Data.ID)); !os.IsNotExist(err) {
 		t.Fatalf("cancelled branch fetch published or retained files: %v", err)
 	}
 	cacheAfterCancellation, err := digestProjectCache(app.projects.repoPath(created.ID))
@@ -1102,14 +1133,17 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var persistedDeployments []deployment
-	if err = json.NewDecoder(deploymentsResponse.Body).Decode(&persistedDeployments); err != nil {
+	var persistedOutcome struct {
+		Code string       `json:"code"`
+		Data []deployment `json:"data"`
+	}
+	if err = json.NewDecoder(deploymentsResponse.Body).Decode(&persistedOutcome); err != nil {
 		deploymentsResponse.Body.Close()
 		t.Fatal(err)
 	}
 	deploymentsResponse.Body.Close()
 	persistedBranchTarget := false
-	for _, item := range persistedDeployments {
+	for _, item := range persistedOutcome.Data {
 		if item.ID == branchDeployment.ID && item.TargetKind == "branch" && item.TargetName == "feature/search" {
 			persistedBranchTarget = true
 		}
@@ -1117,7 +1151,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if !persistedBranchTarget {
 		t.Fatal("configured branch target did not survive application restart")
 	}
-	assertTagDeploymentRestarted(t, restarted.Client(), restarted.URL, cookie, persistedDeployments, tagDeployment, hardMovedTagJobID, featureAfter, tagIdentityBeforeRestart)
+	assertTagDeploymentRestarted(t, restarted.Client(), restarted.URL, cookie, persistedOutcome.Data, tagDeployment, hardMovedTagJobID, featureAfter, tagIdentityBeforeRestart)
 	if got := projectRefsFromAPI(t, restarted.Client(), restarted.URL, cookie, created.ID); !equalProjectRefs(refreshedRefs, got) {
 		t.Fatalf("cached refs did not survive restart: %#v", got)
 	}
@@ -1300,13 +1334,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("missing-branch deploy status %d: %s", missingBranchResponse.StatusCode, responseText(missingBranchResponse))
 	}
 	var missingBranchJob struct {
-		JobID string `json:"jobId"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(missingBranchResponse.Body).Decode(&missingBranchJob); err != nil {
 		t.Fatal(err)
 	}
 	missingBranchResponse.Body.Close()
-	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, missingBranchJob.JobID, "failed")
+	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, missingBranchJob.Data.JobID, "failed")
 	testRejectedRollbackKeepsLive(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, featureAtCreate, branchPath)
 	if afterMissingBranch, identityErr := identity(branchPath); identityErr != nil || afterMissingBranch != beforeMissingBranch {
 		t.Fatalf("deleted branch changed the live publication: before=%+v after=%+v err=%v", beforeMissingBranch, afterMissingBranch, identityErr)
@@ -1329,13 +1365,15 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 		t.Fatalf("manual branch deploy status %d: %s", manualFetch.StatusCode, responseText(manualFetch))
 	}
 	var manualJob struct {
-		JobID string `json:"jobId"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(manualFetch.Body).Decode(&manualJob); err != nil {
 		t.Fatal(err)
 	}
 	manualFetch.Body.Close()
-	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, manualJob.JobID, "noop")
+	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, manualJob.Data.JobID, "noop")
 	mirrorID, err := randomID()
 	if err != nil {
 		t.Fatal(err)
@@ -1360,12 +1398,17 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	setupResponse.Body.Close()
 	webhookSecret := []byte(webhookSetup.Data.Secret)
 	rollbackBeforePush := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/rollback", `{"commit":"`+featureAtCreate+`"}`)
-	var rollbackBeforePushJob struct{ JobID string }
-	if rollbackBeforePush.StatusCode != http.StatusAccepted || json.NewDecoder(rollbackBeforePush.Body).Decode(&rollbackBeforePushJob) != nil {
+	var rollbackBeforePushJob struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
+	if rollbackBeforePush.StatusCode != http.StatusAccepted || json.NewDecoder(rollbackBeforePush.Body).Decode(&rollbackBeforePushJob) != nil || rollbackBeforePushJob.Code != "deployment.rollback_queued" {
 		t.Fatalf("rollback before webhook status %d", rollbackBeforePush.StatusCode)
 	}
 	rollbackBeforePush.Body.Close()
-	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, rollbackBeforePushJob.JobID, "succeeded")
+	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, rollbackBeforePushJob.Data.JobID, "succeeded")
 	if content, err := os.ReadFile(filepath.Join(branchPath, "README.md")); err != nil || string(content) != "searchable feature\n" {
 		t.Fatalf("rollback before matching webhook content=%q err=%v", content, err)
 	}
@@ -1442,12 +1485,17 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	giteaSecret := setupProviderWebhook(t, branchServer, cookie, created.ID, "gitea")
 	giteaURL := branchServer.URL + "/webhooks/gitea/" + created.ID
 	rollbackBeforeGitea := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments/"+branchDeployment.ID+"/rollback", `{"commit":"`+featureAtCreate+`"}`)
-	var rollbackBeforeGiteaJob struct{ JobID string }
-	if rollbackBeforeGitea.StatusCode != http.StatusAccepted || json.NewDecoder(rollbackBeforeGitea.Body).Decode(&rollbackBeforeGiteaJob) != nil {
+	var rollbackBeforeGiteaJob struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
+	if rollbackBeforeGitea.StatusCode != http.StatusAccepted || json.NewDecoder(rollbackBeforeGitea.Body).Decode(&rollbackBeforeGiteaJob) != nil || rollbackBeforeGiteaJob.Code != "deployment.rollback_queued" {
 		t.Fatalf("rollback before Gitea webhook status %d", rollbackBeforeGitea.StatusCode)
 	}
 	rollbackBeforeGitea.Body.Close()
-	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, rollbackBeforeGiteaJob.JobID, "succeeded")
+	waitForDeploymentJob(t, branchServer.Client(), branchServer.URL, cookie, branchDeployment.ID, rollbackBeforeGiteaJob.Data.JobID, "succeeded")
 	if content, err := os.ReadFile(filepath.Join(branchPath, "README.md")); err != nil || string(content) != "searchable feature\n" {
 		t.Fatalf("rollback before Gitea webhook content=%q err=%v", content, err)
 	}
@@ -1490,13 +1538,17 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	second.Body.Close()
 	secondSecret := setupProviderWebhook(t, branchServer, cookie, secondProject.ID, "gitea")
 	deployment := projectPost(t, branchServer.Client(), branchServer.URL, cookie, "/api/deployments", `{"projectId":"`+secondProject.ID+`","name":"second Gitea site","targetKind":"branch","targetName":"feature/search"}`)
-	var secondDeployment struct{ ID string }
+	var secondDeployment struct {
+		Data struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
 	if deployment.StatusCode != 201 || json.NewDecoder(deployment.Body).Decode(&secondDeployment) != nil {
 		t.Fatalf("second deployment = %d: %s", deployment.StatusCode, responseText(deployment))
 	}
 	deployment.Body.Close()
-	waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, secondDeployment.ID, "README.md"), "Gitea latest tip\n")
-	waitForPublicJobsSettled(t, branchServer, cookie, secondDeployment.ID)
+	waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, secondDeployment.Data.ID, "README.md"), "Gitea latest tip\n")
+	waitForPublicJobsSettled(t, branchServer, cookie, secondDeployment.Data.ID)
 	secondTip := commitFixtureFile(t, remoteDir, webhookWorktree, "feature", "second Gitea project tip").String()
 	if err := source.Storer.SetReference(plumbing.NewHashReference(featureBranch, plumbing.NewHash(secondTip))); err != nil {
 		t.Fatal(err)
@@ -1504,7 +1556,7 @@ func TestAuthenticatedProjectLifecycleOverSmartHTTPS(t *testing.T) {
 	if status := sendGiteaWebhook(branchServer.Client(), branchServer.URL+"/webhooks/gitea/"+secondProject.ID, "github-delivery-1", "push", stalePush, secondSecret); status != 200 {
 		t.Fatalf("cross-project push = %d", status)
 	}
-	waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, secondDeployment.ID, "README.md"), "second Gitea project tip\n")
+	waitForPublishedFile(t, filepath.Join(app.cfg.DeploymentRoot, secondDeployment.Data.ID, "README.md"), "second Gitea project tip\n")
 	if content, err := os.ReadFile(filepath.Join(branchPath, "README.md")); err != nil || string(content) != "Gitea latest tip\n" {
 		t.Fatalf("other project affected first publication: %q %v", content, err)
 	}
@@ -1545,11 +1597,14 @@ func publicDeploymentJobs(t *testing.T, server *httptest.Server, cookie, id stri
 		t.Fatal(err)
 	}
 	defer res.Body.Close()
-	var jobs []deploymentJob
-	if res.StatusCode != 200 || json.NewDecoder(res.Body).Decode(&jobs) != nil {
+	var outcome struct {
+		Code string          `json:"code"`
+		Data []deploymentJob `json:"data"`
+	}
+	if res.StatusCode != http.StatusOK || json.NewDecoder(res.Body).Decode(&outcome) != nil || outcome.Code != "job.listed" {
 		t.Fatalf("job list = %d", res.StatusCode)
 	}
-	return jobs
+	return outcome.Data
 }
 
 func waitForPublicJobsSettled(t *testing.T, server *httptest.Server, cookie, id string) {

@@ -155,9 +155,11 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 		t.Fatalf("deletion failure was not visible: %#v", visible)
 	}
 	response = projectPost(t, server.Client(), server.URL, cookie, path, `{"confirm":true}`)
-	response.Body.Close()
-	if response.StatusCode != http.StatusNoContent {
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("confirmed deletion retry status=%d", response.StatusCode)
+	}
+	if outcome := responseText(response); !strings.Contains(outcome, `"code":"deployment.deleted"`) {
+		t.Fatalf("deployment deletion outcome=%s", outcome)
 	}
 	if _, err = os.Stat(app.deploymentPath(firstID)); !os.IsNotExist(err) {
 		t.Fatalf("deleted publication still exists: %v", err)
@@ -170,30 +172,39 @@ func TestProtectedDeletionConfirmationAndIndependentPublication(t *testing.T) {
 		t.Fatalf("deployment audit jobs not retained: count=%d err=%v", archived, err)
 	}
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/projects/"+projectID+"/delete", `{"confirm":true}`)
-	response.Body.Close()
 	if response.StatusCode != http.StatusConflict {
 		t.Fatalf("project with deployment delete status=%d", response.StatusCode)
+	}
+	if outcome := responseText(response); !strings.Contains(outcome, `"code":"project.has_deployments"`) {
+		t.Fatalf("project dependency conflict outcome=%s", outcome)
 	}
 	if _, err = os.Stat(cache); err != nil {
 		t.Fatalf("blocked project deletion removed repository cache: %v", err)
 	}
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+otherID+"/delete", `{"confirm":true}`)
-	response.Body.Close()
-	if response.StatusCode != http.StatusNoContent {
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("second deployment deletion status=%d", response.StatusCode)
+	}
+	if outcome := responseText(response); !strings.Contains(outcome, `"code":"deployment.deleted"`) {
+		t.Fatalf("second deployment deletion outcome=%s", outcome)
 	}
 	cacheFS := &deletionCacheFS{fail: true}
 	app.projects.cacheFS = cacheFS
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/projects/"+projectID+"/delete", `{"confirm":true}`)
-	response.Body.Close()
 	if response.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("project cleanup failure status=%d", response.StatusCode)
 	}
+	if outcome := responseText(response); !strings.Contains(outcome, `"code":"operation.cleanup_pending"`) ||
+		!strings.Contains(outcome, `"operationAccepted":true`) {
+		t.Fatalf("project cleanup outcome=%s", outcome)
+	}
 	cacheFS.fail = false
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/projects/"+projectID+"/delete", `{"confirm":true}`)
-	response.Body.Close()
-	if response.StatusCode != http.StatusNoContent {
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("project deletion retry status=%d", response.StatusCode)
+	}
+	if outcome := responseText(response); !strings.Contains(outcome, `"code":"project.deleted"`) {
+		t.Fatalf("project deletion outcome=%s", outcome)
 	}
 	if _, err = os.Stat(cache); !os.IsNotExist(err) {
 		t.Fatalf("project cache remains after deletion: %v", err)
@@ -570,9 +581,12 @@ func deletionRaceAt(t *testing.T, pausePoint string) {
 		req.AddCookie(&http.Cookie{Name: sessionCookie, Value: cookie})
 		res, e := server.Client().Do(req)
 		if e == nil {
-			var values []deployment
-			if json.NewDecoder(res.Body).Decode(&values) == nil {
-				for _, d := range values {
+			var outcome struct {
+				Code string       `json:"code"`
+				Data []deployment `json:"data"`
+			}
+			if json.NewDecoder(res.Body).Decode(&outcome) == nil {
+				for _, d := range outcome.Data {
 					if d.ID == deploymentID && d.Status == "deleting" {
 						res.Body.Close()
 						close(release)
@@ -591,7 +605,7 @@ deletionMarked:
 		t.Fatal(e)
 	case response := <-responseCh:
 		defer response.Body.Close()
-		if response.StatusCode != http.StatusNoContent {
+		if response.StatusCode != http.StatusOK {
 			t.Fatalf("delete status=%d: %s", response.StatusCode, responseText(response))
 		}
 	case <-time.After(5 * time.Second):

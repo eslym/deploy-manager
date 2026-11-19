@@ -44,6 +44,11 @@ export type OutcomeCode =
 	| 'operation.capacity_exceeded'
 	| 'operation.upstream_failed'
 	| 'project.cache_recovery_required'
+	| 'project.deleted'
+	| 'project.has_deployments'
+	| 'operation.cleanup_pending'
+	| 'publication.recovery_required'
+	| 'publication.path_conflict'
 	| import('./deployments').DeploymentOutcomeCode;
 
 const knownCodes = new Set<string>([
@@ -84,6 +89,11 @@ const knownCodes = new Set<string>([
 	'operation.capacity_exceeded',
 	'operation.upstream_failed',
 	'project.cache_recovery_required',
+	'project.deleted',
+	'project.has_deployments',
+	'operation.cleanup_pending',
+	'publication.recovery_required',
+	'publication.path_conflict',
 	'deployment.listed',
 	'deployment.root_loaded',
 	'deployment.created',
@@ -94,6 +104,8 @@ const knownCodes = new Set<string>([
 	'deployment.rollback_queued',
 	'deployment.paused',
 	'deployment.resumed',
+	'deployment.moved',
+	'deployment.deleted',
 	'job.listed'
 ]);
 

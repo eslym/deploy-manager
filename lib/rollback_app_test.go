@@ -54,23 +54,33 @@ func testTemporaryRollback(t *testing.T, client *http.Client, origin, cookie, id
 		t.Fatalf("history status %d: %s", response.StatusCode, responseText(response))
 	}
 	var history struct {
-		Commits []struct{ ID, ShortID, Subject, Author, Date string }
-		HasMore bool
+		Code string `json:"code"`
+		Data struct {
+			Commits []struct {
+				ID      string `json:"id"`
+				ShortID string `json:"shortId"`
+				Subject string `json:"subject"`
+				Author  string `json:"author"`
+				Date    string `json:"date"`
+			} `json:"commits"`
+			Page    int  `json:"page"`
+			HasMore bool `json:"hasMore"`
+		} `json:"data"`
 	}
 	if err := json.NewDecoder(response.Body).Decode(&history); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if len(history.Commits) != 1 || !history.HasMore || len(history.Commits[0].ID) != 40 || history.Commits[0].Author == "" || history.Commits[0].Date == "" {
+	if response.StatusCode != http.StatusOK || history.Code != "deployment.history_loaded" || len(history.Data.Commits) != 1 || !history.Data.HasMore || len(history.Data.Commits[0].ID) != 40 || history.Data.Commits[0].Author == "" || history.Data.Commits[0].Date == "" {
 		t.Fatalf("incomplete history: %+v", history)
 	}
-	firstID := history.Commits[0].ID
+	firstID := history.Data.Commits[0].ID
 	response = get("?page=2&limit=1")
 	if err := json.NewDecoder(response.Body).Decode(&history); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if len(history.Commits) != 1 || history.Commits[0].ID == firstID {
+	if len(history.Data.Commits) != 1 || history.Data.Page != 2 || history.Data.Commits[0].ID == firstID {
 		t.Fatalf("pagination repeated first page: %+v", history)
 	}
 	response = get("?search=" + oldCommit + "&limit=1")
@@ -78,7 +88,7 @@ func testTemporaryRollback(t *testing.T, client *http.Client, origin, cookie, id
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if len(history.Commits) != 1 || history.Commits[0].ID != oldCommit || history.HasMore {
+	if len(history.Data.Commits) != 1 || history.Data.Commits[0].ID != oldCommit || history.Data.HasMore {
 		t.Fatalf("search history: %+v", history)
 	}
 	rejected := projectPost(t, client, origin, cookie, "/api/deployments/"+id+"/rollback", `{"commit":"`+oldCommit[:12]+`"}`)
@@ -90,17 +100,28 @@ func testTemporaryRollback(t *testing.T, client *http.Client, origin, cookie, id
 	if rollback.StatusCode != 202 {
 		t.Fatalf("rollback status %d: %s", rollback.StatusCode, responseText(rollback))
 	}
-	var queued struct{ JobID string }
+	var queued struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	json.NewDecoder(rollback.Body).Decode(&queued)
 	rollback.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, id, queued.JobID, "succeeded")
+	if queued.Code != "deployment.rollback_queued" || queued.Data.JobID == "" {
+		t.Fatalf("rollback outcome=%#v", queued)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, id, queued.Data.JobID, "succeeded")
 	if content, err := os.ReadFile(filepath.Join(path, "README.md")); err != nil || string(content) != "searchable feature\n" {
 		t.Fatalf("rollback content=%q err=%v", content, err)
 	}
 	deploy := projectPost(t, client, origin, cookie, "/api/deployments/"+id+"/deploy", `{}`)
 	json.NewDecoder(deploy.Body).Decode(&queued)
 	deploy.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, id, queued.JobID, "succeeded")
+	if queued.Code != "deployment.queued" || queued.Data.JobID == "" {
+		t.Fatalf("deploy outcome=%#v", queued)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, id, queued.Data.JobID, "succeeded")
 	if content, err := os.ReadFile(filepath.Join(path, "README.md")); err != nil || string(content) != "race branch tip\n" {
 		t.Fatalf("Deploy did not preserve branch: %q %v", content, err)
 	}
@@ -152,12 +173,26 @@ func testRollbackGraphAndRaces(t *testing.T, server *httptest.Server, cookie, pr
 		if response.StatusCode != 202 {
 			t.Fatalf("%s status %d: %s", action, response.StatusCode, responseText(response))
 		}
-		var queued struct{ JobID string }
+		var queued struct {
+			Code string `json:"code"`
+			Data struct {
+				JobID string `json:"jobId"`
+			} `json:"data"`
+		}
 		if err := json.NewDecoder(response.Body).Decode(&queued); err != nil {
 			t.Fatal(err)
 		}
 		response.Body.Close()
-		return queued.JobID
+		wantCode := "deployment.queued"
+		if action == "rollback" {
+			wantCode = "deployment.rollback_queued"
+		} else if action == "hard-redeploy" {
+			wantCode = "deployment.hard_redeploy_queued"
+		}
+		if queued.Code != wantCode || queued.Data.JobID == "" {
+			t.Fatalf("%s outcome=%#v", action, queued)
+		}
+		return queued.Data.JobID
 	}
 	assertContent := func(want string) {
 		t.Helper()
@@ -175,12 +210,19 @@ func testRollbackGraphAndRaces(t *testing.T, server *httptest.Server, cookie, pr
 	if err != nil {
 		t.Fatal(err)
 	}
-	var hidden struct{ Commits []rollbackCommit }
+	var hidden struct {
+		Code string `json:"code"`
+		Data struct {
+			Commits []rollbackCommit `json:"commits"`
+			Page    int              `json:"page"`
+			HasMore bool             `json:"hasMore"`
+		} `json:"data"`
+	}
 	if err = json.NewDecoder(response.Body).Decode(&hidden); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	if len(hidden.Commits) != 0 {
+	if response.StatusCode != http.StatusOK || hidden.Code != "deployment.history_loaded" || len(hidden.Data.Commits) != 0 {
 		t.Fatal("first-parent history displayed second-parent candidate")
 	}
 	expectedJobs := make(map[string]bool)
@@ -392,6 +434,15 @@ func testTemporaryRollbackPreservesPause(t *testing.T, client *http.Client, orig
 	if pause.StatusCode != 200 {
 		t.Fatalf("pause before rollback status %d: %s", pause.StatusCode, responseText(pause))
 	}
+	var paused struct {
+		Code string `json:"code"`
+		Data struct {
+			AutomationPaused bool `json:"automationPaused"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(pause.Body).Decode(&paused); err != nil || paused.Code != "deployment.paused" || !paused.Data.AutomationPaused {
+		t.Fatalf("pause outcome=%#v, err=%v", paused, err)
+	}
 	pause.Body.Close()
 	assertPaused := func() {
 		request, _ := http.NewRequest("GET", origin+"/api/deployments", nil)
@@ -400,12 +451,15 @@ func testTemporaryRollbackPreservesPause(t *testing.T, client *http.Client, orig
 		if err != nil {
 			t.Fatal(err)
 		}
-		var deployments []deployment
-		if err = json.NewDecoder(response.Body).Decode(&deployments); err != nil {
+		var outcome struct {
+			Code string       `json:"code"`
+			Data []deployment `json:"data"`
+		}
+		if err = json.NewDecoder(response.Body).Decode(&outcome); err != nil {
 			t.Fatal(err)
 		}
 		response.Body.Close()
-		for _, item := range deployments {
+		for _, item := range outcome.Data {
 			if item.ID == id {
 				if !item.AutomationPaused || item.TargetKind != "branch" || item.TargetName != "feature/search" {
 					t.Fatalf("temporary rollback changed branch automation: %+v", item)
@@ -416,12 +470,20 @@ func testTemporaryRollbackPreservesPause(t *testing.T, client *http.Client, orig
 		t.Fatal("deployment missing")
 	}
 	rollback := projectPost(t, client, origin, cookie, "/api/deployments/"+id+"/rollback", `{"commit":"`+commit+`"}`)
-	var queued struct{ JobID string }
+	var queued struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if rollback.StatusCode != 202 || json.NewDecoder(rollback.Body).Decode(&queued) != nil {
 		t.Fatalf("paused rollback status %d", rollback.StatusCode)
 	}
 	rollback.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, id, queued.JobID, "succeeded")
+	if queued.Code != "deployment.rollback_queued" {
+		t.Fatalf("paused rollback outcome=%#v", queued)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, id, queued.Data.JobID, "succeeded")
 	assertPaused()
 	for _, provider := range []string{"github", "gitea"} {
 		response := projectPost(t, client, origin, cookie, "/api/projects/"+projectID+"/"+provider+"-webhook", `{"rotate":true}`)
@@ -455,18 +517,21 @@ func testTemporaryRollbackPreservesPause(t *testing.T, client *http.Client, orig
 			if err != nil {
 				t.Fatal(err)
 			}
-			var jobs []deploymentJob
-			err = json.NewDecoder(response.Body).Decode(&jobs)
+			var outcome struct {
+				Code string          `json:"code"`
+				Data []deploymentJob `json:"data"`
+			}
+			err = json.NewDecoder(response.Body).Decode(&outcome)
 			response.Body.Close()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(jobs) > 0 && jobs[0].ID != queued.JobID && jobs[0].Status == "noop" {
-				queued.JobID = jobs[0].ID
+			if len(outcome.Data) > 0 && outcome.Data[0].ID != queued.Data.JobID && outcome.Data[0].Status == "noop" {
+				queued.Data.JobID = outcome.Data[0].ID
 				break
 			}
 			if time.Now().After(deadline) {
-				t.Fatalf("paused %s webhook did not finish fetch-only: %+v", provider, jobs)
+				t.Fatalf("paused %s webhook did not finish fetch-only: %+v", provider, outcome.Data)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -478,11 +543,11 @@ func testTemporaryRollbackPreservesPause(t *testing.T, client *http.Client, orig
 	testRejectedRollbackKeepsLive(t, client, origin, cookie, id, strings.Repeat("f", 40), path)
 	assertPaused()
 	resume := projectPost(t, client, origin, cookie, "/api/deployments/"+id+"/resume", `{}`)
-	if resume.StatusCode != 202 || json.NewDecoder(resume.Body).Decode(&queued) != nil {
+	if resume.StatusCode != 202 || json.NewDecoder(resume.Body).Decode(&queued) != nil || queued.Code != "deployment.resumed" {
 		t.Fatalf("resume after rollback status %d", resume.StatusCode)
 	}
 	resume.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, id, queued.JobID, "succeeded")
+	waitForDeploymentJob(t, client, origin, cookie, id, queued.Data.JobID, "succeeded")
 }
 
 func testRejectedRollbackKeepsLive(t *testing.T, client *http.Client, origin, cookie, id, commit, path string) {
@@ -495,12 +560,20 @@ func testRejectedRollbackKeepsLive(t *testing.T, client *http.Client, origin, co
 	if response.StatusCode != 202 {
 		t.Fatalf("rollback rejection job status %d: %s", response.StatusCode, responseText(response))
 	}
-	var queued struct{ JobID string }
+	var queued struct {
+		Code string `json:"code"`
+		Data struct {
+			JobID string `json:"jobId"`
+		} `json:"data"`
+	}
 	if err = json.NewDecoder(response.Body).Decode(&queued); err != nil {
 		t.Fatal(err)
 	}
 	response.Body.Close()
-	waitForDeploymentJob(t, client, origin, cookie, id, queued.JobID, "failed")
+	if queued.Code != "deployment.rollback_queued" {
+		t.Fatalf("rejected rollback acceptance outcome=%#v", queued)
+	}
+	waitForDeploymentJob(t, client, origin, cookie, id, queued.Data.JobID, "failed")
 	if after, err := identity(path); err != nil || after != before {
 		t.Fatalf("failed rollback changed live directory: %+v -> %+v: %v", before, after, err)
 	}

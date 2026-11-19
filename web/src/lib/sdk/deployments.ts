@@ -11,6 +11,8 @@ export type DeploymentOutcomeCode =
 	| 'deployment.rollback_queued'
 	| 'deployment.paused'
 	| 'deployment.resumed'
+	| 'deployment.moved'
+	| 'deployment.deleted'
 	| 'job.listed';
 
 export interface Deployment {
@@ -234,6 +236,27 @@ export function createDeploymentSDK(send: Send) {
 					object(value) && value.automationPaused === false && queuedData(value),
 				signal,
 				'deployment.resumed'
+			),
+		move: (
+			id: string,
+			input: { publicationPath: string; expectedPublicationPath: string; confirm: true },
+			signal?: AbortSignal
+		) =>
+			mutate(
+				`/api/deployments/${encodeURIComponent(id)}/move`,
+				input,
+				(value): value is { publicationPath: string } =>
+					object(value) && text(value.publicationPath),
+				signal,
+				'deployment.moved'
+			),
+		delete: (id: string, signal?: AbortSignal) =>
+			mutate(
+				`/api/deployments/${encodeURIComponent(id)}/delete`,
+				{ confirm: true },
+				(value): value is null => value === null,
+				signal,
+				'deployment.deleted'
 			)
 	};
 }

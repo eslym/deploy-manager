@@ -90,6 +90,15 @@ export function createProjectOperations(request: ProjectOperation) {
 				isNull,
 				signal,
 				'project.cache_cleared'
+			),
+		delete: (id: string, signal?: AbortSignal) =>
+			request(
+				`/api/projects/${encodeURIComponent(id)}/delete`,
+				'POST',
+				{ confirm: true },
+				isNull,
+				signal,
+				'project.deleted'
 			)
 	};
 }

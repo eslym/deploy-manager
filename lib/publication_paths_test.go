@@ -173,7 +173,7 @@ func TestPublicationPathStaysOwnedAcrossFirstReleaseReplacementAndDeletion(t *te
 	}
 	response = projectPost(t, server.Client(), server.URL, cookie, "/api/deployments/"+created.ID+"/delete", `{"confirm":true}`)
 	response.Body.Close()
-	if response.StatusCode != http.StatusNoContent {
+	if response.StatusCode != http.StatusOK {
 		t.Fatalf("delete status=%d", response.StatusCode)
 	}
 	if _, err = os.Lstat(path); !os.IsNotExist(err) {

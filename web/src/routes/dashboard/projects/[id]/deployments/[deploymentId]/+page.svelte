@@ -1,5 +1,4 @@
 <script lang="ts">
-	import { dashboardRequest } from '#lib/dashboard-request.js';
 	import { BrowserSDKError, sdk } from '#lib/sdk/index.js';
 	import {
 		isReservedPublicationFolder,
@@ -83,14 +82,6 @@
 					queued: 'Queued',
 					running: 'Running'
 				}[job.status] ?? job.status);
-
-	async function request(path: string, init?: RequestInit) {
-		return dashboardRequest(
-			path,
-			init,
-			() => new Error('The request could not be completed. Refresh and try again.')
-		);
-	}
 
 	async function listDeployments() {
 		try {
@@ -318,24 +309,46 @@
 	}
 	async function deleteDeployment(id: string) {
 		if (busy || !item || !project || !deleteConfirmation) return;
+		const currentProjectId = projectId;
+		const currentDeploymentId = deploymentId;
+		const currentView = viewVersion;
+		const isCurrent = () =>
+			currentView === viewVersion &&
+			currentProjectId === projectId &&
+			currentDeploymentId === deploymentId;
 		busy = true;
 		error = '';
 		try {
-			await request(`/api/deployments/${id}/delete`, {
-				method: 'POST',
-				body: JSON.stringify({ confirm: true })
-			});
+			await sdk.deployments.delete(id);
+			if (!isCurrent()) return;
 			deleteConfirmation = false;
 			await goto(`/dashboard/projects/${projectId}`);
 		} catch (cause) {
-			error = cause instanceof Error ? cause.message : 'Could not delete the deployment.';
+			if (!isCurrent()) return;
+			if (
+				cause instanceof BrowserSDKError &&
+				(cause.outcome.kind !== 'server' || cause.outcome.status >= 500)
+			)
+				deleteConfirmation = false;
+			error = mutationError(
+				cause,
+				'Could not delete the deployment.',
+				'Could not confirm whether the deployment was deleted. Refresh to check its status before trying again.'
+			);
 		} finally {
-			busy = false;
+			if (isCurrent()) busy = false;
 		}
 	}
 
 	async function moveDeployment(id: string) {
 		const confirmation = moveConfirmation;
+		const currentProjectId = projectId;
+		const currentDeploymentId = deploymentId;
+		const currentView = viewVersion;
+		const isCurrent = () =>
+			currentView === viewVersion &&
+			currentProjectId === projectId &&
+			currentDeploymentId === deploymentId;
 		if (
 			busy ||
 			!item ||
@@ -349,36 +362,30 @@
 		busy = true;
 		error = '';
 		try {
-			await dashboardRequest(
-				`/api/deployments/${id}/move`,
-				{
-					method: 'POST',
-					body: JSON.stringify({
-						publicationPath: movePath,
-						expectedPublicationPath: confirmation.oldPath,
-						confirm: true
-					})
-				},
-				(response) =>
-					response.status === 409
-						? new Error(
-								'The publication may have changed or the destination is unavailable. Refresh and review the move before trying again.'
-							)
-						: new Error(
-								response.status >= 500
-									? 'The request could not be completed. Try again shortly.'
-									: 'The request was rejected. Refresh and try again.'
-							)
-			);
+			await sdk.deployments.move(id, {
+				publicationPath: movePath,
+				expectedPublicationPath: confirmation.oldPath,
+				confirm: true
+			});
+			if (!isCurrent()) return;
 			moveConfirmation = null;
 			movePath = '';
 			moveOpen = false;
 			await load();
 		} catch (cause) {
+			if (!isCurrent()) return;
 			moveConfirmation = null;
-			error = cause instanceof Error ? cause.message : 'Could not move the deployment.';
+			const code = cause instanceof BrowserSDKError ? cause.outcome.code : undefined;
+			error =
+				code === 'publication.path_conflict'
+					? 'The publication may have changed or the destination is unavailable. Refresh and review the move before trying again.'
+					: mutationError(
+							cause,
+							'Could not move the deployment.',
+							'Could not confirm whether the publication moved. Refresh and check its path before trying again.'
+						);
 		} finally {
-			busy = false;
+			if (isCurrent()) busy = false;
 		}
 	}
 
@@ -400,6 +407,7 @@
 		historyStatus = 'loading';
 		missing = false;
 		loading = true;
+		busy = false;
 		error = '';
 		publicationStatusError = '';
 		refsError = '';

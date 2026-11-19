@@ -61,22 +61,19 @@ outcome envelope. Shared authorization/security guards and maintenance
 responses also use outcome envelopes, including on routes whose handler-specific
 success and failure responses have not migrated. Deployment outcome conversion
 covers list/root/create, target change, Deploy, Hard re-deploy, job reads,
-history, rollback, and pause/resume. Deployment deletion and move remain
-route-specific legacy responses until #70. Other application routes retain
+history, rollback, pause/resume, move, and deletion. Other application routes retain
 their existing response forms until their coordinated migration slice lands.
 Times are JSON RFC 3339 timestamps, not Unix integers. Unmigrated list responses
 are bare arrays unless stated otherwise; migrated resource arrays are in
 envelope `data`. Optional fields marked below may be omitted.
 
-Publication move is deliberately excluded from the typed deployment SDK.
-Its route-specific outcomes remain on the pre-migration contract: plain JSON
-success and plain-text route-specific failures. Shared authorization, Origin,
-transport, and maintenance guards still use their migrated outcome envelopes.
-Its atomic move,
-confirmation, generation, and recovery protections are unchanged. #70 owns
-migrating that action and documenting its typed outcome/recovery behavior.
-Rollback and pause/resume outcomes have been converted, but #70 still owns their
-specified handler/browser safety coverage and recovery guidance.
+Lifecycle mutations use named typed SDK operations and require explicit
+confirmation where the route requires it. A non-2xx, invalid response, or
+transport failure does not prove that a mutation was rejected. In particular,
+`operation.cleanup_pending` with `operationAccepted: true` means durable
+deletion was accepted and cleanup remains pending; `publication.recovery_required`
+means inspect authoritative state and do not repeat the move automatically.
+Callers may refresh status but must not automatically resubmit mutations.
 
 Unmigrated errors generally use Go's `http.Error`: `text/plain; charset=utf-8`
 with a trailing newline. Migrated outcomes have exactly `code`, `message`,
@@ -84,19 +81,19 @@ and `data`; `data` is `null` when the operation has no response data. Messages
 are for display, never branching. JSON outcomes use `application/json` and
 `Cache-Control: no-store`.
 
-| Status | Typical meaning |
-| --- | --- |
-| 400 | Invalid JSON, field validation, unavailable selected Git object/ref |
-| 401 | Missing/expired session or failed login/webhook signature |
-| 403 | Origin, transport, or request-policy rejection in protocol/webhook handlers |
-| 404 | Unknown route/resource, or webhook not configured |
-| 405 | Wrong method for a registered path |
-| 409 | Conflict: target/state changed, destination occupied, trust or dependency restriction |
-| 410 | Expired, consumed, or invalid registration grant/transaction |
-| 413 | Body or storage/resource limit exceeded where explicitly handled |
-| 415 | JSON media type required by OPAQUE/key creation |
-| 421 / 426 | Wrong configured Host / HTTPS required |
-| 429 | Dashboard mutation rate limit or login/session capacity limit |
+| Status          | Typical meaning                                                                                                  |
+| --------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 400             | Invalid JSON, field validation, unavailable selected Git object/ref                                              |
+| 401             | Missing/expired session or failed login/webhook signature                                                        |
+| 403             | Origin, transport, or request-policy rejection in protocol/webhook handlers                                      |
+| 404             | Unknown route/resource, or webhook not configured                                                                |
+| 405             | Wrong method for a registered path                                                                               |
+| 409             | Conflict: target/state changed, destination occupied, trust or dependency restriction                            |
+| 410             | Expired, consumed, or invalid registration grant/transaction                                                     |
+| 413             | Body or storage/resource limit exceeded where explicitly handled                                                 |
+| 415             | JSON media type required by OPAQUE/key creation                                                                  |
+| 421 / 426       | Wrong configured Host / HTTPS required                                                                           |
+| 429             | Dashboard mutation rate limit or login/session capacity limit                                                    |
 | 500 / 502 / 503 | Internal failure / upstream authentication failure in Git operations / unavailable capacity or recovery required |
 
 These are shared categories, not a guarantee that every handler uses each code.
@@ -109,14 +106,14 @@ creation explicitly require a single JSON value with no trailing data.
 Repository-management outcomes use the stable semantic codes below. Messages are
 short display text; callers branch on code/status, not English wording.
 
-| Code | Status | Meaning |
-| --- | --- | --- |
-| `repository_key.in_use` | 409 | The key remains assigned to a project. |
-| `ssh_host.observation_changed` | 409 | The host observation no longer matches the reviewed fingerprint; refresh and verify again. |
-| `webhook.signature_invalid` | 401 | Provider signature validation failed. |
-| `webhook.not_configured` | 404 | No secret is configured for that project/provider. |
-| `operation.capacity_exceeded` | 503 | Durable webhook work could not be accepted because capacity is unavailable. |
-| `service.unavailable` | 503 | Durable acceptance or another service operation failed; inspect state before retrying a mutation. |
+| Code                           | Status | Meaning                                                                                           |
+| ------------------------------ | ------ | ------------------------------------------------------------------------------------------------- |
+| `repository_key.in_use`        | 409    | The key remains assigned to a project.                                                            |
+| `ssh_host.observation_changed` | 409    | The host observation no longer matches the reviewed fingerprint; refresh and verify again.        |
+| `webhook.signature_invalid`    | 401    | Provider signature validation failed.                                                             |
+| `webhook.not_configured`       | 404    | No secret is configured for that project/provider.                                                |
+| `operation.capacity_exceeded`  | 503    | Durable webhook work could not be accepted because capacity is unavailable.                       |
+| `service.unavailable`          | 503    | Durable acceptance or another service operation failed; inspect state before retrying a mutation. |
 
 Other validation failures use shared `request.invalid`, `request.invalid_json`,
 `request.json_required`, `request.too_large`, or `request.policy_rejected`
@@ -143,16 +140,16 @@ browser crypto implementation. The single credential identifier is
 65,536 bytes and `value` to 60,000 encoded characters. Unknown fields, missing
 values, and trailing JSON are rejected.
 
-| Method and path | Request JSON | Success |
-| --- | --- | --- |
-| POST `/opaque/register/start` | `{"grant":"<setup-or-recovery-token>","value":"<registration-request>"}` | 200 `auth.registration_started`; `data` is `{"value":"<registration-response>","transaction":"<handle>"}` |
-| POST `/opaque/register/finish` | `{"transaction":"<handle>","value":"<registration-record>"}` | 200 `auth.registration_completed`; `data: null`; creates/replaces credentials, does not sign in |
-| POST `/opaque/login/start` | `{"value":"<KE1>"}` | 200 `auth.login_started`; `data` is `{"transaction":"<handle>","value":"<KE2>"}` |
-| POST `/opaque/login/finish` | `{"transaction":"<handle>","value":"<KE3>"}` | 200 `auth.login_completed`; `data: null` plus session cookie after KE3 verification |
-| GET `/api/session` | None | 200 `auth.session_valid`; `data: {"authenticated":true}` |
-| POST `/api/logout` | No body required | 200 `auth.logged_out`; `data: null`; invalidates current session if present and expires cookie |
-| POST `/opaque/password/change/start` | `{"value":"<new-password-registration-request>"}` | 200 `auth.password_change_started`; `data` is `{"value":"<registration-response>"}` |
-| POST `/opaque/password/change/finish` | `{"value":"<new-password-registration-record>"}` | 200 `auth.password_changed`; `data: null`; replaces credentials and revokes sessions |
+| Method and path                       | Request JSON                                                             | Success                                                                                                   |
+| ------------------------------------- | ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| POST `/opaque/register/start`         | `{"grant":"<setup-or-recovery-token>","value":"<registration-request>"}` | 200 `auth.registration_started`; `data` is `{"value":"<registration-response>","transaction":"<handle>"}` |
+| POST `/opaque/register/finish`        | `{"transaction":"<handle>","value":"<registration-record>"}`             | 200 `auth.registration_completed`; `data: null`; creates/replaces credentials, does not sign in           |
+| POST `/opaque/login/start`            | `{"value":"<KE1>"}`                                                      | 200 `auth.login_started`; `data` is `{"transaction":"<handle>","value":"<KE2>"}`                          |
+| POST `/opaque/login/finish`           | `{"transaction":"<handle>","value":"<KE3>"}`                             | 200 `auth.login_completed`; `data: null` plus session cookie after KE3 verification                       |
+| GET `/api/session`                    | None                                                                     | 200 `auth.session_valid`; `data: {"authenticated":true}`                                                  |
+| POST `/api/logout`                    | No body required                                                         | 200 `auth.logged_out`; `data: null`; invalidates current session if present and expires cookie            |
+| POST `/opaque/password/change/start`  | `{"value":"<new-password-registration-request>"}`                        | 200 `auth.password_change_started`; `data` is `{"value":"<registration-response>"}`                       |
+| POST `/opaque/password/change/finish` | `{"value":"<new-password-registration-record>"}`                         | 200 `auth.password_changed`; `data: null`; replaces credentials and revokes sessions                      |
 
 For example, success is `{"code":"auth.login_completed","message":"Signed in.","data":null}`. Errors use the same shape. Authentication codes include `auth.session_required` (401), `auth.login_failed` (401), `auth.protocol_invalid` (400), `auth.registration_expired` (410), `auth.registration_conflict` (409), `auth.recent_login_required` (401), and `auth.capacity_exceeded` (existing 429). Shared request and service codes are `request.https_required`, `request.json_required`, `request.policy_rejected`, `request.origin_rejected`, `request.rate_limited`, `service.unavailable`, and `service.internal_error`, retaining their existing statuses. Authentication errors do not disclose account existence, password validity, or grant-consumption details.
 
@@ -197,13 +194,11 @@ through the same barrel: `sdk.repositoryKeys.list/create/delete`,
 resource IDs, accept an optional `AbortSignal`, and never retry mutations.
 Webhook rotation returns its printable secret only in that authorized response;
 the settings read and live notifications never include it.
-Project and repository routes use named SDK operations and outcome envelopes.
-Deployment, webhook ingestion/settings, and destructive project deletion retain
-their separate migration ownership.
-
-Publication move and deployment deletion remain on their route-specific legacy
-contracts and are deferred to #70; their shared authorization/security guards
-are already envelope-based.
+Project and repository routes use named SDK operations and outcome envelopes,
+including `sdk.projects.delete`. Lifecycle deployment actions use
+`sdk.deployments.history`, `rollback`, `pause`, `resume`, `move`, and `delete`.
+These operations accept an optional `AbortSignal`; cancellation does not cancel
+durably accepted server work and mutations are never automatically retried.
 
 ### Flow and state details
 
@@ -250,15 +245,15 @@ list again for measured sizes.
 **Ref:** `{"name":"main","kind":"branch","commit":"<full-sha1>"}`.
 `kind` is `branch` or `tag`; names do not include `refs/heads/` or `refs/tags/`.
 
-| Method and path | Request / success | Important behavior |
-| --- | --- | --- |
-| GET `/api/projects` | 200 `project.listed`; `data` is Project[] | Ordered by creation time then ID; measures Git/LFS cache sizes. |
-| POST `/api/projects` | `{"name":"site","url":"https://git.example/site.git"}`; 201 `project.created`; `data` is Project | Synchronously clones without checkout and saves cached refs; not a queued job. |
-| GET `/api/projects/{id}/refs` | 200 `project.refs_listed`; `data` is Ref[] | Cached only, sorted by kind/name; does not fetch. |
-| POST `/api/projects/{id}/refresh` | No body required; 200 `project.refreshed`; `data` is `{"lastFetched":"<timestamp>","warning":""}` | Synchronously fetches; failed refresh preserves cached refs and last successful fetch information. |
-| POST `/api/projects/{id}/key` | `{"keyId":"<key-id>"}`; 200 `project.key_assigned`; `data` is null | SSH projects only; changes assigned managed key, does not fetch. |
-| POST `/api/projects/{id}/cache/recreate` | `{"confirm":true}`; 200 `project.cache_cleared`; `data` is null | Clears Git and verified LFS caches; this does not clone or fetch a replacement repository. Recovery-required errors mean inspect/restart recovery before retrying. |
-| POST `/api/projects/{id}/delete` | `{"confirm":true}`; 204 | Blocked with 409 while deployments exist; removes project caches/settings. |
+| Method and path                          | Request / success                                                                                 | Important behavior                                                                                                                                                 |
+| ---------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| GET `/api/projects`                      | 200 `project.listed`; `data` is Project[]                                                         | Ordered by creation time then ID; measures Git/LFS cache sizes.                                                                                                    |
+| POST `/api/projects`                     | `{"name":"site","url":"https://git.example/site.git"}`; 201 `project.created`; `data` is Project  | Synchronously clones without checkout and saves cached refs; not a queued job.                                                                                     |
+| GET `/api/projects/{id}/refs`            | 200 `project.refs_listed`; `data` is Ref[]                                                        | Cached only, sorted by kind/name; does not fetch.                                                                                                                  |
+| POST `/api/projects/{id}/refresh`        | No body required; 200 `project.refreshed`; `data` is `{"lastFetched":"<timestamp>","warning":""}` | Synchronously fetches; failed refresh preserves cached refs and last successful fetch information.                                                                 |
+| POST `/api/projects/{id}/key`            | `{"keyId":"<key-id>"}`; 200 `project.key_assigned`; `data` is null                                | SSH projects only; changes assigned managed key, does not fetch.                                                                                                   |
+| POST `/api/projects/{id}/cache/recreate` | `{"confirm":true}`; 200 `project.cache_cleared`; `data` is null                                   | Clears Git and verified LFS caches; this does not clone or fetch a replacement repository. Recovery-required errors mean inspect/restart recovery before retrying. |
+| POST `/api/projects/{id}/delete`         | `{"confirm":true}`; 200 `project.deleted`; `data: null`                                           | Blocked with `project.has_deployments` / 409; accepted cache cleanup failures return `operation.cleanup_pending`.                                                  |
 
 Project failure outcomes use `request.invalid` (400), `request.not_found` (404),
 `git.target_unavailable` (400/502), `git.authentication_failed` (502),
@@ -317,28 +312,27 @@ This confirms queue acceptance, not successful publication.
 
 ### Route inventory
 
-| Method and path | Request / success | Important behavior |
-| --- | --- | --- |
-| GET `/api/deployments` | 200 `deployment.listed`; `data: Deployment[]` | All deployments; no project filter or pagination. |
-| GET `/api/deployments/root` | 200 `deployment.root_loaded`; `data: {"publicationRoot":"<server-path>"}` | Configured publication root for folder selection. |
-| POST `/api/deployments` | Create body below; 201 `deployment.created`; `data` contains `id`, `jobId`, `status: "queued"`, and `publicationPath` | Saves deployment and automatically queues initial publication. |
-| POST `/api/deployments/{id}/deploy` | No body required; 202 `deployment.queued`; `data: Queued response` | Ordinary Deploy; branch fetches latest, tag/commit uses saved commit. |
-| POST `/api/deployments/{id}/hard-redeploy` | No body required; 202 `deployment.hard_redeploy_queued`; `data: Queued response` | Fetches; resolves branch/tag again; forces recreation even if already live. Commit targets stay fixed. |
-| POST `/api/deployments/{id}/target` | Target body below; 202 `deployment.target_changed`; `data: Queued response` | Changes configuration and queues publication; unchanged target returns `deployment.target_unchanged` / 409. |
-| GET `/api/deployments/{id}/jobs` | 200 `job.listed`; `data: Job[]` | Newest first, at most 100; no pagination. Unknown deployment IDs currently yield an empty array. |
-| GET `/api/deployments/{id}/history` | Query below; 200 `deployment.history_loaded`; `data` contains commits/page/hasMore | Branch only; cached first-parent history, no fetch. |
-| POST `/api/deployments/{id}/rollback` | `{"commit":"<full-sha1>","permanent":false}`; 202 `deployment.rollback_queued`; `data: Queued response` | Branch only; ancestry validation happens in the worker after fetching. |
-| POST `/api/deployments/{id}/pause` | No body required; 200 `deployment.paused`; `data: {"automationPaused":true}` | Branch only; repeated pause succeeds. |
-| POST `/api/deployments/{id}/resume` | No body required; 202 `deployment.resumed`; `data` contains `automationPaused`, `jobId`, and `status: "queued"` | Branch only; immediately queues latest tip; already enabled returns 409. |
-| POST `/api/deployments/{id}/delete` | `{"confirm":true}`; 204 | Supersedes work and removes published files; blocked cleanup returns 503 after durable acceptance and retries cleanup. The route-specific response remains legacy until #70. |
+| Method and path                            | Request / success                                                                                                     | Important behavior                                                                                                                                            |
+| ------------------------------------------ | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET `/api/deployments`                     | 200 `deployment.listed`; `data: Deployment[]`                                                                         | All deployments; no project filter or pagination.                                                                                                             |
+| GET `/api/deployments/root`                | 200 `deployment.root_loaded`; `data: {"publicationRoot":"<server-path>"}`                                             | Configured publication root for folder selection.                                                                                                             |
+| POST `/api/deployments`                    | Create body below; 201 `deployment.created`; `data` contains `id`, `jobId`, `status: "queued"`, and `publicationPath` | Saves deployment and automatically queues initial publication.                                                                                                |
+| POST `/api/deployments/{id}/deploy`        | No body required; 202 `deployment.queued`; `data: Queued response`                                                    | Ordinary Deploy; branch fetches latest, tag/commit uses saved commit.                                                                                         |
+| POST `/api/deployments/{id}/hard-redeploy` | No body required; 202 `deployment.hard_redeploy_queued`; `data: Queued response`                                      | Fetches; resolves branch/tag again; forces recreation even if already live. Commit targets stay fixed.                                                        |
+| POST `/api/deployments/{id}/target`        | Target body below; 202 `deployment.target_changed`; `data: Queued response`                                           | Changes configuration and queues publication; unchanged target returns `deployment.target_unchanged` / 409.                                                   |
+| GET `/api/deployments/{id}/jobs`           | 200 `job.listed`; `data: Job[]`                                                                                       | Newest first, at most 100; no pagination. Unknown deployment IDs currently yield an empty array.                                                              |
+| GET `/api/deployments/{id}/history`        | Query below; 200 `deployment.history_loaded`; `data` contains commits/page/hasMore                                    | Branch only; cached first-parent history, no fetch.                                                                                                           |
+| POST `/api/deployments/{id}/rollback`      | `{"commit":"<full-sha1>","permanent":false}`; 202 `deployment.rollback_queued`; `data: Queued response`               | Branch only; ancestry validation happens in the worker after fetching.                                                                                        |
+| POST `/api/deployments/{id}/pause`         | No body required; 200 `deployment.paused`; `data: {"automationPaused":true}`                                          | Branch only; repeated pause succeeds.                                                                                                                         |
+| POST `/api/deployments/{id}/resume`        | No body required; 202 `deployment.resumed`; `data` contains `automationPaused`, `jobId`, and `status: "queued"`       | Branch only; immediately queues latest tip; already enabled returns 409.                                                                                      |
+| POST `/api/deployments/{id}/delete`        | `{"confirm":true}`; 200 `deployment.deleted`; `data: null`                                                            | Supersedes work and removes published files; blocked cleanup returns 503 `operation.cleanup_pending` with `operationAccepted: true` after durable acceptance. |
+| POST `/api/deployments/{id}/move`          | Move body below; 200 `deployment.moved`; `data: {"publicationPath":"<absolute-path>"}`                                | Requires confirmation and expected current publication path; durable atomic move/reconciliation protections apply.                                            |
+| POST `/api/projects/{id}/delete`           | `{"confirm":true}`; 200 `project.deleted`; `data: null`                                                               | Blocked with `project.has_deployments`; accepted cache cleanup pending uses `operation.cleanup_pending`.                                                      |
 
-The deployment outcomes migration covers only list/root/create, target changes,
-Deploy, Hard re-deploy, jobs, history, rollback, and pause/resume. Deployment
-deletion and publication move remain on their existing route-specific response
-contracts and are intentionally deferred to #70; neither is a typed SDK
-operation in this slice. Their shared authorization and Origin guards continue
-to return outcome envelopes. Durable deletion cleanup and move safeguards are
-unchanged.
+Deployment outcomes use the common `code`, `message`, and `data` envelope.
+Lifecycle error codes distinguish ordinary path conflicts from recovery-required
+move outcomes and accepted cleanup-pending deletion. Never infer that nothing
+changed from a non-2xx response.
 
 Create body (8 KiB limit):
 
@@ -368,8 +362,7 @@ No path separators, traversal, symlinks, occupied paths, or reserved destination
 are allowed. Omission on create retains the historical ID-named destination.
 The display name is independent of the publication folder.
 
-Move body (4 KiB limit; route-specific legacy contract, deferred to #70;
-shared authorization and Origin guards use outcome envelopes):
+Move body (4 KiB limit; confirmation required):
 
 ```json
 {
@@ -450,14 +443,14 @@ Sources: [`repository_keys.go`](../lib/repository_keys.go),
 See [repository-keys.md](repository-keys.md) for supported import formats and
 operational guidance.
 
-| Method and path | Request / success |
-| --- | --- |
-| GET `/api/repository-keys` | 200 `repository_key.listed`; `data: Key[]` |
-| POST `/api/repository-keys` | `{"name":"reader","generate":true}` **or** `{"name":"reader","privateKey":"<unprotected-key-text>"}`; 201 `repository_key.created`; `data: Key` |
-| POST `/api/repository-keys/{id}/delete` | No body required; 200 `repository_key.deleted`; 409 `repository_key.in_use` if assigned |
-| GET `/api/ssh-hosts` | 200 `ssh_host.listed`; `data: Host[]` |
-| POST `/api/ssh-hosts/approve` | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 200 `ssh_host.approved`; stale observations return 409 `ssh_host.observation_changed` |
-| POST `/api/ssh-hosts/revoke` | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 200 `ssh_host.revoked`; stale observations return 409 `ssh_host.observation_changed` |
+| Method and path                         | Request / success                                                                                                                                                          |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET `/api/repository-keys`              | 200 `repository_key.listed`; `data: Key[]`                                                                                                                                 |
+| POST `/api/repository-keys`             | `{"name":"reader","generate":true}` **or** `{"name":"reader","privateKey":"<unprotected-key-text>"}`; 201 `repository_key.created`; `data: Key`                            |
+| POST `/api/repository-keys/{id}/delete` | No body required; 200 `repository_key.deleted`; 409 `repository_key.in_use` if assigned                                                                                    |
+| GET `/api/ssh-hosts`                    | 200 `ssh_host.listed`; `data: Host[]`                                                                                                                                      |
+| POST `/api/ssh-hosts/approve`           | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 200 `ssh_host.approved`; stale observations return 409 `ssh_host.observation_changed` |
+| POST `/api/ssh-hosts/revoke`            | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 200 `ssh_host.revoked`; stale observations return 409 `ssh_host.observation_changed`  |
 
 **Key:** `id`, `name`, `algorithm`, `bits`, `fingerprint`, `publicKey`, `createdAt`.
 Private keys are never returned. Generation and import are mutually exclusive;
@@ -484,10 +477,10 @@ independently verified and approved again.
 Sources: [`lfs_settings.go`](../lib/lfs_settings.go),
 [`lfs_transport.go`](../lib/lfs_transport.go).
 
-| Method and path | Request / success |
-| --- | --- |
-| GET `/api/projects/{id}/lfs` | 200 `lfs.settings_loaded`; `data: {"settings":{"endpoint":"","objectOrigins":[],"allowInternal":false},"suggestedEndpoint":"<url-or-empty>"}` |
-| POST `/api/projects/{id}/lfs` | Body below (16 KiB limit); 200 `lfs.settings_saved`; `data: null` |
+| Method and path               | Request / success                                                                                                                             |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| GET `/api/projects/{id}/lfs`  | 200 `lfs.settings_loaded`; `data: {"settings":{"endpoint":"","objectOrigins":[],"allowInternal":false},"suggestedEndpoint":"<url-or-empty>"}` |
+| POST `/api/projects/{id}/lfs` | Body below (16 KiB limit); 200 `lfs.settings_saved`; `data: null`                                                                             |
 
 Existing settings may additionally include `internalAddresses`, a map of origins
 to approved internal IP-address arrays. `suggestedEndpoint` is a convenience
@@ -518,10 +511,10 @@ not an arbitrary provider parameter.
 
 ### Dashboard configuration (session + mutation Origin rules)
 
-| Method and path | Request / success |
-| --- | --- |
-| GET `/api/projects/{id}/{provider}-webhook` | 200 `webhook.settings_loaded`; `data: {"configured":true,"url":"/webhooks/<provider>/<project-id>"}` (`configured` may be false) |
-| POST `/api/projects/{id}/{provider}-webhook` | `{"rotate":true}` (1 KiB limit); 201 `webhook.secret_rotated`; data contains URL and new secret |
+| Method and path                              | Request / success                                                                                                                |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| GET `/api/projects/{id}/{provider}-webhook`  | 200 `webhook.settings_loaded`; `data: {"configured":true,"url":"/webhooks/<provider>/<project-id>"}` (`configured` may be false) |
+| POST `/api/projects/{id}/{provider}-webhook` | `{"rotate":true}` (1 KiB limit); 201 `webhook.secret_rotated`; data contains URL and new secret                                  |
 
 The URL is relative to the application origin. Rotation also initializes an
 unconfigured webhook. Each project/provider has an independent encrypted secret.
@@ -536,10 +529,10 @@ obtained by hex-decoding it. Update provider configuration after rotation.
 duplicate/ignored deliveries. This acknowledges handling, not publication.
 HTTPS is required even in explicit HTTP-origin dashboard mode.
 
-| Provider | Delivery ID | Event | HMAC-SHA256 signature over exact raw body |
-| --- | --- | --- | --- |
-| GitHub | `X-GitHub-Delivery` | `X-GitHub-Event` | `X-Hub-Signature-256: sha256=<64-hex-digits>` |
-| Gitea | `X-Gitea-Delivery` | `X-Gitea-Event` | `X-Gitea-Signature: <64-hex-digits>` |
+| Provider | Delivery ID         | Event            | HMAC-SHA256 signature over exact raw body     |
+| -------- | ------------------- | ---------------- | --------------------------------------------- |
+| GitHub   | `X-GitHub-Delivery` | `X-GitHub-Event` | `X-Hub-Signature-256: sha256=<64-hex-digits>` |
+| Gitea    | `X-Gitea-Delivery`  | `X-Gitea-Event`  | `X-Gitea-Signature: <64-hex-digits>`          |
 
 Body size is bounded by `WebhookMaxBodyBytes`. Invalid headers/push payloads
 return **400**, bad signatures `webhook.signature_invalid` (**401**),
@@ -569,15 +562,15 @@ every mutation is safely repeatable after a network failure.
 
 Useful behavior checks:
 
-| Area | Tests |
-| --- | --- |
-| Registration, login, credential lifecycle | [`bootstrap_test.go`](../lib/bootstrap_test.go), [`registration_transaction_test.go`](../lib/registration_transaction_test.go) |
-| Routing/embedding/backend errors | [`assets_test.go`](../lib/assets_test.go) |
-| Projects, cache, SSH | [`projects_test.go`](../lib/projects_test.go), [`projects_smart_test.go`](../lib/projects_smart_test.go), [`ssh_projects_test.go`](../lib/ssh_projects_test.go) |
-| Deploy/jobs/tag refresh | [`deployments_test.go`](../lib/deployments_test.go), [`tags_app_test.go`](../lib/tags_app_test.go) |
-| Rollback/pause/restart | [`rollback_app_test.go`](../lib/rollback_app_test.go), [`rollback_restart_test.go`](../lib/rollback_restart_test.go), [`automation_test.go`](../lib/automation_test.go) |
-| Publication path/move/delete | [`publication_paths_test.go`](../lib/publication_paths_test.go), [`publication_move_test.go`](../lib/publication_move_test.go), [`deletion_test.go`](../lib/deletion_test.go) |
-| Keys/LFS/webhooks | [`repository_keys_test.go`](../lib/repository_keys_test.go), [`lfs_test.go`](../lib/lfs_test.go), [`webhooks_test.go`](../lib/webhooks_test.go), [`gitea_webhooks_test.go`](../lib/gitea_webhooks_test.go) |
+| Area                                      | Tests                                                                                                                                                                                                      |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Registration, login, credential lifecycle | [`bootstrap_test.go`](../lib/bootstrap_test.go), [`registration_transaction_test.go`](../lib/registration_transaction_test.go)                                                                             |
+| Routing/embedding/backend errors          | [`assets_test.go`](../lib/assets_test.go)                                                                                                                                                                  |
+| Projects, cache, SSH                      | [`projects_test.go`](../lib/projects_test.go), [`projects_smart_test.go`](../lib/projects_smart_test.go), [`ssh_projects_test.go`](../lib/ssh_projects_test.go)                                            |
+| Deploy/jobs/tag refresh                   | [`deployments_test.go`](../lib/deployments_test.go), [`tags_app_test.go`](../lib/tags_app_test.go)                                                                                                         |
+| Rollback/pause/restart                    | [`rollback_app_test.go`](../lib/rollback_app_test.go), [`rollback_restart_test.go`](../lib/rollback_restart_test.go), [`automation_test.go`](../lib/automation_test.go)                                    |
+| Publication path/move/delete              | [`publication_paths_test.go`](../lib/publication_paths_test.go), [`publication_move_test.go`](../lib/publication_move_test.go), [`deletion_test.go`](../lib/deletion_test.go)                              |
+| Keys/LFS/webhooks                         | [`repository_keys_test.go`](../lib/repository_keys_test.go), [`lfs_test.go`](../lib/lfs_test.go), [`webhooks_test.go`](../lib/webhooks_test.go), [`gitea_webhooks_test.go`](../lib/gitea_webhooks_test.go) |
 
 Combined-binary browser coverage and its build prerequisites are described in
 [`tests/README.md`](../tests/README.md). For storage/process recovery rather than
