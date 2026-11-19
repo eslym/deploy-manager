@@ -1,19 +1,21 @@
-export type RepositoryOutcomeCode =
-	| 'repository_key.listed'
-	| 'repository_key.created'
-	| 'repository_key.deleted'
-	| 'repository_key.in_use'
-	| 'ssh_host.listed'
-	| 'ssh_host.approved'
-	| 'ssh_host.revoked'
-	| 'ssh_host.observation_changed'
-	| 'lfs.settings_loaded'
-	| 'lfs.settings_saved'
-	| 'webhook.settings_loaded'
-	| 'webhook.secret_rotated'
-	| 'webhook.accepted'
-	| 'webhook.signature_invalid'
-	| 'webhook.not_configured';
+export const repositoryOutcomeCodes = [
+	'repository_key.listed',
+	'repository_key.created',
+	'repository_key.deleted',
+	'repository_key.in_use',
+	'ssh_host.listed',
+	'ssh_host.approved',
+	'ssh_host.revoked',
+	'ssh_host.observation_changed',
+	'lfs.settings_loaded',
+	'lfs.settings_saved',
+	'webhook.settings_loaded',
+	'webhook.secret_rotated',
+	'webhook.accepted',
+	'webhook.signature_invalid',
+	'webhook.not_configured'
+] as const;
+export type RepositoryOutcomeCode = (typeof repositoryOutcomeCodes)[number];
 
 export interface RepositoryKey {
 	id: string;

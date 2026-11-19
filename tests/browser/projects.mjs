@@ -173,7 +173,7 @@ try {
   await page.route("**/api/repository-keys", route => route.fulfill({
     status: 200,
     contentType: "application/json",
-    body: JSON.stringify([{ id: "fixture-key", name: "Fixture key", algorithm: "ed25519", bits: 256, fingerprint: "SHA256:test", publicKey: "ssh-ed25519 test", createdAt: new Date().toISOString() }])
+    body: JSON.stringify({ code: "repository_key.listed", message: "Repository keys loaded.", data: [{ id: "fixture-key", name: "Fixture key", algorithm: "ed25519", bits: 256, fingerprint: "SHA256:test", publicKey: "ssh-ed25519 test", createdAt: new Date().toISOString() }] })
   }));
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByLabel("Project name").fill("SSH fixture site");
@@ -205,9 +205,9 @@ try {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify(warningDisappearsAfterApprovalFailure
+        body: JSON.stringify({ code: "ssh_host.listed", message: "SSH hosts loaded.", data: warningDisappearsAfterApprovalFailure
           ? hosts.filter(host => host.host !== observedHost.host || !host.warning)
-          : hosts)
+          : hosts })
       });
       return;
     }
@@ -218,14 +218,14 @@ try {
     if (approvalAttempts === 1) {
       latestWarning = { ...observedHost, fingerprint: "SHA256:replacement-key-fingerprint" };
       if (hideWarningAfterApprovalFailure) warningDisappearsAfterApprovalFailure = true;
-      await route.fulfill({ status: 409, body: "the observed SSH key has changed; refresh the warning and verify it again" });
+      await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code: "ssh_host.observation_changed", message: "SSH host details changed. Review them again.", data: null }) });
       return;
     }
     const approval = route.request().postDataJSON();
     if (approval.fingerprint !== latestWarning.fingerprint || approval.host !== observedHost.host || approval.port !== observedHost.port || approval.confirm !== true) {
       throw new Error(`approval did not match the reviewed observation: ${JSON.stringify(approval)}`);
     }
-    await route.fulfill({ status: 204 });
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "ssh_host.approved", message: "SSH host approved.", data: null }) });
   });
   await page.route("**/api/projects", async route => {
     if (route.request().method() !== "POST") return route.continue();
@@ -253,7 +253,7 @@ try {
   await createButton.click();
   await page.getByRole("dialog").getByRole("button", { name: /Approve/ }).click();
   await page.getByRole("dialog").getByText("SHA256:replacement-key-fingerprint", { exact: true }).waitFor();
-  await page.getByRole("dialog").getByRole("alert").filter({ hasText: /changed.*independently/i }).waitFor();
+  await page.getByRole("dialog").getByRole("alert").filter({ hasText: /changed|review/i }).waitFor();
   if (projectAttempts !== 2) throw new Error("project creation retried before the changed fingerprint was reviewed");
   await page.getByRole("dialog").getByRole("button", { name: /Approve/ }).click();
   await page.waitForURL("**/dashboard/projects/ssh-browser-project");
@@ -316,7 +316,7 @@ try {
   await page.getByRole("heading", { name: "Fixture site", exact: true }).waitFor();
   if (!(await page.title()).includes("Fixture site")) throw new Error("project detail lacks its own page title");
   await page.getByRole("heading", { name: "Branches and tags" }).waitFor({ timeout: 30000 });
-  await page.getByRole("alert").filter({ hasText: "GitHub webhook settings could not be saved. Try again shortly." }).waitFor();
+  await page.getByRole("alert").filter({ hasText: "The request could not be completed. Try again." }).waitFor();
   const dashboardURLBeforeRetry = page.url();
   const githubWebhook = page.getByRole("region", { name: "GitHub webhook", exact: true });
   await githubWebhook.getByRole("button", { name: "Retry loading settings" }).click();
@@ -338,7 +338,7 @@ try {
 
   milestone("configure LFS");
   await page.getByLabel("LFS server URL").waitFor();
-  const initialLfsSettings = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), id);
+  const initialLfsSettings = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/lfs`)).json()).data, id);
   if (!Array.isArray(initialLfsSettings.settings.objectOrigins) || initialLfsSettings.settings.objectOrigins.length !== 0) throw new Error(`unconfigured LFS settings had an inconsistent shape: ${JSON.stringify(initialLfsSettings)}`);
   await page.getByLabel("LFS server URL").fill(`${fixtureURL}/info/lfs`);
   await page.getByLabel("Object download origins").fill(fixtureOrigin);
@@ -347,7 +347,7 @@ try {
   page.once("dialog", dialog => dialog.accept());
   await page.getByRole("button", { name: "Save LFS settings" }).click();
   await page.getByText("LFS settings saved.").waitFor();
-  const configuredLfsSettings = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), id);
+  const configuredLfsSettings = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/lfs`)).json()).data, id);
   if (JSON.stringify(configuredLfsSettings.settings.objectOrigins) !== JSON.stringify([fixtureOrigin])) throw new Error(`configured LFS destinations were not rendered consistently: ${JSON.stringify(configuredLfsSettings.settings)}`);
 
   milestone("ordinary repository LFS settings and stale response protection");
@@ -363,7 +363,7 @@ try {
   const ordinaryRefs = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/refs`)).json(), ordinaryProject.id);
   if (!ordinaryRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("ordinary fixture repository did not have a main branch");
   await page.getByLabel("LFS server URL").waitFor();
-  const ordinarySettings = await page.evaluate(async projectID => await (await fetch(`/api/projects/${projectID}/lfs`)).json(), ordinaryProject.id);
+  const ordinarySettings = await page.evaluate(async projectID => (await (await fetch(`/api/projects/${projectID}/lfs`)).json()).data, ordinaryProject.id);
   if (!Array.isArray(ordinarySettings.settings.objectOrigins) || ordinarySettings.settings.objectOrigins.length !== 0) throw new Error(`ordinary repository LFS settings had an inconsistent shape: ${JSON.stringify(ordinarySettings)}`);
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("ordinary repository displayed unexpected LFS destinations");
 
@@ -385,7 +385,7 @@ try {
   await page.getByLabel("LFS server URL").waitFor();
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("switching to an ordinary repository showed another project's LFS settings");
   releaseLfsResponse();
-  await heldLfsResponse.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ settings: { endpoint: "https://stale.example/lfs", objectOrigins: ["https://stale.example"] }, suggestedEndpoint: "https://stale.example/lfs" }) });
+  await heldLfsResponse.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "lfs.settings_loaded", message: "LFS settings loaded.", data: { settings: { endpoint: "https://stale.example/lfs", objectOrigins: ["https://stale.example"], allowInternal: false }, suggestedEndpoint: "https://stale.example/lfs" } }) });
   await page.waitForTimeout(100);
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("a delayed prior-project response overwrote the selected project's LFS form");
   await page.unroute(`**/api/projects/${id}/lfs`);
@@ -411,7 +411,7 @@ try {
   const heldLfsSave = await lfsSaveIntercepted;
   await openProject(page, ordinaryProject.id, "Ordinary fixture site");
   releaseLfsSave();
-  await heldLfsSave.fulfill({ status: 204 });
+  await heldLfsSave.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ code: "lfs.settings_saved", message: "LFS settings saved.", data: null }) });
   await page.waitForTimeout(100);
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("a completed save for another project overwrote the selected project's LFS form");
   if (await page.getByText("LFS settings saved.", { exact: true }).count()) throw new Error("a completed save for another project showed a stale success notice");
@@ -419,6 +419,19 @@ try {
   await openProject(page, id, "Fixture site");
   await page.getByLabel("LFS server URL").waitFor();
 
+  if (process.env.REPOSITORY_OUTCOMES_ONLY === "true") {
+    milestone("exercise repository-key and SSH-host SDK operations against the combined binary");
+    await page.goto(`https://${appListen}/dashboard/keys`, { waitUntil: "domcontentloaded" });
+    await page.getByLabel("Key name").fill("Repository outcomes browser key");
+    await page.getByRole("button", { name: "Create Ed25519 key" }).click();
+    await page.getByText("Repository outcomes browser key", { exact: true }).waitFor();
+    await page.getByRole("button", { name: "Remove key" }).click();
+    await page.getByText("No repository keys yet.", { exact: true }).waitFor();
+    await page.goto(`https://${appListen}/dashboard/ssh-hosts`, { waitUntil: "domcontentloaded" });
+    await page.getByRole("heading", { name: "SSH host keys" }).waitFor();
+    await page.getByText("No SSH host warnings.", { exact: true }).waitFor();
+    console.log("combined-binary repository outcome browser slice passed: key list/create/delete, SSH-host list, and LFS settings load/save");
+  } else {
   const cacheRecreationPath = `/api/projects/${id}/cache/recreate`;
   const unauthenticatedCacheRecreation = await httpsRequestStatus("127.0.0.1", 18440, cacheRecreationPath, "POST", JSON.stringify({ confirm: true }), { Origin: `https://${appListen}`, "Content-Type": "application/json" });
   if (unauthenticatedCacheRecreation !== 401) throw new Error(`unauthenticated cache recreation returned ${unauthenticatedCacheRecreation}`);
@@ -835,7 +848,7 @@ try {
   await page.getByText("SSH browser key", { exact: true }).waitFor();
   const generatedKey = page.locator("li").filter({ hasText: "SSH browser key" });
   if (!(await generatedKey.locator("code").innerText()).startsWith("ssh-ed25519 ") || !(await generatedKey.getByText(/SHA256:/).count())) throw new Error("public key or fingerprint is missing from the key page");
-  const sshKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).find(key => key.name === "SSH browser key").id);
+  const sshKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).data.find(key => key.name === "SSH browser key").id);
   const importedPrivateKey = generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString();
   await page.getByLabel("Name for imported key").fill("Imported browser key");
   await page.getByLabel("Private key").fill(importedPrivateKey);
@@ -891,7 +904,7 @@ try {
   await page.getByLabel("Key name").fill("Replacement SSH key");
   await page.getByRole("button", { name: "Create Ed25519 key" }).click();
   await page.getByText("Replacement SSH key", { exact: true }).waitFor();
-  const replacementKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).find(key => key.name === "Replacement SSH key").id);
+  const replacementKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).data.find(key => key.name === "Replacement SSH key").id);
   await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "SSH fixture site", exact: true }).waitFor();
   await page.getByLabel("SSH key").selectOption(replacementKeyId);
@@ -908,7 +921,7 @@ try {
   });
   await page.getByRole("heading", { name: "SSH fixture site", exact: true }).waitFor();
   await page.getByLabel("LFS server URL").waitFor();
-  const sshEmptyLfs = await page.evaluate(async id => await (await fetch(`/api/projects/${id}/lfs`)).json(), sshProject.id);
+  const sshEmptyLfs = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/lfs`)).json()).data, sshProject.id);
   if (!Array.isArray(sshEmptyLfs.settings.objectOrigins) || sshEmptyLfs.settings.objectOrigins.length !== 0) throw new Error(`ordinary SSH repository LFS settings had an inconsistent shape: ${JSON.stringify(sshEmptyLfs)}`);
   if (await page.getByLabel("LFS server URL").inputValue() !== "" || await page.getByLabel("Object download origins").inputValue() !== "") throw new Error("unconfigured project displayed unexpected LFS destinations");
   await page.getByText("No deployments for this project yet.", { exact: true }).waitFor();
@@ -1187,6 +1200,7 @@ try {
   if (await page.evaluate(async id => (await (await fetch("/api/deployments")).json()).some(item => item.id === id), deploymentID)) throw new Error("deleted deployment remained in the list");
   if (pageErrors.length) throw new Error(`browser errors: ${pageErrors.slice(0, 4).join("; ")}`);
   console.log("combined-binary authenticated project workflow passed: readable publication folders, legacy move and deletion, private SSH/LFS publication, cache size/recreation warning and confirmation, restart-safe cache lifecycle, host trust, cross-origin mutation rejection, and cached-ref retention");
+  }
 } catch (error) {
   console.error(`[projects-browser] failed during: ${currentStep}`);
   throw error;

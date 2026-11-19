@@ -1,4 +1,8 @@
-import { createRepositoryOperations, type RepositoryOutcomeCode } from './repository';
+import {
+	createRepositoryOperations,
+	repositoryOutcomeCodes,
+	type RepositoryOutcomeCode
+} from './repository';
 
 export type OutcomeCode =
 	| RepositoryOutcomeCode
@@ -48,21 +52,7 @@ const knownCodes = new Set<string>([
 	'request.rate_limited',
 	'service.unavailable',
 	'service.internal_error',
-	'repository_key.listed',
-	'repository_key.created',
-	'repository_key.deleted',
-	'repository_key.in_use',
-	'ssh_host.listed',
-	'ssh_host.approved',
-	'ssh_host.revoked',
-	'ssh_host.observation_changed',
-	'lfs.settings_loaded',
-	'lfs.settings_saved',
-	'webhook.settings_loaded',
-	'webhook.secret_rotated',
-	'webhook.accepted',
-	'webhook.signature_invalid',
-	'webhook.not_configured'
+	...repositoryOutcomeCodes
 ]);
 
 export interface Outcome<T> {

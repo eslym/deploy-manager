@@ -1,24 +1,7 @@
 <script lang="ts">
-	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import { sdk } from '#lib/sdk/index.js';
+	import type { RepositoryKey } from '#lib/sdk/repository.js';
 	import { onMount } from 'svelte';
-	type RepositoryKey = {
-		id: string;
-		name: string;
-		algorithm: string;
-		bits: number;
-		fingerprint: string;
-		publicKey: string;
-		createdAt: string;
-	};
-	async function request(path: string, init?: RequestInit) {
-		return dashboardRequest(path, init, (response) => {
-			const status = ` (HTTP ${response.status})`;
-			if (response.status === 401 || response.status === 403)
-				return new Error(`Your session may have expired. Sign in again.${status}`);
-			if (response.status === 409) return new Error(`This change could not be completed.${status}`);
-			return new Error(`The request could not be completed. Try again shortly.${status}`);
-		});
-	}
 	let repositoryKeys = $state<RepositoryKey[]>([]);
 	let keyName = $state('');
 	let privateKeyInput = $state('');
@@ -26,7 +9,7 @@
 	let keyBusy = $state(false);
 	async function loadRepositoryKeys() {
 		try {
-			repositoryKeys = await request('/api/repository-keys');
+			repositoryKeys = (await sdk.repositoryKeys.list()).data;
 		} catch (cause) {
 			keyError = cause instanceof Error ? cause.message : 'Could not load repository keys.';
 		}
@@ -34,7 +17,7 @@
 	async function deleteKey(key: RepositoryKey) {
 		keyError = '';
 		try {
-			await request(`/api/repository-keys/${key.id}/delete`, { method: 'POST', body: '{}' });
+			await sdk.repositoryKeys.delete(key.id);
 			await loadRepositoryKeys();
 		} catch (cause) {
 			keyError =
@@ -54,10 +37,7 @@
 		// Remove the secret from reactive state before starting the network request.
 		privateKeyInput = '';
 		try {
-			await request('/api/repository-keys', {
-				method: 'POST',
-				body: JSON.stringify(generate ? { name, generate: true } : { name, privateKey })
-			});
+			await sdk.repositoryKeys.create(generate ? { name, generate: true } : { name, privateKey });
 			keyName = '';
 			await loadRepositoryKeys();
 		} catch (cause) {

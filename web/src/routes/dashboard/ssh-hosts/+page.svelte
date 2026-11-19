@@ -1,22 +1,11 @@
 <script lang="ts">
-	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import { sdk } from '#lib/sdk/index.js';
 	import { onMount } from 'svelte';
-	async function request(path: string, init?: RequestInit) {
-		return dashboardRequest(path, init, (response) => {
-			const status = ` (HTTP ${response.status})`;
-			if (response.status === 401 || response.status === 403)
-				return new Error(`Your session may have expired. Sign in again.${status}`);
-			if (response.status === 409) return new Error(`This change could not be completed.${status}`);
-			return new Error(`The request could not be completed. Try again shortly.${status}`);
-		});
-	}
-	let sshHosts = $state<
-		{ host: string; port: number; fingerprint: string; warning?: string; trusted: boolean }[]
-	>([]);
+	let sshHosts = $state<import('#lib/sdk/repository.js').SSHHost[]>([]);
 	let hostError = $state('');
 	async function loadSshHosts() {
 		try {
-			sshHosts = await request('/api/ssh-hosts');
+			sshHosts = (await sdk.sshHosts.list()).data;
 		} catch (cause) {
 			hostError = cause instanceof Error ? cause.message : 'Could not load SSH hosts.';
 		}
@@ -30,14 +19,11 @@
 			return;
 		hostError = '';
 		try {
-			await request('/api/ssh-hosts/approve', {
-				method: 'POST',
-				body: JSON.stringify({
-					host: host.host,
-					port: host.port,
-					fingerprint: host.fingerprint,
-					confirm: true
-				})
+			await sdk.sshHosts.approve({
+				host: host.host,
+				port: host.port,
+				fingerprint: host.fingerprint,
+				confirm: true
 			});
 			await loadSshHosts();
 		} catch (cause) {
@@ -53,14 +39,11 @@
 			return;
 		hostError = '';
 		try {
-			await request('/api/ssh-hosts/revoke', {
-				method: 'POST',
-				body: JSON.stringify({
-					host: host.host,
-					port: host.port,
-					fingerprint: host.fingerprint,
-					confirm: true
-				})
+			await sdk.sshHosts.revoke({
+				host: host.host,
+				port: host.port,
+				fingerprint: host.fingerprint,
+				confirm: true
 			});
 			await loadSshHosts();
 		} catch (cause) {

@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import { sdk } from '#lib/sdk/index.js';
 	import { formatBytes } from '#lib/format-bytes.js';
 	import { tick } from 'svelte';
 	import { afterNavigate, goto } from '$app/navigation';
@@ -123,14 +124,14 @@
 	}
 	async function loadRepositoryKeys() {
 		try {
-			repositoryKeys = await request('/api/repository-keys');
+			repositoryKeys = (await sdk.repositoryKeys.list()).data;
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not load repository keys.';
 		}
 	}
 	async function loadSshHosts() {
 		try {
-			sshHosts = await request('/api/ssh-hosts');
+			sshHosts = (await sdk.sshHosts.list()).data;
 		} catch {
 			/* Keep the original project error visible. */
 		}
@@ -160,19 +161,12 @@
 		lfsInternalConfirmation = false;
 		lfsSuggestedEndpoint = '';
 		try {
-			const result: {
-				settings?: {
-					endpoint?: string | null;
-					objectOrigins?: string[] | null;
-					allowInternal?: boolean | null;
-				} | null;
-				suggestedEndpoint?: string | null;
-			} = await request(`/api/projects/${id}/lfs`);
+			const result = (await sdk.lfs.settings(id)).data;
 			if (isCurrent()) {
-				lfsEndpoint = result.settings?.endpoint ?? '';
-				lfsOrigins = (result.settings?.objectOrigins ?? []).join('\n');
-				lfsAllowInternal = result.settings?.allowInternal ?? false;
-				lfsSuggestedEndpoint = result.suggestedEndpoint ?? '';
+				lfsEndpoint = result.settings.endpoint;
+				lfsOrigins = result.settings.objectOrigins.join('\n');
+				lfsAllowInternal = result.settings.allowInternal;
+				lfsSuggestedEndpoint = result.suggestedEndpoint;
 			}
 		} catch (cause) {
 			if (isCurrent())
@@ -196,18 +190,15 @@
 		lfsError = '';
 		lfsNotice = '';
 		try {
-			await request(`/api/projects/${projectId}/lfs`, {
-				method: 'POST',
-				body: JSON.stringify({
-					endpoint: lfsEndpoint,
-					objectOrigins: lfsOrigins
-						.split(/\r?\n/)
-						.map((origin) => origin.trim())
-						.filter(Boolean),
-					allowInternal: lfsAllowInternal,
-					confirmation: lfsConfirmation,
-					...(lfsAllowInternal ? { internalConfirmation: lfsConfirmation } : {})
-				})
+			await sdk.lfs.save(projectId, {
+				endpoint: lfsEndpoint,
+				objectOrigins: lfsOrigins
+					.split(/\r?\n/)
+					.map((origin) => origin.trim())
+					.filter(Boolean),
+				allowInternal: lfsAllowInternal,
+				confirmation: lfsConfirmation,
+				...(lfsAllowInternal ? { internalConfirmation: lfsConfirmation } : {})
 			});
 			if (selectionVersion === lfsSelectionVersion && selected === projectId) {
 				await loadLfsSettings(projectId);

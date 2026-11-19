@@ -527,7 +527,7 @@ try {
   await authPage.getByRole("button", { name: "Import private key" }).click();
   await authPage.getByText("imported integration key").waitFor({ timeout: 30000 });
   if (await authPage.getByLabel("Private key").inputValue()) throw new Error("imported private key remained in the browser form");
-  const listedKeys = await authPage.evaluate(async () => (await (await fetch("/api/repository-keys")).json()));
+  const listedKeys = await authPage.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).data);
   if (listedKeys.length !== 2 || listedKeys.some(key => !key.publicKey || !key.fingerprint || Object.keys(key).some(field => /private|ciphertext/i.test(field)))) throw new Error("key list did not contain only public metadata");
   if ((await authPage.locator("body").innerText()).includes(importedPrivateKey)) throw new Error("private key appeared in dashboard content");
   for (const suffix of ["state.sqlite", "state.sqlite-wal"]) {

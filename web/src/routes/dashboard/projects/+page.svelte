@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { dashboardRequest } from '#lib/dashboard-request.js';
+	import { sdk } from '#lib/sdk/index.js';
 	import { formatBytes } from '#lib/format-bytes.js';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
@@ -116,7 +117,7 @@
 	async function findObservedHost(repositoryUrl: string) {
 		const address = parseSshOrigin(repositoryUrl);
 		if (!address.isSsh || !address.host || address.port === null) return null;
-		const hosts: SshHost[] = await request('/api/ssh-hosts');
+		const hosts: SshHost[] = (await sdk.sshHosts.list()).data;
 		return (
 			hosts.find(
 				(host) =>
@@ -133,7 +134,7 @@
 	}
 	async function loadRepositoryKeys() {
 		try {
-			repositoryKeys = await request('/api/repository-keys');
+			repositoryKeys = (await sdk.repositoryKeys.list()).data;
 		} catch (cause) {
 			error = cause instanceof Error ? cause.message : 'Could not load repository keys.';
 		}
@@ -180,19 +181,12 @@
 		busy = true;
 		approvalError = '';
 		try {
-			await request(
-				'/api/ssh-hosts/approve',
-				{
-					method: 'POST',
-					body: JSON.stringify({
-						host: observedHost.host,
-						port: observedHost.port,
-						fingerprint: observedHost.fingerprint,
-						confirm: true
-					})
-				},
-				{ sshApproval: true }
-			);
+			await sdk.sshHosts.approve({
+				host: observedHost.host,
+				port: observedHost.port,
+				fingerprint: observedHost.fingerprint,
+				confirm: true
+			});
 			const approvedCreate = createSnapshot;
 			const created: Project = await request(
 				'/api/projects',
