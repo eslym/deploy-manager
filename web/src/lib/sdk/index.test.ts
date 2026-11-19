@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { BrowserSDKError, createBrowserSDK } from './index';
+import { BrowserSDKError, createBrowserSDK, serverErrorCode } from './index';
 
 function response(body: unknown, status = 200): Response {
 	return new Response(JSON.stringify(body), {
@@ -123,6 +123,43 @@ describe('browser SDK authentication transport', () => {
 			}
 		});
 		expect(send).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([
+		{
+			name: 'network',
+			code: 'sdk.network',
+			fetch: vi.fn().mockRejectedValue(new TypeError('private network detail')),
+			call: (api: ReturnType<typeof createBrowserSDK>) => api.auth.loginStart({ value: 'request' })
+		},
+		{
+			name: 'invalid response',
+			code: 'sdk.invalid_response',
+			fetch: vi.fn().mockResolvedValue(new Response('<h1>proxy secret</h1>', { status: 502 })),
+			call: (api: ReturnType<typeof createBrowserSDK>) => api.auth.loginStart({ value: 'request' })
+		},
+		{
+			name: 'cancellation',
+			code: 'sdk.cancelled',
+			fetch: vi.fn().mockRejectedValue(new DOMException('private detail', 'AbortError')),
+			call: (api: ReturnType<typeof createBrowserSDK>) => {
+				const controller = new AbortController();
+				controller.abort();
+				return api.auth.loginStart({ value: 'request' }, controller.signal);
+			}
+		}
+	])('uses a local $code code for $name, not a server outcome', async ({ code, fetch, call }) => {
+		const api = createBrowserSDK({ fetch });
+
+		try {
+			await call(api);
+			throw new Error('expected request to fail');
+		} catch (error) {
+			expect(error).toBeInstanceOf(BrowserSDKError);
+			expect((error as BrowserSDKError).outcome).toMatchObject({ code });
+			expect((error as BrowserSDKError).outcome.kind).not.toBe('server');
+			expect(serverErrorCode(error)).toBeUndefined();
+		}
 	});
 
 	it('clears the affected browser session after successful recovery', async () => {

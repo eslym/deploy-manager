@@ -133,6 +133,9 @@ operations such as `sdk.auth.loginStart`, `sdk.auth.session`,
 including OPAQUE exchanges, are never retried automatically. SDK errors are
 discriminated as `server`, `network`, `invalid_response`, or `cancelled`;
 proxy HTML and raw exception text are not displayed as trusted messages.
+Only server outcomes carry server-returned codes. SDK-local failures carry
+`sdk.network`, `sdk.invalid_response`, or `sdk.cancelled`, respectively; these
+codes are client-generated and must not be interpreted as server outcomes.
 Unknown nonempty server codes may be surfaced with valid envelope/data, but do
 not match known-code behavior. Only `auth.session_required` from a protected
 operation triggers session-loss handling; `auth.login_failed` and

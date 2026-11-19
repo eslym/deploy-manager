@@ -66,9 +66,9 @@ interface SDKAdapters {
 
 export type SDKError =
 	| { kind: 'server'; status: number; code: string; message: string; data: unknown }
-	| { kind: 'network'; message: string }
-	| { kind: 'invalid_response'; message: string }
-	| { kind: 'cancelled'; message: string };
+	| { kind: 'network'; code: 'sdk.network'; message: string }
+	| { kind: 'invalid_response'; code: 'sdk.invalid_response'; message: string }
+	| { kind: 'cancelled'; code: 'sdk.cancelled'; message: string };
 
 export class BrowserSDKError extends Error {
 	constructor(readonly outcome: SDKError) {
@@ -126,9 +126,17 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			});
 		} catch (cause) {
 			const isCancelled = signal?.aborted || cancelled(cause);
+			if (isCancelled) {
+				throw new BrowserSDKError({
+					kind: 'cancelled',
+					code: 'sdk.cancelled',
+					message: 'Request cancelled.'
+				});
+			}
 			throw new BrowserSDKError({
-				kind: isCancelled ? 'cancelled' : 'network',
-				message: isCancelled ? 'Request cancelled.' : safeFallback
+				kind: 'network',
+				code: 'sdk.network',
+				message: safeFallback
 			});
 		}
 
@@ -137,12 +145,24 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			parsed = await response.json();
 		} catch {
 			if (signal?.aborted) {
-				throw new BrowserSDKError({ kind: 'cancelled', message: 'Request cancelled.' });
+				throw new BrowserSDKError({
+					kind: 'cancelled',
+					code: 'sdk.cancelled',
+					message: 'Request cancelled.'
+				});
 			}
-			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
+			throw new BrowserSDKError({
+				kind: 'invalid_response',
+				code: 'sdk.invalid_response',
+				message: safeFallback
+			});
 		}
 		if (!isOutcome(parsed)) {
-			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
+			throw new BrowserSDKError({
+				kind: 'invalid_response',
+				code: 'sdk.invalid_response',
+				message: safeFallback
+			});
 		}
 		if (!response.ok) {
 			if (protectedRequest && parsed.code === 'auth.session_required' && !sessionLossReported) {
@@ -158,10 +178,18 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			});
 		}
 		if (!validate(parsed.data)) {
-			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
+			throw new BrowserSDKError({
+				kind: 'invalid_response',
+				code: 'sdk.invalid_response',
+				message: safeFallback
+			});
 		}
 		if (expectedCode && knownCodes.has(parsed.code) && parsed.code !== expectedCode) {
-			throw new BrowserSDKError({ kind: 'invalid_response', message: safeFallback });
+			throw new BrowserSDKError({
+				kind: 'invalid_response',
+				code: 'sdk.invalid_response',
+				message: safeFallback
+			});
 		}
 		return { code: parsed.code, message: parsed.message, data: parsed.data };
 	}
