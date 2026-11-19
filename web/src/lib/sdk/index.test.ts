@@ -748,6 +748,77 @@ describe('browser SDK live event ownership', () => {
 		dispose();
 	});
 
+	it('restarts fallback after a ready connection drops during repeated reconnect failures', async () => {
+		const sockets = [
+			new FakeEventSocket(),
+			new FakeEventSocket(),
+			new FakeEventSocket(),
+			new FakeEventSocket()
+		];
+		const [first, second, third, fourth] = sockets;
+		const timers = new Map<number, { callback: () => void; delay: number }>();
+		let nextTimer = 0;
+		const read = vi.fn(async () => []);
+		const api = createBrowserSDK({
+			webSocket: () => sockets.shift()!,
+			random: () => 0.5,
+			isOnline: () => true,
+			isVisible: () => true,
+			setTimeout: (callback, delay) => {
+				const id = ++nextTimer;
+				timers.set(id, { callback, delay });
+				return id as unknown as ReturnType<typeof setTimeout>;
+			},
+			clearTimeout: (timer) => timers.delete(timer as unknown as number)
+		});
+		const dispose = api.resources.subscribe({
+			identity: { kind: 'repository_keys' },
+			read,
+			onValue: vi.fn()
+		});
+		await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+		first.emit(
+			'message',
+			JSON.stringify({ code: 'events.ready', data: { epoch: 'epoch', sequence: 0 } })
+		);
+		first.closeWith(1006);
+		const fallbackStart = [...timers.entries()].find(([, timer]) => timer.delay === 10_000);
+		expect(fallbackStart).toBeDefined();
+		const reconnect = [...timers.entries()].find(([, timer]) => timer.delay === 1000);
+		expect([...timers.values()].map((timer) => timer.delay)).toContain(1000);
+		reconnect![1].callback();
+		timers.delete(reconnect![0]);
+		second.closeWith(1006);
+		await vi.waitFor(() =>
+			expect([...timers.values()].some((timer) => timer.delay === 2000)).toBe(true)
+		);
+		const nextReconnect = [...timers.entries()].find(([, timer]) => timer.delay === 2000);
+		nextReconnect![1].callback();
+		timers.delete(nextReconnect![0]);
+		third.closeWith(1006);
+		await vi.waitFor(() =>
+			expect([...timers.values()].some((timer) => timer.delay === 4000)).toBe(true)
+		);
+
+		expect(read).toHaveBeenCalledTimes(2);
+		fallbackStart![1].callback();
+		timers.delete(fallbackStart![0]);
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(3));
+		expect([...timers.values()].filter((timer) => timer.delay === 15_000)).toHaveLength(1);
+
+		const laterReconnect = [...timers.entries()].find(([, timer]) => timer.delay === 4000);
+		expect(laterReconnect).toBeDefined();
+		laterReconnect![1].callback();
+		timers.delete(laterReconnect![0]);
+		fourth.emit(
+			'message',
+			JSON.stringify({ code: 'events.ready', data: { epoch: 'epoch', sequence: 0 } })
+		);
+		await vi.waitFor(() => expect(read).toHaveBeenCalledTimes(4));
+		expect([...timers.values()].some((timer) => timer.delay === 15_000)).toBe(false);
+		dispose();
+	});
+
 	it('routes every resource invalidation to its active typed read and dependencies', async () => {
 		const socket = new FakeEventSocket();
 		const api = createBrowserSDK({ webSocket: () => socket });

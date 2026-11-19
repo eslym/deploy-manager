@@ -630,6 +630,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 				void probeEventSession();
 				return;
 			}
+			scheduleFallbackStart();
 			scheduleReconnect();
 		});
 		socket.addEventListener('error', () => {
@@ -658,13 +659,7 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 		subscribers.add(onInvalidate);
 		disposedEvents = false;
 		if (subscribers.size === 1) {
-			fallbackStartTimer = schedule(() => {
-				fallbackStartTimer = undefined;
-				if (!eventReady) {
-					notifyInvalidation();
-					startFallbackPolling();
-				}
-			}, 10_000);
+			scheduleFallbackStart();
 			attachBrowserListeners();
 		}
 		connectEvents();
@@ -684,6 +679,17 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			eventSocket = undefined;
 			socket?.close();
 		};
+	}
+
+	function scheduleFallbackStart(): void {
+		if (fallbackStartTimer || eventReady || subscribers.size === 0 || disposedEvents) return;
+		fallbackStartTimer = schedule(() => {
+			fallbackStartTimer = undefined;
+			if (!eventReady && subscribers.size > 0 && !disposedEvents) {
+				notifyInvalidation();
+				startFallbackPolling();
+			}
+		}, 10_000);
 	}
 
 	function isVisible(): boolean {
