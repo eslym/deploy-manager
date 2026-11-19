@@ -209,9 +209,21 @@
 			approvalError = cause instanceof Error ? cause.message : 'Could not approve this host key.';
 			try {
 				const refreshed = await findObservedHost(createSnapshot.url);
-				if (refreshed) observedHost = refreshed;
+				if (refreshed) {
+					observedHost = refreshed;
+				} else {
+					observedHost = null;
+					approvalError =
+						'The host warning is no longer available, so this fingerprint cannot be approved. Your repository details are still filled in; review the current SSH host warnings before trying again.';
+					error = approvalError;
+					pendingCreate = null;
+				}
 			} catch {
-				// Keep the fingerprint currently under review.
+				observedHost = null;
+				approvalError =
+					'Could not refresh SSH host warnings, so this fingerprint cannot be approved. Your repository details are still filled in; refresh the warnings before trying again.';
+				error = approvalError;
+				pendingCreate = null;
 			}
 		} finally {
 			busy = false;
@@ -234,7 +246,7 @@
 	<p class="mt-2 text-[#58645b]">
 		You’re signed in. Connect HTTPS or SSH repositories to browse branches and tags.
 	</p>
-	{#if error && url.startsWith('ssh://')}
+	{#if error && parseSshOrigin(url).isSsh}
 		<p class="mt-3 text-sm text-[#58645b]">
 			Check <a class="font-semibold text-[#214c30] underline" href="/dashboard/keys"
 				>repository keys</a

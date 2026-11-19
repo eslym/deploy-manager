@@ -215,7 +215,19 @@ func safeSSHRemote(raw string) (*url.URL, string, int, string, error) {
 }
 
 func isSSHRemote(remote string) bool {
-	return strings.HasPrefix(remote, "ssh://") || strings.Contains(remote, "@")
+	remote = strings.TrimSpace(remote)
+	if strings.HasPrefix(remote, "ssh://") {
+		return true
+	}
+	// Git's SCP-style SSH syntax is user@host:path. Do not infer SSH merely
+	// from an '@' anywhere in a URL: public HTTPS repository paths may contain
+	// names such as owner/repo@name.git.
+	at := strings.IndexByte(remote, '@')
+	colon := strings.IndexByte(remote, ':')
+	return at > 0 &&
+		colon > at+1 &&
+		strings.IndexByte(remote[at+1:], '@') < 0 &&
+		!strings.ContainsAny(remote[:colon], "/?#\\\r\n\x00\t ")
 }
 
 func (p *projectManager) repoPath(id string) string { return filepath.Join(p.root, id) }
