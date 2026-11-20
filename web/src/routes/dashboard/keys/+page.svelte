@@ -6,14 +6,16 @@
 	let keyName = $state('');
 	let privateKeyInput = $state('');
 	let keyError = $state('');
+	let keyLoadError = $state('');
 	let keyBusy = $state(false);
 	let keysLoaded = $state(false);
 	async function loadRepositoryKeys() {
 		try {
 			repositoryKeys = (await sdk.repositoryKeys.list()).data;
 			keysLoaded = true;
+			keyLoadError = '';
 		} catch (cause) {
-			keyError = cause instanceof Error ? cause.message : 'Could not load repository keys.';
+			keyLoadError = cause instanceof Error ? cause.message : 'Could not load repository keys.';
 		}
 	}
 	async function deleteKey(key: RepositoryKey) {
@@ -55,11 +57,12 @@
 			read: () => sdk.repositoryKeys.list().then((result) => result.data),
 			onValue: (keys, cause) => {
 				if (cause) {
-					keyError = cause instanceof Error ? cause.message : 'Could not load repository keys.';
+					keyLoadError = cause instanceof Error ? cause.message : 'Could not load repository keys.';
 					return;
 				}
 				repositoryKeys = keys ?? [];
 				keysLoaded = true;
+				keyLoadError = '';
 			}
 		});
 	});
@@ -140,10 +143,10 @@
 			>
 		</form>
 		<h3 class="mt-8 text-lg font-semibold text-[#243528]">Saved keys</h3>
-		{#if !keysLoaded && !keyError}<p class="text-[#58645b]" role="status">
-				Loading repository keys…
-			</p>{:else if keyError}<p class="text-[#58645b]">
+		{#if !keysLoaded && keyLoadError}<p class="text-[#58645b]">
 				Repository keys could not be loaded.
+			</p>{:else if !keysLoaded}<p class="text-[#58645b]" role="status">
+				Loading repository keys…
 			</p>{:else if repositoryKeys.length === 0}<p class="text-[#58645b]">
 				No repository keys yet.
 			</p>{:else}<ul class="grid gap-3 p-0">
