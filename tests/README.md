@@ -42,10 +42,14 @@ pass its selector to the same pinned container. These modes still build the
 frontend and executable, but skip the Go suite and unrelated browser scenarios:
 
 ```sh
+docker compose -f tests/compose.yaml run --build --rm -e PROJECT_KEY_FILTER_RACE_ONLY=true test
 docker compose -f tests/compose.yaml run --build --rm -e LIFECYCLE_OUTCOMES_ONLY=true test
 docker compose -f tests/compose.yaml run --build --rm -e PROJECT_OUTCOMES_ONLY=true test
 docker compose -f tests/compose.yaml run --build --rm -e LIVE_UPDATES_ONLY=true test
 ```
+
+The project-key filter race slice exercises a delayed filtered project-list
+response while navigating back to the unfiltered listing.
 
 To run the full projects browser scenario without repeating the Go suite:
 

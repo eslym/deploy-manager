@@ -142,6 +142,8 @@
 		<h3 class="mt-8 text-lg font-semibold text-[#243528]">Saved keys</h3>
 		{#if !keysLoaded && !keyError}<p class="text-[#58645b]" role="status">
 				Loading repository keys…
+			</p>{:else if keyError}<p class="text-[#58645b]">
+				Repository keys could not be loaded.
 			</p>{:else if repositoryKeys.length === 0}<p class="text-[#58645b]">
 				No repository keys yet.
 			</p>{:else}<ul class="grid gap-3 p-0">

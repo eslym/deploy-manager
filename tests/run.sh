@@ -26,7 +26,7 @@ if [[ "${REGISTRATION_ONLY:-false}" == "true" ]]; then
 		timeout --kill-after=10s 180s node registration.mjs
 	exit
 fi
-if [[ "${PROJECT_BROWSER_ONLY:-false}" == "true" || "${LIFECYCLE_OUTCOMES_ONLY:-false}" == "true" || "${PROJECT_OUTCOMES_ONLY:-false}" == "true" || "${LIVE_UPDATES_ONLY:-false}" == "true" ]]; then
+if [[ "${PROJECT_BROWSER_ONLY:-false}" == "true" || "${PROJECT_KEY_FILTER_RACE_ONLY:-false}" == "true" || "${LIFECYCLE_OUTCOMES_ONLY:-false}" == "true" || "${PROJECT_OUTCOMES_ONLY:-false}" == "true" || "${LIVE_UPDATES_ONLY:-false}" == "true" ]]; then
 	cd "$workspace/tests/browser"
 	bun install --frozen-lockfile
 	DEPLOY_MANAGER_BINARY="$workspace/deploy-manager" \

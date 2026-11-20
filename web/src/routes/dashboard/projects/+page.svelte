@@ -138,8 +138,10 @@
 		approvalError = '';
 	}
 	let disposeProjects: (() => void) | undefined;
+	let projectsRequestIdentity = 0;
 	afterNavigate(() => {
 		disposeProjects?.();
+		const requestIdentity = ++projectsRequestIdentity;
 		const filterKeyId = page.url.searchParams.get('keyId') || undefined;
 		projectsLoaded = false;
 		projectsReadError = '';
@@ -147,6 +149,7 @@
 			identity: { kind: 'projects', keyId: filterKeyId },
 			read: () => sdk.projects.list({ keyId: filterKeyId }).then((result) => result.data),
 			onValue: (items, cause) => {
+				if (requestIdentity !== projectsRequestIdentity) return;
 				if (cause) {
 					projectsReadError = cause instanceof Error ? cause.message : 'Could not load projects.';
 					return;
@@ -172,6 +175,7 @@
 			}
 		});
 		return () => {
+			projectsRequestIdentity++;
 			disposeProjects?.();
 			disposeKeys();
 		};

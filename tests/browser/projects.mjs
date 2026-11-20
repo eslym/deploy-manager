@@ -1145,8 +1145,26 @@ try {
   await page.waitForURL(`**/dashboard/projects/${sshProject.id}`);
   const sshRefs = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/refs`)).json()).data, sshProject.id);
   if (!sshRefs.some(ref => ref.kind === "branch" && ref.name === "main")) throw new Error("approved SSH project did not cache its branch");
+  let failNextRepositoryKeyList = true;
+  await page.route("**/api/repository-keys", async route => {
+    if (route.request().method() === "GET" && failNextRepositoryKeyList) {
+      failNextRepositoryKeyList = false;
+      await route.fulfill({ status: 500, contentType: "text/plain", body: "SENSITIVE KEY LIST FAILURE" });
+      return;
+    }
+    await route.continue();
+  });
   await page.getByRole("link", { name: "Repository keys", exact: true }).click();
   await page.waitForURL("**/dashboard/keys");
+  await page.getByText("Repository keys could not be loaded.", { exact: true }).waitFor();
+  if (await page.getByText("No repository keys yet.", { exact: true }).count()) {
+    throw new Error("a failed repository-key listing was shown as a successful empty state");
+  }
+  if ((await page.locator("body").innerText()).includes("SENSITIVE KEY LIST FAILURE")) {
+    throw new Error("the repository-key listing exposed the raw HTTP failure body");
+  }
+  await page.unroute("**/api/repository-keys");
+  await page.reload({ waitUntil: "domcontentloaded" });
   const assignedKey = page.locator("li").filter({ hasText: "SSH browser key" });
   await assignedKey.getByText("1 project", { exact: true }).waitFor();
   await assignedKey.getByRole("button", { name: "Remove key" }).click();
@@ -1184,6 +1202,50 @@ try {
   await page.getByRole("link", { name: "SSH fixture site", exact: true }).waitFor();
   const filteredProjects = await page.evaluate(async keyId => (await (await fetch(`/api/projects?keyId=${encodeURIComponent(keyId)}`)).json()).data, replacementKeyId);
   if (filteredProjects.length !== 1 || filteredProjects[0].id !== sshProject.id) throw new Error("server-side key project filter returned unrelated projects");
+  await page.getByRole("link", { name: "Repository keys", exact: true }).click();
+  await page.waitForURL("**/dashboard/keys");
+  let releaseStaleProjectList;
+  let interceptStaleProjectList;
+  const delayedStaleProjectList = new Promise(resolveRelease => { releaseStaleProjectList = resolveRelease; });
+  const staleProjectListIntercepted = new Promise(resolveIntercepted => { interceptStaleProjectList = resolveIntercepted; });
+  let holdStaleProjectList = true;
+  await page.route("**/api/projects?keyId=*", async route => {
+    if (holdStaleProjectList && new URL(route.request().url()).searchParams.get("keyId") === replacementKeyId) {
+      holdStaleProjectList = false;
+      interceptStaleProjectList(route);
+      await delayedStaleProjectList;
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ code: "project.listed", message: "Projects loaded.", data: [{ ...sshProject, id: "stale-filter-project", name: "Stale filtered project" }] })
+      });
+      return;
+    }
+    await route.continue();
+  });
+  await page.locator("li").filter({ hasText: "Replacement SSH key" }).getByRole("link", { name: "1 project", exact: true }).click();
+  await withDeadline(staleProjectListIntercepted, "filtered project list interception");
+  await page.getByRole("link", { name: "Clear key filter" }).click();
+  await page.waitForURL("**/dashboard/projects");
+  await page.getByRole("heading", { name: "Your projects", exact: true }).waitFor();
+  await page.getByRole("link", { name: "SSH fixture site", exact: true }).waitFor();
+  const staleProjectListResponse = page.waitForResponse(response =>
+    response.url().includes(`/api/projects?keyId=${encodeURIComponent(replacementKeyId)}`)
+  );
+  releaseStaleProjectList();
+  await staleProjectListResponse;
+  await page.waitForTimeout(100);
+  if (await page.getByRole("link", { name: "Stale filtered project", exact: true }).count()) {
+    throw new Error("a delayed filtered-project response overwrote the current unfiltered project list");
+  }
+  if (await page.getByText("Showing projects using Replacement SSH key").count()) {
+    throw new Error("a delayed filtered-project response restored a stale key label after clearing the filter");
+  }
+  await page.unroute("**/api/projects?keyId=*");
+  if (process.env.PROJECT_KEY_FILTER_RACE_ONLY === "true") {
+    console.log("delayed key-filter navigation regression passed");
+    throw focusedOutcomesComplete;
+  }
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.waitForURL(`**/dashboard/projects?keyId=${replacementKeyId}`);
   await page.getByText("Showing projects using Replacement SSH key").waitFor();
