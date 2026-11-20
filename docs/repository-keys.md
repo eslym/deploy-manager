@@ -7,6 +7,11 @@ algorithms, weak RSA keys, malformed keys, and passphrase-protected keys are
 rejected. The dashboard only returns authorized public keys and public metadata;
 there is no private-key export endpoint.
 
+Key management displays each key's current project usage count. A project counts
+once when it is assigned to that key, regardless of its deployments; unused keys
+show zero. Reassignment and project deletion change the count because it reflects
+current assignments, not historical use.
+
 Private material is encrypted with AES-256-GCM in SQLite. Its independent
 32-byte master key is stored outside SQLite at `--repository-key-master` (by
 default `<data>/repository-key-master.key`), with exclusive creation and mode

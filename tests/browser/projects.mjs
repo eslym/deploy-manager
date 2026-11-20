@@ -193,7 +193,7 @@ try {
   await page.route("**/api/repository-keys", route => route.fulfill({
     status: 200,
     contentType: "application/json",
-    body: JSON.stringify({ code: "repository_key.listed", message: "Repository keys loaded.", data: [{ id: "fixture-key", name: "Fixture key", algorithm: "ed25519", bits: 256, fingerprint: "SHA256:test", publicKey: "ssh-ed25519 test", createdAt: new Date().toISOString() }] })
+    body: JSON.stringify({ code: "repository_key.listed", message: "Repository keys loaded.", data: [{ id: "fixture-key", name: "Fixture key", algorithm: "ed25519", bits: 256, fingerprint: "SHA256:test", publicKey: "ssh-ed25519 test", createdAt: new Date().toISOString(), projectCount: 0 }] })
   }));
   await page.reload({ waitUntil: "domcontentloaded" });
   await page.getByLabel("Project name").fill("SSH fixture site");
@@ -1088,6 +1088,7 @@ try {
   await page.getByRole("button", { name: "Create Ed25519 key" }).click();
   await page.getByText("SSH browser key", { exact: true }).waitFor();
   const generatedKey = page.locator("li").filter({ hasText: "SSH browser key" });
+  await generatedKey.getByText("0 projects", { exact: true }).waitFor();
   if (!(await generatedKey.locator("code").innerText()).startsWith("ssh-ed25519 ") || !(await generatedKey.getByText(/SHA256:/).count())) throw new Error("public key or fingerprint is missing from the key page");
   const sshKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).data.find(key => key.name === "SSH browser key").id);
   const importedPrivateKey = generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString();
@@ -1147,11 +1148,13 @@ try {
   await page.getByRole("link", { name: "Repository keys", exact: true }).click();
   await page.waitForURL("**/dashboard/keys");
   const assignedKey = page.locator("li").filter({ hasText: "SSH browser key" });
+  await assignedKey.getByText("1 project", { exact: true }).waitFor();
   await assignedKey.getByRole("button", { name: "Remove key" }).click();
   await page.getByText("This key is assigned to a project.").waitFor();
   await page.getByLabel("Key name").fill("Replacement SSH key");
   await page.getByRole("button", { name: "Create Ed25519 key" }).click();
   await page.getByText("Replacement SSH key", { exact: true }).waitFor();
+  await page.locator("li").filter({ hasText: "Replacement SSH key" }).getByText("0 projects", { exact: true }).waitFor();
   const replacementKeyId = await page.evaluate(async () => (await (await fetch("/api/repository-keys")).json()).data.find(key => key.name === "Replacement SSH key").id);
   await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
   await page.getByRole("heading", { name: "SSH fixture site", exact: true }).waitFor();
@@ -1170,6 +1173,12 @@ try {
       return response.status === 200 && outcome.data?.find(project => project.id === id)?.keyId === keyId;
     }, { id: sshProject.id, keyId: replacementKeyId });
   }, "project key assignment");
+  await page.getByRole("link", { name: "Repository keys", exact: true }).click();
+  await page.waitForURL("**/dashboard/keys");
+  await page.locator("li").filter({ hasText: "SSH browser key" }).getByText("0 projects", { exact: true }).waitFor();
+  await page.locator("li").filter({ hasText: "Replacement SSH key" }).getByText("1 project", { exact: true }).waitFor();
+  await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
+  await page.getByRole("heading", { name: "SSH fixture site", exact: true }).waitFor();
   await page.getByLabel("SSH key").selectOption(sshKeyId);
   const restoreKeyResponse = page.waitForResponse(response => response.url().endsWith(`/api/projects/${sshProject.id}/key`));
   await page.getByRole("button", { name: "Change SSH key" }).click();

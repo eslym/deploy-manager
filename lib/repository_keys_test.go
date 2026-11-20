@@ -128,6 +128,48 @@ func TestRepositoryKeyHTTPPersistsOnlyCiphertextAndFailsClosed(t *testing.T) {
 	if e != nil || listedOutcome.Code != "repository_key.listed" || len(listedOutcome.Data) != 1 || listedOutcome.Data[0].PublicKey != key.PublicKey {
 		t.Fatalf("public list mismatch: %+v (%v)", listedOutcome, e)
 	}
+	if listedOutcome.Data[0].ProjectCount != 0 {
+		t.Fatalf("unused key has project count %d, want 0", listedOutcome.Data[0].ProjectCount)
+	}
+	for _, projectID := range []string{"project-one", "project-two"} {
+		if _, e = app.db.Exec(`INSERT INTO projects(id,name,remote_url,created_at) VALUES(?,?,?,?)`, projectID, projectID, "git@github.com:owner/"+projectID+".git", time.Now().UnixNano()); e != nil {
+			t.Fatal(e)
+		}
+		if _, e = app.db.Exec(`INSERT INTO project_ssh_keys(project_id,key_id) VALUES(?,?)`, projectID, key.ID); e != nil {
+			t.Fatal(e)
+		}
+	}
+	listReq, _ = http.NewRequest(http.MethodGet, server.URL+"/api/repository-keys", nil)
+	listReq.AddCookie(&http.Cookie{Name: sessionCookie, Value: base64.RawURLEncoding.EncodeToString(token)})
+	listed, e = client.Do(listReq)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = json.NewDecoder(listed.Body).Decode(&listedOutcome); e != nil {
+		listed.Body.Close()
+		t.Fatal(e)
+	}
+	listed.Body.Close()
+	if got := listedOutcome.Data[0].ProjectCount; got != 2 {
+		t.Fatalf("shared key has project count %d, want 2", got)
+	}
+	if _, e = app.db.Exec(`DELETE FROM projects WHERE id=?`, "project-two"); e != nil {
+		t.Fatal(e)
+	}
+	listReq, _ = http.NewRequest(http.MethodGet, server.URL+"/api/repository-keys", nil)
+	listReq.AddCookie(&http.Cookie{Name: sessionCookie, Value: base64.RawURLEncoding.EncodeToString(token)})
+	listed, e = client.Do(listReq)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if e = json.NewDecoder(listed.Body).Decode(&listedOutcome); e != nil {
+		listed.Body.Close()
+		t.Fatal(e)
+	}
+	listed.Body.Close()
+	if got := listedOutcome.Data[0].ProjectCount; got != 1 {
+		t.Fatalf("key after project deletion has project count %d, want 1", got)
+	}
 	challenge := []byte("repository key remains usable")
 	if !app.repositoryKeyCanSign(key.ID, challenge) {
 		t.Fatal("imported key could not sign in process")

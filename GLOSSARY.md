@@ -29,6 +29,9 @@ A deployment target selected by a Git tag and frozen to its resolved commit unle
 An SSH credential assigned to a project for reading its Git repository, not for accessing deployment servers.
 _Avoid_: Deployment-server key
 
+**Project usage count**:
+The number of current projects assigned to a repository key; deployments and historical assignments are not counted.
+
 **Hard re-deploy**:
 An explicit publication that refreshes the configured Git target and recreates its published content even when the resolved commit is unchanged. Branches and tags are resolved again; a commit target remains fixed.
 

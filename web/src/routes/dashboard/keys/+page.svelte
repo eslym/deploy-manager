@@ -147,6 +147,10 @@
 						<p class="mt-1 text-sm text-[#58645b]">
 							{key.algorithm} · {key.bits} bits · {key.fingerprint}
 						</p>
+						<p class="mt-1 text-sm text-[#58645b]">
+							{key.projectCount}
+							{key.projectCount === 1 ? 'project' : 'projects'}
+						</p>
 						<code class="mt-2 block text-xs break-all text-[#58645b]">{key.publicKey}</code>
 						<p class="mt-2 text-xs text-[#58645b]">
 							Added {new Date(key.createdAt).toLocaleString()}

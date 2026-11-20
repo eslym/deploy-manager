@@ -22,7 +22,8 @@ describe('repository management SDK operations', () => {
 						bits: 256,
 						fingerprint: 'SHA256:public-fingerprint',
 						publicKey: 'ssh-ed25519 public-key',
-						createdAt: '2026-11-19T00:00:00Z'
+						createdAt: '2026-11-19T00:00:00Z',
+						projectCount: 0
 					}
 				]
 			})
@@ -33,6 +34,7 @@ describe('repository management SDK operations', () => {
 
 		expect(result.code).toBe('repository_key.listed');
 		expect(result.data[0].id).toBe('key-id');
+		expect(result.data[0].projectCount).toBe(0);
 		expect(send).toHaveBeenCalledWith(
 			'/api/repository-keys',
 			expect.objectContaining({ method: 'GET', credentials: 'same-origin' })
@@ -88,7 +90,8 @@ describe('repository management SDK operations', () => {
 						bits: 256,
 						fingerprint: 'SHA256:public-fingerprint',
 						publicKey: 'ssh-ed25519 public-key',
-						createdAt: '2026-11-19T00:00:00Z'
+						createdAt: '2026-11-19T00:00:00Z',
+						projectCount: 0
 					}
 				})
 			)

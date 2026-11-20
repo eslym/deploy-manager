@@ -25,6 +25,7 @@ export interface RepositoryKey {
 	fingerprint: string;
 	publicKey: string;
 	createdAt: string;
+	projectCount: number;
 }
 
 export interface SSHHost {
@@ -79,7 +80,10 @@ const isRepositoryKey = (value: unknown): value is RepositoryKey =>
 	typeof value.bits === 'number' &&
 	isString(value.fingerprint) &&
 	isString(value.publicKey) &&
-	isString(value.createdAt);
+	isString(value.createdAt) &&
+	typeof value.projectCount === 'number' &&
+	Number.isInteger(value.projectCount) &&
+	value.projectCount >= 0;
 const isSSHHost = (value: unknown): value is SSHHost =>
 	isObject(value) &&
 	isString(value.host) &&

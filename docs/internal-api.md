@@ -180,7 +180,7 @@ described in the route sections below. `null` is JSON null, not an omitted field
 | POST `/api/deployments/{id}/resume` | 202 | `deployment.resumed` | Automatic deployment resumed. Publication queued. | Existing automationPaused, jobId, status |
 | POST `/api/deployments/{id}/move` | 200 | `deployment.moved` | Publication path changed. | Existing `publicationPath` |
 | POST `/api/deployments/{id}/delete` | 200 | `deployment.deleted` | Deployment deleted. | `null` |
-| GET `/api/repository-keys` | 200 | `repository_key.listed` | Repository keys loaded. | Key array; never private material |
+| GET `/api/repository-keys` | 200 | `repository_key.listed` | Repository keys loaded. | Key array with current `projectCount` on every key; never private material |
 | POST `/api/repository-keys` | 201 | `repository_key.created` | Repository key created. | Key; never private material |
 | POST `/api/repository-keys/{id}/delete` | 200 | `repository_key.deleted` | Repository key deleted. | `null` |
 | GET `/api/ssh-hosts` | 200 | `ssh_host.listed` | SSH hosts loaded. | Host array |
@@ -679,8 +679,12 @@ operational guidance.
 | POST `/api/ssh-hosts/approve`           | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 200 `ssh_host.approved`; stale observations return 409 `ssh_host.observation_changed` |
 | POST `/api/ssh-hosts/revoke`            | `{"host":"git.example","port":22,"fingerprint":"SHA256:<observed>","confirm":true}`; 200 `ssh_host.revoked`; stale observations return 409 `ssh_host.observation_changed`  |
 
-**Key:** `id`, `name`, `algorithm`, `bits`, `fingerprint`, `publicKey`, `createdAt`.
-Private keys are never returned. Generation and import are mutually exclusive;
+**Key:** `id`, `name`, `algorithm`, `bits`, `fingerprint`, `publicKey`,
+`createdAt`, `projectCount`. Every key includes an integer `projectCount`,
+including zero for unused keys. It counts current project–key assignments only;
+deployments and historical assignments do not affect it. It is refreshed from
+current assignments on each list request. Private keys are never returned.
+Generation and import are mutually exclusive;
 imports have a 64 KiB private-key limit (request limit 64 KiB + 2048 bytes).
 Creation requires JSON media type and rejects unknown/trailing fields/data.
 Private keys are encrypted at rest with an external master key.

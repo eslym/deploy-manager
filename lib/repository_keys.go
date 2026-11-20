@@ -35,13 +35,14 @@ const maxRepositoryPrivateKeyBytes = 64 << 10
 const repositoryKeyVerifierContext = "deploy-manager repository key encryption verifier v1"
 
 type repositoryKey struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Algorithm   string    `json:"algorithm"`
-	Bits        int       `json:"bits"`
-	Fingerprint string    `json:"fingerprint"`
-	PublicKey   string    `json:"publicKey"`
-	CreatedAt   time.Time `json:"createdAt"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Algorithm    string    `json:"algorithm"`
+	Bits         int       `json:"bits"`
+	Fingerprint  string    `json:"fingerprint"`
+	PublicKey    string    `json:"publicKey"`
+	CreatedAt    time.Time `json:"createdAt"`
+	ProjectCount int       `json:"projectCount"`
 }
 
 // prepareRepositoryKeyStore consumes the pre-schema classification. The mere
@@ -278,7 +279,12 @@ func (a *App) listRepositoryKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	out := []repositoryKey{}
 	for _, record := range keys {
-		out = append(out, repositoryKey{ID: record.ID, Name: record.Name, Algorithm: record.Algorithm, Bits: record.Bits, Fingerprint: record.Fingerprint, PublicKey: strings.TrimSpace(record.PublicKey), CreatedAt: time.Unix(0, record.CreatedAt).UTC()})
+		var projectCount int
+		if err := a.db.QueryRowContext(r.Context(), `SELECT count(*) FROM project_ssh_keys WHERE key_id=?`, record.ID).Scan(&projectCount); err != nil {
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
+			return
+		}
+		out = append(out, repositoryKey{ID: record.ID, Name: record.Name, Algorithm: record.Algorithm, Bits: record.Bits, Fingerprint: record.Fingerprint, PublicKey: strings.TrimSpace(record.PublicKey), CreatedAt: time.Unix(0, record.CreatedAt).UTC(), ProjectCount: projectCount})
 	}
 	writeOutcome(w, http.StatusOK, "repository_key.listed", "Repository keys loaded.", out)
 }
