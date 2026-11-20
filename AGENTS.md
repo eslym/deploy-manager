@@ -13,6 +13,14 @@
 - Run Go tests from the root with `go test ./...` after frontend assets exist; run `govulncheck ./...` after the same build prerequisite. `scripts/build.sh` builds the frontend and executable together.
 - Compose provides the pinned Bun/Go/Playwright development shell and browser test runner. Use `docker compose -f tests/compose.yaml run --build --rm test bash` for the shell or omit `bash` to run the full suite. The checkout is mounted read-only at `/source`; copy it into `/workspace` before commands that generate files. See `tests/README.md` for cache sharing and cleanup.
 
+### Test selection and merge gate
+
+- Documentation-only changes require no test run.
+- For frontend-only changes, run frontend checks and relevant unit/browser tests; do not run Go tests or Go race tests. Use the browser-only Compose selectors in `tests/README.md` when combined-binary browser coverage is needed; compiling the Go backend for those tests is allowed.
+- Before merging frontend-only changes into `main`, both full browser scenarios (registration and projects) must pass; focused browser slices alone do not satisfy this merge gate. Go tests and race tests remain excluded.
+- If the changes being merged include Go code, the full Compose test suite must pass before merging into `main`, including Go tests, race tests, vet, frontend checks/build, and both browser scenarios.
+- Reuse passing results for the exact tested commit; a fast-forward merge that preserves its hash requires no post-merge rerun.
+
 ## Shared workflow
 
 - Follow `docs/agents/issue-tracker.md` and `docs/agents/triage-labels.md` when managing GitHub issue/spec tracking; read `docs/agents/domain.md` when changing `GLOSSARY.md` or ADRs.
