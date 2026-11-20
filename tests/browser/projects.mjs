@@ -1202,6 +1202,9 @@ try {
   await page.getByRole("link", { name: "SSH fixture site", exact: true }).waitFor();
   const filteredProjects = await page.evaluate(async keyId => (await (await fetch(`/api/projects?keyId=${encodeURIComponent(keyId)}`)).json()).data, replacementKeyId);
   if (filteredProjects.length !== 1 || filteredProjects[0].id !== sshProject.id) throw new Error("server-side key project filter returned unrelated projects");
+  await page.reload({ waitUntil: "domcontentloaded" });
+  await page.waitForURL(`**/dashboard/projects?keyId=${replacementKeyId}`);
+  await page.getByText("Showing projects using Replacement SSH key").waitFor();
   await page.getByRole("link", { name: "Repository keys", exact: true }).click();
   await page.waitForURL("**/dashboard/keys");
   let releaseStaleProjectList;
@@ -1247,9 +1250,6 @@ try {
     throw focusedOutcomesComplete;
   }
   await page.reload({ waitUntil: "domcontentloaded" });
-  await page.waitForURL(`**/dashboard/projects?keyId=${replacementKeyId}`);
-  await page.getByText("Showing projects using Replacement SSH key").waitFor();
-  await page.getByRole("link", { name: "Clear key filter" }).click();
   await page.waitForURL("**/dashboard/projects");
   await page.getByRole("heading", { name: "Your projects", exact: true }).waitFor();
   await page.goto(`https://${appListen}/dashboard/projects/${sshProject.id}`, { waitUntil: "domcontentloaded" });
