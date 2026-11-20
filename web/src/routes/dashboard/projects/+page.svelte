@@ -1,6 +1,7 @@
 <script lang="ts">
 	import { sdk, serverErrorCode } from '#lib/sdk/index.js';
 	import { formatBytes } from '#lib/format-bytes.js';
+	import { parseRepositoryUrl } from '#lib/repository-url.js';
 	import { onMount } from 'svelte';
 	import { goto } from '$app/navigation';
 	type Project = {
@@ -41,27 +42,9 @@
 	let pendingCreate = $state<{ name: string; url: string; keyId: string } | null>(null);
 	let observedHost = $state<SshHost | null>(null);
 	let approvalError = $state('');
-	function parseSshOrigin(repositoryUrl: string) {
-		const sshScheme = /^ssh:\/\//i.test(repositoryUrl);
-		try {
-			const parsed = new URL(repositoryUrl);
-			if (parsed.protocol === 'ssh:' && parsed.hostname) {
-				return {
-					isSsh: true,
-					host: parsed.hostname.toLowerCase(),
-					port: Number(parsed.port || 22)
-				};
-			}
-		} catch {
-			// SCP-style origins are not valid URLs; parse those below.
-		}
-		const scp = repositoryUrl.match(/^[^@\s/:]+@([a-zA-Z0-9.-]+):(.+)$/);
-		if (scp) return { isSsh: true, host: scp[1].toLowerCase(), port: 22 };
-		return { isSsh: sshScheme, host: null, port: null };
-	}
 	async function findObservedHost(repositoryUrl: string) {
-		const address = parseSshOrigin(repositoryUrl);
-		if (!address.isSsh || !address.host || address.port === null) return null;
+		const address = parseRepositoryUrl(repositoryUrl);
+		if (address.kind !== 'ssh' || !address.host || address.port === null) return null;
 		const hosts: SshHost[] = (await sdk.sshHosts.list()).data;
 		return (
 			hosts.find(
@@ -75,17 +58,17 @@
 		if (busy) return;
 		busy = true;
 		error = '';
-		const sshOrigin = parseSshOrigin(url);
-		const createValues = { name, url, keyId: sshOrigin.isSsh ? keyId : '' };
+		const origin = parseRepositoryUrl(url);
+		const createValues = { name, url, keyId: origin.kind === 'ssh' ? keyId : '' };
 		try {
 			const created: Project = (await sdk.projects.create(createValues)).data;
 			await goto(`/dashboard/projects/${encodeURIComponent(created.id)}`);
 		} catch (cause) {
-			if (sshOrigin.isSsh && serverErrorCode(cause) === 'ssh_host.approval_required') {
+			if (origin.kind === 'ssh' && serverErrorCode(cause) === 'ssh_host.approval_required') {
 				error =
 					'Host key not approved. Verify the fingerprint in SSH host warnings independently before approving it.';
 			}
-			if (sshOrigin.isSsh) {
+			if (origin.kind === 'ssh') {
 				try {
 					const observed = await findObservedHost(url);
 					if (observed) {
@@ -188,7 +171,7 @@
 	<p class="mt-2 text-[#58645b]">
 		You’re signed in. Connect HTTPS or SSH repositories to browse branches and tags.
 	</p>
-	{#if error && parseSshOrigin(url).isSsh}
+	{#if error && parseRepositoryUrl(url).kind === 'ssh'}
 		<p class="mt-3 text-sm text-[#58645b]">
 			Check <a class="font-semibold text-[#214c30] underline" href="/dashboard/keys"
 				>repository keys</a
@@ -236,7 +219,7 @@
 					required
 				/></label
 			>
-			{#if parseSshOrigin(url).isSsh}
+			{#if parseRepositoryUrl(url).kind === 'ssh'}
 				<p class="text-sm text-[#58645b] sm:col-span-2">
 					Need a key? <a class="font-semibold text-[#214c30] underline" href="/dashboard/keys"
 						>Manage repository keys</a
