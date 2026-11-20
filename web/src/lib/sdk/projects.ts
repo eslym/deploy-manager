@@ -51,8 +51,23 @@ const isNull = (value: unknown): value is null => value === null;
 
 export function createProjectOperations(request: ProjectOperation) {
 	return {
-		list: (signal?: AbortSignal) =>
-			request('/api/projects', 'GET', undefined, isProjects, signal, 'project.listed'),
+		list: (options?: { keyId?: string } | AbortSignal, signal?: AbortSignal) => {
+			const query =
+				options && 'aborted' in options
+					? ''
+					: options?.keyId
+						? `?keyId=${encodeURIComponent(options.keyId)}`
+						: '';
+			const requestSignal = options && 'aborted' in options ? options : signal;
+			return request(
+				`/api/projects${query}`,
+				'GET',
+				undefined,
+				isProjects,
+				requestSignal,
+				'project.listed'
+			);
+		},
 		create: (input: ProjectCreate, signal?: AbortSignal) =>
 			request('/api/projects', 'POST', input, isProject, signal, 'project.created'),
 		refs: (id: string, signal?: AbortSignal) =>

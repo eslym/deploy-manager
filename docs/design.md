@@ -26,6 +26,7 @@ Design confirmed by the user on 2026-11-12; frontend architecture corrected by t
 
 - Generate or import repository SSH keys, display public keys, and assign a key to a project. Do not display or export private keys.
 - Key management shows each repository key's current project-usage count, based on project–key assignments (not deployments or historical usage); counts include zero and follow assignment changes and project deletion.
+- Selecting a repository key's project-usage count opens the existing project listing filtered to its current assignments. The selected key is identified, projects link to their details, and the filter can be cleared; the URL preserves the filter across reloads.
 - Encrypt private keys at rest with a master key held outside the database. Imported keys need not support passphrases in v1.
 - Store and manage SSH host trust in SQLite rather than requiring a host known_hosts file. Surface host verification failures as dashboard warnings and block connections pending approval after independent verification.
 - Verify webhook requests with separate per-project secrets.

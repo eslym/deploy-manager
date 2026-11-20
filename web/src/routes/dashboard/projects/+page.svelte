@@ -3,7 +3,8 @@
 	import { formatBytes } from '#lib/format-bytes.js';
 	import { parseRepositoryUrl } from '#lib/repository-url.js';
 	import { onMount } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { afterNavigate, goto } from '$app/navigation';
+	import { page } from '$app/state';
 	type Project = {
 		id: string;
 		name: string;
@@ -31,6 +32,7 @@
 		trusted: boolean;
 	};
 	let projects = $state<Project[]>([]);
+	let projectsLoaded = $state(false);
 	let repositoryKeys = $state<RepositoryKey[]>([]);
 	let name = $state('');
 	let url = $state('');
@@ -39,6 +41,9 @@
 	let projectsReadError = $state('');
 	let keysReadError = $state('');
 	let busy = $state(false);
+	let selectedKeyId = $derived(page.url.searchParams.get('keyId') ?? '');
+	let selectedKey = $derived(repositoryKeys.find((key) => key.id === selectedKeyId));
+	let visibleProjects = $derived(projects);
 	let pendingCreate = $state<{ name: string; url: string; keyId: string } | null>(null);
 	let observedHost = $state<SshHost | null>(null);
 	let approvalError = $state('');
@@ -132,19 +137,27 @@
 		observedHost = null;
 		approvalError = '';
 	}
-	onMount(() => {
-		const disposeProjects = sdk.resources.subscribe({
-			identity: { kind: 'projects' },
-			read: () => sdk.projects.list().then((result) => result.data),
+	let disposeProjects: (() => void) | undefined;
+	afterNavigate(() => {
+		disposeProjects?.();
+		const filterKeyId = page.url.searchParams.get('keyId') || undefined;
+		projectsLoaded = false;
+		projectsReadError = '';
+		disposeProjects = sdk.resources.subscribe({
+			identity: { kind: 'projects', keyId: filterKeyId },
+			read: () => sdk.projects.list({ keyId: filterKeyId }).then((result) => result.data),
 			onValue: (items, cause) => {
 				if (cause) {
 					projectsReadError = cause instanceof Error ? cause.message : 'Could not load projects.';
 					return;
 				}
 				projects = items ?? [];
+				projectsLoaded = true;
 				projectsReadError = '';
 			}
 		});
+	});
+	onMount(() => {
 		const disposeKeys = sdk.resources.subscribe({
 			identity: { kind: 'repository_keys' },
 			read: () => sdk.repositoryKeys.list().then((result) => result.data),
@@ -159,7 +172,7 @@
 			}
 		});
 		return () => {
-			disposeProjects();
+			disposeProjects?.();
 			disposeKeys();
 		};
 	});
@@ -292,9 +305,32 @@
 	{/if}
 	<section class="mt-8">
 		<h2 class="text-xl font-semibold text-[#243528]">Your projects</h2>
-		{#if projects.length === 0}<p class="text-[#58645b]">No projects yet.</p>{:else}
+		{#if selectedKeyId}
+			<div
+				class="mt-3 flex flex-wrap items-center gap-3 rounded-lg border border-[#d7ded6] bg-white p-3"
+			>
+				<p class="m-0 text-sm text-[#354238]">
+					{#if selectedKey}Showing projects using <strong>{selectedKey.name}</strong>{:else}Showing
+						projects for the selected repository key{/if}
+				</p>
+				<a class="text-sm font-semibold text-[#214c30] underline" href="/dashboard/projects"
+					>Clear key filter</a
+				>
+			</div>
+		{/if}
+		{#if projectsReadError}
+			<p class="mt-3 text-sm text-[#58645b]">
+				Project list could not be refreshed. Try reloading this page.
+			</p>
+		{:else if !projectsLoaded}
+			<p class="mt-3 text-[#58645b]" role="status">Loading projects…</p>
+		{:else if visibleProjects.length === 0}
+			<p class="mt-3 text-[#58645b]">
+				{selectedKeyId ? 'No projects use this repository key.' : 'No projects yet.'}
+			</p>
+		{:else}
 			<ul class="grid gap-3 p-0">
-				{#each projects as project (project.id)}
+				{#each visibleProjects as project (project.id)}
 					<li class="min-w-0 list-none">
 						<a
 							href={`/dashboard/projects/${encodeURIComponent(project.id)}`}

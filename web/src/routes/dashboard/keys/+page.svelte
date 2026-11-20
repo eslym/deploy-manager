@@ -7,9 +7,11 @@
 	let privateKeyInput = $state('');
 	let keyError = $state('');
 	let keyBusy = $state(false);
+	let keysLoaded = $state(false);
 	async function loadRepositoryKeys() {
 		try {
 			repositoryKeys = (await sdk.repositoryKeys.list()).data;
+			keysLoaded = true;
 		} catch (cause) {
 			keyError = cause instanceof Error ? cause.message : 'Could not load repository keys.';
 		}
@@ -57,6 +59,7 @@
 					return;
 				}
 				repositoryKeys = keys ?? [];
+				keysLoaded = true;
 			}
 		});
 	});
@@ -137,9 +140,11 @@
 			>
 		</form>
 		<h3 class="mt-8 text-lg font-semibold text-[#243528]">Saved keys</h3>
-		{#if repositoryKeys.length === 0}<p class="text-[#58645b]">No repository keys yet.</p>{:else}<ul
-				class="grid gap-3 p-0"
-			>
+		{#if !keysLoaded && !keyError}<p class="text-[#58645b]" role="status">
+				Loading repository keys…
+			</p>{:else if repositoryKeys.length === 0}<p class="text-[#58645b]">
+				No repository keys yet.
+			</p>{:else}<ul class="grid gap-3 p-0">
 				{#each repositoryKeys as key (key.id)}<li
 						class="list-none rounded-lg border border-[#e1e6df] p-4"
 					>
@@ -148,9 +153,19 @@
 							{key.algorithm} · {key.bits} bits · {key.fingerprint}
 						</p>
 						<p class="mt-1 text-sm text-[#58645b]">
-							{key.projectCount}
-							{key.projectCount === 1 ? 'project' : 'projects'}
+							<a
+								class="font-semibold text-[#214c30] underline underline-offset-2"
+								href={`/dashboard/projects?keyId=${encodeURIComponent(key.id)}`}
+							>
+								{key.projectCount}
+								{key.projectCount === 1 ? 'project' : 'projects'}
+							</a>
 						</p>
+						<a
+							class="mt-2 inline-block text-sm font-semibold text-[#214c30] underline"
+							href={`/dashboard/projects?keyId=${encodeURIComponent(key.id)}`}
+							>View projects using this key</a
+						>
 						<code class="mt-2 block text-xs break-all text-[#58645b]">{key.publicKey}</code>
 						<p class="mt-2 text-xs text-[#58645b]">
 							Added {new Date(key.createdAt).toLocaleString()}

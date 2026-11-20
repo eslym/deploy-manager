@@ -143,7 +143,7 @@ interface EventSocket {
 }
 
 export type EventResource =
-	| { kind: 'projects' }
+	| { kind: 'projects'; keyId?: string }
 	| { kind: 'refs' | 'lfs_settings' | 'webhook_settings'; projectId: string }
 	| { kind: 'deployments'; projectId?: string; deploymentId?: string }
 	| { kind: 'jobs' | 'history'; deploymentId: string }
@@ -153,7 +153,7 @@ export type ResourceIdentity =
 	| { kind: 'deployments' }
 	| { kind: 'deployment'; projectId: string; deploymentId: string }
 	| { kind: 'root' }
-	| { kind: 'projects' }
+	| { kind: 'projects'; keyId?: string }
 	| { kind: 'refs'; projectId: string }
 	| { kind: 'repository_keys' | 'ssh_hosts' }
 	| { kind: 'lfs_settings' | 'webhook_settings'; projectId: string }
@@ -298,12 +298,13 @@ export function createBrowserSDK(adapters: SDKAdapters = {}) {
 			case 'deployments':
 			case 'deployment':
 			case 'root':
-			case 'projects':
 			case 'repository_keys':
 			case 'ssh_hosts':
 				return identity.kind === 'deployment'
 					? JSON.stringify([identity.kind, identity.projectId, identity.deploymentId])
 					: JSON.stringify([identity.kind]);
+			case 'projects':
+				return JSON.stringify([identity.kind, identity.keyId ?? '']);
 			case 'refs':
 			case 'lfs_settings':
 			case 'webhook_settings':

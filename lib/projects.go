@@ -262,7 +262,33 @@ func (a *App) listProjects(w http.ResponseWriter, r *http.Request) {
 		writeOutcomeError(w, http.StatusServiceUnavailable, "project.cache_recovery_required", "Repository cache recovery is required.")
 		return
 	}
-	projects, err := a.store.Project.Query().Order(ent.Asc(projectent.FieldCreatedAt), ent.Asc(projectent.FieldID)).All(r.Context())
+	projectQuery := a.store.Project.Query()
+	matchNoProjects := false
+	if values, present := r.URL.Query()["keyId"]; present {
+		if len(values) != 1 || !validProjectID(values[0]) {
+			writeOutcomeError(w, http.StatusBadRequest, "request.invalid", "Invalid repository key ID.")
+			return
+		}
+		assignments, err := a.store.ProjectSSHKey.Query().Where(projectsshkey.KeyIDEQ(values[0])).All(r.Context())
+		if err != nil {
+			writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
+			return
+		}
+		projectIDs := make([]string, 0, len(assignments))
+		for _, assignment := range assignments {
+			projectIDs = append(projectIDs, assignment.ID)
+		}
+		if len(projectIDs) == 0 {
+			matchNoProjects = true
+		} else {
+			projectQuery.Where(projectent.IDIn(projectIDs...))
+		}
+	}
+	var projects []*ent.Project
+	var err error
+	if !matchNoProjects {
+		projects, err = projectQuery.Order(ent.Asc(projectent.FieldCreatedAt), ent.Asc(projectent.FieldID)).All(r.Context())
+	}
 	if err != nil {
 		writeOutcomeError(w, http.StatusInternalServerError, "service.internal_error", "Operation could not be completed.")
 		return

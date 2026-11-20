@@ -473,7 +473,7 @@ list again for measured sizes.
 
 | Method and path                          | Request / success                                                                                 | Important behavior                                                                                                                                                 |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| GET `/api/projects`                      | 200 `project.listed`; `data` is Project[]                                                         | Ordered by creation time then ID; measures Git/LFS cache sizes.                                                                                                    |
+| GET `/api/projects`                      | 200 `project.listed`; `data` is Project[]                                                         | Ordered by creation time then ID; measures Git/LFS cache sizes. Optional `keyId=<32-lowercase-hex-id>` filters server-side to current assignments; valid unknown/unused keys return an empty array. |
 | POST `/api/projects`                     | `{"name":"site","url":"https://git.example/site.git"}`; 201 `project.created`; `data` is Project  | Synchronously clones without checkout and saves cached refs; not a queued job.                                                                                     |
 | GET `/api/projects/{id}/refs`            | 200 `project.refs_listed`; `data` is Ref[]                                                        | Cached only, sorted by kind/name; does not fetch.                                                                                                                  |
 | POST `/api/projects/{id}/refresh`        | No body required; 200 `project.refreshed`; `data` is `{"lastFetched":"<timestamp>","warning":""}` | Synchronously fetches; failed refresh preserves cached refs and last successful fetch information.                                                                 |
@@ -489,6 +489,14 @@ upstream status), and `project.cache_recovery_required` (503) where applicable.
 Failures do not echo upstream Git text in the outcome message. A failed repository
 refresh preserves the last successful cached refs and fetch time; inspect its
 warning before retrying. Cache recovery-required means do not assume retry safety.
+
+`GET /api/projects?keyId=<id>` applies the optional repository-key filter before
+loading project details. The ID must be a 32-character lowercase hexadecimal
+resource ID; malformed or repeated `keyId` parameters return `request.invalid`
+(400). A valid key with no current project assignments and a well-formed unknown
+key both return `project.listed` with `data: []`. Omitting `keyId` preserves the
+unfiltered listing and its creation-time/ID ordering. This remains the ordinary
+session-authorized project-list route; no key-specific endpoint is introduced.
 
 Project creation accepts `keyId` for an `ssh://` URL or conventional SCP-style
 SSH origin (for example, `git@github.com:owner/repo.git`) and requires it for SSH.

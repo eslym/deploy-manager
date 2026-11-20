@@ -12,6 +12,12 @@ once when it is assigned to that key, regardless of its deployments; unused keys
 show zero. Reassignment and project deletion change the count because it reflects
 current assignments, not historical use.
 
+Selecting a key's count opens the project list filtered to current projects using
+that key. The selected key is shown in the list, and **Clear filter** returns to
+all projects. The filter is encoded in the browser URL, so it remains active on
+refresh. Each result links to its project details; an unused or unknown key has
+no matching projects.
+
 Private material is encrypted with AES-256-GCM in SQLite. Its independent
 32-byte master key is stored outside SQLite at `--repository-key-master` (by
 default `<data>/repository-key-master.key`), with exclusive creation and mode

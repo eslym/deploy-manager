@@ -34,7 +34,7 @@ func TestProjectHTTPRejectsUnauthenticatedAndUnsupportedURLs(t *testing.T) {
 	defer server.Close()
 	client := server.Client()
 
-	unauth, err := client.Get(server.URL + "/api/projects")
+	unauth, err := client.Get(server.URL + "/api/projects?keyId=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,10 +111,10 @@ func TestListProjectsIncludesAssignedAndUnassignedKeysInProjectOrder(t *testing.
 		id, name, key string
 		created       int64
 	}{
-		{"project-a", "A", "key-shared", 1},
-		{"project-b", "B", "key-other", 2},
+		{"project-a", "A", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1},
+		{"project-b", "B", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 2},
 		{"project-c", "C", "", 3},
-		{"project-d", "D", "key-shared", 4},
+		{"project-d", "D", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 4},
 	} {
 		if _, err := app.db.Exec(`INSERT INTO projects(id,name,remote_url,created_at) VALUES(?,?,?,?)`, row.id, row.name, "https://example.invalid/"+row.name, row.created); err != nil {
 			t.Fatal(err)
@@ -127,6 +127,9 @@ func TestListProjectsIncludesAssignedAndUnassignedKeysInProjectOrder(t *testing.
 				t.Fatal(err)
 			}
 		}
+	}
+	if _, err := app.db.Exec(`INSERT INTO repository_keys(id,name,algorithm,bits,fingerprint,public_key,ciphertext,created_at) VALUES(?,?,?,?,?,?,?,?)`, "cccccccccccccccccccccccccccccccc", "unused", "ed25519", 256, "fingerprint", "public", []byte("ciphertext"), 5); err != nil {
+		t.Fatal(err)
 	}
 	token := []byte("0123456789abcdef0123456789abcdef")
 	digest := sha256.Sum256(token)
@@ -160,11 +163,51 @@ func TestListProjectsIncludesAssignedAndUnassignedKeysInProjectOrder(t *testing.
 		t.Fatalf("got %d projects, want 4", len(got))
 	}
 	wantIDs := []string{"project-a", "project-b", "project-c", "project-d"}
-	wantKeys := []string{"key-shared", "key-other", "", "key-shared"}
+	wantKeys := []string{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 	for i := range got {
 		if got[i].ID != wantIDs[i] || got[i].KeyID != wantKeys[i] {
 			t.Errorf("project[%d] = (%q, %q), want (%q, %q)", i, got[i].ID, got[i].KeyID, wantIDs[i], wantKeys[i])
 		}
+	}
+	for _, test := range []struct {
+		name, keyID string
+		wantIDs     []string
+	}{
+		{"shared key", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", []string{"project-a", "project-d"}},
+		{"other key", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", []string{"project-b"}},
+		{"unused key", "cccccccccccccccccccccccccccccccc", []string{}},
+		{"unknown key", "ffffffffffffffffffffffffffffffff", []string{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			filteredReq, err := http.NewRequest(http.MethodGet, server.URL+"/api/projects?keyId="+test.keyID, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			filteredReq.AddCookie(&http.Cookie{Name: sessionCookie, Value: base64.RawURLEncoding.EncodeToString(token)})
+			filteredRes, err := server.Client().Do(filteredReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer filteredRes.Body.Close()
+			var filtered struct {
+				Code string    `json:"code"`
+				Data []project `json:"data"`
+			}
+			if err := json.NewDecoder(filteredRes.Body).Decode(&filtered); err != nil {
+				t.Fatal(err)
+			}
+			if filteredRes.StatusCode != http.StatusOK || filtered.Code != "project.listed" {
+				t.Fatalf("filtered response = %d %q", filteredRes.StatusCode, filtered.Code)
+			}
+			if len(filtered.Data) != len(test.wantIDs) {
+				t.Fatalf("got %d filtered projects, want %d", len(filtered.Data), len(test.wantIDs))
+			}
+			for i, id := range test.wantIDs {
+				if filtered.Data[i].ID != id {
+					t.Errorf("filtered project[%d] = %q, want %q", i, filtered.Data[i].ID, id)
+				}
+			}
+		})
 	}
 }
 

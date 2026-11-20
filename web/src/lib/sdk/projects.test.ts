@@ -85,6 +85,26 @@ describe('project SDK operations', () => {
 		});
 	});
 
+	it('sends a key filter as an encoded projects-list query parameter', async () => {
+		const fetch = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify({
+					code: 'project.listed',
+					message: 'Projects loaded.',
+					data: []
+				})
+			)
+		);
+		const api = createBrowserSDK({ fetch });
+
+		await api.projects.list({ keyId: 'key/id + one' });
+
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/projects?keyId=key%2Fid%20%2B%20one',
+			expect.objectContaining({ method: 'GET', credentials: 'same-origin' })
+		);
+	});
+
 	it('passes caller cancellation through project operations without retrying mutations', async () => {
 		const controller = new AbortController();
 		const fetch = vi.fn().mockResolvedValue(
