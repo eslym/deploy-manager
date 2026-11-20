@@ -3,10 +3,28 @@ import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vitest/config';
 import { loadEnv } from 'vite';
+import { execSync } from 'node:child_process';
 
 export default defineConfig(({ mode }) => {
 	const backendURL = loadEnv(mode, '.', '').GO_BACKEND_URL ?? 'http://127.0.0.1:8080';
+	const githubSha = loadEnv(mode, '.', '').GITHUB_SHA;
 
+	let version: string;
+	if (mode === 'development') {
+		version = 'dev-' + Date.now();
+	} else if (githubSha) {
+		version = githubSha;
+	} else {
+		try {
+			const sha = execSync('git rev-parse HEAD').toString().trim();
+			const clean = execSync('test -z "$(git status --porcelain)" && echo clean || echo dirty')
+				.toString()
+				.trim();
+			version = clean === 'clean' ? sha : sha + '-dev';
+		} catch {
+			version = 'dev-' + Date.now();
+		}
+	}
 	return {
 		test: {
 			include: ['src/lib/**/*.test.ts'],
@@ -33,7 +51,11 @@ export default defineConfig(({ mode }) => {
 					pages: '../lib/web',
 					assets: '../lib/web',
 					fallback: 'index.html'
-				})
+				}),
+
+				version: {
+					name: version
+				}
 			})
 		]
 	};
