@@ -184,6 +184,68 @@ async function assertCacheClearFailureFeedback(page, projectID) {
   }
 }
 
+async function assertPostApprovalCreateFailure(page, origin, hostChanges = false) {
+  let approved = false;
+  let approvals = 0;
+  let creations = 0;
+  let fingerprint = "SHA256:verified-host";
+  await page.route("**/api/ssh-hosts", route => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    body: JSON.stringify(outcome("ssh_host.listed", "SSH hosts loaded.", [{
+      host: "host.example", port: 22, fingerprint,
+      warning: approved ? "" : "Verify the SSH host independently.", trusted: approved
+    }]))
+  }));
+  await page.route("**/api/ssh-hosts/approve", async route => {
+    if (route.request().postDataJSON().fingerprint !== fingerprint) throw new Error("approval reused a stale host fingerprint");
+    approved = true;
+    approvals++;
+    await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(outcome("ssh_host.approved", "SSH host approved.")) });
+  });
+  await page.route("**/api/projects", async route => {
+    if (route.request().method() !== "POST") return route.continue();
+    creations++;
+    if (creations === 1) return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify(outcome("ssh_host.approval_required", "Verify and approve the SSH host first.")) });
+    if (creations === 2) {
+      if (hostChanges) {
+        approved = false;
+        fingerprint = "SHA256:changed-after-approval";
+        return route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify(outcome("ssh_host.approval_required", "Verify and approve the changed SSH host first.")) });
+      }
+      return route.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify(outcome("git.authentication_failed", "Repository authentication failed.")) });
+    }
+    await route.fulfill({ status: 201, contentType: "application/json", body: JSON.stringify(outcome("project.created", "Project created.", { id: "ssh-approved-retry", name: "Approved host project", url: "git@host.example:owner/site.git", keyId: "fixture-key", lastFetched: null, gitCacheBytes: 0, lfsCacheBytes: 0 })) });
+  });
+  try {
+    await page.goto(`${origin}/dashboard/projects`, { waitUntil: "domcontentloaded" });
+    await page.getByLabel("Project name").fill("Approved host project");
+    await page.getByLabel("Repository URL").fill("git@host.example:owner/site.git");
+    await page.getByLabel("SSH key").selectOption("fixture-key");
+    await page.getByRole("button", { name: "Add repository" }).click();
+    await page.getByRole("dialog").getByRole("button", { name: /Approve/ }).click();
+    if (hostChanges) {
+      await page.getByRole("dialog").getByText("SHA256:changed-after-approval", { exact: true }).waitFor();
+      if (approvals !== 1 || creations !== 2) throw new Error("changed host was approved or repository retried before reviewing its new fingerprint");
+      await page.getByRole("dialog").getByRole("button", { name: /Approve/ }).click();
+    } else {
+      await page.getByRole("dialog").waitFor({ state: "detached" });
+      const failure = await page.getByRole("alert").innerText();
+      if (failure !== "Repository authentication failed.") throw new Error(`successful host approval masked the repository failure: ${failure}`);
+      await page.waitForFunction(() => document.activeElement?.id === "add-repository-button");
+      if (approvals !== 1 || creations !== 2) throw new Error("unexpected request sequence after approved-host repository failure");
+      if (await page.getByLabel("Project name").inputValue() !== "Approved host project" || await page.getByLabel("Repository URL").inputValue() !== "git@host.example:owner/site.git" || await page.getByLabel("SSH key").inputValue() !== "fixture-key") throw new Error("repository failure after approval cleared the project form");
+      await page.getByRole("button", { name: "Add repository" }).click();
+    }
+    await page.waitForURL("**/dashboard/projects/ssh-approved-retry");
+    if (approvals !== (hostChanges ? 2 : 1) || creations !== 3) throw new Error("repository retry did not follow the current host approval");
+  } finally {
+    await page.unroute("**/api/projects");
+    await page.unroute("**/api/ssh-hosts");
+    await page.unroute("**/api/ssh-hosts/approve");
+  }
+}
+
 async function startApplication(cert, key, gitCA) {
   const env = { ...process.env, DEPLOY_MANAGER_TEST_GIT_CA: gitCA, DEPLOY_MANAGER_TEST_GIT_ORIGIN: fixtureOrigin, DEPLOY_MANAGER_TEST_LFS_CA: gitCA };
   app = spawn(executable, ["serve", "--data", dir, "--listen", appListen, "--tls-cert", cert, "--tls-key", key, "--origin", `https://${appListen}`, "--auth-rate-per-minute", "1000"], { cwd: dir, env, stdio: ["ignore", "pipe", "pipe"] });
@@ -397,9 +459,13 @@ try {
     throw new Error("missing-warning recovery cleared the project form");
   }
   await page.unroute("**/api/projects");
-  await page.unroute("**/api/repository-keys");
   await page.unroute("**/api/ssh-hosts");
   await page.unroute("**/api/ssh-hosts/approve");
+  milestone("preserve repository failure after successful SSH host approval");
+  await assertPostApprovalCreateFailure(page, `https://${appListen}`);
+  milestone("re-review host fingerprint changed after successful approval");
+  await assertPostApprovalCreateFailure(page, `https://${appListen}`, true);
+  await page.unroute("**/api/repository-keys");
   await page.goto(`https://${appListen}/dashboard/projects`, { waitUntil: "domcontentloaded" });
   const sessionCookie = (await context.cookies()).find(cookie => cookie.name === "__Host-deploy-manager-session")?.value;
   if (!sessionCookie) throw new Error("authenticated browser session cookie is missing");

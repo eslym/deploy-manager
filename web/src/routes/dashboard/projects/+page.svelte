@@ -50,15 +50,18 @@
 	let observedHost = $state<SshHost | null>(null);
 	let approvalError = $state('');
 	let approvalSubmitter: HTMLElement | undefined;
-	function cancelHostApprovalDialog() {
-		if (busy) return;
-		cancelHostApproval();
+	function restoreApprovalFocus() {
 		const submitter = approvalSubmitter;
 		approvalSubmitter = undefined;
 		void tick().then(() => {
 			if (submitter?.isConnected) submitter.focus();
 			else document.getElementById('add-repository-button')?.focus();
 		});
+	}
+	function cancelHostApprovalDialog() {
+		if (busy) return;
+		cancelHostApproval();
+		restoreApprovalFocus();
 	}
 	const hostApprovalModal = modalAttachment(cancelHostApprovalDialog, () => busy);
 	async function findObservedHost(repositoryUrl: string) {
@@ -112,36 +115,59 @@
 		busy = true;
 		approvalError = '';
 		try {
-			await sdk.sshHosts.approve({
-				host: observedHost.host,
-				port: observedHost.port,
-				fingerprint: observedHost.fingerprint,
-				confirm: true
-			});
-			const approvedCreate = createSnapshot;
-			const created: Project = (await sdk.projects.create(approvedCreate)).data;
-			pendingCreate = null;
-			observedHost = null;
-			await goto(`/dashboard/projects/${encodeURIComponent(created.id)}`);
-		} catch (cause) {
-			approvalError = cause instanceof Error ? cause.message : 'Could not approve this host key.';
 			try {
-				const refreshed = await findObservedHost(createSnapshot.url);
-				if (refreshed) {
-					observedHost = refreshed;
-				} else {
+				await sdk.sshHosts.approve({
+					host: observedHost.host,
+					port: observedHost.port,
+					fingerprint: observedHost.fingerprint,
+					confirm: true
+				});
+			} catch (cause) {
+				approvalError = cause instanceof Error ? cause.message : 'Could not approve this host key.';
+				try {
+					const refreshed = await findObservedHost(createSnapshot.url);
+					if (refreshed) {
+						observedHost = refreshed;
+					} else {
+						observedHost = null;
+						approvalError =
+							'The host warning is no longer available, so this fingerprint cannot be approved. Your repository details are still filled in; review the current SSH host warnings before trying again.';
+						error = approvalError;
+						pendingCreate = null;
+					}
+				} catch {
 					observedHost = null;
 					approvalError =
-						'The host warning is no longer available, so this fingerprint cannot be approved. Your repository details are still filled in; review the current SSH host warnings before trying again.';
+						'Could not refresh SSH host warnings, so this fingerprint cannot be approved. Your repository details are still filled in; refresh the warnings before trying again.';
 					error = approvalError;
 					pendingCreate = null;
 				}
-			} catch {
-				observedHost = null;
-				approvalError =
-					'Could not refresh SSH host warnings, so this fingerprint cannot be approved. Your repository details are still filled in; refresh the warnings before trying again.';
-				error = approvalError;
-				pendingCreate = null;
+				return;
+			}
+
+			// Approval succeeded. A later repository-creation failure is not an
+			// approval failure and must not be replaced by a stale-warning message.
+			pendingCreate = null;
+			observedHost = null;
+			approvalError = '';
+			try {
+				const created: Project = (await sdk.projects.create(createSnapshot)).data;
+				await goto(`/dashboard/projects/${encodeURIComponent(created.id)}`);
+			} catch (cause) {
+				if (serverErrorCode(cause) === 'ssh_host.approval_required') {
+					try {
+						const refreshed = await findObservedHost(createSnapshot.url);
+						if (refreshed) {
+							pendingCreate = createSnapshot;
+							observedHost = refreshed;
+							return;
+						}
+					} catch {
+						// Show the original repository error if the warning cannot be loaded.
+					}
+				}
+				error = cause instanceof Error ? cause.message : 'Could not add repository.';
+				restoreApprovalFocus();
 			}
 		} finally {
 			busy = false;
