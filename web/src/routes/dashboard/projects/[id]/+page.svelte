@@ -7,6 +7,7 @@
 	import { page } from '$app/state';
 	import Deployments from '#lib/components/Deployments.svelte';
 	import WebhookSetup from '#lib/components/WebhookSetup.svelte';
+	import { modalAttachment } from '#lib/modal.js';
 	type Project = {
 		id: string;
 		name: string;
@@ -59,7 +60,15 @@
 	let cacheRecreateTriggerProject = '';
 	let cacheRecreateBusy = $state(false);
 	let cacheRecreateError = $state('');
+	let cacheClearedProject = $state('');
 	let cacheRecreateNotice = $state('');
+	const cacheRecreateModal = modalAttachment(
+		() => {
+			if (!cacheRecreateBusy) closeCacheRecreateConfirmation();
+		},
+		() => cacheRecreateBusy,
+		'#cache-recreate-confirm'
+	);
 	let projectReadController: AbortController | undefined;
 	let refreshController: AbortController | undefined;
 	let cacheReadController: AbortController | undefined;
@@ -292,21 +301,26 @@
 		cacheRecreateBusy = true;
 		cacheRecreateError = '';
 		cacheRecreateNotice = '';
-		let storageCleared = false;
 		try {
-			await sdk.projects.clearCache(project.id, readController.signal);
-			storageCleared = true;
+			if (cacheClearedProject !== project.id) {
+				await sdk.projects.clearCache(project.id, readController.signal);
+				if (readController.signal.aborted || selected !== project.id) return;
+				cacheClearedProject = project.id;
+			}
 			const refreshedProjects: Project[] = (await sdk.projects.list(readController.signal)).data;
 			if (readController.signal.aborted || selected !== project.id) return;
 			projects = refreshedProjects;
+			cacheClearedProject = '';
+			cacheRecreateError = '';
 			if (cacheRecreateConfirmation === project.id) closeCacheRecreateConfirmation(true);
 			if (selected === project.id)
 				cacheRecreateNotice = 'Repository storage cleared. Sizes updated.';
 		} catch (cause) {
 			if (readController.signal.aborted || selected !== project.id) return;
-			cacheRecreateError = storageCleared
-				? 'Storage was cleared, but the sizes could not be refreshed. Reload the page to check them.'
-				: 'Could not clear repository storage. Try again.';
+			cacheRecreateError =
+				cacheClearedProject === project.id
+					? 'Storage was cleared, but the sizes could not be refreshed. Try refreshing the sizes again.'
+					: 'Could not clear repository storage. Try again.';
 		} finally {
 			if (cacheReadController === readController) {
 				cacheReadController = undefined;
@@ -314,15 +328,15 @@
 			}
 		}
 	}
-	async function openCacheRecreateConfirmation(project: Project) {
+	function openCacheRecreateConfirmation(project: Project) {
 		cacheRecreateTrigger =
 			document.activeElement instanceof HTMLButtonElement ? document.activeElement : undefined;
 		cacheRecreateTriggerProject = project.id;
 		cacheRecreateConfirmation = project.id;
-		cacheRecreateError = '';
-		cacheRecreateNotice = '';
-		await tick();
-		document.getElementById('cache-recreate-confirm')?.focus();
+		if (cacheClearedProject !== project.id) {
+			cacheRecreateError = '';
+			cacheRecreateNotice = '';
+		}
 	}
 	function closeCacheRecreateConfirmation(restoreFocus = true) {
 		cacheRecreateConfirmation = '';
@@ -339,25 +353,6 @@
 						);
 				target?.focus();
 			});
-	}
-	function trapCacheRecreateFocus(event: KeyboardEvent) {
-		if (event.key === 'Escape' && !cacheRecreateBusy) {
-			event.preventDefault();
-			closeCacheRecreateConfirmation();
-			return;
-		}
-		const dialog = document.getElementById('cache-recreate-dialog');
-		if (event.key !== 'Tab' || !dialog) return;
-		const focusable = Array.from(dialog.querySelectorAll<HTMLElement>('button:not(:disabled)'));
-		const first = focusable[0];
-		const last = focusable.at(-1);
-		if (event.shiftKey && document.activeElement === first) {
-			event.preventDefault();
-			last?.focus();
-		} else if (!event.shiftKey && document.activeElement === last) {
-			event.preventDefault();
-			first?.focus();
-		}
 	}
 	function loadDetail() {
 		projectReadController?.abort();
@@ -384,6 +379,7 @@
 		closeCacheRecreateConfirmation(false);
 		cacheRecreateError = '';
 		cacheRecreateNotice = '';
+		cacheClearedProject = '';
 	}
 	afterNavigate(() => {
 		for (const dispose of resourceDisposers) dispose();
@@ -544,45 +540,58 @@
 						project?.lfsCacheBytes ?? 0
 					)}
 				</p>
-				{#if cacheRecreateError}<p role="alert" class="mt-2 text-sm text-red-800">
+				{#if cacheRecreateError && cacheRecreateConfirmation !== project?.id}<p
+						role="alert"
+						class="mt-2 text-sm text-red-800"
+					>
 						{cacheRecreateError}
 					</p>{/if}
 				{#if cacheRecreateNotice}<p role="status" class="mt-2 text-sm text-[#214c30]">
 						{cacheRecreateNotice}
 					</p>{/if}
 				{#if cacheRecreateConfirmation === project?.id}
-					<div
+					<dialog
 						id="cache-recreate-dialog"
-						class="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-3"
-						role="dialog"
-						aria-modal="true"
+						{@attach cacheRecreateModal}
+						class="app-modal w-[min(100%-2rem,36rem)] rounded-lg border border-amber-300 bg-amber-50 p-3"
 						aria-labelledby="cache-recreate-title"
 						aria-describedby="cache-recreate-warning"
-						tabindex="-1"
-						onkeydown={trapCacheRecreateFocus}
 					>
 						<h4 id="cache-recreate-title" class="m-0 font-semibold text-amber-950">
-							Confirm clearing repository storage
+							{cacheClearedProject === project?.id
+								? 'Repository storage cleared'
+								: 'Confirm clearing repository storage'}
 						</h4>
-						<p id="cache-recreate-warning" role="alert" class="mt-2 text-sm text-amber-950">
-							This can free disk space. It permanently removes commits no longer reachable from a
-							branch or tag, plus Git LFS files the server can no longer provide. You may lose the
-							ability to redeploy or roll back releases that need them.
-						</p>
+						{#if cacheClearedProject === project?.id}
+							<p id="cache-recreate-warning" class="mt-2 text-sm text-amber-950">
+								Storage was cleared. Refresh the sizes to see the updated totals.
+							</p>
+						{:else}
+							<p id="cache-recreate-warning" role="alert" class="mt-2 text-sm text-amber-950">
+								This can free disk space. It permanently removes commits no longer reachable from a
+								branch or tag, plus Git LFS files the server can no longer provide. You may lose the
+								ability to redeploy or roll back releases that need them.
+							</p>
+						{/if}
+						{#if cacheRecreateError}<p role="alert" class="mt-2 text-sm text-red-800">
+								{cacheRecreateError}
+							</p>{/if}
 						<div class="mt-3 flex flex-wrap gap-2">
 							<button
 								id="cache-recreate-confirm"
 								class="min-h-9 rounded-lg bg-amber-900 px-3 text-sm font-semibold text-white disabled:opacity-60"
 								onclick={() => project && recreateCache(project)}
-								disabled={cacheRecreateBusy || !project}>Clear cache</button
+								disabled={cacheRecreateBusy || !project}
+								>{cacheClearedProject === project?.id ? 'Refresh sizes' : 'Clear cache'}</button
 							>
 							<button
 								class="min-h-9 rounded-lg border border-[#aeb9ae] px-3 text-sm font-semibold disabled:opacity-60"
 								onclick={() => closeCacheRecreateConfirmation()}
-								disabled={cacheRecreateBusy}>Cancel</button
+								disabled={cacheRecreateBusy}
+								>{cacheClearedProject === project?.id ? 'Close' : 'Cancel'}</button
 							>
 						</div>
-					</div>
+					</dialog>
 				{:else}
 					<button
 						id="cache-recreate-trigger"

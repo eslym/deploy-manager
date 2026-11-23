@@ -5,6 +5,8 @@
 	import { onMount } from 'svelte';
 	import { afterNavigate, goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import { tick } from 'svelte';
+	import { modalAttachment } from '#lib/modal.js';
 	type Project = {
 		id: string;
 		name: string;
@@ -47,6 +49,18 @@
 	let pendingCreate = $state<{ name: string; url: string; keyId: string } | null>(null);
 	let observedHost = $state<SshHost | null>(null);
 	let approvalError = $state('');
+	let approvalSubmitter: HTMLElement | undefined;
+	function cancelHostApprovalDialog() {
+		if (busy) return;
+		cancelHostApproval();
+		const submitter = approvalSubmitter;
+		approvalSubmitter = undefined;
+		void tick().then(() => {
+			if (submitter?.isConnected) submitter.focus();
+			else document.getElementById('add-repository-button')?.focus();
+		});
+	}
+	const hostApprovalModal = modalAttachment(cancelHostApprovalDialog, () => busy);
 	async function findObservedHost(repositoryUrl: string) {
 		const address = parseRepositoryUrl(repositoryUrl);
 		if (address.kind !== 'ssh' || !address.host || address.port === null) return null;
@@ -61,6 +75,7 @@
 	async function createProject(event: SubmitEvent) {
 		event.preventDefault();
 		if (busy) return;
+		approvalSubmitter = event.submitter instanceof HTMLElement ? event.submitter : undefined;
 		busy = true;
 		error = '';
 		const origin = parseRepositoryUrl(url);
@@ -260,6 +275,7 @@
 				</label>
 			{/if}
 			<button
+				id="add-repository-button"
 				class="min-h-11 w-fit rounded-lg bg-[#214c30] px-5 font-semibold text-white disabled:opacity-60"
 				disabled={busy}>Add repository</button
 			>
@@ -267,8 +283,8 @@
 	</section>
 	{#if observedHost && pendingCreate}
 		<dialog
-			open
-			class="mt-4 w-full max-w-none rounded-xl border border-amber-400 bg-amber-50 p-5 text-left"
+			{@attach hostApprovalModal}
+			class="app-modal w-[min(100%-2rem,36rem)] rounded-xl border border-amber-400 bg-amber-50 p-5 text-left"
 			aria-labelledby="host-approval-title"
 		>
 			<h2 id="host-approval-title" class="m-0 text-lg font-semibold text-[#243528]">
@@ -301,7 +317,7 @@
 				>
 				<button
 					class="min-h-10 rounded-lg border border-[#aeb9ae] px-4"
-					onclick={cancelHostApproval}
+					onclick={cancelHostApprovalDialog}
 					disabled={busy}>Cancel</button
 				>
 			</div>

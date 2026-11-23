@@ -85,6 +85,40 @@ async function openProject(page, id, name) {
   await page.waitForURL(`**/dashboard/projects/${id}`);
 }
 
+async function assertModalDialog(dialog) {
+  // Inspect rendering and browser behavior, rather than trusting aria-modal alone.
+  const state = await dialog.evaluate(node => {
+    const rect = node.getBoundingClientRect();
+    let overlay = node;
+    while (overlay && getComputedStyle(overlay).position !== "fixed") overlay = overlay.parentElement;
+    return {
+      nativeModal: node.matches(":modal"),
+      fixedOverlay: Boolean(overlay),
+      insideViewport: rect.top >= 0 && rect.left >= 0 && rect.bottom <= innerHeight && rect.right <= innerWidth,
+      focusInside: node.contains(document.activeElement)
+    };
+  });
+  if ((!state.nativeModal && !state.fixedOverlay) || !state.insideViewport || !state.focusInside) {
+    throw new Error(`dialog renders as page content instead of a modal: ${JSON.stringify(state)}`);
+  }
+  const focusableCount = await dialog.locator("button:enabled, input:enabled, select:enabled, textarea:enabled, a[href]").count();
+  // Chromium can report BODY while Tab visits browser chrome. That is not
+  // background page focus; the native modal still makes the page inert.
+  const focusStaysModal = () => dialog.evaluate(node => node.contains(document.activeElement) || (node.matches(":modal") && document.activeElement === document.body));
+  for (let index = 0; index <= focusableCount; index++) {
+    await dialog.page().keyboard.press("Tab");
+    if (!(await focusStaysModal())) throw new Error("Tab moved focus behind the modal");
+  }
+  await dialog.page().keyboard.press("Shift+Tab");
+  if (!(await focusStaysModal())) throw new Error("Shift+Tab moved focus behind the modal");
+  const backgroundBlocked = await dialog.evaluate(node => {
+    node.querySelector("button:enabled")?.focus();
+    document.querySelector('nav[aria-label="Dashboard"] a')?.focus();
+    return node.contains(document.activeElement);
+  });
+  if (!backgroundBlocked) throw new Error("background navigation remained focusable while the modal was open");
+}
+
 async function assertProjectLayout(page) {
   // The original two-column layout placed storage and LFS outside the selected project's column.
   // Check the actual rendered rectangles, not just CSS class names or a screenshot snapshot.
@@ -101,6 +135,53 @@ async function assertProjectLayout(page) {
     if (bounds.hasProjectList || [bounds.storage, bounds.actions, bounds.lfs].some(rect => rect.left < bounds.detail.left - 2 || rect.right > bounds.detail.right + 2) || bounds.scrollWidth > bounds.width) throw new Error(`project detail escaped its dedicated page at ${width}px: ${JSON.stringify(bounds)}`);
   }
   await page.setViewportSize({ width: 1280, height: 900 });
+}
+
+async function assertCacheClearFailureFeedback(page, projectID) {
+  const storage = page.getByRole("region", { name: "Repository storage" });
+  const dialog = storage.getByRole("dialog");
+  const clearURL = `**/api/projects/${projectID}/cache/recreate`;
+  let clearRequests = 0;
+  let failRefresh = true;
+  await page.route(clearURL, async route => {
+    clearRequests++;
+    await route.fulfill({
+      status: clearRequests === 1 ? 500 : 200,
+      contentType: "application/json",
+      body: JSON.stringify(outcome(clearRequests === 1 ? "internal.error" : "project.cache_cleared", "Cache test response."))
+    });
+  });
+  await page.route("**/api/projects", async route => {
+    if (route.request().method() !== "GET" || !failRefresh) return route.continue();
+    await route.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify(outcome("internal.error", "Size refresh test failure.")) });
+  });
+  try {
+    await storage.getByRole("button", { name: "Clear cache…" }).click();
+    await dialog.getByRole("button", { name: "Clear cache", exact: true }).click();
+    await page.getByText("Could not clear repository storage. Try again.", { exact: true }).waitFor();
+    if (!(await dialog.getByRole("alert").filter({ hasText: "Could not clear repository storage." }).count())) throw new Error("cache-clear failure feedback is outside the modal");
+    if (!(await dialog.evaluate(node => node.matches(":modal")))) throw new Error("cache-clear failure closed the modal unexpectedly");
+    await dialog.getByRole("button", { name: "Clear cache", exact: true }).click();
+    await page.getByText(/Storage was cleared, but the sizes could not be refreshed/).waitFor();
+    if (!(await dialog.getByRole("alert").filter({ hasText: /Storage was cleared/ }).count())) throw new Error("cache-clear partial-success feedback is outside the modal");
+    if (await dialog.getByRole("button", { name: "Clear cache", exact: true }).count()) throw new Error("cache clearing remained available after storage was already cleared");
+    const failedRefresh = page.waitForResponse(response => new URL(response.url()).pathname === "/api/projects" && response.request().method() === "GET");
+    await dialog.getByRole("button", { name: "Refresh sizes", exact: true }).click();
+    if ((await failedRefresh).status() !== 500) throw new Error("size-refresh failure fixture did not run");
+    await dialog.getByRole("alert").filter({ hasText: /Storage was cleared/ }).waitFor();
+    if (clearRequests !== 2) throw new Error("retrying the size refresh repeated cache clearing");
+    await dialog.getByRole("button", { name: "Close", exact: true }).click();
+    await storage.getByRole("button", { name: "Clear cache…" }).click();
+    if (await dialog.getByRole("button", { name: "Clear cache", exact: true }).count()) throw new Error("reopening partial-success confirmation enabled cache clearing again");
+    failRefresh = false;
+    await dialog.getByRole("button", { name: "Refresh sizes", exact: true }).click();
+    await dialog.waitFor({ state: "detached" });
+    await page.waitForFunction(() => document.activeElement?.id === "cache-recreate-trigger");
+    if (clearRequests !== 2) throw new Error("recovering the size refresh repeated cache clearing");
+  } finally {
+    await page.unroute(clearURL);
+    await page.unroute("**/api/projects");
+  }
 }
 
 async function startApplication(cert, key, gitCA) {
@@ -215,6 +296,7 @@ try {
   let latestWarning = observedHost;
   let hideWarningAfterApprovalFailure = false;
   let warningDisappearsAfterApprovalFailure = false;
+  let releaseApprovalFailure;
   await page.route("**/api/ssh-hosts", async route => {
     if (route.request().method() === "GET") {
       const hosts = [
@@ -236,6 +318,7 @@ try {
   await page.route("**/api/ssh-hosts/approve", async route => {
     approvalAttempts++;
     if (approvalAttempts === 1) {
+      if (!hideWarningAfterApprovalFailure) await new Promise(resolveApproval => { releaseApprovalFailure = resolveApproval; });
       latestWarning = { ...observedHost, fingerprint: "SHA256:replacement-key-fingerprint" };
       if (hideWarningAfterApprovalFailure) warningDisappearsAfterApprovalFailure = true;
       await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ code: "ssh_host.observation_changed", message: "SSH host details changed. Review them again.", data: null }) });
@@ -261,17 +344,28 @@ try {
   await createButton.click();
   const approvalDialog = page.getByRole("dialog");
   await approvalDialog.waitFor();
+  for (const width of [1280, 390]) {
+    await page.setViewportSize({ width, height: 900 });
+    await assertModalDialog(approvalDialog);
+  }
+  await page.setViewportSize({ width: 1280, height: 900 });
   await approvalDialog.getByText("host.example", { exact: true }).waitFor();
   await approvalDialog.getByText("22", { exact: true }).waitFor();
   await approvalDialog.getByText(observedHost.fingerprint, { exact: true }).waitFor();
   await approvalDialog.getByText(/independently/i).waitFor();
-  await approvalDialog.getByRole("button", { name: "Cancel" }).click();
+  await page.keyboard.press("Escape");
+  await approvalDialog.waitFor({ state: "detached" });
+  if (!(await createButton.evaluate(node => node === document.activeElement))) throw new Error("closing host approval did not restore focus to Add repository");
   if (projectAttempts !== 1 || approvalAttempts !== 0) throw new Error("canceling host approval created a project or approved a key");
   if (await page.getByLabel("Project name").inputValue() !== "SSH fixture site" || await page.getByLabel("Repository URL").inputValue() !== "git@host.example:owner/site.git") {
     throw new Error("canceling host approval cleared the project form");
   }
   await createButton.click();
   await page.getByRole("dialog").getByRole("button", { name: /Approve/ }).click();
+  await waitFor(() => Boolean(releaseApprovalFailure), "pending SSH host approval");
+  await page.keyboard.press("Escape");
+  if (!(await page.getByRole("dialog").isVisible()) || !(await page.getByRole("dialog").getByRole("button", { name: "Cancel" }).isDisabled())) throw new Error("Escape dismissed host approval during its request");
+  releaseApprovalFailure();
   await page.getByRole("dialog").getByText("SHA256:replacement-key-fingerprint", { exact: true }).waitFor();
   await page.getByRole("dialog").getByRole("alert").filter({ hasText: /changed|review/i }).waitFor();
   if (projectAttempts !== 2) throw new Error("project creation retried before the changed fingerprint was reviewed");
@@ -361,6 +455,8 @@ try {
   await page.locator("span.font-medium").filter({ hasText: /^feature\/search$/ }).waitFor();
   await page.getByText("v1.0", { exact: true }).waitFor();
 
+  milestone("cache-clear failure and partial-success feedback");
+  await assertCacheClearFailureFeedback(page, id);
   milestone("configure LFS");
   await page.getByLabel("LFS server URL").waitFor();
   const initialLfsSettings = await page.evaluate(async id => (await (await fetch(`/api/projects/${id}/lfs`)).json()).data, id);
@@ -1114,6 +1210,7 @@ try {
   const blockedCreate = await blockedCreateResponse;
   if (blockedCreate.status() !== 409) throw new Error(`unknown SSH host was not blocked (${blockedCreate.status()})`);
   trace("unapproved SSH project creation blocked");
+  await page.getByRole("dialog", { name: "Verify this SSH host" }).getByRole("button", { name: "Cancel", exact: true }).click();
   await page.getByRole("link", { name: "SSH hosts", exact: true }).click();
   await page.waitForURL("**/dashboard/ssh-hosts");
   await page.reload({ waitUntil: "domcontentloaded" });
@@ -1590,7 +1687,8 @@ try {
   await cacheSection.getByRole("button", { name: "Clear cache…" }).click();
   const cacheConfirmation = cacheSection.getByRole("dialog", { name: "Confirm clearing repository storage" });
   if (await page.evaluate(() => document.activeElement?.id) !== "cache-recreate-confirm") throw new Error("cache confirmation did not move focus to its primary action");
-  if (await cacheConfirmation.getAttribute("aria-modal") !== "true" || !(await cacheConfirmation.getAttribute("aria-describedby"))) throw new Error("cache confirmation is missing modal or description semantics");
+  await assertModalDialog(cacheConfirmation);
+  if (!(await cacheConfirmation.evaluate(node => node.matches(":modal"))) || !(await cacheConfirmation.getAttribute("aria-describedby"))) throw new Error("cache confirmation is missing modal or description semantics");
   if (!(await cacheConfirmation.locator('[role="alert"]').count())) throw new Error("cache warning is not announced to assistive technology");
   await cacheConfirmation.getByText(/no longer reachable from a\s+branch or tag/).waitFor();
   await cacheConfirmation.getByText(/server can no longer provide/).waitFor();
